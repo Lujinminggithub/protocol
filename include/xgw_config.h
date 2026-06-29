@@ -7,6 +7,7 @@
 #include "xgw_pool.h"
 #include "xgw_policy.h"
 #include "xgw_protocol.h"
+#include "xgw_route.h"
 #include "xgw_tuning.h"
 
 /* 单节点运行配置。 */
@@ -17,6 +18,7 @@ typedef struct xgw_runtime_config {
     char mtu_profile[32];
     char payload_profile[32];
     char proxy_mode[32];
+    char connect_type[32];
     char acl_mode[32];
     char outbound_type[32];
     char outbound_username[64];
@@ -25,6 +27,10 @@ typedef struct xgw_runtime_config {
     char hop_name[XGW_MAX_NAME_LEN];
     char tun_name[XGW_MAX_NAME_LEN];
     char tun_addr[XGW_MAX_NAME_LEN];
+    char bridge_transport[32];
+    char bridge_tcp_listen[XGW_MAX_NAME_LEN];
+    char bridge_unix_listen[XGW_MAX_NAME_LEN];
+    char bridge_ring_path[160];
     char listen_host[XGW_MAX_NAME_LEN];
     char device[XGW_MAX_NAME_LEN];
     uint32_t queue_id;
@@ -43,6 +49,7 @@ typedef struct xgw_runtime_config {
     int enable_udp;
     char auth_token[128];
     xgw_fixed_path_t path;
+    xgw_line_table_config_t lines;
     xgw_allow_policy_t allow_policy;
     xgw_dos_config_t dos;
     char manifest_url[160];

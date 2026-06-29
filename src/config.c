@@ -158,13 +158,15 @@ static xgw_role_t parse_role(const char *value) {
 }
 
 static xgw_profile_mode_t parse_profile(const char *value) {
-    if (equals_text(value, "live-bbr")) {
-        return XGW_PROFILE_BBR;
-    }
     if (equals_text(value, "live-brutal")) {
         return XGW_PROFILE_BRUTAL;
     }
-    return XGW_PROFILE_NONE;
+    /* 默认（含历史 live-none / 未知值）回退到 live-bbr。 */
+    if (value != NULL && value[0] != '\0' &&
+        !equals_text(value, "live-bbr") && !equals_text(value, "live-brutal")) {
+        fprintf(stderr, "xgw: unknown profile '%s', falling back to live-bbr\n", value);
+    }
+    return XGW_PROFILE_BBR;
 }
 
 static void split_csv(const char *value, void (*consumer)(const char *, void *), void *ctx) {
@@ -192,28 +194,213 @@ typedef struct config_list_ctx {
     int is_suffix;
 } config_list_ctx_t;
 
-static void add_hop(const char *entry, void *ctx) {
-    xgw_runtime_config_t *config = (xgw_runtime_config_t *) ctx;
-    xgw_endpoint_t *hop;
-    char value[160];
-    char *at;
-    char *eq;
-    if (config->path.hop_count >= XGW_MAX_ENDPOINTS) {
+static void endpoint_set_addr(xgw_endpoint_t *hop, const char *value) {
+    char copy[XGW_MAX_NAME_LEN];
+    if (hop == NULL || value == NULL) {
         return;
     }
+    if (hop->address[0] == '\0') {
+        snprintf(copy, sizeof(copy), "%s", value);
+        snprintf(hop->address, sizeof(hop->address), "%s", copy);
+    }
+}
+
+static void parse_endpoint_address_spec(xgw_endpoint_t *hop, const char *spec) {
+    char buffer[256];
+    char *cursor;
+    if (hop == NULL || spec == NULL) {
+        return;
+    }
+    snprintf(buffer, sizeof(buffer), "%s", spec);
+    cursor = buffer;
+    while (*cursor != '\0') {
+        char *sep = strchr(cursor, '|');
+        char *eq = NULL;
+        char *part;
+        if (sep != NULL) {
+            *sep = '\0';
+        }
+        part = trim(cursor);
+        eq = strchr(part, '=');
+        if (eq != NULL) {
+            *eq = '\0';
+            if (equals_text(trim(part), "public")) {
+                snprintf(hop->public_address, sizeof(hop->public_address), "%s", trim(eq + 1));
+                endpoint_set_addr(hop, hop->public_address);
+            } else if (equals_text(trim(part), "private")) {
+                snprintf(hop->private_address, sizeof(hop->private_address), "%s", trim(eq + 1));
+                endpoint_set_addr(hop, hop->private_address);
+            } else if (equals_text(trim(part), "addr") || equals_text(trim(part), "address")) {
+                snprintf(hop->address, sizeof(hop->address), "%s", trim(eq + 1));
+                endpoint_set_addr(hop, hop->address);
+            } else {
+                snprintf(hop->address, sizeof(hop->address), "%s", trim(eq + 1));
+                endpoint_set_addr(hop, hop->address);
+            }
+        } else {
+            snprintf(hop->address, sizeof(hop->address), "%s", part);
+            endpoint_set_addr(hop, hop->address);
+        }
+        if (sep == NULL) {
+            break;
+        }
+        cursor = sep + 1;
+    }
+    if (hop->address[0] == '\0') {
+        if (hop->public_address[0] != '\0') {
+            snprintf(hop->address, sizeof(hop->address), "%s", hop->public_address);
+        } else if (hop->private_address[0] != '\0') {
+            snprintf(hop->address, sizeof(hop->address), "%s", hop->private_address);
+        }
+    }
+}
+
+static int parse_hop_entry(xgw_endpoint_t *hop, const char *entry) {
+    char value[256];
+    char *at;
+    char *eq;
+    if (hop == NULL || entry == NULL) {
+        return 0;
+    }
+    memset(hop, 0, sizeof(*hop));
     snprintf(value, sizeof(value), "%s", entry);
     at = strchr(value, '@');
     eq = strchr(value, '=');
     if (at == NULL || eq == NULL || at > eq) {
-        return;
+        return 0;
     }
     *at = '\0';
     *eq = '\0';
-    hop = &config->path.hops[config->path.hop_count++];
     snprintf(hop->name, sizeof(hop->name), "%s", trim(value));
     hop->role = parse_role(trim(at + 1));
-    snprintf(hop->address, sizeof(hop->address), "%s", trim(eq + 1));
+    parse_endpoint_address_spec(hop, trim(eq + 1));
     hop->stable = (hop->role == XGW_ROLE_RELAY) ? 1 : 0;
+    return hop->role != XGW_ROLE_UNKNOWN && hop->address[0] != '\0';
+}
+
+static void print_hop_entry(const xgw_endpoint_t *hop) {
+    if (hop == NULL) {
+        return;
+    }
+    printf(" %s@%s=%s",
+           hop->name,
+           xgw_role_name(hop->role),
+           hop->address);
+    if (hop->public_address[0] != '\0' || hop->private_address[0] != '\0') {
+        printf(" [public=%s private=%s]",
+               hop->public_address[0] == '\0' ? "-" : hop->public_address,
+               hop->private_address[0] == '\0' ? "-" : hop->private_address);
+    }
+}
+
+static void add_hop(const char *entry, void *ctx) {
+    xgw_runtime_config_t *config = (xgw_runtime_config_t *) ctx;
+    xgw_endpoint_t *hop;
+    if (config->path.hop_count >= XGW_MAX_ENDPOINTS) {
+        return;
+    }
+    hop = &config->path.hops[config->path.hop_count];
+    if (!parse_hop_entry(hop, entry)) {
+        return;
+    }
+    config->path.hop_count++;
+}
+
+static int add_hop_to_path(xgw_fixed_path_t *path, const char *entry) {
+    xgw_endpoint_t *hop;
+    if (path == NULL || entry == NULL || path->hop_count >= XGW_MAX_ENDPOINTS) {
+        return 0;
+    }
+    hop = &path->hops[path->hop_count];
+    if (!parse_hop_entry(hop, entry)) {
+        return 0;
+    }
+    path->hop_count++;
+    return 1;
+}
+
+typedef struct config_line_path_ctx {
+    xgw_fixed_path_t *path;
+    int ok;
+} config_line_path_ctx_t;
+
+static void add_line_hop_item(const char *entry, void *ctx) {
+    config_line_path_ctx_t *line_ctx = (config_line_path_ctx_t *) ctx;
+    if (!add_hop_to_path(line_ctx->path, entry)) {
+        line_ctx->ok = 0;
+    }
+}
+
+static xgw_line_config_t *get_or_add_line(xgw_runtime_config_t *config, const char *line_id) {
+    size_t i;
+    xgw_line_config_t *line;
+    if (config == NULL || line_id == NULL || line_id[0] == '\0') {
+        return NULL;
+    }
+    for (i = 0; i < config->lines.line_count; ++i) {
+        if (strcmp(config->lines.lines[i].id, line_id) == 0) {
+            return &config->lines.lines[i];
+        }
+    }
+    if (config->lines.line_count >= XGW_MAX_LINES) {
+        return NULL;
+    }
+    line = &config->lines.lines[config->lines.line_count++];
+    memset(line, 0, sizeof(*line));
+    snprintf(line->id, sizeof(line->id), "%s", line_id);
+    line->enabled = 1;
+    return line;
+}
+
+static int parse_line_spec(xgw_runtime_config_t *config,
+                           const char *line_id,
+                           const char *value,
+                           char *error,
+                           size_t error_len) {
+    xgw_line_config_t *line = get_or_add_line(config, line_id);
+    char spec[512];
+    char *cursor;
+    int has_path = 0;
+    if (line == NULL) {
+        set_error(error, error_len, "too many or invalid lines", line_id);
+        return 0;
+    }
+    snprintf(spec, sizeof(spec), "%s", value);
+    cursor = spec;
+    while (*cursor != '\0') {
+        char *part;
+        char *semi = strchr(cursor, ';');
+        if (semi != NULL) {
+            *semi = '\0';
+        }
+        part = trim(cursor);
+        if (strncmp(part, "path=", 5) == 0) {
+            config_line_path_ctx_t line_ctx;
+            memset(&line->path, 0, sizeof(line->path));
+            line_ctx.path = &line->path;
+            line_ctx.ok = 1;
+            split_csv(part + 5, add_line_hop_item, &line_ctx);
+            has_path = line_ctx.ok && line->path.hop_count > 0U;
+        } else if (strncmp(part, "priority=", 9) == 0) {
+            line->priority = atoi(part + 9);
+        } else if (strncmp(part, "enabled=", 8) == 0) {
+            int enabled = 0;
+            if (!parse_bool(part + 8, &enabled)) {
+                set_error(error, error_len, "invalid line enabled", line_id);
+                return 0;
+            }
+            line->enabled = enabled;
+        }
+        if (semi == NULL) {
+            break;
+        }
+        cursor = semi + 1;
+    }
+    if (!has_path) {
+        set_error(error, error_len, "line requires path", line_id);
+        return 0;
+    }
+    return 1;
 }
 
 static void add_whitelist_ip(const char *entry, void *ctx) {
@@ -265,6 +452,10 @@ static int apply_key_value(xgw_runtime_config_t *config, const char *key, const 
         snprintf(config->proxy_mode, sizeof(config->proxy_mode), "%s", value);
         return 1;
     }
+    if (equals_text(key, "connect_type") || equals_text(key, "connect-type")) {
+        snprintf(config->connect_type, sizeof(config->connect_type), "%s", value);
+        return 1;
+    }
     if (equals_text(key, "acl_mode")) {
         snprintf(config->acl_mode, sizeof(config->acl_mode), "%s", value);
         return 1;
@@ -286,6 +477,25 @@ static int apply_key_value(xgw_runtime_config_t *config, const char *key, const 
         snprintf(config->pool_select, sizeof(config->pool_select), "%s", value);
         return 1;
     }
+    if (equals_text(key, "default_line")) {
+        snprintf(config->lines.default_line, sizeof(config->lines.default_line), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "route_control_path")) {
+        snprintf(config->lines.route_control_path, sizeof(config->lines.route_control_path), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "route_metrics_path")) {
+        snprintf(config->lines.metrics_path, sizeof(config->lines.metrics_path), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "line_drain_timeout_sec") && parse_uint32(value, &u32)) {
+        config->lines.drain_timeout_sec = u32;
+        return 1;
+    }
+    if (strncmp(key, "line.", 5) == 0) {
+        return parse_line_spec(config, key + 5, value, error, error_len);
+    }
     if (equals_text(key, "mtu_profile")) {
         apply_mtu_profile(config, value);
         return 1;
@@ -304,6 +514,22 @@ static int apply_key_value(xgw_runtime_config_t *config, const char *key, const 
     }
     if (equals_text(key, "tun_addr")) {
         snprintf(config->tun_addr, sizeof(config->tun_addr), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "bridge_transport")) {
+        snprintf(config->bridge_transport, sizeof(config->bridge_transport), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "bridge_tcp_listen")) {
+        snprintf(config->bridge_tcp_listen, sizeof(config->bridge_tcp_listen), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "bridge_unix_listen") || equals_text(key, "bridge_unix_path")) {
+        snprintf(config->bridge_unix_listen, sizeof(config->bridge_unix_listen), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "bridge_ring_path")) {
+        snprintf(config->bridge_ring_path, sizeof(config->bridge_ring_path), "%s", value);
         return 1;
     }
     if (equals_text(key, "listen_host")) {
@@ -401,6 +627,38 @@ static int apply_key_value(xgw_runtime_config_t *config, const char *key, const 
     }
     if (equals_text(key, "enable_summary_dump") && parse_bool(value, &flag)) {
         config->tuning.enable_summary_dump = flag;
+        return 1;
+    }
+    if (equals_text(key, "summary_dump_path")) {
+        snprintf(config->tuning.summary_path, sizeof(config->tuning.summary_path), "%s", value);
+        return 1;
+    }
+    if (equals_text(key, "traffic_baseline_bps") && parse_uint64(value, &u64)) {
+        config->tuning.traffic_baseline_bps = u64;
+        return 1;
+    }
+    if (equals_text(key, "traffic_burst_bps") && parse_uint64(value, &u64)) {
+        config->tuning.traffic_burst_bps = u64;
+        return 1;
+    }
+    if (equals_text(key, "traffic_burst_seconds") && parse_uint32(value, &u32)) {
+        config->tuning.traffic_burst_seconds = u32;
+        return 1;
+    }
+    if (equals_text(key, "bridge_egress_pending_chunks") && parse_uint32(value, &u32)) {
+        config->tuning.bridge_egress_pending_chunks = u32;
+        return 1;
+    }
+    if (equals_text(key, "bridge_egress_dequeue_max_chunks_per_tick") && parse_uint32(value, &u32)) {
+        config->tuning.bridge_egress_dequeue_max_chunks_per_tick = u32;
+        return 1;
+    }
+    if (equals_text(key, "bridge_egress_dequeue_max_bytes_per_tick") && parse_uint32(value, &u32)) {
+        config->tuning.bridge_egress_dequeue_max_bytes_per_tick = u32;
+        return 1;
+    }
+    if (equals_text(key, "bridge_egress_dequeue_max_us_per_tick") && parse_uint32(value, &u32)) {
+        config->tuning.bridge_egress_dequeue_max_us_per_tick = u32;
         return 1;
     }
     if (equals_text(key, "acl_allow")) {
@@ -631,12 +889,20 @@ int xgw_config_load(const char *path, xgw_runtime_config_t *config, char *error,
     snprintf(config->mtu_profile, sizeof(config->mtu_profile), "%s", "default");
     snprintf(config->payload_profile, sizeof(config->payload_profile), "%s", "default");
     snprintf(config->proxy_mode, sizeof(config->proxy_mode), "%s", "fixed-path");
+    snprintf(config->connect_type, sizeof(config->connect_type), "%s", "native");
     snprintf(config->acl_mode, sizeof(config->acl_mode), "%s", "allow");
     snprintf(config->outbound_type, sizeof(config->outbound_type), "%s", "direct");
     snprintf(config->pool_select, sizeof(config->pool_select), "%s", "best");
     snprintf(config->obfs_mode, sizeof(config->obfs_mode), "%s", "none");
     snprintf(config->obfs_scope, sizeof(config->obfs_scope), "%s", "hop");
     snprintf(config->listen_host, sizeof(config->listen_host), "%s", "0.0.0.0");
+    snprintf(config->bridge_transport, sizeof(config->bridge_transport), "%s", "tcp");
+    snprintf(config->bridge_unix_listen, sizeof(config->bridge_unix_listen), "%s", "/run/xgw/bridge.sock");
+    snprintf(config->bridge_ring_path, sizeof(config->bridge_ring_path), "%s", "/run/xgw/bridge-ring");
+    snprintf(config->lines.default_line, sizeof(config->lines.default_line), "%s", "primary");
+    snprintf(config->lines.route_control_path, sizeof(config->lines.route_control_path), "%s", "");
+    snprintf(config->lines.metrics_path, sizeof(config->lines.metrics_path), "%s", "");
+    config->lines.drain_timeout_sec = 5U;
     config->congestion_mode = XGW_CC_BBR;
     config->bbr_profile = XGW_BBR_STANDARD;
     config->advertised_rx_bps = 0;
@@ -645,7 +911,7 @@ int xgw_config_load(const char *path, xgw_runtime_config_t *config, char *error,
     config->max_stream_receive_window = 8U * 1024U * 1024U;
     config->initial_connection_receive_window = 20U * 1024U * 1024U;
     config->max_connection_receive_window = 20U * 1024U * 1024U;
-    config->max_idle_timeout_sec = 30U;
+    config->max_idle_timeout_sec = 120U;
     config->keepalive_sec = 10U;
     config->disable_path_mtu_discovery = 0;
     config->enable_udp = 1;
@@ -686,16 +952,33 @@ int xgw_config_load(const char *path, xgw_runtime_config_t *config, char *error,
         set_error(error, error_len, "role is required", "");
         return 0;
     }
-    if (config->path.hop_count < 2) {
+    if (config->path.hop_count < 2 && config->lines.line_count == 0U) {
         set_error(error, error_len, "path requires at least two hops", "");
         return 0;
     }
-    if (config->profile.mode != XGW_PROFILE_NONE &&
-        config->profile.fec_data_shards > 0 &&
+    if (config->lines.line_count > 0U) {
+        size_t i;
+        for (i = 0; i < config->lines.line_count; ++i) {
+            if (config->lines.lines[i].enabled && config->lines.lines[i].path.hop_count < 2U) {
+                set_error(error, error_len, "line path requires at least two hops", config->lines.lines[i].id);
+                return 0;
+            }
+        }
+    }
+    if (config->profile.fec_data_shards > 0 &&
         config->profile.fec_parity_shards == 0 &&
         config->profile.mode != XGW_PROFILE_BBR) {
         set_error(error, error_len, "fec parity shards required", "");
         return 0;
+    }
+    if (((equals_text(config->bridge_transport, "tcp") && config->bridge_tcp_listen[0] != '\0') ||
+         (equals_text(config->bridge_transport, "unix") && config->bridge_unix_listen[0] != '\0') ||
+         ((equals_text(config->bridge_transport, "shared-ring") ||
+           equals_text(config->bridge_transport, "shared_ring") ||
+           equals_text(config->bridge_transport, "ring")) &&
+          config->bridge_ring_path[0] != '\0')) &&
+        equals_text(config->connect_type, "native")) {
+        snprintf(config->connect_type, sizeof(config->connect_type), "%s", "bridge");
     }
     return 1;
 }
@@ -704,9 +987,10 @@ int xgw_config_load(const char *path, xgw_runtime_config_t *config, char *error,
 void xgw_config_print(const xgw_runtime_config_t *config) {
     size_t i;
     printf("node_name=%s\n", config->node_name);
-    printf("transport=%s proxy_mode=%s acl_mode=%s outbound_type=%s pool_select=%s mtu_profile=%s payload_profile=%s hop_name=%s tun_name=%s tun_addr=%s listen_host=%s device=%s queue_id=%u\n",
+    printf("transport=%s proxy_mode=%s connect_type=%s acl_mode=%s outbound_type=%s pool_select=%s mtu_profile=%s payload_profile=%s hop_name=%s tun_name=%s tun_addr=%s bridge_transport=%s bridge_tcp_listen=%s bridge_unix_listen=%s bridge_ring_path=%s listen_host=%s device=%s queue_id=%u\n",
            config->transport,
            config->proxy_mode,
+           config->connect_type,
            config->acl_mode,
            config->outbound_type,
            config->pool_select,
@@ -715,6 +999,10 @@ void xgw_config_print(const xgw_runtime_config_t *config) {
            config->hop_name,
            config->tun_name,
            config->tun_addr,
+           config->bridge_transport,
+           config->bridge_tcp_listen,
+           config->bridge_unix_listen,
+           config->bridge_ring_path,
            config->listen_host,
            config->device,
            config->queue_id);
@@ -745,14 +1033,44 @@ void xgw_config_print(const xgw_runtime_config_t *config) {
            config->outbound_password,
            config->obfs_mode,
            config->obfs_scope);
-    printf("tuning rcvbuf=%u sndbuf=%u log_level=%u debug_timing=%d summary_dump=%d pool_nodes=%zu acl_rules=%zu\n",
+    printf("tuning rcvbuf=%u sndbuf=%u log_level=%u debug_timing=%d summary_dump=%d summary_path=%s traffic_baseline_bps=%llu traffic_burst_bps=%llu traffic_burst_seconds=%u pool_nodes=%zu acl_rules=%zu\n",
            config->tuning.udp_rcvbuf_bytes,
            config->tuning.udp_sndbuf_bytes,
            config->tuning.log_level,
            config->tuning.enable_debug_timing,
            config->tuning.enable_summary_dump,
+           config->tuning.summary_path,
+           (unsigned long long) config->tuning.traffic_baseline_bps,
+           (unsigned long long) config->tuning.traffic_burst_bps,
+           config->tuning.traffic_burst_seconds,
            config->pool.node_count,
            config->acl.rule_count);
+    printf("tuning.bridge_egress pending_chunks=%u dequeue_max_chunks=%u dequeue_max_bytes=%u dequeue_max_us=%u\n",
+           config->tuning.bridge_egress_pending_chunks,
+           config->tuning.bridge_egress_dequeue_max_chunks_per_tick,
+           config->tuning.bridge_egress_dequeue_max_bytes_per_tick,
+           config->tuning.bridge_egress_dequeue_max_us_per_tick);
+    printf("lines count=%zu default=%s route_control_path=%s route_metrics_path=%s drain_timeout=%u\n",
+           config->lines.line_count,
+           config->lines.default_line,
+           config->lines.route_control_path,
+           config->lines.metrics_path,
+           config->lines.drain_timeout_sec);
+    for (i = 0; i < config->lines.line_count; ++i) {
+        size_t j;
+        const xgw_line_config_t *line = &config->lines.lines[i];
+        printf("line.%s enabled=%d priority=%d path:",
+               line->id,
+               line->enabled,
+               line->priority);
+        for (j = 0; j < line->path.hop_count; ++j) {
+            print_hop_entry(&line->path.hops[j]);
+            if (j + 1 < line->path.hop_count) {
+                printf(",");
+            }
+        }
+        printf("\n");
+    }
     printf("fec=%u/%u pacing_rate_bps=%llu pacing_interval_us=%u copies=%u\n",
            config->profile.fec_data_shards,
            config->profile.fec_parity_shards,
@@ -761,10 +1079,7 @@ void xgw_config_print(const xgw_runtime_config_t *config) {
            config->profile.redundant_copies);
     printf("path:");
     for (i = 0; i < config->path.hop_count; ++i) {
-        printf(" %s@%s=%s",
-               config->path.hops[i].name,
-               xgw_role_name(config->path.hops[i].role),
-               config->path.hops[i].address);
+        print_hop_entry(&config->path.hops[i]);
         if (i + 1 < config->path.hop_count) {
             printf(",");
         }

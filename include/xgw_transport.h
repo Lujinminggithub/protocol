@@ -24,8 +24,19 @@ int xgw_udp_set_remote(xgw_udp_socket_t *sock, const char *host, uint16_t port);
 int xgw_udp_recv(xgw_udp_socket_t *sock, xgw_packet_t *packet, int timeout_ms);
 /* 发送一个 UDP 包。 */
 int xgw_udp_send(xgw_udp_socket_t *sock, const uint8_t *data, size_t data_len, const char *host, uint16_t port);
+int xgw_udp_send_ex(xgw_udp_socket_t *sock, const uint8_t *data, size_t data_len, const char *host, uint16_t port, int *out_sent_bytes, int *out_error_code);
+int xgw_udp_last_error_code(void);
+const char *xgw_udp_last_error_stage(void);
+const char *xgw_udp_last_error_host(void);
+uint16_t xgw_udp_last_error_port(void);
 /* 调整 UDP socket 读写缓冲区。 */
 int xgw_udp_set_buffers(xgw_udp_socket_t *sock, int rcvbuf_bytes, int sndbuf_bytes);
+/* 启用路径 MTU 发现（置 DF 位）。返回 1 表示成功。 */
+int xgw_udp_enable_pmtud(xgw_udp_socket_t *sock);
+/* 查询内核发现的路径 MTU（字节），不可用返回 0。 */
+uint32_t xgw_udp_query_pmtu(xgw_udp_socket_t *sock);
+/* 判断 send 错误码是否为「报文过大」（需 PMTUD 回退）。 */
+int xgw_udp_error_is_too_big(int error_code);
 /* 关闭 UDP socket。 */
 void xgw_udp_close(xgw_udp_socket_t *sock);
 
