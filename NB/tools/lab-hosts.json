@@ -1,0 +1,10 @@
+{
+  "entry":  {"name":"gz-83",  "host":"106.75.169.83",  "port":22,   "user":"root", "password":"CDs84p6"},
+  "middle": {"name":"hk-216", "host":"152.32.171.216", "port":22,   "user":"root", "password":"CDs84p6", "jump_via":"entry", "jump_target_host":"172.16.31.28"},
+  "exit":   {"name":"kz-1",   "host":"2.135.147.102",  "port":5222, "user":"root", "password":"6pvUpfowcB"},
+  "paths": {
+    "work_dir": "/root/nb",
+    "picoquic": "/root/poc/picoquic",
+    "certs":    "/root/poc/picoquic/certs"
+  }
+}
