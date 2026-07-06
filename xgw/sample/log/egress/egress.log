@@ -1,0 +1,2 @@
+runtime.start role=egress transport=udp proxy_mode=fixed-path acl_mode=allow current=2.135.147.74:52830 prev=172.20.174.36:52830 next=
+runtime.negotiation auth=set udp=1 congestion=bbr bbr_profile=standard rx_bps=0 tx_bps=0 windows=8388608/8388608/20971520/20971520 idle=30 keepalive=10 pmtud_disabled=0 outbound=:0

@@ -1,0 +1,286 @@
+{
+  "listen": ":20023",
+  "frontend_mode": "hy2-official-bridge",
+  "connect_type": "bridge",
+  "bridge_transport": "shm-direct",
+  "bridge_ring_path": "/run/xgw/bridge-ring",
+  "compatibility": {
+    "mode": "hy2-official-bridge",
+    "enable_hysteria_auth": true,
+    "enable_hysteria_udp": true,
+    "enable_hysteria_tcp": true,
+    "shadowrocket_name": "xgw-edge"
+  },
+  "tls": {
+    "cert_file": "/etc/xgw/gz-self.crt",
+    "key_file": "/etc/xgw/gz-self.key",
+    "alpn": [
+      "h3",
+      "h3-29"
+    ],
+    "min_version": "1.3",
+    "enable_session_tickets": true
+  },
+  "control": {
+    "token": "edge-secret",
+    "require_auth": true,
+    "supported_congestion": [
+      "bbr",
+      "reno"
+    ],
+    "keepalive": "10s",
+    "idle_timeout": "30s",
+    "enable_migration": true,
+    "route_update_interval": "0s"
+  },
+  "masquerade": {
+    "upstream_url": "https://www.example.com",
+    "server_names": [
+      "www.example.com"
+    ],
+    "allowed_paths": [
+      "/",
+      "/assets",
+      "/favicon.ico"
+    ],
+    "prefer_http3": true
+  },
+  "flow_classifier": {
+    "enabled": true,
+    "rules": [
+      {
+        "name": "control-udp-probe-ports",
+        "kind": "udp",
+        "ports": [
+          3478,
+          3479,
+          5349
+        ],
+        "host_contains_any": [],
+        "flow_class": "control-plane",
+        "priority": "critical",
+        "budget": {
+          "read_timeout_millis": 180000,
+          "idle_after_first_byte_millis": 180000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": true,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 524288,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "media-udp-realtime-ports",
+        "kind": "udp",
+        "ports": [
+          443,
+          8443,
+          8801,
+          1935
+        ],
+        "host_contains_any": [],
+        "flow_class": "media-realtime",
+        "priority": "interactive",
+        "budget": {
+          "read_timeout_millis": 900000,
+          "idle_after_first_byte_millis": 1200000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": false,
+          "prefer_fast_ack": false,
+          "max_buffered_bytes": 8388608,
+          "prefer_independent_io": false
+        }
+      },
+      {
+        "name": "probe-web-ip-sb",
+        "kind": "",
+        "ports": [],
+        "host_contains_any": [
+          "ip.sb"
+        ],
+        "flow_class": "probe-web",
+        "priority": "critical",
+        "budget": {
+          "read_timeout_millis": 300000,
+          "idle_after_first_byte_millis": 300000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": true,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 1048576,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "probe-web-google-apple-ocsp",
+        "kind": "",
+        "ports": [],
+        "host_contains_any": [
+          "google.com",
+          "ocsp2.apple.com",
+          "updates.cdn-apple.com",
+          "gdmf.apple.com",
+          "bag.itunes.apple.com",
+          "itunes.apple.com",
+          "iphone-ld.apple.com",
+          "configuration.ls.apple.com",
+          "init.push.apple.com",
+          "gspe1-ssl.ls.apple.com",
+          "pagead2.googlesyndication.com"
+        ],
+        "flow_class": "probe-web",
+        "priority": "critical",
+        "budget": {
+          "read_timeout_millis": 300000,
+          "idle_after_first_byte_millis": 300000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": true,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 1048576,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "probe-push-apple",
+        "kind": "",
+        "ports": [
+          123,
+          443,
+          5223
+        ],
+        "host_contains_any": [
+          "courier.push.apple.com",
+          "time.apple.com"
+        ],
+        "flow_class": "probe-push",
+        "priority": "interactive",
+        "budget": {
+          "read_timeout_millis": 300000,
+          "idle_after_first_byte_millis": 600000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": true,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 1048576,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "tiktok-media-bootstrap-phone",
+        "kind": "",
+        "ports": [],
+        "host_contains_any": [
+          "api-boot.tiktokv.com",
+          "api-core-boot.tiktokv.com",
+          "mon-boot.tiktokv.com",
+          "mssdk-boot.tiktokv.com",
+          "jsb-boot.tiktokv.com",
+          "gecko-boot.tiktokv.com",
+          "bsync-va.tiktokv.com",
+          "frontier.tiktokv.com",
+          "webcast-boot.tiktokv.com",
+          "pitaya-boot.tiktokv.com",
+          "pitayacdn.tiktokcdn.com",
+          "pkgcdn.pitaya-clientai.com",
+          "pitaya-clientai.com"
+        ],
+        "flow_class": "media-bootstrap",
+        "priority": "interactive",
+        "budget": {
+          "read_timeout_millis": 720000,
+          "idle_after_first_byte_millis": 900000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": false,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 4194304,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "tiktok-login-control-phone",
+        "kind": "",
+        "ports": [],
+        "host_contains_any": [
+          "tnc-boot.tiktokv.com",
+          "vcs-boot.tiktokv.com",
+          "log-boot.tiktokv.com",
+          "inapp.tiktokv.com",
+          "sf16-website-login.neutral.ttwstatic.com",
+          "api16-normal-",
+          "www.tiktok.com"
+        ],
+        "flow_class": "login-critical",
+        "priority": "critical",
+        "budget": {
+          "read_timeout_millis": 600000,
+          "idle_after_first_byte_millis": 900000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": true,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 2097152,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "tiktok-bulk-cdn-video",
+        "kind": "",
+        "ports": [],
+        "host_contains_any": [
+          "v9.tiktokcdn.com",
+          "v16m.tiktokcdn.com",
+          "v19.tiktokcdn.com",
+          "v9-",
+          "v16m-",
+          "v19-",
+          "-va.tiktokcdn.com",
+          "sf16-va.tiktokcdn.com",
+          "muscdn.com",
+          "ibyteimg.com",
+          "ipstatp.com"
+        ],
+        "flow_class": "bulk",
+        "priority": "default",
+        "budget": {
+          "read_timeout_millis": 600000,
+          "idle_after_first_byte_millis": 900000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": false,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 4194304,
+          "prefer_independent_io": true
+        }
+      },
+      {
+        "name": "tiktok-interactive-generic",
+        "kind": "",
+        "ports": [],
+        "host_contains_any": [
+          "tiktok",
+          "tiktokcdn",
+          "ttwstatic",
+          "pitaya-clientai"
+        ],
+        "flow_class": "interactive",
+        "priority": "interactive",
+        "budget": {
+          "read_timeout_millis": 600000,
+          "idle_after_first_byte_millis": 900000,
+          "preferred_copies": 1,
+          "prefer_reduced_fec": false,
+          "prefer_fast_ack": true,
+          "max_buffered_bytes": 2097152,
+          "prefer_independent_io": true
+        }
+      }
+    ],
+    "fallback_class": "compat-fallback",
+    "fallback_priority": "default",
+    "fallback_budget": {
+      "read_timeout_millis": 600000,
+      "idle_after_first_byte_millis": 900000,
+      "preferred_copies": 1,
+      "prefer_reduced_fec": false,
+      "prefer_fast_ack": true,
+      "max_buffered_bytes": 2097152,
+      "prefer_independent_io": true
+    }
+  }
+}

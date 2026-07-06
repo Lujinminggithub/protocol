@@ -1,0 +1,1 @@
+{"level":"info","ts":1782873550.1746895,"caller":"officialbridge/server.go:454","msg":"xgw-edge official hy2 front listen=:20023 connect_type=bridge bridge_transport=shared-ring bridge_tcp=127.0.0.1:19080 bridge_ring=/run/xgw/bridge-ring udp_enabled=true alpn=[h3 h3-29]"}

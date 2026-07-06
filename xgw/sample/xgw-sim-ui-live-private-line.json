@@ -1,0 +1,47 @@
+{
+  "token": "edge-secret",
+  "listen": ":1023",
+  "cert_file": "/etc/xgw/gz-self.crt",
+  "key_file": "/etc/xgw/gz-self.key",
+  "server_name": "www.example.com",
+  "host": "106.75.143.135",
+  "frontend_mode": "hy2-official-bridge",
+  "bridge_transport": "shared-ring",
+  "bridge_ring_path": "/run/xgw/bridge-ring",
+  "bridge_tcp_addr": "127.0.0.1:19080",
+  "route_control_path": "/run/xgw/route-control",
+  "route_metrics_path": "/run/xgw/route-metrics.json",
+  "product_profile": "live",
+  "lines": [
+    {
+      "id": "gz-hk-kz-live",
+      "name": "广州-香港-哈萨克直播线",
+      "region": "kz",
+      "priority": 10,
+      "weight": 12,
+      "capacity_mbps": 1000,
+      "max_sessions": 10000,
+      "tags": ["default", "live", "tiktok"],
+      "hops": [
+        {
+          "name": "gz",
+          "role": "ingress",
+          "public_addr": "106.75.143.135:51840",
+          "private_addr": "172.17.20.202:51840",
+          "backend_udp_addr": "127.0.0.1:51840"
+        },
+        {
+          "name": "hk",
+          "role": "relay",
+          "public_addr": "165.154.112.167:51840",
+          "private_addr": "172.20.216.218:51840"
+        },
+        {
+          "name": "kz",
+          "role": "egress",
+          "public_addr": "2.135.147.71:51840"
+        }
+      ]
+    }
+  ]
+}

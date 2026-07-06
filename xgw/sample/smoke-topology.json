@@ -1,0 +1,34 @@
+{
+  "path_name": "gz-hk-kz-smoke",
+  "description": "Minimal smoke path using Guangzhou -> Hong Kong -> Kazakhstan hosts from lab-hosts.json",
+  "ingress": {
+    "name": "gz-141",
+    "public_host": "106.75.141.139",
+    "private_host": "172.17.43.116",
+    "ssh_port": 22,
+    "user": "root",
+    "role": "ingress"
+  },
+  "relay": {
+    "name": "hk-2",
+    "public_host": "165.154.110.140",
+    "private_host": "172.20.174.36",
+    "ssh_port": 22,
+    "user": "root",
+    "role": "relay",
+    "jump_via": "gz-141"
+  },
+  "egress": {
+    "name": "kz-1",
+    "public_host": "2.135.147.71",
+    "ssh_port": 5222,
+    "user": "root",
+    "role": "egress"
+  },
+  "runtime": {
+    "transport": "udp",
+    "tunnel_port": 51830,
+    "tun_name": "xgw0",
+    "mtu": 1380
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "controller": {
+    "host": "106.75.136.170",
+    "port": 22,
+    "user": "root",
+    "password": "nsmg7asx7htA9PhF",
+    "role": "controller",
+    "name": "controller"
+  },
+  "edges": [
+    {
+      "host": "106.75.136.170",
+      "port": 22,
+      "user": "root",
+      "password": "nsmg7asx7htA9PhF",
+      "role": "edge",
+      "name": "gz-170",
+      "private_ip": "172.17.7.105"
+    }
+  ],
+  "relays": [
+    {
+      "host": "165.154.152.176",
+      "port": 22,
+      "user": "root",
+      "password": "MdnRxc2TmXebqRga",
+      "role": "relay",
+      "name": "hk-176",
+      "private_ip": "172.20.225.7",
+      "jump_via": "gz-170"
+    }
+  ],
+  "terminals": [
+    {
+      "host": "2.135.147.71",
+      "port": 5222,
+      "user": "root",
+      "password": "dvXZ0sD1aL",
+      "role": "server",
+      "name": "kz-1"
+    }
+  ],
+  "paths": {
+    "deploy_dir": "/etc/xgw",
+    "work_dir": "/etc/xgw"
+  }
+}
