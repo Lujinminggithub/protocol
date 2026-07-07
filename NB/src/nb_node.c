@@ -113,6 +113,7 @@ typedef struct proxy_stream {
     uint64_t down_rcvd, down2_rcvd; /* 回程(middle)每条物理 down stream 累计已收字节(去重基准) */
     uint64_t dedup_upstreamed;      /* 回程去重: 已向上游转发的字节数 */
     int up_fin_sent;                /* 回程: 已向上游发过 fin(两条 down 各触发一次, 防重复) */
+    int down_fin_sent;              /* 去程(entry->middle FEC): 已向下游发过 fin(两条 up 各触发一次, 防重复) */
     /* SOCKS5 入口(仅 entry -S): 握手阶段 0=greeting 1=request 2=直通 */
     int socks_stage;
     uint8_t socks_buf[512];
@@ -128,9 +129,16 @@ typedef struct cnx_pool {
     int configured;                  /* addr 已配、池已初始化 */
     int rr;                          /* 批量道 round-robin 游标 */
     int rr_lat;                      /* 直播专用道 round-robin 游标 */
-    double recent_loss[POOL_SIZE];   /* 最近一次 linkq 采样的丢包率(%) */
+    double recent_loss[POOL_SIZE];   /* 最近一个采样窗(增量)的有效丢包率(%) */
     uint64_t recent_rtt[POOL_SIZE];  /* 最近一次 linkq 采样的 RTT(us) */
+    uint64_t recent_rtt_max[POOL_SIZE]; /* 最近一次 linkq 采样的最大 RTT(us) */
+    uint64_t recent_sent[POOL_SIZE]; /* 最近一个采样窗(增量)的发包数 */
+    uint64_t last_sent_total[POOL_SIZE]; /* 上次采样时的累计 sent */
+    uint64_t last_lost_total[POOL_SIZE]; /* 上次采样时的累计 lost */
+    uint64_t last_spurious_total[POOL_SIZE]; /* 上次采样时的累计 spurious_losses */
+    uint64_t recent_rtt_var[POOL_SIZE]; /* 最近一次采样窗对应的 RTT 抖动(us) */
     uint64_t recent_ts[POOL_SIZE];   /* 最近一次 linkq 采样时间(us), 0=暂无样本 */
+    int fec_latched;                 /* D 方案回滞: 当前是否保持双发开启态 */
 } cnx_pool_t;
 
 typedef struct nb_global {
@@ -247,24 +255,15 @@ static int dns_pop_result(dns_res_t* out){
 /* ---- 工具 ---- */
 static int set_nonblock(int fd){ int fl=fcntl(fd,F_GETFL,0); return fl<0?-1:fcntl(fd,F_SETFL,fl|O_NONBLOCK); }
 static const char* role_name(nb_role_t r){ return r==ROLE_ENTRY?"entry":(r==ROLE_MIDDLE?"middle":"exit"); }
-/* 按目标域名判定流优先级: TikTok 直播/实时(webcast/pull/live/flv/rtmp/rtc) -> 低延迟专用道 */
+/* Q1: 把明显的直播/实时控制流 + 一小批已证实会承载直播推流的媒体 CDN 送进低延迟专用道。
+ * 这里不再追求完整媒体识别, 只保守抬高那批"开播时不抬优先级就容易炸"的域名模式。 */
 static int classify_target(const char* host){
-    static const char* pat[]={"webcast","pull","live","flv","rtmp","rtc"};
+    static const char* pat[]={
+        "webcast","pull","live","flv","rtmp","rtc","rtcpc","frontier","netacc",
+        "tiktokcdn","teko","sf-teko","v16m","v58","v9","common-sign","pitayacdn","ies-music",
+    };
     for(unsigned i=0;i<sizeof(pat)/sizeof(pat[0]);i++) if(strstr(host,pat[i])) return PRIO_LATENCY;
     return PRIO_BULK;
-}
-
-/* FEC 是否值得对该流双发: 仅"媒体传输流"(持续大流量音视频)命中; 直播信令/控制流(webcast/rtc 等)
- * 不命中 -> 只走低延迟专用道但不双发, 避免复制控制流拖慢直播打开。零分配, 事件循环内可调。 */
-static int is_fec_media(const char* route){
-    static const char* MEDIA_KEYS[] = {
-        "flv","rtmp","hls","m3u8","pull-","-pull","push-","pull.",
-        "livestream","douyincdn","huoshan","tiktokcdn","teko",
-        "netacc","live.","live-","webcast","rtc","rtcpc","frontier",
-        NULL
-    };
-    for(int i=0; MEDIA_KEYS[i]; i++) if(strstr(route, MEDIA_KEYS[i])) return 1;
-    return 0;
 }
 
 
@@ -448,7 +447,14 @@ static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr){
     pool->addr=*addr; pool->rr=0; pool->rr_lat=0;
     memset(pool->recent_loss, 0, sizeof(pool->recent_loss));
     memset(pool->recent_rtt, 0, sizeof(pool->recent_rtt));
+    memset(pool->recent_rtt_max, 0, sizeof(pool->recent_rtt_max));
+    memset(pool->recent_sent, 0, sizeof(pool->recent_sent));
+    memset(pool->last_sent_total, 0, sizeof(pool->last_sent_total));
+    memset(pool->last_lost_total, 0, sizeof(pool->last_lost_total));
+    memset(pool->last_spurious_total, 0, sizeof(pool->last_spurious_total));
+    memset(pool->recent_rtt_var, 0, sizeof(pool->recent_rtt_var));
     memset(pool->recent_ts, 0, sizeof(pool->recent_ts));
+    pool->fec_latched = 0;
     int ok=0; for(int i=0;i<POOL_SIZE;i++) if(pool_ensure(pool,i)==0) ok++;
     pool->configured=1;
     log4c_info("cnx pool ready: %d/%d connections up",ok,POOL_SIZE);
@@ -470,9 +476,20 @@ static int pool_pick_latency_rr(cnx_pool_t* pool, int avoid_idx){
     return -1;
 }
 
+#define FEC_LOSS_ON_PCT 3.0
+#define FEC_LOSS_OFF_PCT 1.0
+#define FEC_JITTER_ON_US 40000ULL
+#define FEC_JITTER_OFF_US 15000ULL
+#define FEC_MIN_SENT_PKTS 20ULL
+#define FEC_COLDSTART_US 3000000ULL
+
 static int pool_quality_fresh(cnx_pool_t* pool, int idx, uint64_t now){
     return pool->recent_ts[idx] != 0 && now >= pool->recent_ts[idx] &&
         now - pool->recent_ts[idx] <= 30000000ULL; /* 30s 内样本视为新鲜 */
+}
+
+static int pool_quality_sampled(cnx_pool_t* pool, int idx, uint64_t now){
+    return pool_quality_fresh(pool, idx, now) && pool->recent_sent[idx] >= FEC_MIN_SENT_PKTS;
 }
 
 static int pool_quality_better(cnx_pool_t* pool, int a, int b, uint64_t now){
@@ -484,18 +501,92 @@ static int pool_quality_better(cnx_pool_t* pool, int a, int b, uint64_t now){
     return a < b;
 }
 
-/* FEC 2B: 从直播专用道里挑"当前最稳"的连接。优先使用 30s 内的 linkq 样本按 loss->rtt 排序;
- * 若还没采到样本, 回退原有 latency round-robin。avoid_idx>=0 时排除该连接, 便于挑第二条。 */
-static int pool_pick_latency_best(cnx_pool_t* pool, int avoid_idx){
+static int pool_quality_best(cnx_pool_t* pool, int avoid_idx, int require_sampled){
     uint64_t now = picoquic_current_time();
     int best = -1;
-    for(int idx=0; idx<LAT_LANES; idx++){
+    for(int idx=0; idx<POOL_SIZE; idx++){
         if(idx==avoid_idx) continue;
         if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
         if(pool->cnx[idx]==NULL) continue;
-        if(!pool_quality_fresh(pool, idx, now)) continue;
+        if(require_sampled){
+            if(!pool_quality_sampled(pool, idx, now)) continue;
+        } else {
+            if(!pool_quality_fresh(pool, idx, now)) continue;
+        }
         if(best<0 || pool_quality_better(pool, idx, best, now)) best = idx;
     }
+    return best;
+}
+
+/* Q2: 要不要双发？看这条 hop 最近一个采样窗的线质是否变差。
+ * 使用"增量 loss + 回滞"版:
+ * - 只在样本足够(delta sent >= FEC_MIN_SENT_PKTS)时才更新判断
+ * - 打开阈值高于关闭阈值, 避免在边缘抖动时来回开关
+ * - 先以全池最优连接的增量 loss/jitter 作为该 hop 当前代表值 */
+static int pool_line_bad(cnx_pool_t* pool, int prio, double* best_loss, double* best_jitter_ms, int* best_idx, int* coldstart_on){
+    int idx = pool_quality_best(pool, -1, 1);
+    int idx2 = (idx >= 0) ? pool_quality_best(pool, idx, 1) : -1;
+    if(coldstart_on) *coldstart_on = 0;
+    if(best_idx) *best_idx = (idx2 >= 0) ? idx2 : idx;
+    if(idx < 0){
+        if(best_loss) *best_loss = -1.0;
+        if(best_jitter_ms) *best_jitter_ms = -1.0;
+        if(prio == PRIO_LATENCY){
+            int fresh_idx = pool_quality_best(pool, -1, 0);
+            if(fresh_idx >= 0 && pool->recent_ts[fresh_idx] != 0 &&
+                picoquic_current_time() - pool->recent_ts[fresh_idx] <= FEC_COLDSTART_US){
+                if(coldstart_on) *coldstart_on = 1;
+                pool->fec_latched = 1;
+                if(best_idx) *best_idx = fresh_idx;
+                if(best_loss) *best_loss = pool->recent_loss[fresh_idx];
+                if(best_jitter_ms) *best_jitter_ms = (double)pool->recent_rtt_var[fresh_idx] / 1000.0;
+                return 1;
+            }
+        }
+        return pool->fec_latched;
+    }
+    int eval_idx = (idx2 >= 0) ? idx2 : idx; /* 用前两条最优里的第二优值, 比单看最优更保守 */
+    double loss = pool->recent_loss[eval_idx];
+    double jitter_ms = (double)pool->recent_rtt_var[eval_idx] / 1000.0;
+    if(best_loss) *best_loss = loss;
+    if(best_jitter_ms) *best_jitter_ms = jitter_ms;
+    if(idx2 < 0){
+        /* 只有一条样本充足的连接时, 允许它触发打开, 但不允许它单独触发关闭。 */
+        if(loss >= FEC_LOSS_ON_PCT || pool->recent_rtt_var[eval_idx] >= FEC_JITTER_ON_US){
+            pool->fec_latched = 1;
+            return 1;
+        }
+        if(prio == PRIO_LATENCY && pool->recent_ts[eval_idx] != 0 &&
+            picoquic_current_time() - pool->recent_ts[eval_idx] <= FEC_COLDSTART_US){
+            if(coldstart_on) *coldstart_on = 1;
+            pool->fec_latched = 1;
+            return 1;
+        }
+        return pool->fec_latched;
+    }
+    if(!pool->fec_latched){
+        if(loss >= FEC_LOSS_ON_PCT || pool->recent_rtt_var[eval_idx] >= FEC_JITTER_ON_US) pool->fec_latched = 1;
+    } else {
+        if(loss <= FEC_LOSS_OFF_PCT && pool->recent_rtt_var[eval_idx] <= FEC_JITTER_OFF_US) pool->fec_latched = 0;
+    }
+    return pool->fec_latched;
+}
+
+/* FEC 2B: 从全池里挑"当前最稳"的连接。FEC 的候选不受 LAT_LANES 限制, 因为实测最稳的连接
+ * 未必落在前几条 latency lanes。优先使用 30s 内的 linkq 样本按 loss->rtt 排序; 若都无样本,
+ * 回退普通 latency round-robin。avoid_idx>=0 时排除该连接, 便于挑第二条。 */
+static int pool_pick_fec_best(cnx_pool_t* pool, int avoid_idx){
+    uint64_t now = picoquic_current_time();
+    int best = -1;
+    for(int idx=0; idx<POOL_SIZE; idx++){
+        if(idx==avoid_idx) continue;
+        if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
+        if(pool->cnx[idx]==NULL) continue;
+        if(!pool_quality_sampled(pool, idx, now)) continue;
+        if(best<0 || pool_quality_better(pool, idx, best, now)) best = idx;
+    }
+    if(best>=0) return best;
+    best = pool_quality_best(pool, avoid_idx, 0);
     return best>=0 ? best : pool_pick_latency_rr(pool, avoid_idx);
 }
 
@@ -520,15 +611,24 @@ static int pool_pick(cnx_pool_t* pool, int is_latency){
 static int downstream_open_stream(proxy_stream_t* p, const char* route, int prio){
     /* FEC 双发(仅 middle, 开关开, 直播延迟流): 分配非0 flowid, 稍后在池中另一条连接上开 down2,
      * 首部同 flowid 端到端传, exit 端据 flowid 配对同一逻辑流并按字节去重。0=单发不受影响。 */
-    int hit_media = is_fec_media(route);
-    int fec = (G.role==ROLE_MIDDLE && g_fec_enabled && prio==PRIO_LATENCY && hit_media);
+    double best_loss=-1.0, best_jitter_ms=-1.0;
+    int best_idx=-1;
+    int coldstart_on=0;
+    int line_bad = ((G.role==ROLE_MIDDLE || G.role==ROLE_ENTRY) && g_fec_enabled)
+        ? pool_line_bad(&G.pool, prio, &best_loss, &best_jitter_ms, &best_idx, &coldstart_on) : 0;
+    int fec = ((G.role==ROLE_MIDDLE || G.role==ROLE_ENTRY) && g_fec_enabled && prio==PRIO_LATENCY && line_bad);
+    if((G.role==ROLE_MIDDLE || G.role==ROLE_ENTRY) && prio==PRIO_LATENCY){
+        log4c_info("%s id=%u fec gate route=%s prio=%d fec_enabled=%d line_bad=%d coldstart=%d best=%d best_loss=%.2f best_jitter=%.1fms fec=%d",
+            role_name(G.role), p->id, route, prio, g_fec_enabled, line_bad, coldstart_on, best_idx, best_loss, best_jitter_ms, fec);
+    }
     if(fec && p->flowid==0){ if(++g_next_flowid==0) g_next_flowid=1; p->flowid=g_next_flowid; }
 
-    int idx = fec ? pool_pick_latency_best(&G.pool, -1) : pool_pick(&G.pool, prio==PRIO_LATENCY);
+    int idx = fec ? pool_pick_fec_best(&G.pool, -1) : pool_pick(&G.pool, prio==PRIO_LATENCY);
     if(idx<0){ log4c_error("id=%u no downstream cnx in pool", p->id); return -1; }
     picoquic_cnx_t* c=G.pool.cnx[idx];
-    if(G.role==ROLE_MIDDLE && g_fec_enabled && prio==PRIO_LATENCY && !hit_media){
-        log4c_info("middle id=%u fec skip route=%s prio=%d hit_media=0", p->id, route, prio);
+    if((G.role==ROLE_MIDDLE || G.role==ROLE_ENTRY) && g_fec_enabled && prio==PRIO_LATENCY && !line_bad){
+        log4c_info("%s id=%u fec skip route=%s prio=%d line_bad=0 coldstart=%d best=%d best_loss=%.2f best_jitter=%.1fms",
+            role_name(G.role), p->id, route, prio, coldstart_on, best_idx, best_loss, best_jitter_ms);
     }
     p->down_cnx=c; p->prio=prio;
     p->down_stream_id=G.pool.next_sid[idx]; G.pool.next_sid[idx]+=4; /* 该连接独立的 client bidi */
@@ -542,9 +642,9 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, int prio
 
     /* FEC 第二条: 选一条与 down 不同的池连接开 down2, 首部同 flowid。第二条失败则退化单发, 不影响主路。 */
     if(fec && p->flowid!=0){
-        int idx2=pool_pick_latency_best(&G.pool, idx);
-        log4c_info("middle id=%u fec decide route=%s hit_media=1 pick=%d,%d loss=%.2f/%.2f rtt=%.1f/%.1fms",
-            p->id, route, idx, idx2,
+        int idx2=pool_pick_fec_best(&G.pool, idx);
+        log4c_info("%s id=%u fec decide route=%s line_bad=1 pick=%d,%d loss=%.2f/%.2f rtt=%.1f/%.1fms",
+            role_name(G.role), p->id, route, idx, idx2,
             G.pool.recent_loss[idx], idx2>=0 ? G.pool.recent_loss[idx2] : -1.0,
             G.pool.recent_rtt[idx]/1000.0, idx2>=0 ? (G.pool.recent_rtt[idx2]/1000.0) : -1.0);
         if(idx2>=0 && G.pool.cnx[idx2]!=NULL && G.pool.cnx[idx2]!=c){
@@ -615,6 +715,26 @@ static void upstream_dedup(proxy_stream_t* p, int from_down2, uint8_t* data, siz
     if(fin && !p->up_fin_sent){ p->up_fin_sent=1; fwd_up(p, NULL, 0, 1); }
 }
 
+/* middle 去程 FEC 去重: entry 双发两条上游 stream(up/up2)承载相同去程字节流。middle 只把新增部分
+ * 转发到下游(此时 fwd_down 仍可继续在 middle->exit 段做下一跳双发), 避免 entry 双发放大成 2x 以上。
+ * 任一条 fin 只向下游发一次。 */
+static void middle_deliver_dedup(proxy_stream_t* p, int from_up2, uint8_t* data, size_t n, int fin){
+    ps_touch(p);
+    uint64_t* rcvd = from_up2 ? &p->up2_rcvd : &p->up_rcvd;
+    uint64_t now = *rcvd + n;
+    *rcvd = now;
+    if(now > p->dedup_delivered){
+        uint64_t nb = now - p->dedup_delivered;
+        if(nb > n) nb = n;
+        fwd_down(p, data + (n - nb), (size_t)nb, 0);
+        p->dedup_delivered = now;
+        g_fec_dedup_bytes += (uint64_t)(n - nb);
+    } else if(n){
+        g_fec_dedup_bytes += (uint64_t)n;
+    }
+    if(fin && !p->down_fin_sent){ p->down_fin_sent=1; fwd_down(p, NULL, 0, 1); }
+}
+
 /* exit FEC 去重交付: 双发两条上游 stream(up/up2)承载完全相同的有序字节流。对每条维护累计接收字节,
  * 只把"累计已超过 dedup_delivered"的新增部分交付给 target(q2t): 领先的先交付、落后的追上不重复。
  * 单发(仅 up, flowid=0)时 up_rcvd 单调等于 dedup_delivered, 等价于直接交付。fin 仅推进结束标记。 */
@@ -657,18 +777,25 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin, in
                     if(ok2){ flowid=(uint32_t)strtoul(rt,NULL,10); rt=semi2+1; } } } } }
         p->prio=prio;
         picoquic_set_stream_priority(p->up_cnx,p->up_stream_id,(uint8_t)prio);
-        /* FEC exit 配对: 非0 flowid 且已有同 flowid 的 first ps -> 本条(p 的 up)是双发第二条:
+        /* FEC 配对(exit/middle): 非0 flowid 且已有同 flowid 的 first ps -> 本条(p 的 up)是双发第二条:
          * 挂为 first 的 up2, 首部后数据去重交付给 first, 释放临时 p(不 discard stream, 归 first)。
          * 单线程串行保证第一条已先设好 flowid, 第二条必能配对到; 谁先到谁 first, 与去重无关。 */
-        if(G.role==ROLE_EXIT && flowid!=0){
+        if((G.role==ROLE_EXIT || G.role==ROLE_MIDDLE) && flowid!=0){
             proxy_stream_t* first=ps_find_by_flowid(flowid);   /* p->flowid 尚未设, 不会匹配自身 */
             if(first){
                 first->up2_cnx=p->up_cnx; first->up2_stream_id=p->up_stream_id;
                 picoquic_set_app_stream_ctx(p->up_cnx,p->up_stream_id,first);
-                log4c_debug("exit id=%u FEC pair flowid=%u up2_sid=%llu -> first id=%u",
-                    p->id,flowid,(unsigned long long)p->up_stream_id,first->id);
-                if(off<len) exit_deliver_dedup(first,1,bytes+off,len-off,0);
-                if(fin){ first->up_fin_seen=1; exit_deliver_dedup(first,1,NULL,0,1); }
+                log4c_debug("%s id=%u FEC pair flowid=%u up2_sid=%llu -> first id=%u",
+                    role_name(G.role),p->id,flowid,(unsigned long long)p->up_stream_id,first->id);
+                if(off<len){
+                    if(G.role==ROLE_EXIT) exit_deliver_dedup(first,1,bytes+off,len-off,0);
+                    else middle_deliver_dedup(first,1,bytes+off,len-off,0);
+                }
+                if(fin){
+                    first->up_fin_seen=1;
+                    if(G.role==ROLE_EXIT) exit_deliver_dedup(first,1,NULL,0,1);
+                    else middle_deliver_dedup(first,1,NULL,0,1);
+                }
                 p->up_cnx=NULL; p->up_stream_id=0;   /* 解除临时 p 对该 stream 的所有权, 防误匹配 */
                 ps_free(p);
                 return 0;
@@ -713,10 +840,12 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin, in
     /* 首部之后的数据 -> 转发 right(exit 走 FEC 去重交付, 兼容单发; middle 直接转下游) */
     if(off<len){
         if(G.role==ROLE_EXIT) exit_deliver_dedup(p,from_up2,bytes+off,len-off,0);
+        else if(G.role==ROLE_MIDDLE && p->flowid!=0) middle_deliver_dedup(p,from_up2,bytes+off,len-off,0);
         else fwd_down(p,bytes+off,len-off,0);
     }
     if(fin){ p->up_fin_seen=1;
         if(G.role==ROLE_EXIT) exit_deliver_dedup(p,from_up2,NULL,0,1);
+        else if(G.role==ROLE_MIDDLE && p->flowid!=0) middle_deliver_dedup(p,from_up2,NULL,0,1);
         else fwd_down(p,NULL,0,1);
     }
     return 0;
@@ -764,7 +893,9 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_stateless_reset: {
         int i; for(i=0;i<MAX_CONN;i++) if(G.streams[i].in_use && (G.streams[i].up_cnx==cnx||G.streams[i].down_cnx==cnx||G.streams[i].up2_cnx==cnx||G.streams[i].down2_cnx==cnx)) ps_free(&G.streams[i]);
         for(i=0;i<POOL_SIZE;i++) if(G.pool.cnx[i]==cnx){
-            G.pool.cnx[i]=NULL; G.pool.recent_loss[i]=0; G.pool.recent_rtt[i]=0; G.pool.recent_ts[i]=0;
+            G.pool.cnx[i]=NULL; G.pool.recent_loss[i]=0; G.pool.recent_rtt[i]=0; G.pool.recent_rtt_max[i]=0;
+            G.pool.recent_sent[i]=0; G.pool.last_sent_total[i]=0; G.pool.last_lost_total[i]=0;
+            G.pool.last_spurious_total[i]=0; G.pool.recent_rtt_var[i]=0; G.pool.recent_ts[i]=0;
         } /* 从池移除, 下次 pool_pick 惰性重建 */
         picoquic_set_callback(cnx,NULL,NULL); break; }
     default: break;
@@ -791,7 +922,9 @@ static void entry_accept(void){
         return;
     }
     snprintf(p->route,sizeof(p->route),"%s",G.route_str);
-    if(downstream_open_stream(p,G.route_str,classify_target(G.route_str))!=0){ ps_free(p); return; }
+    { int prio = classify_target(G.route_str);
+      log4c_info("entry id=%u classify fixed route=%s prio=%d", p->id, G.route_str, prio);
+      if(downstream_open_stream(p,G.route_str,prio)!=0){ ps_free(p); return; } }
     log4c_info("entry id=%u accept fd=%d -> down_sid=%llu route=%s",p->id,fd,(unsigned long long)p->down_stream_id,G.route_str);
 }
 
@@ -841,6 +974,7 @@ static void socks_handshake(proxy_stream_t* p){
         else snprintf(route,sizeof(route),"T:%s:%d",host,port);
         snprintf(p->route,sizeof(p->route),"%s",route);
         int prio=classify_target(host); /* 直播/实时 -> 低延迟专用道 */
+        log4c_info("entry id=%u classify host=%s port=%d prio=%d route=%s", p->id, host, port, prio, route);
         if(downstream_open_stream(p,route,prio)!=0){ ps_free(p); return; }
         p->socks_stage=2;
         log4c_debug("entry id=%u socks CONNECT %s:%d -> down_sid=%llu route=%s",p->id,host,port,(unsigned long long)p->down_stream_id,route);
@@ -1156,9 +1290,20 @@ int main(int argc,char**argv){
                 for(int k=0;k<POOL_SIZE;k++){ if(!G.pool.cnx[k]) continue;
                     picoquic_path_quality_t q; memset(&q,0,sizeof(q));
                     picoquic_get_default_path_quality(G.pool.cnx[k], &q);
-                    double loss = q.sent ? (100.0*(double)q.lost/(double)q.sent) : 0.0;
+                    uint64_t delta_sent = (q.sent >= G.pool.last_sent_total[k]) ? (q.sent - G.pool.last_sent_total[k]) : q.sent;
+                    uint64_t delta_lost = (q.lost >= G.pool.last_lost_total[k]) ? (q.lost - G.pool.last_lost_total[k]) : q.lost;
+                    uint64_t delta_spurious = (q.spurious_losses >= G.pool.last_spurious_total[k])
+                        ? (q.spurious_losses - G.pool.last_spurious_total[k]) : q.spurious_losses;
+                    uint64_t eff_lost = (delta_lost > delta_spurious) ? (delta_lost - delta_spurious) : 0;
+                    double loss = delta_sent ? (100.0*(double)eff_lost/(double)delta_sent) : 0.0;
                     G.pool.recent_loss[k] = loss;
                     G.pool.recent_rtt[k] = q.rtt;
+                    G.pool.recent_rtt_max[k] = q.rtt_max;
+                    G.pool.recent_sent[k] = delta_sent;
+                    G.pool.last_sent_total[k] = q.sent;
+                    G.pool.last_lost_total[k] = q.lost;
+                    G.pool.last_spurious_total[k] = q.spurious_losses;
+                    G.pool.recent_rtt_var[k] = q.rtt_variant;
                     G.pool.recent_ts[k] = tn;
                     log4c_info("linkq pool[%d] rtt=%.1fms(min%.1f/max%.1f) loss=%.2f%% lost_pkt=%llu cwin=%lluKB bw=%lluKbps sent=%lluKB",
                         k, q.rtt/1000.0, q.rtt_min/1000.0, q.rtt_max/1000.0, loss,
