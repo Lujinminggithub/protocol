@@ -40,7 +40,9 @@ WL_DEFAULT = """# NB 白名单(访问控制): 命中(域名后缀/IP CIDR/端口
 # 远程编辑本文件后 ~5s 自动热重载生效, 无需重启。
 domain tiktok.com
 domain tiktokv.com
+domain tiktokv.us
 domain tiktokcdn.com
+domain tiktokcdn.us
 domain tiktokcdn-us.com
 domain byteoversea.com
 domain ibyteimg.com
@@ -158,6 +160,10 @@ def _whitelist_remote():
     return f"{WORK}/whitelist.conf"
 
 
+def _tiktok_rules_remote():
+    return f"{WORK}/tiktok_flow_rules.conf"
+
+
 def _ensure_remote_whitelist(c):
     wl_remote = _whitelist_remote()
     exists = run(c, f"test -f {wl_remote} && echo EXISTS || echo NONE").strip()
@@ -178,13 +184,19 @@ def _push_whitelist(c, local_path: pathlib.Path):
     return wl_remote
 
 
-def _middle_override_path():
-    return "/etc/systemd/system/nb-middle.service.d/override.conf"
+def _push_tiktok_rules(c):
+    local_rules = ROOT / "tools" / "tiktok_flow_rules.conf"
+    if local_rules.exists():
+        push_bytes(c, local_rules.read_bytes(), _tiktok_rules_remote())
 
 
-def _middle_fec_enabled(c):
-    if _service_exists(c, "middle"):
-        out = run(c, f"systemctl show -p Environment --value {_service_name('middle')} 2>/dev/null")
+def _fec_override_path(role):
+    return f"/etc/systemd/system/nb-{role}.service.d/override.conf"
+
+
+def _role_fec_enabled(c, role):
+    if _service_exists(c, role):
+        out = run(c, f"systemctl show -p Environment --value {_service_name(role)} 2>/dev/null")
         return "NB_FEC=on" in out or "NB_FEC=1" in out
     out = run(c,
         "pid=$(pgrep -xo nb_node 2>/dev/null || true); "
@@ -200,7 +212,8 @@ def _legacy_start_cmd(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, fec_e
     key = f"{DEPLOY_CERTS}/key.pem"
     if role == "entry":
         mid = f"H:{kz['host']}:4443"
-        return (f"cd {WORK} && setsid nohup ./nb_node -r entry -l {socks_port} -n {hk['host']} -N 4443 "
+        env = "env NB_FEC=on " if fec_enabled else ""
+        return (f"cd {WORK} && setsid nohup {env}./nb_node -r entry -l {socks_port} -n {hk['host']} -N 4443 "
                 f"-S -M '{mid}' </dev/null >/tmp/nb_entry.log 2>&1 &")
     if role == "middle":
         env = "env NB_FEC=on " if fec_enabled else ""
@@ -223,40 +236,43 @@ def _restart_role(c, role, legacy_cmd, warmup=2.0):
     return "legacy " + (proc or "started")
 
 
-def _set_middle_fec(enabled: bool):
-    c = connect("middle")
-    if _service_exists(c, "middle"):
-        override = _middle_override_path()
-        if enabled:
-            push_bytes(c, b"[Service]\nEnvironment=NB_FEC=on\n", override)
-        else:
-            run(c, f"rm -f {override}")
-        run(c, "systemctl daemon-reload")
-        state = "systemd " + _systemd_restart(c, "middle")
-    else:
-        state = _restart_role(c, "middle", _legacy_start_cmd("middle", fec_enabled=enabled))
-    tail = run(c, f"tail -8 {WORK}/logs/nb-middle.log 2>/dev/null")
-    c.close()
+def _set_fec_roles(enabled: bool, roles=("entry", "middle")):
     action = "ENABLED" if enabled else "DISABLED"
-    print(f"middle FEC {action}: {state}")
-    if tail.strip():
-        print(tail)
+    for role in roles:
+        c = connect(role)
+        if _service_exists(c, role):
+            override = _fec_override_path(role)
+            if enabled:
+                push_bytes(c, b"[Service]\nEnvironment=NB_FEC=on\n", override)
+            else:
+                run(c, f"rm -f {override}")
+            run(c, "systemctl daemon-reload")
+            state = "systemd " + _systemd_restart(c, role)
+        else:
+            state = _restart_role(c, role, _legacy_start_cmd(role, fec_enabled=enabled))
+        tail = run(c, f"tail -8 {WORK}/logs/nb-{role}.log 2>/dev/null")
+        c.close()
+        print(f"{role} FEC {action}: {state}")
+        if tail.strip():
+            print(tail)
 
 
 def act_fec_status():
-    c = connect("middle")
-    runtime = "systemd" if _service_exists(c, "middle") else "legacy"
-    override = _middle_override_path()
-    out = run(c,
-        f"echo RUNTIME={runtime}; "
-        f"echo ACTIVE=$(systemctl is-active {_service_name('middle')} 2>/dev/null || echo unknown); "
-        f"echo ENV=$(systemctl show -p Environment --value {_service_name('middle')} 2>/dev/null); "
-        f"echo DROPIN=$(systemctl show -p DropInPaths --value {_service_name('middle')} 2>/dev/null); "
-        f"echo PROC=$(pgrep -ax nb_node 2>/dev/null | tail -1); "
-        f"echo '--- override ---'; cat {override} 2>/dev/null || echo '(no override)'; "
-        f"echo '--- log tail ---'; tail -8 {WORK}/logs/nb-middle.log 2>/dev/null")
-    print(out)
-    c.close()
+    for role in ("entry", "middle"):
+        c = connect(role)
+        runtime = "systemd" if _service_exists(c, role) else "legacy"
+        override = _fec_override_path(role)
+        out = run(c,
+            f"echo ROLE={role}; "
+            f"echo RUNTIME={runtime}; "
+            f"echo ACTIVE=$(systemctl is-active {_service_name(role)} 2>/dev/null || echo unknown); "
+            f"echo ENV=$(systemctl show -p Environment --value {_service_name(role)} 2>/dev/null); "
+            f"echo DROPIN=$(systemctl show -p DropInPaths --value {_service_name(role)} 2>/dev/null); "
+            f"echo PROC=$(pgrep -ax nb_node 2>/dev/null | tail -1); "
+            f"echo '--- override ---'; cat {override} 2>/dev/null || echo '(no override)'; "
+            f"echo '--- log tail ---'; tail -8 {WORK}/logs/nb-{role}.log 2>/dev/null")
+        print(out)
+        c.close()
 
 
 def _smoke_socks(socks_port=DEFAULT_SOCKS_PORT):
@@ -280,6 +296,10 @@ BUILD_CMD = (
 # CMake 构建集: 自有源码 + CMakeLists + build_libs.sh + 目标平台预编译 .a(自包含, 零依赖 /root/poc)
 BUILD_FILES = {
     "src/nb_node.c": SRC / "nb_node.c",
+    "src/nb_policy.c": SRC / "nb_policy.c",
+    "src/nb_policy.h": SRC / "nb_policy.h",
+    "src/nb_fec_rs.c": SRC / "nb_fec_rs.c",
+    "src/nb_fec_rs.h": SRC / "nb_fec_rs.h",
     "src/log/log4c.c": SRC / "log" / "log4c.c",
     "src/log/log4c.h": SRC / "log" / "log4c.h",
     "CMakeLists.txt": ROOT / "CMakeLists.txt",
@@ -404,6 +424,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
     push_bytes(ck, bindata, f"{WORK}/nb_node", mode=0o755)
     push_bytes(ck, cert, f"{DEPLOY_CERTS}/cert.pem")
     push_bytes(ck, key, f"{DEPLOY_CERTS}/key.pem")
+    _push_tiktok_rules(ck)
     wl_remote = _ensure_remote_whitelist(ck)
     print("exit(kz):", _restart_role(ck, "exit", _legacy_start_cmd("exit", wl_remote=wl_remote)))
     print(run(ck, f"tail -4 {WORK}/logs/nb-exit.log 2>/dev/null"))
@@ -413,14 +434,17 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
     push_bytes(cm, bindata, f"{WORK}/nb_node", mode=0o755)
     push_bytes(cm, cert, f"{DEPLOY_CERTS}/cert.pem")
     push_bytes(cm, key, f"{DEPLOY_CERTS}/key.pem")
+    _push_tiktok_rules(cm)
     print("middle(hk):", _restart_role(cm, "middle",
-        _legacy_start_cmd("middle", fec_enabled=_middle_fec_enabled(cm))))
+        _legacy_start_cmd("middle", fec_enabled=_role_fec_enabled(cm, "middle"))))
     print(run(cm, f"tail -4 {WORK}/logs/nb-middle.log 2>/dev/null"))
     cm.close()
 
     cg = connect("entry")
     push_bytes(cg, bindata, f"{WORK}/nb_node", mode=0o755)
-    print("entry(gz):", _restart_role(cg, "entry", _legacy_start_cmd("entry", socks_port=socks_port)))
+    _push_tiktok_rules(cg)
+    print("entry(gz):", _restart_role(cg, "entry",
+        _legacy_start_cmd("entry", socks_port=socks_port, fec_enabled=_role_fec_enabled(cg, "entry"))))
     print(run(cg, f"tail -4 {WORK}/logs/nb-entry.log 2>/dev/null"))
     cg.close()
 
@@ -461,8 +485,8 @@ def main():
     elif a.action == "wl-show": act_wl_show()
     elif a.action == "wl-push": act_wl_push(pathlib.Path(a.whitelist))
     elif a.action == "fec-status": act_fec_status()
-    elif a.action == "fec-on": _set_middle_fec(True)
-    elif a.action == "fec-off": _set_middle_fec(False)
+    elif a.action == "fec-on": _set_fec_roles(True)
+    elif a.action == "fec-off": _set_fec_roles(False)
 
 
 if __name__ == "__main__":
