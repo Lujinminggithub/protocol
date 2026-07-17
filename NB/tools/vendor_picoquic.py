@@ -10,20 +10,17 @@
 一次性 vendor 工具; 升级 picoquic 版本时重跑。
 """
 from __future__ import annotations
-import io, json, pathlib, tarfile, shutil
-import paramiko
+import io, pathlib, tarfile, shutil
+
+from deploy import connect, LAB
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-LAB = json.loads((ROOT / "tools" / "lab-hosts.json").read_text(encoding="utf-8"))
 PQ = LAB["paths"]["picoquic"]
 DST = ROOT / "third_party" / "picoquic"
-KZ = LAB["exit"]
 
 
 def main():
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(KZ["host"], port=KZ["port"], username=KZ["user"], password=KZ["password"],
-              timeout=25, banner_timeout=25, auth_timeout=25, allow_agent=False, look_for_keys=False)
+    c = connect("exit")
 
     def run(cmd, t=120):
         _i, o, e = c.exec_command(cmd, timeout=t)

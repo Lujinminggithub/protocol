@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "../dist-electron/main",
+    "rootDir": "main",
+    "baseUrl": "."
+  },
+  "include": ["main/**/*.ts", "preload/**/*.ts"]
+}

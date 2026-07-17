@@ -5065,6 +5065,17 @@ void picoquic_set_congestion_algorithm(picoquic_cnx_t* cnx, picoquic_congestion_
     picoquic_set_congestion_algorithm_ex(cnx, alg, NULL);
 }
 
+int picoquic_set_loss_reorder_tolerance(picoquic_cnx_t* cnx, uint64_t packet_gap, uint64_t delay_microseconds)
+{
+    PICOQUIC_THREAD_CHECK(cnx->quic);
+    if ((packet_gap != 0 && (packet_gap < 3 || packet_gap > 1024)) || delay_microseconds > 1000000) {
+        return -1;
+    }
+    cnx->loss_reorder_gap = packet_gap;
+    cnx->loss_reorder_delay = delay_microseconds;
+    return 0;
+}
+
 void picoquic_set_priority_limit_for_bypass(picoquic_cnx_t* cnx, uint8_t priority_limit)
 {
     PICOQUIC_THREAD_CHECK(cnx->quic);

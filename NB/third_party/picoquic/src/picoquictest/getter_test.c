@@ -136,6 +136,17 @@ int getter_test(void)
     if (ret == 0) {
         cnx_s = test_ctx->cnx_server;
     }
+
+    if (ret == 0) {
+        if (picoquic_set_loss_reorder_tolerance(cnx, 20, 30000) != 0 ||
+            cnx->loss_reorder_gap != 20 || cnx->loss_reorder_delay != 30000 ||
+            picoquic_set_loss_reorder_tolerance(cnx, 2, 30000) == 0 ||
+            picoquic_set_loss_reorder_tolerance(cnx, 20, 1000001) == 0 ||
+            picoquic_set_loss_reorder_tolerance(cnx, 0, 0) != 0 ||
+            cnx->loss_reorder_gap != 0 || cnx->loss_reorder_delay != 0) {
+            ret = -1;
+        }
+    }
     /* Test a series of getter interfaces */
 
     if (ret == 0 &&

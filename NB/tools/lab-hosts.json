@@ -1,10 +1,16 @@
 {
-  "entry":  {"name":"gz-83",  "host":"106.75.169.83",  "port":22,   "user":"root", "password":"CDs84p6"},
-  "middle": {"name":"hk-216", "host":"152.32.171.216", "port":22,   "user":"root", "password":"CDs84p6", "jump_via":"entry", "jump_target_host":"172.16.31.28"},
-  "exit":   {"name":"kz-1",   "host":"2.135.147.102",  "port":5222, "user":"root", "password":"6pvUpfowcB"},
+  "entry":  {"name":"gz-83",  "host":"106.75.169.83",  "port":22, "user":"root", "password_env":"NB_SSH_PASSWORD_ENTRY"},
+  "middle": {"name":"hk-216", "host":"152.32.171.216", "private_ip":"172.16.31.28", "port":22, "user":"root", "password_env":"NB_SSH_PASSWORD_MIDDLE", "jump_via":"entry", "jump_target_host":"172.16.31.28"},
+  "exit":   {"name":"kz-1",   "host":"2.135.147.106",  "port":5222, "user":"root", "password_env":"NB_SSH_PASSWORD_EXIT"},
+  "workers": {"entry": 1, "middle": 1, "exit": 2},
+  "transport": {
+    "entry":  {"cc":"cubic", "cwin_max_bytes":524288, "udp_port_min":20000, "udp_port_max":21023, "reorder_gap":20, "reorder_delay_us":30000},
+    "middle": {"cc":"bbr", "bbr_options":"Q0.0001:F0.25:", "reorder_gap":80, "reorder_delay_us":350000},
+    "exit":   {"cc":"bbr", "bbr_options":"Q0.0001:"}
+  },
   "paths": {
-    "work_dir": "/root/nb",
-    "picoquic": "/root/poc/picoquic",
-    "certs":    "/root/poc/picoquic/certs"
+    "work_dir": "/etc/NB",
+    "picoquic": "/etc/NB/third_party/picoquic",
+    "certs":    "/etc/NB/certs"
   }
 }

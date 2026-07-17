@@ -29,7 +29,7 @@ def main():
     bindata = (deploy.BUILD_DIR / 'nb_node').read_bytes()
     print(f"    OK, 产物 {len(bindata)} bytes")
 
-    # 2) 分发 + 重启三跳 + 冒烟。内部会优先走 systemd, 无 unit 时自动回退 legacy 启动。
+    # 2) 分发安全材料 + 原子安装 systemd + 重启三跳 + 认证冒烟。
     print(">>> [2/3] 分发 + 重启三跳 ...")
     deploy.act_deploy_socks()
 

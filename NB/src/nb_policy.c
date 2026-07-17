@@ -169,7 +169,9 @@ int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out){
             out->lane_hint = g_rules[i].lane_hint;
             out->fec_hint = g_rules[i].fec_hint;
             out->prio = g_rules[i].prio;
-            snprintf(out->rule_name, sizeof(out->rule_name), "%s", g_rules[i].pattern);
+            size_t rule_len=strnlen(g_rules[i].pattern,sizeof(g_rules[i].pattern));
+            if(rule_len>=sizeof(out->rule_name))rule_len=sizeof(out->rule_name)-1;
+            memcpy(out->rule_name,g_rules[i].pattern,rule_len);out->rule_name[rule_len]=0;
             return 1;
         }
     }

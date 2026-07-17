@@ -1,0 +1,36 @@
+{
+  "entry": {
+    "name": "sh-203",
+    "host": "115.175.66.203",
+    "port": 22,
+    "user": "root",
+    "password_env": "NB_SSH_PASSWORD_ENTRY"
+  },
+  "middle": {
+    "name": "us-135-cn2",
+    "host": "154.7.182.135",
+    "port": 22,
+    "user": "root",
+    "password_env": "NB_SSH_PASSWORD_MIDDLE"
+  },
+  "exit": {
+    "name": "us-207",
+    "host": "207.168.53.38",
+    "port": 2273,
+    "user": "root",
+    "password_env": "NB_SSH_PASSWORD_EXIT"
+    ,"outip": "207.168.53.207"
+  },
+  "build_host": "exit",
+  "workers": {"entry": 1, "middle": 1, "exit": 2},
+  "transport": {
+    "entry":  {"cc":"bbr", "bbr_options":"Q0.0001:", "reorder_gap":20, "reorder_delay_us":30000},
+    "middle": {"cc":"bbr", "bbr_options":"Q0.0001:"},
+    "exit":   {"cc":"bbr", "bbr_options":"Q0.0001:"}
+  },
+  "paths": {
+    "work_dir": "/etc/NB",
+    "picoquic": "/etc/NB/third_party/picoquic",
+    "certs": "/etc/NB/certs"
+  }
+}

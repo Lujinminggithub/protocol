@@ -30,7 +30,7 @@
  *     "hot_reload_interval_ms": 2000,
  *     "level_file_name": "level.txt",
  *     "include_source_info": true,
- *     "timestamp_format": "%Y-%m-%d %H:%M:%S.%03d"
+ *     "timestamp_format": "%Y-%m-%dT%H:%M:%S.%03dZ"
  *   }
  *
  * Build:
@@ -62,6 +62,7 @@ extern "C" {
  *
  * @param process_name  The executable name (e.g. "myapp"). Used as prefix
  *                      for log filenames: myapp.log, myapp_20260627_153000.log
+ *                      Log timestamps are emitted in UTC with a trailing "Z".
  */
 void log4c_init(const char* process_name);
 

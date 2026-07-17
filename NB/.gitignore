@@ -1,0 +1,6 @@
+/build/security/
+/build/nb_node
+/build/*.pem
+/build/*.key
+/build/*.users
+

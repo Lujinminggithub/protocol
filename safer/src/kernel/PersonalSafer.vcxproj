@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6f1b0c3a-9d2e-4a7f-8b3c-1e2d3f4a5b6c}</ProjectGuid>
+    <RootNamespace>PersonalSafer</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <DriverType>KMDF</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <!-- 关闭构建期自动测试签名：测试签名需本地测试证书，属于加载/分发环节。
+       .sys 产物本身不受影响；需要加载时再用 signtool /fd SHA256 单独签名。 -->
+  <PropertyGroup>
+    <SignMode>Off</SignMode>
+    <!-- 关闭通用驱动 API 校验（ApiValidator/aitstatic）：该 x86 校验工具在本机
+         预览版 SDK + 虚拟盘环境下无法运行（退出码 193），不影响 .sys 生成。 -->
+    <ApiValidator_Enable>false</ApiValidator_Enable>
+    <!-- 关闭 .cat 目录清单生成 / 可签名性测试（inf2cat）：同属分发环节，
+         该工具在本机环境下无法正确定位包内 .sys（退出码 -2）。 -->
+    <EnableInf2cat>false</EnableInf2cat>
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- WFP/NDIS headers (fwpsk.h -> ndis.h) gate NET_BUFFER_LIST etc. behind
+           NDIS_SUPPORT_NDIS6, which is only auto-derived for NDIS miniport
+           drivers. A plain WFP callout driver must define these explicitly. -->
+      <PreprocessorDefinitions>NDIS_SUPPORT_NDIS6=1;NDIS_SUPPORT_NDIS61=1;NDIS_SUPPORT_NDIS620=1;NDIS_SUPPORT_NDIS630=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Source files use UTF-8 encoded Chinese comments; without /utf-8,
+           MSVC parses them as the system ANSI code page (936/GBK) and emits
+           C4819, which becomes a hard error under WX (warnings-as-errors). -->
+      <!-- ndis.h (pulled in by fwpsk.h) uses nameless structs/unions (C4201),
+           a benign MSVC extension that becomes a hard error under WX. Disable
+           it — standard for WFP/NDIS-consuming driver projects. -->
+      <AdditionalOptions>/utf-8 /wd4201 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <!-- MiniFilter APIs (FltXxx) 需链接 fltMgr.lib；WFP 管理/callout APIs
+           (FwpmXxx/FwpsXxx) 需链接 fwpkclnt.lib。KMDF 工程默认不带这两个。 -->
+      <AdditionalDependencies>fltMgr.lib;fwpkclnt.lib;ntstrsafe.lib;cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <Inf Include="inf\PersonalSafer.inf" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="device.c" />
+    <ClCompile Include="driver.c" />
+    <ClCompile Include="core\protect.c" />
+    <ClCompile Include="filter\fltmgr.c" />
+    <ClCompile Include="filter\process_tracker.c" />
+    <ClCompile Include="filter\file_event.c" />
+    <ClCompile Include="comm\pipe_manager.c" />
+    <ClCompile Include="network\wfp_callout.c" />
+    <ClCompile Include="network\ale_auth.c" />
+    <ClCompile Include="network\classification.c" />
+    <ClCompile Include="network\sni_capture.c" />
+    <ClCompile Include="network\net_event.c" />
+    <ClCompile Include="policy\policy_engine.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="device.h" />
+    <ClInclude Include="driver.h" />
+    <ClInclude Include="ioctls.h" />
+    <ClInclude Include="core\protect.h" />
+    <ClInclude Include="filter\fltmgr.h" />
+    <ClInclude Include="filter\process_tracker.h" />
+    <ClInclude Include="filter\file_event.h" />
+    <ClInclude Include="network\wfp_callout.h" />
+    <ClInclude Include="network\ale_auth.h" />
+    <ClInclude Include="network\classification.h" />
+    <ClInclude Include="network\sni_capture.h" />
+    <ClInclude Include="network\net_event.h" />
+    <ClInclude Include="comm\pipe_manager.h" />
+    <ClInclude Include="policy\policy_engine.h" />
+    <ClInclude Include="common\shared_types.h" />
+    <ClInclude Include="common\shared_events.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -222,7 +222,7 @@ static log4c_runtime_cfg_t g_runtime_cfg = {
     .cleanup_every_n    = 10,
     .hot_reload_interval_ms = 1000,
     .include_source_info = 1,
-    .timestamp_format   = "%Y-%m-%d %H:%M:%S.%03d"
+    .timestamp_format   = "%Y-%m-%dT%H:%M:%S.%03dZ"
 };
 
 /* ── Internal State ─────────────────────────────────────────── */
@@ -275,20 +275,25 @@ static int log4c_current_ms(void)
 #endif
 }
 
-/* Format current timestamp into buffer using configurable format */
+/* Convert current wall-clock time to UTC broken-down time */
+static void log4c_gmtime_utc(time_t now, struct tm* out_tm)
+{
+#if LOG4C_WIN
+    gmtime_s(out_tm, &now);
+#else
+    gmtime_r(&now, out_tm);
+#endif
+}
+
+/* Format current timestamp into buffer using UTC time, independent of machine local timezone. */
 static void log4c_timestamp(char* buf, size_t buflen)
 {
     time_t now = time(NULL);
     struct tm tm_buf;
-
-#if LOG4C_WIN
-    localtime_s(&tm_buf, &now);
-#else
-    localtime_r(&now, &tm_buf);
-#endif
+    log4c_gmtime_utc(now, &tm_buf);
 
     int ms = log4c_current_ms();
-    snprintf(buf, buflen, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+    snprintf(buf, buflen, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, ms);
 }
@@ -360,8 +365,8 @@ static void log4c_get_exe_dir(char* buf, size_t buflen)
         tmp[len] = '\0';
         char* last_sep = strrchr(tmp, '/');
         if (last_sep) *last_sep = '\0';
-        strncpy(buf, tmp, buflen - 1);
-        buf[buflen - 1] = '\0';
+        size_t copy_len=strlen(tmp);if(copy_len>=buflen)copy_len=buflen-1;
+        memcpy(buf,tmp,copy_len);buf[copy_len]='\0';
     } else {
         strcpy(buf, ".");
     }
@@ -403,16 +408,11 @@ static void log4c_rotate_file(void)
     fclose(g_state.fp);
     g_state.fp = NULL;
 
-    /* Build rotated filename with timestamp */
+    /* Build rotated filename with UTC timestamp so rotated files match log line time basis. */
     char ts_buf[32];
     time_t now = time(NULL);
     struct tm tm_buf;
-
-#if LOG4C_WIN
-    localtime_s(&tm_buf, &now);
-#else
-    localtime_r(&now, &tm_buf);
-#endif
+    log4c_gmtime_utc(now, &tm_buf);
 
     snprintf(ts_buf, sizeof(ts_buf), "%04d%02d%02d_%02d%02d%02d",
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,

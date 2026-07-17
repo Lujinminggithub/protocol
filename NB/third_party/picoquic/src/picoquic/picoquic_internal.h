@@ -1415,6 +1415,8 @@ typedef struct st_picoquic_cnx_t {
     uint64_t max_ack_gap_local;
     uint64_t min_ack_delay_remote;
     uint64_t min_ack_delay_local;
+    uint64_t loss_reorder_gap; /* packet threshold for declaring ordered loss; 0 uses default */
+    uint64_t loss_reorder_delay; /* minimum RACK delay in microseconds; 0 uses default */
     unsigned int cwin_blocked : 1;
     unsigned int flow_blocked : 1;
     unsigned int stream_blocked : 1;

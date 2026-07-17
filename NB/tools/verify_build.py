@@ -7,28 +7,17 @@
 利用 vendor 时残留在 kz /tmp 的 pqsrc.tgz/pqa.tgz 重建 third_party, 避免慢链路重传。
 """
 from __future__ import annotations
-import io, json, pathlib
-import paramiko
+from deploy import BUILD_FILES, connect, put_tar
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-LAB = json.loads((ROOT / "tools" / "lab-hosts.json").read_text(encoding="utf-8"))
-KZ = LAB["exit"]
 NBV = "/root/nb-verify"
 
 
 def main():
-    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(KZ["host"], port=KZ["port"], username=KZ["user"], password=KZ["password"],
-              timeout=25, banner_timeout=25, auth_timeout=25, allow_agent=False, look_for_keys=False)
+    c = connect("exit")
 
     def run(cmd, t=400):
         _i, o, e = c.exec_command(cmd, timeout=t)
         return o.read().decode("utf-8", "replace") + e.read().decode("utf-8", "replace")
-
-    def put(local, remote, mode=0o644):
-        run(f"mkdir -p $(dirname {remote})")
-        sf = c.open_sftp(); sf.putfo(io.BytesIO(pathlib.Path(local).read_bytes()), remote)
-        sf.chmod(remote, mode); sf.close()
 
     # 1) 从 /tmp tgz 重建 vendored third_party
     print("### 重建 third_party(从 kz /tmp tgz) ...")
@@ -38,13 +27,8 @@ def main():
     run(f"tar xf /tmp/pqsrc.tgz -C {NBV}/third_party/picoquic/src")
     run(f"tar xf /tmp/pqa.tgz -C {NBV}/third_party/picoquic/prebuilt/linux-x86_64")
 
-    # 2) 上传 NB 自有源码 + 构建脚本
-    put(ROOT / "src" / "nb_node.c", f"{NBV}/src/nb_node.c")
-    put(ROOT / "src" / "log" / "log4c.c", f"{NBV}/src/log/log4c.c")
-    put(ROOT / "src" / "log" / "log4c.h", f"{NBV}/src/log/log4c.h")
-    put(ROOT / "CMakeLists.txt", f"{NBV}/CMakeLists.txt")
-    put(ROOT / "third_party" / "picoquic" / "build_libs.sh",
-        f"{NBV}/third_party/picoquic/build_libs.sh", mode=0o755)
+    # 2) 上传 NB 自有源码、头文件和构建脚本
+    put_tar(c, BUILD_FILES, NBV)
 
     # 路径 A: prebuilt 直链
     print("\n### 路径A: prebuilt 直链 ###")

@@ -107,6 +107,7 @@ typedef enum {
 #define BBRLossThresh 0.02 /* maximum tolerated packet loss (default: 2%) */
 #define BBRStartupFullLossCnt 6 /* discontiguous lost ranges required for startup high-loss exit */
 #define BBRBeta 0.7 /* Multiplicative decrease on packet loss (default: 0.7) */
+#define BBRLongPathLossFloorMinRtt 50000 /* 50 ms: avoid compounded random-loss floors on WAN paths */
 #define BBRHeadroom 0.15 /* Realive amount of headroom left for other flows. (default: 0.15). (Erroneously set to 0.85 in draft-bbr-02) */
 #define BBRMinPipeCwnd 4 /* Default to 4*SMSS, i.e, 4*PMTU */
 
@@ -226,6 +227,7 @@ typedef struct st_picoquic_bbr_state_t {
     uint64_t probe_rtt_min_stamp; /* time when probe_rtt_min_delay was obtained */
     uint64_t probe_rtt_done_stamp;
     uint64_t min_rtt_margin; /* Margin of error for min RTT, to avoid spurious expiry of probe RTT timer. */
+    double fast_recovery_floor_ratio; /* Optional prior-cwnd floor during long-path fast recovery. */
     unsigned int probe_rtt_expired; /* indicates whether min rtt is due for a refresh */
     unsigned int probe_rtt_round_done;
     unsigned int idle_restart : 1;
@@ -251,6 +253,8 @@ typedef struct st_picoquic_bbr_state_t {
     unsigned int startup_inflight_too_high_in_round : 1;
     uint64_t startup_loss_ranges_in_round;
     uint64_t loss_round_delivered;
+    uint64_t loss_round_lost_bytes;
+    uint64_t loss_round_acked_bytes;
 
     unsigned int is_in_recovery;
     unsigned int is_pto_recovery;
@@ -264,6 +268,7 @@ typedef struct st_picoquic_bbr_state_t {
     /* Management of App limited and transition */
     int app_limited_round_count;
     int app_limited_this_round;
+    unsigned int startup_app_limited_seen : 1;
 
     /* Management of ECN marks */
     uint64_t ecn_ect0_last_round;
@@ -462,6 +467,7 @@ static void BBRInitFullPipe(picoquic_bbr_state_t* bbr_state)
 * - Complex options, ends with ':'
 *   T999999999: wifi_shadow_rtt, microseconds
 *   Q99999.999: quantum_ratio, %
+*   F0.999: long-path fast-recovery floor as a fraction of prior CWIN
 *   S999999999: deterministic random seed for tests
 * 
 * The "BBR Experiment" is an attempt to improve behavior of BBR for
@@ -578,6 +584,36 @@ static void BBRSetOptions(picoquic_bbr_state_t* bbr_state)
                     bbr_state->quantum_ratio = d;
                     break;
                 }
+                break;
+            }
+            case 'F': {
+                double d = 0;
+                double div = 1.0;
+                int dotted = 0;
+                while ((c = *x) != 0) {
+                    if (c >= '0' && c <= '9') {
+                        if (!dotted) {
+                            d *= 10;
+                            d += c - '0';
+                        }
+                        else {
+                            div /= 10.0;
+                            d += div * (c - '0');
+                        }
+                        x++;
+                    }
+                    else if (c == '.' && !dotted) {
+                        dotted = 1;
+                        x++;
+                    }
+                    else {
+                        break;
+                    }
+                }
+                if (d >= 0.0 && d <= 1.0) {
+                    bbr_state->fast_recovery_floor_ratio = d;
+                }
+                break;
             }
             case ':':
                 /* Ignore */
@@ -785,6 +821,14 @@ static void BBROnEnterFastRecovery(picoquic_bbr_state_t* bbr_state, picoquic_pat
         additional_cwnd = rs->newly_acked;
     }
     path_x->cwin = path_x->bytes_in_transit + additional_cwnd;
+    if (bbr_state->fast_recovery_floor_ratio > 0.0 &&
+        bbr_state->min_rtt != UINT64_MAX && bbr_state->min_rtt >= BBRLongPathLossFloorMinRtt) {
+        uint64_t recovery_floor = (uint64_t)((double)bbr_state->prior_cwnd *
+            bbr_state->fast_recovery_floor_ratio);
+        if (recovery_floor > path_x->cwin) {
+            path_x->cwin = recovery_floor;
+        }
+    }
     bbr_state->recovery_packet_number = picoquic_cc_get_sequence_number(path_x->cnx, path_x);
     bbr_state->packet_conservation = 1;
     bbr_state->is_in_recovery = 1;
@@ -1054,6 +1098,8 @@ static void BBRResetCongestionSignals(picoquic_bbr_state_t* bbr_state)
 #endif
     bbr_state->bw_latest = 0;
     bbr_state->inflight_latest = 0;
+    bbr_state->loss_round_lost_bytes = 0;
+    bbr_state->loss_round_acked_bytes = 0;
 }
 
 /* Handle the first congestion episode in this cycle */
@@ -1083,18 +1129,46 @@ static void BBRLossLowerBounds(picoquic_bbr_state_t* bbr_state)
 }
 
 /* Once per round-trip respond to congestion */
-static void BBRAdaptLowerBoundsFromCongestion(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x)
+static int BBRRoundHasMaterialLoss(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x)
+{
+    uint64_t total = bbr_state->loss_round_acked_bytes + bbr_state->loss_round_lost_bytes;
+    return total > 0 &&
+        bbr_state->loss_round_lost_bytes > 3 * path_x->send_mtu &&
+        (double)bbr_state->loss_round_lost_bytes >= BBRLossThresh * (double)total;
+}
+
+static void BBRAdaptLowerBoundsFromCongestion(picoquic_bbr_state_t* bbr_state,
+    picoquic_path_t* path_x, int material_loss)
 {
     if (BBRIsProbingBW(bbr_state)) {
         return;
     }
 #ifdef RTTJitterBufferAdapt
-    if (bbr_state->loss_in_round || bbr_state->rtt_too_high_in_round) {
+    if ((bbr_state->loss_in_round && material_loss) || bbr_state->rtt_too_high_in_round) {
 #else
-    if (bbr_state->loss_in_round) {
+    if (bbr_state->loss_in_round && material_loss) {
 #endif
-        BBRInitLowerBounds(bbr_state, path_x);
-        BBRLossLowerBounds(bbr_state);
+        if (path_x->rtt_min < BBRLongPathLossFloorMinRtt) {
+            BBRInitLowerBounds(bbr_state, path_x);
+            BBRLossLowerBounds(bbr_state);
+        }
+        else if (bbr_state->bw_lo == UINT64_MAX || bbr_state->inflight_lo == UINT64_MAX) {
+            /* Apply beta at most once between REFILL resets. Random loss on a
+             * long-RTT path can otherwise compound the lower bounds every RTT
+             * and hold a newly active media burst below its usable bandwidth. */
+            BBRInitLowerBounds(bbr_state, path_x);
+            BBRLossLowerBounds(bbr_state);
+        }
+        else {
+            /* Fresh delivery can raise a stale floor; repeated loss rounds are
+             * handled by inflight_hi and the next ProbeBW cycle. */
+            if (bbr_state->bw_lo < bbr_state->bw_latest) {
+                bbr_state->bw_lo = bbr_state->bw_latest;
+            }
+            if (bbr_state->inflight_lo < bbr_state->inflight_latest) {
+                bbr_state->inflight_lo = bbr_state->inflight_latest;
+            }
+        }
     }
 }
 
@@ -1102,6 +1176,8 @@ static void BBRAdaptLowerBoundsFromCongestion(picoquic_bbr_state_t* bbr_state, p
 static void  BBRUpdateCongestionSignals(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x, bbr_per_ack_state_t * rs)
 {
     BBRUpdateMaxBw(bbr_state, path_x, rs);
+    bbr_state->loss_round_lost_bytes += rs->newly_lost;
+    bbr_state->loss_round_acked_bytes += rs->newly_acked;
     if (rs->newly_lost > 0) {
         bbr_state->loss_in_round = 1;
     }
@@ -1113,8 +1189,11 @@ static void  BBRUpdateCongestionSignals(picoquic_bbr_state_t* bbr_state, picoqui
     if (!bbr_state->loss_round_start) {
         return;  /* wait until end of round trip */
     }
-    BBRAdaptLowerBoundsFromCongestion(bbr_state, path_x);
+    BBRAdaptLowerBoundsFromCongestion(bbr_state, path_x,
+        BBRRoundHasMaterialLoss(bbr_state, path_x));
     bbr_state->loss_in_round = 0;
+    bbr_state->loss_round_lost_bytes = 0;
+    bbr_state->loss_round_acked_bytes = 0;
 #ifdef RTTJitterBufferAdapt
     bbr_state->rtt_too_high_in_round = 0;
 #endif
@@ -2046,6 +2125,7 @@ static void BBRCheckStartupDone(picoquic_bbr_state_t* bbr_state,
     picoquic_path_t * path_x, bbr_per_ack_state_t * rs)
 {
     if (bbr_state->state == picoquic_bbr_alg_startup) {
+        bbr_state->startup_app_limited_seen |= rs->is_app_limited;
         BBRCheckStartupFullBandwidth(bbr_state, rs);
         BBRCheckStartupHighLoss(bbr_state, path_x, rs);
 #ifdef RTTJitterBufferStartup
@@ -2054,6 +2134,13 @@ static void BBRCheckStartupDone(picoquic_bbr_state_t* bbr_state,
         }
 #endif
         if (bbr_state->filled_pipe) {
+            if (bbr_state->startup_app_limited_seen && bbr_state->max_bw > 0) {
+                /* Random loss on an app-limited stream must not carry a repeatedly
+                 * reduced short-term floor into ProbeBW. Keep the recent delivery
+                 * estimate, while subsequent material congestion can lower it. */
+                bbr_state->bw_lo = bbr_state->max_bw;
+                bbr_state->inflight_lo = UINT64_MAX;
+            }
             bbr_state->probe_probe_bw_quickly = 1;
             bbr_state->full_bw_count = 0;
             BBREnterDrain(bbr_state, path_x);
@@ -2063,6 +2150,7 @@ static void BBRCheckStartupDone(picoquic_bbr_state_t* bbr_state,
 
 static void BBREnterStartup(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x)
 {
+    bbr_state->startup_app_limited_seen = 0;
     bbr_state->state = picoquic_bbr_alg_startup;
     bbr_state->pacing_gain = BBRStartupPacingGain;
     bbr_state->cwnd_gain = BBRStartupCwndGain;

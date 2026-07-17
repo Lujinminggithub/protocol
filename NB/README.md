@@ -1,87 +1,91 @@
-# Newbility (NB) —— 自研可级联 TCP-over-QUIC 传输
+# Newbility（NB）
 
-基于 **picoquic (BBRv2)** 的多跳 TCP-over-QUIC 隧道。一份二进制 `nb_node`,靠 `-r` 选角色,
-组成 **entry → middle(×N) → exit** 的可变跳数链路。路径由 entry 下发的 source-route 决定,
-**中间节点无状态**(下一跳地址来自 stream 首部),天然适配"卖线路 / 动态选路 / 路径探测"产品模型。
+NB 是基于 picoquic 的可级联 TCP-over-QUIC 三跳传输系统。当前 V1.5 保留可靠 TCP 语义，拓扑为 `entry -> middle -> exit -> target`，并将手机原生客户端留到 V2。
 
-## 角色
+## 当前基线
 
-| 角色 | left(靠 client) | right(靠 target) | 说明 |
-|------|-----------------|------------------|------|
-| entry  | 本地 TCP accept | 下游 QUIC(第一跳) | 每 TCP 连接开一个 QUIC bidi stream,首部发 route |
-| middle | 上游 QUIC(上一跳) | 下游 QUIC(下一跳) | 读首部 `H:host:port` 动态连下一跳,转发剩余 route + 数据 |
-| exit   | 上游 QUIC(上一跳) | 目标 TCP | 读首部 `T:host:port`,connect 目标,双向泵 |
+- 普通 QUIC 主链为默认数据面，自动 FEC 处于观察模式。
+- 只有受控测试显式设置 `NB_FEC_V15_ACTIVE=on` 时，纠错型 FEC 才接管候选媒体流。
+- 发送路径统一使用 `picoquic_callback_prepare_to_send`，不存在 `picoquic_add_to_stream` 遗留。
+- 每个进程使用 `epoll`、环形发送队列、TCP 高低水位背压和 O(1) FEC session 索引。
+- 部署默认每个角色启动 2 个独立 worker，使用 `SO_REUSEPORT` 接收内核分流。
+- entry 可按权重选择多个出口；middle 按下一跳地址维护最多 8 个独立 QUIC 连接池。
 
-## source-route
+## FEC V1.5
 
-stream 首部第一行(文本 + `\n`),语义 = 接收节点出发的剩余路径:
+FEC 已独立到 `src/nb_fec.c`，数据面采用 QUIC datagram 的 source/repair 分片，控制面负责 block meta、NACK、RETX、RETX ACK、block ACK、FIN/FIN ACK 和 RST。
+
+当前实现包含：
+
+- GF(256) Reed-Solomon `RS(k,r)`；
+- 多 block 乱序接收窗口；
+- 按 BDP 计算的 TX history；
+- NACK 重试与稀疏可靠补发；
+- 严格协议长度、索引、状态和 FIN 边界校验；
+- payload 完整性、乱序、恢复、重试和 netem 矩阵测试。
+
+## 安全基线
+
+生产模式为 fail-closed：
+
+- 三个角色都必须提供 `-c <cert> -k <key> -a <ca>`；
+- middle 和 exit 强制校验客户端证书，entry 和 middle 校验下游服务端证书；
+- SOCKS5 entry 必须提供 RFC 1929 用户认证文件 `-U`；
+- SOCKS 密码只保存 PBKDF2-SHA256 派生值；
+- SOCKS entry 与 exit 都必须提供 `-W <whitelist>`；
+- 私钥和用户文件必须由运行用户持有，权限为 `0600` 或更严格；
+- 部署主机密码来自环境变量，SSH 默认要求 `NB_KNOWN_HOSTS`。
+
+`NB_INSECURE_TEST_MODE=1` 只用于隔离实验，不得用于线上。
+
+## 构建与部署
+
+```powershell
+# 1. 设置 SSH 凭据和主机指纹文件
+$env:NB_SSH_PASSWORD_ENTRY = "..."
+$env:NB_SSH_PASSWORD_MIDDLE = "..."
+$env:NB_SSH_PASSWORD_EXIT = "..."
+$env:NB_KNOWN_HOSTS = "C:\path\to\known_hosts"
+
+# 2. 一次性生成私有 CA、节点证书和 SOCKS 凭据
+$env:NB_SOCKS_USERNAME = "..."
+$env:NB_SOCKS_PASSWORD = "..."
+python tools/security_setup.py
+
+# 3. 构建并部署
+python tools/deploy.py build
+python tools/deploy.py deploy-socks
 ```
-H:hop2:qport,...,T:targethost:targetport
-```
-- `H:` = 下一 QUIC 跳地址(middle 消费第一个 H,转发其余);
-- `T:` = 最终 TCP 目标(exit 消费);
-- 两跳(entry 直连 exit)时 route 仅 `T:target:port`(无 H)。
 
-例(三跳 gz→hk→kz→target): entry `-n hk -R "H:kz:4443,T:target:80"`
-→ hk 消费 `H:kz:4443` 连 kz、转发 `T:target:80` → kz 连 target。
+首次引导且尚未建立 known_hosts 时，可以显式设置 `NB_SSH_INSECURE=1`，完成指纹核验后应立即取消。
 
-## 目录
+## 多出口
 
-```
-src/nb_node.c             统一三角色节点
-src/log/log4c.{c,h}       结构化日志(route+stream_id 贯穿三跳可 grep 追踪)
-third_party/picoquic/     vendored picoquic(源码 + 平台预编译静态库) —— 见 docs/design.md
-tools/deploy.py           运维入口: recon / build / deploy-socks / wl-* / fec-* / logs
-tools/redeploy.py         一键 build + systemd 滚动发布
-tools/nb_diag.py          三跳诊断 / 压测 / 吞吐基线
-tools/lab-hosts.json      机器清单(entry/middle/exit + 跳板)
-tools/vendor_picoquic.py  从构建机抽取 picoquic 固化进 third_party/
-scripts/runtri.sh         单机三角色 loopback 回归(不依赖真机)
-docs/design.md            架构 / 协议 / BBRv2+FEC 规划 / 验证结果
+在 hosts JSON 中增加 `exits`：
+
+```json
+"exits": [
+  {"name": "kz-a", "host": "203.0.113.10", "port": 4443, "weight": 2},
+  {"name": "kz-b", "host": "203.0.113.11", "port": 4443, "weight": 1}
+]
 ```
 
-## 用法
+部署脚本会生成 `exit_routes.conf`。entry 按权重选择 `H:host:port`，middle 为每个出口建立独立连接池。新增出口服务器仍需部署对应的 exit 服务进程。
+
+## 控制面与测试
+
+每个 worker 提供本机 `0600` Unix socket：`/run/nb-<role>-<worker>.ctl`。
 
 ```bash
-# 1) 编译(在有 picoquic 的机器, 产物下载到 build/)
-python tools/deploy.py build
+printf 'health\n' | socat - UNIX-CONNECT:/run/nb-middle-0.ctl
+printf 'metrics\n' | socat - UNIX-CONNECT:/run/nb-middle-0.ctl
 
-# 2) 分发到三跳 + 优先 systemd、无 unit 自动回退 legacy + SOCKS5 冒烟(默认 1080)
-python tools/deploy.py deploy-socks
+# 单机三角色回归
+bash scripts/runtri.sh
 
-# 或一键 build + deploy
-python tools/redeploy.py
-
-# 3) FEC 双发开关(仅 middle 需要开)
-python tools/deploy.py fec-status
-python tools/deploy.py fec-on
-python tools/deploy.py fec-off
-
-# 4) 查三跳日志/诊断
-python tools/deploy.py logs
-python tools/nb_diag.py probe
-
-# 停
-python tools/deploy.py stop
-
-# 单机 loopback 回归(一台机起 entry+middle+exit)
-bash scripts/runtri.sh /path/to/picoquic
+# FEC 自动测试与 netem 矩阵
+python tools/v15_fec_test.py --help
+python tools/netem_matrix.py --help
 ```
 
-## 命令行
-
-```
-entry : nb_node -r entry  -l <tcp_port> -n <hop1_host> -N <hop1_qport> -R <route>
-middle: nb_node -r middle -p <quic_port> -c <cert> -k <key>
-exit  : nb_node -r exit   -p <quic_port> -c <cert> -k <key>
-```
-
-## 验证状态(2026-07-05)
-
-真实地理三跳 **gz(广州)→hk(香港)→kz(哈萨克斯坦)→target** 打通，当前线上入口为 `106.75.169.83:1080`:
-- 5 并发 stream 全部 http=200,300KB md5 零损坏穿三跳;
-- first_byte: 冷启动 ~400ms(含握手),复用 ~200ms;
-- middle 正确做 `H:` 逐跳消费转发,log4c route+stream_id 三跳可追踪。
-- 直播延迟流已支持基于 `flowid` 的 FEC 双发/去重，默认关闭；middle 用 `NB_FEC=on` 开启。
-
-后续: 量化 FEC 在丢包场景下的收益(tc netem)、按链路质量自适应开关双发、以及控制平面(探测+选路+下发)。
+代码级测试覆盖 FEC 协议、144 组 RS 擦除组合、环形队列、认证、控制 socket、出口路由和 worker 监督器。真实三跳、netem 和手机直播仍属于部署后的阶段验收。

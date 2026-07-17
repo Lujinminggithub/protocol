@@ -4,13 +4,12 @@ from __future__ import annotations
 import argparse
 import pathlib
 import re
-import subprocess
 import sys
 import tempfile
 import time
 import traceback
 
-from deploy import connect, run, launch, _service_exists, _service_name, WORK, _legacy_start_cmd, _whitelist_remote  # type: ignore
+from deploy import connect, run, launch, _service_exists, _service_name, WORK  # type: ignore
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -19,7 +18,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ENTRY_HOST = "106.75.169.83"
 SOCKS_PORT = 1080
-TRAFFIC_URL = "https://www.baidu.com"
+PAYLOAD_URL = "http://127.0.0.1/fec-test.bin"
 
 MIDDLE_LOG = f"{WORK}/logs/nb-middle.log"
 EXIT_LOG = f"{WORK}/logs/nb-exit.log"
@@ -42,24 +41,6 @@ def write_systemd_override(c, role: str, env: dict[str, str]) -> None:
         raise RuntimeError(f"{role} 写入 systemd drop-in 失败:\n{out}")
 
 
-def restart_legacy_with_env(c, role: str, env: dict[str, str]) -> None:
-    env_prefix = " ".join(f"{k}={v}" for k, v in env.items())
-    if role == "exit":
-        base = _legacy_start_cmd("exit", wl_remote=_whitelist_remote())
-    elif role == "middle":
-        base = _legacy_start_cmd("middle", fec_enabled=False)
-    else:
-        raise RuntimeError(f"自动化测试目前只重启 middle/exit，不支持 role={role}")
-    cmd = base.replace("setsid nohup ", f"setsid nohup env {env_prefix} ", 1)
-    out = run(c, "pkill -9 -x nb_node 2>/dev/null || true", tmo=20)
-    _ = out
-    launch(c, cmd, warmup=3.0)
-    time.sleep(3.0)
-    proc = run(c, "pgrep -ax nb_node 2>/dev/null | tail -1", tmo=20).strip()
-    if "nb_node" not in proc:
-        raise RuntimeError(f"{role} legacy 重启失败，未发现 nb_node 进程")
-
-
 def clear_remote_logs() -> None:
     for role, path in (("entry", ENTRY_LOG), ("middle", MIDDLE_LOG), ("exit", EXIT_LOG)):
         c = connect(role)
@@ -76,22 +57,44 @@ def fetch_remote_log(role: str, remote_path: str) -> pathlib.Path:
     return out
 
 
-def curl_traffic(rounds: int = 2) -> None:
-    curl = "curl"
-    for _ in range(rounds):
-        cmd = [
-            curl,
-            "--socks5",
-            f"{ENTRY_HOST}:{SOCKS_PORT}",
-            "-o",
-            "NUL" if sys.platform.startswith("win") else "/dev/null",
-            "-L",
-            "--max-time",
-            "25",
-            TRAFFIC_URL,
-        ]
-        subprocess.run(cmd, check=False, capture_output=True, text=True)
-        time.sleep(1.0)
+def prepare_payload_target() -> str:
+    c = connect("exit")
+    out = run(c, f"mkdir -p {WORK}/www && "
+        f"[ -s {WORK}/www/fec-test.bin ] || head -c 1048576 /dev/urandom >{WORK}/www/fec-test.bin; "
+        "sha256sum " + f"{WORK}/www/fec-test.bin | awk '{{print $1}}'; "
+        "if ! ss -ltn 'sport = :80' | grep -q LISTEN; then "
+        f"(cd {WORK}/www && nohup python3 -m http.server 80 --bind 127.0.0.1 "
+        "</dev/null >/tmp/nb-fec-http.log 2>&1 &); fi; "
+        "sleep 1", tmo=30)
+    c.close()
+    hashes = re.findall(r"\b[0-9a-f]{64}\b", out)
+    if not hashes:
+        raise RuntimeError(f"无法准备 FEC payload: {out}")
+    return hashes[0]
+
+
+def curl_payload(rounds: int = 2, expected_sha256: str | None = None) -> list[float]:
+    expected_sha256 = expected_sha256 or prepare_payload_target()
+    c = connect("entry")
+    times: list[float] = []
+    try:
+        for _ in range(rounds):
+            cmd = (
+                "tmp=$(mktemp); "
+                f"meta=$(curl -sS --socks5-hostname 127.0.0.1:{SOCKS_PORT} -o $tmp "
+                f"-w '%{{http_code}} %{{time_total}}' {PAYLOAD_URL} --max-time 30); rc=$?; "
+                "sha=$(sha256sum $tmp 2>/dev/null|awk '{print $1}'); rm -f $tmp; "
+                "echo RC=$rc META=$meta SHA=$sha"
+            )
+            out = run(c, cmd, tmo=45)
+            m = re.search(r"RC=(\d+) META=(\d+) ([0-9.]+) SHA=([0-9a-f]+)", out)
+            if not m or m.group(1) != "0" or m.group(2) != "200" or m.group(4) != expected_sha256:
+                raise RuntimeError(f"payload 完整性失败: {out.strip()}")
+            times.append(float(m.group(3)))
+            time.sleep(0.5)
+    finally:
+        c.close()
+    return times
 
 
 def grep_expect(text: str, pattern: str) -> int:
@@ -109,33 +112,35 @@ def apply_stage_env(stage: str) -> None:
     common_middle = {
         "NB_LOG_LEVEL": "DEBUG",
         "NB_FEC_V15": "on",
+        "NB_FEC_V15_ACTIVE": "on",
         "NB_FEC_V15_FORCE": "on",
     }
     common_exit = {
         "NB_LOG_LEVEL": "DEBUG",
         "NB_FEC_V15": "on",
+        "NB_FEC_V15_ACTIVE": "on",
     }
     if stage == "t1":
         middle_env = dict(common_middle)
         exit_env = dict(common_exit)
     elif stage == "t2":
-        middle_env = dict(common_middle, NB_FEC_V15_DROP_SRC_MOD="1")
-        exit_env = dict(common_exit, NB_FEC_V15_DROP_SRC_MOD="1")
+        middle_env = dict(common_middle, NB_FEC_V15_DROP_SRC_MOD="4")
+        exit_env = dict(common_exit, NB_FEC_V15_DROP_SRC_MOD="4")
     elif stage == "t3":
         middle_env = dict(common_middle, NB_FEC_V15_DROP_SRC_MOD="1", NB_FEC_V15_DROP_REPAIR_MOD="1")
         exit_env = dict(common_exit, NB_FEC_V15_DROP_SRC_MOD="1", NB_FEC_V15_DROP_REPAIR_MOD="1")
     elif stage == "auto":
-        middle_env = {"NB_FEC_V15": "on"}
-        exit_env = {"NB_FEC_V15": "on"}
+        middle_env = {"NB_FEC_V15": "on", "NB_FEC_V15_ACTIVE": "off"}
+        exit_env = {"NB_FEC_V15": "on", "NB_FEC_V15_ACTIVE": "off"}
     else:
         raise ValueError(stage)
 
     for role, env in (("middle", middle_env), ("exit", exit_env)):
         c = connect(role)
-        if _service_exists(c, role):
-            write_systemd_override(c, role, env)
-        else:
-            restart_legacy_with_env(c, role, env)
+        if not _service_exists(c, role):
+            c.close()
+            raise RuntimeError(f"nb-{role}.service 不存在，请先执行安全部署")
+        write_systemd_override(c, role, env)
         c.close()
 
 
@@ -143,7 +148,9 @@ def stage_t1() -> None:
     print("[RUN] T1 sidecar 拉起")
     apply_stage_env("t1")
     clear_remote_logs()
-    curl_traffic(2)
+    sha = prepare_payload_target()
+    curl_payload(2, sha)
+    time.sleep(11)
     middle = fetch_remote_log("middle", MIDDLE_LOG).read_text(encoding="utf-8", errors="ignore")
     exit_ = fetch_remote_log("exit", EXIT_LOG).read_text(encoding="utf-8", errors="ignore")
     assert_marker("middle fec start", middle, r"fec v1\.5 start")
@@ -157,25 +164,28 @@ def stage_t2() -> None:
     print("[RUN] T2 单缺片恢复")
     apply_stage_env("t2")
     clear_remote_logs()
-    curl_traffic(3)
+    sha = prepare_payload_target()
+    curl_payload(3, sha)
+    time.sleep(11)
     exit_ = fetch_remote_log("exit", EXIT_LOG).read_text(encoding="utf-8", errors="ignore")
-    assert_marker("drop", exit_, r"fec test drop")
-    assert_marker("recover", exit_, r"fec recover block")
+    assert_marker("recover", exit_, r"recovered=[1-9][0-9]*")
 
 
 def stage_t3() -> None:
     print("[RUN] T3 NACK / RETX 回退")
     apply_stage_env("t3")
     clear_remote_logs()
-    curl_traffic(4)
+    sha = prepare_payload_target()
+    curl_payload(4, sha)
+    time.sleep(11)
     middle = fetch_remote_log("middle", MIDDLE_LOG).read_text(encoding="utf-8", errors="ignore")
     exit_ = fetch_remote_log("exit", EXIT_LOG).read_text(encoding="utf-8", errors="ignore")
-    nack_total = grep_expect(middle, r"fec nack") + grep_expect(exit_, r"fec nack")
+    nack_total = grep_expect(middle, r"nack=[1-9]") + grep_expect(exit_, r"nack=[1-9]")
     print(f"[INFO] nack(total): {nack_total}")
     if nack_total == 0:
         raise RuntimeError("缺少关键日志: nack")
-    assert_marker("retx send", middle, r"fec retx send")
-    assert_marker("retx recv", exit_, r"fec retx recv")
+    assert_marker("retx send", middle, r"retx_sent=[1-9]")
+    assert_marker("retx recv", exit_, r"retx_recv=[1-9]")
 
 
 def main() -> int:
@@ -195,10 +205,10 @@ def main() -> int:
             stage_t2()
             stage_t3()
             apply_stage_env("auto")
-            print("[INFO] 已恢复自动模式(NB_FEC_V15=on, 无 force/drop)")
+            print("[INFO] 已恢复观察模式(NB_FEC_V15=on, NB_FEC_V15_ACTIVE=off)")
         elif args.stage == "auto":
             apply_stage_env("auto")
-            print("[INFO] 已恢复自动模式(NB_FEC_V15=on, 无 force/drop)")
+            print("[INFO] 已恢复观察模式(NB_FEC_V15=on, NB_FEC_V15_ACTIVE=off)")
         print("[OK] 自动化测试阶段完成")
         return 0
     except Exception as e:

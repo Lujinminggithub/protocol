@@ -540,6 +540,7 @@ static int picoquic_is_packet_probably_lost(picoquic_cnx_t* cnx,
     int64_t delta_seq = 0;
     int64_t delta_sent = 0;
     uint64_t rack_timer_min;
+    uint64_t reorder_gap = (cnx->loss_reorder_gap >= 3) ? cnx->loss_reorder_gap : 3;
     int is_probably_lost = 0;
 
     *is_timer_expired = 0;
@@ -559,7 +560,7 @@ static int picoquic_is_packet_probably_lost(picoquic_cnx_t* cnx,
             &old_p->send_path->pkt_ctx : &cnx->pkt_ctx[old_p->pc];
         delta_seq = pkt_ctx->highest_acknowledged - old_p->sequence_number;
 
-        if (delta_seq >= 3) {
+        if (delta_seq >= (int64_t)reorder_gap) {
             /* Last acknowledged packet is ways ahead. That means this packet
             * is most probably lost.
             */
@@ -572,6 +573,9 @@ static int picoquic_is_packet_probably_lost(picoquic_cnx_t* cnx,
             delta_sent = pkt_ctx->latest_time_acknowledged - old_p->send_time;
             if (rack_delay > PICOQUIC_RACK_DELAY / 2) {
                 rack_delay = PICOQUIC_RACK_DELAY / 2;
+            }
+            if (cnx->loss_reorder_delay > (uint64_t)rack_delay) {
+                rack_delay = (int64_t)cnx->loss_reorder_delay;
             }
             retransmit_time = old_p->send_time + old_p->send_path->retransmit_timer;
             rack_timer_min = pkt_ctx->highest_acknowledged_time + rack_delay
@@ -895,6 +899,13 @@ static void picoquic_check_path_mtu_on_losses(
 static void picoquic_count_and_notify_loss(
     picoquic_cnx_t* cnx, picoquic_packet_t * old_p, int timer_based_retransmit, uint64_t current_time)
 {
+    /* Value 2 is used when an expired packet is ACK-only. Such packets do not
+     * require acknowledgement or retransmission, so expiring them is queue
+     * cleanup rather than evidence of congestion. */
+    if (timer_based_retransmit >= 2) {
+        return;
+    }
+
     if (timer_based_retransmit < 2) {
         picoquic_log_packet_lost(cnx, old_p->send_path, old_p->ptype, old_p->sequence_number,
             (timer_based_retransmit) ? "timer" : "repeat",

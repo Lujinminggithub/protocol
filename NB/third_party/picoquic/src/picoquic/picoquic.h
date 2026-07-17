@@ -1853,6 +1853,11 @@ void picoquic_set_default_congestion_algorithm_ex(picoquic_quic_t* quic, picoqui
 void picoquic_set_default_congestion_algorithm_by_name(picoquic_quic_t* quic, char const* alg_name);
 
 void picoquic_set_congestion_algorithm(picoquic_cnx_t* cnx, picoquic_congestion_algorithm_t const* algo);
+
+/* Set per-connection packet reordering tolerance for loss recovery.
+ * A packet gap of 0 restores the default threshold of 3 packets. A delay of
+ * 0 restores the default RACK delay. This does not change the PTO timer. */
+int picoquic_set_loss_reorder_tolerance(picoquic_cnx_t* cnx, uint64_t packet_gap, uint64_t delay_microseconds);
 void picoquic_set_congestion_algorithm_ex(picoquic_cnx_t* cnx, picoquic_congestion_algorithm_t const* alg, char const* alg_option_string);
 
 /* The experimental API 'picoquic_set_priority_limit_for_bypass' 

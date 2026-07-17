@@ -1,0 +1,15 @@
+{
+  "name": "personal-safer-native",
+  "version": "1.0.0",
+  "description": "PersonalSafer C++ N-API 原生模块",
+  "main": "index.js",
+  "napiVersion": "6",
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "clean": "node-gyp clean"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.0.0"
+  },
+  "gypfile": true
+}

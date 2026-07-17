@@ -24,8 +24,8 @@
 ### P0 — 纠错型 FEC 重构与量化（抗抖动）
 - 详见 [fec-plan.md](fec-plan.md)。
 - 根因：三跳任一跳丢包→QUIC重传恢复≈1.5×RTT×跳数→直播卡/黄红。**已用 linkq 定位：hk→kz 跨境段丢包高15-20倍、RTT~200ms(gz→hk仅~50ms)是瓶颈**。
-- 当前线上仍是**双发试验版**：仅直播延迟流(prio=4)在 `middle→exit` 去程双发、`exit→middle` 回程双写，并在 exit/middle 按 `flowid` 做字节级去重；默认关闭，middle 配 `NB_FEC=on` 启用。
-- **V1.5 目标**：退役双发方案，改为**按跳纠错型 FEC**，避免 2 倍带宽放大。
+- V1.5 已物理移除双发、`flowid` 配对和字节级去重，改为按跳 RS(k,r) 纠错与稀疏可靠补发。
+- FEC 默认处于观察模式；仅受控测试使用 `NB_FEC_V15_ACTIVE=on` 接管候选流。
 - V1.5 的 FEC 仍服务于当前 `TCP-over-QUIC` 三跳主线，但在受保护 hop 内部允许使用独立 FEC sidecar 机制，不要求等到 V2 才开始纠错。
 - 下一步：
   1. 定义 `middle↔exit` 坏跳的系统码 FEC 方案：按 block/group 编码，发送 `k` 个数据分片 + `r` 个修复分片；
