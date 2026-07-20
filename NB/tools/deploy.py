@@ -2,12 +2,12 @@
 """Newbility(NB) 三跳部署工具 —— entry(gz) / middle(hk) / exit(kz)。
 
 角色与机器由 lab-hosts.json 描述; middle 经 entry 跳板连接(direct-tcpip)。
-NB 节点是一份二进制 nb_node, 靠 -r 选角色。egress/middle 可能无编译器,
-故支持"在某台有 picoquic 的机器编译后分发"。
+NB 节点是一份二进制 nb_node, 靠 -r 选角色。构建固定在 hosts JSON 指定的
+build_host/compile_dir，产物下载到本地后再统一分发，middle/exit 无需编译器。
 
 动作:
   recon        只读侦察: 架构/gcc/picoquic/certs/现有 nb 进程, 不改动。
-  build        上传 src 到各机, 本地(有 picoquic 者)编译 nb_node。
+  build        上传源码到独立构建机目录，编译并下载 nb_node。
   deploy-tri   分发二进制 + 起 exit->middle->entry + 冒烟(多 stream + md5)。
   stop         停三跳所有 nb_node 进程。
   logs         拉三跳最近日志(便于跨跳追踪 route+stream_id)。
@@ -27,8 +27,9 @@ SRC = ROOT / "src"
 LAB_FILE = pathlib.Path(os.environ.get("NB_HOSTS_FILE", str(ROOT / "tools" / "lab-hosts.json")))
 LAB = json.loads(LAB_FILE.read_text(encoding="utf-8"))
 WORK = LAB["paths"]["work_dir"]
+COMPILE_WORK = LAB["paths"].get("compile_dir", "/opt/compile")
 DEPLOY_CERTS = f"{WORK}/certs"        # 三跳统一部署证书路径
-BUILD_HOST = LAB.get("build_host", "exit")                   # 负责编译的机器(自包含后任意 x86_64 皆可)
+BUILD_HOST = LAB.get("build_host", "entry")                 # 独立构建机角色，默认使用广州 entry
 BUILD_DIR = ROOT / "build"
 PLATFORM = "linux-x86_64"             # 目标平台(三跳均 x86_64)
 SECURITY_DIR = pathlib.Path(os.environ.get("NB_SECURITY_DIR", str(BUILD_DIR / "security")))
@@ -55,8 +56,12 @@ domain ip.sb
 domain www.google.com
 port 443
 port 80
+port 50000
+port 50001
 port 50008
 port 50009
+port 50020
+port 50021
 """
 
 
@@ -314,6 +319,14 @@ def _install_and_restart_role(c, role, command, warmup=2.0):
     if cwin_max_bytes != 0 and not 65536<=cwin_max_bytes<=67108864:
         raise ValueError(f"transport.{role}.cwin_max_bytes 必须为 0 或 65536..67108864")
     cwin_env=(f"Environment=NB_CWIN_MAX_BYTES={cwin_max_bytes}\n" if cwin_max_bytes else "")
+    mtu_max=int(transport.get("mtu_max",0))
+    if mtu_max != 0 and not 1280<=mtu_max<=1536:
+        raise ValueError(f"transport.{role}.mtu_max 必须为 0 或 1280..1536")
+    mtu_env=(f"Environment=NB_MTU_MAX={mtu_max}\n" if mtu_max else "")
+    udp_gso=transport.get("udp_gso",False)
+    if not isinstance(udp_gso,bool):
+        raise ValueError(f"transport.{role}.udp_gso 必须为 true 或 false")
+    udp_gso_env=f"Environment=NB_UDP_GSO={'on' if udp_gso else 'off'}\n"
     udp_advertise_env=""
     if role=="entry":
         entry_host=_role_host("entry")
@@ -351,10 +364,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=NB_FEC_V15=on
-Environment=NB_UDP_GSO=on
 Environment=NB_CC={cc}
 Environment=NB_BBR_OPTIONS={bbr_options}
-{cwin_env}{udp_advertise_env}{reorder_env}ExecStart={exec_start}
+{cwin_env}{mtu_env}{udp_gso_env}{udp_advertise_env}{reorder_env}ExecStart={exec_start}
 Restart=on-failure
 RestartSec=2
 KillMode=control-group
@@ -439,14 +451,14 @@ def _smoke_socks(socks_port=DEFAULT_SOCKS_PORT):
 
 REBUILD_PICOQUIC = os.environ.get("NB_REBUILD_PICOQUIC") == "1"
 PICOQUIC_REBUILD_CMD = (
-    f"rm -rf {WORK}/third_party/picoquic/prebuilt/{PLATFORM} "
-    f"{WORK}/third_party/picoquic/src/build-{PLATFORM} "
-    f"{WORK}/third_party/picoquic/src/picotls/build-{PLATFORM}; "
-    f"bash {WORK}/third_party/picoquic/build_libs.sh {PLATFORM}; "
+    f"rm -rf {COMPILE_WORK}/third_party/picoquic/prebuilt/{PLATFORM} "
+    f"{COMPILE_WORK}/third_party/picoquic/src/build-{PLATFORM} "
+    f"{COMPILE_WORK}/third_party/picoquic/src/picotls/build-{PLATFORM}; "
+    f"bash {COMPILE_WORK}/third_party/picoquic/build_libs.sh {PLATFORM}; "
 ) if REBUILD_PICOQUIC else ""
 BUILD_CMD = (
     PICOQUIC_REBUILD_CMD +
-    f"cd {WORK} && rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >/tmp/nbcmake.log 2>&1; "
+    f"cd {COMPILE_WORK} && rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >/tmp/nbcmake.log 2>&1; "
     f"cmake --build build -j$(nproc) >>/tmp/nbcmake.log 2>&1; echo cmake_rc=$?; tail -3 /tmp/nbcmake.log"
 )
 
@@ -455,6 +467,8 @@ BUILD_FILES = {
     "src/nb_node.c": SRC / "nb_node.c",
     "src/nb_policy.c": SRC / "nb_policy.c",
     "src/nb_policy.h": SRC / "nb_policy.h",
+    "src/nb_live.c": SRC / "nb_live.c",
+    "src/nb_live.h": SRC / "nb_live.h",
     "src/nb_fec_rs.c": SRC / "nb_fec_rs.c",
     "src/nb_fec_rs.h": SRC / "nb_fec_rs.h",
     "src/nb_fec.c": SRC / "nb_fec.c",
@@ -476,12 +490,16 @@ BUILD_FILES = {
     "tools/test_control.c": ROOT / "tools" / "test_control.c",
     "tools/test_routes.c": ROOT / "tools" / "test_routes.c",
     "tools/test_udp.c": ROOT / "tools" / "test_udp.c",
+    "tools/test_policy.c": ROOT / "tools" / "test_policy.c",
+    "tools/test_live.c": ROOT / "tools" / "test_live.c",
     "src/log/log4c.c": SRC / "log" / "log4c.c",
     "src/log/log4c.h": SRC / "log" / "log4c.h",
     "CMakeLists.txt": ROOT / "CMakeLists.txt",
     "third_party/picoquic/build_libs.sh": ROOT / "third_party" / "picoquic" / "build_libs.sh",
     # 该文件包含 NB 针对长 RTT 随机丢包的 BBRv3 修正；源码构建验证时覆盖 vendored 基线。
     "third_party/picoquic/src/picoquic/bbr.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "bbr.c",
+    "third_party/picoquic/src/picoquic/cubic.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "cubic.c",
+    "third_party/picoquic/src/picoquic/loss_recovery.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "loss_recovery.c",
 }
 for _a in sorted((ROOT / "third_party" / "picoquic" / "prebuilt" / PLATFORM).glob("*.a")):
     BUILD_FILES[f"third_party/picoquic/prebuilt/{PLATFORM}/{_a.name}"] = _a
@@ -507,7 +525,7 @@ def act_recon(roles):
         out = run(c, "echo arch=$(uname -m); echo gcc=$(gcc -dumpversion 2>/dev/null||echo NONE); "
                      "echo cmake=$(cmake --version 2>/dev/null|head -1|awk '{print $3}'||echo NONE); "
                      "echo openssl_dev=$(ls /usr/include/openssl/ssl.h 2>/dev/null||echo NONE); "
-                     f"echo nb_bin=$(ls {WORK}/build/nb_node 2>/dev/null||echo NONE); "
+                     f"echo nb_bin=$(ls {COMPILE_WORK}/build/nb_node 2>/dev/null||echo NONE); "
                      "echo proc=$(pgrep -x nb_node|tr '\\n' ',' || echo none)")
         print(f"### {r}({h['name']}) {h['host']}:{h['port']}\n{out}")
         c.close()
@@ -516,24 +534,29 @@ def act_recon(roles):
 def act_build(roles):
     """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
     c = connect(BUILD_HOST); h = _role_host(BUILD_HOST)
-    print(f"### build on {BUILD_HOST}({h['name']}) via CMake + vendored picoquic ...")
-    run(c, f"rm -rf {WORK}/src {WORK}/third_party {WORK}/CMakeLists.txt {WORK}/build; mkdir -p {WORK}")
-    put_tar(c, BUILD_FILES, WORK)
+    print(f"### build on {BUILD_HOST}({h['name']}) in {COMPILE_WORK} via CMake + vendored picoquic ...")
+    deps = run(c, "for x in gcc g++ make cmake pkg-config; do command -v $x >/dev/null 2>&1 || echo MISSING:$x; done; "
+                  "test -f /usr/include/openssl/ssl.h || echo MISSING:libssl-dev")
+    if "MISSING:" in deps:
+        c.close()
+        raise RuntimeError(f"构建机 {h['name']} 缺少依赖: {', '.join(x.split(':', 1)[1] for x in deps.splitlines() if x.startswith('MISSING:'))}")
+    run(c, f"rm -rf {COMPILE_WORK}/src {COMPILE_WORK}/third_party {COMPILE_WORK}/CMakeLists.txt {COMPILE_WORK}/build; mkdir -p {COMPILE_WORK}")
+    put_tar(c, BUILD_FILES, COMPILE_WORK)
     out = run(c, BUILD_CMD, tmo=300)
     print(out.strip()[-600:] if out.strip() else "(no output)")
-    ok = run(c, f"ls -l {WORK}/build/nb_node 2>/dev/null && echo BUILD_OK || echo BUILD_FAIL")
+    ok = run(c, f"ls -l {COMPILE_WORK}/build/nb_node 2>/dev/null && echo BUILD_OK || echo BUILD_FAIL")
     print(ok)
     if "BUILD_OK" not in ok:
         c.close(); sys.exit("编译失败, 中止")
     BUILD_DIR.mkdir(exist_ok=True)
-    (BUILD_DIR / "nb_node").write_bytes(fetch_bytes(c, f"{WORK}/build/nb_node"))
+    (BUILD_DIR / "nb_node").write_bytes(fetch_bytes(c, f"{COMPILE_WORK}/build/nb_node"))
     if REBUILD_PICOQUIC:
         local_prebuilt = ROOT / "third_party" / "picoquic" / "prebuilt" / PLATFORM
         local_prebuilt.mkdir(parents=True, exist_ok=True)
         for archive in ("libpicoquic-core.a", "libpicoquic-log.a", "libpicotls-openssl.a",
                         "libpicotls-core.a", "libpicotls-minicrypto.a"):
             (local_prebuilt / archive).write_bytes(fetch_bytes(
-                c, f"{WORK}/third_party/picoquic/prebuilt/{PLATFORM}/{archive}"))
+                c, f"{COMPILE_WORK}/third_party/picoquic/prebuilt/{PLATFORM}/{archive}"))
     print(f"产物 -> {BUILD_DIR}: nb_node")
     c.close()
 

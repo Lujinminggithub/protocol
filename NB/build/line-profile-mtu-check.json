@@ -1,0 +1,228 @@
+{
+  "schema_version": 2,
+  "generated_at_utc": "2026-07-20T02:28:13.934989+00:00",
+  "line": "gz-83-hk-216-kz-1",
+  "fixed_exit": "kz-1",
+  "probe_mode": "passive-runtime",
+  "status": "candidate",
+  "active_probe": null,
+  "segments": {
+    "entry_middle": {
+      "source_role": "entry",
+      "target": "172.16.31.28",
+      "icmp": {
+        "loss_pct": 0.0,
+        "rtt_min_ms": 4.266,
+        "rtt_avg_ms": 4.38,
+        "rtt_max_ms": 4.945,
+        "rtt_mdev_ms": 0.192
+      },
+      "mtu": {
+        "method": "icmp-ipv4-df",
+        "status": "ok",
+        "max_ip_mtu": 1452,
+        "search_min": 1280,
+        "search_max": 1500,
+        "attempts": [
+          {
+            "ip_mtu": 1390,
+            "icmp_payload": 1362,
+            "ok": true
+          },
+          {
+            "ip_mtu": 1445,
+            "icmp_payload": 1417,
+            "ok": true
+          },
+          {
+            "ip_mtu": 1473,
+            "icmp_payload": 1445,
+            "ok": false
+          },
+          {
+            "ip_mtu": 1459,
+            "icmp_payload": 1431,
+            "ok": false
+          },
+          {
+            "ip_mtu": 1452,
+            "icmp_payload": 1424,
+            "ok": true
+          },
+          {
+            "ip_mtu": 1455,
+            "icmp_payload": 1427,
+            "ok": false
+          },
+          {
+            "ip_mtu": 1453,
+            "icmp_payload": 1425,
+            "ok": false
+          }
+        ]
+      },
+      "quic": {
+        "windows_total": 120,
+        "windows_valid": 116,
+        "packets_observed": 455091,
+        "rtt_p50_ms": 4.4,
+        "rtt_p95_ms": 4.6,
+        "rtt_p99_ms": 4.7,
+        "jitter_p95_ms": 0.3,
+        "effective_loss_mean_pct": 0.0,
+        "effective_loss_p95_pct": 0.0,
+        "reorder_gap_max": 18,
+        "reorder_delay_max_ms": 11.0,
+        "blocked_windows": 0,
+        "quic_udp_payload_mtu_min": 1424,
+        "quic_udp_payload_mtu_max": 1424,
+        "quic_ip_mtu_proven": 1452
+      },
+      "candidate": {
+        "confidence": "load-qualified",
+        "auto_apply_allowed": false,
+        "cc": "cubic",
+        "cwin_max_bytes": 262144,
+        "reorder_gap": 23,
+        "reorder_delay_us": 24000,
+        "mtu_max": 1452,
+        "provisional": {
+          "cc": "cubic",
+          "cwin_max_bytes": 262144,
+          "reorder_gap": 23,
+          "reorder_delay_us": 24000,
+          "mtu_max": 1452
+        },
+        "target_mbps": 10.0,
+        "current": {
+          "cc": "cubic",
+          "cwin_max_bytes": 524288,
+          "mtu_max": 1452,
+          "udp_gso": false,
+          "udp_port_min": 20000,
+          "udp_port_max": 21023,
+          "reorder_gap": 128,
+          "reorder_delay_us": 450000
+        },
+        "mtu_evidence": {
+          "mtu_max": 1452,
+          "confidence": "quic-and-df",
+          "quic_udp_payload_mtu": 1424,
+          "quic_ip_mtu_proven": 1452,
+          "icmp_df_max_ip_mtu": 1452,
+          "icmp_safety_margin_bytes": 48
+        }
+      }
+    },
+    "middle_exit": {
+      "source_role": "middle",
+      "target": "2.135.147.106",
+      "icmp": {
+        "loss_pct": 0.0,
+        "rtt_min_ms": 231.898,
+        "rtt_avg_ms": 232.153,
+        "rtt_max_ms": 233.118,
+        "rtt_mdev_ms": 0.342
+      },
+      "mtu": {
+        "method": "icmp-ipv4-df",
+        "status": "ok",
+        "max_ip_mtu": 1452,
+        "search_min": 1280,
+        "search_max": 1500,
+        "attempts": [
+          {
+            "ip_mtu": 1390,
+            "icmp_payload": 1362,
+            "ok": true
+          },
+          {
+            "ip_mtu": 1445,
+            "icmp_payload": 1417,
+            "ok": true
+          },
+          {
+            "ip_mtu": 1473,
+            "icmp_payload": 1445,
+            "ok": false
+          },
+          {
+            "ip_mtu": 1459,
+            "icmp_payload": 1431,
+            "ok": false
+          },
+          {
+            "ip_mtu": 1452,
+            "icmp_payload": 1424,
+            "ok": true
+          },
+          {
+            "ip_mtu": 1455,
+            "icmp_payload": 1427,
+            "ok": false
+          },
+          {
+            "ip_mtu": 1453,
+            "icmp_payload": 1425,
+            "ok": false
+          }
+        ]
+      },
+      "quic": {
+        "windows_total": 120,
+        "windows_valid": 118,
+        "packets_observed": 446773,
+        "rtt_p50_ms": 231.1,
+        "rtt_p95_ms": 231.9,
+        "rtt_p99_ms": 232.1,
+        "jitter_p95_ms": 2.8,
+        "effective_loss_mean_pct": 0.007203389830508475,
+        "effective_loss_p95_pct": 0.03,
+        "reorder_gap_max": 0,
+        "reorder_delay_max_ms": 0.0,
+        "blocked_windows": 0,
+        "quic_udp_payload_mtu_min": 1424,
+        "quic_udp_payload_mtu_max": 1424,
+        "quic_ip_mtu_proven": 1452
+      },
+      "candidate": {
+        "confidence": "load-qualified",
+        "auto_apply_allowed": false,
+        "cc": "bbr",
+        "cwin_max_bytes": null,
+        "reorder_gap": 3,
+        "reorder_delay_us": 464000,
+        "mtu_max": 1452,
+        "provisional": {
+          "cc": "bbr",
+          "cwin_max_bytes": null,
+          "reorder_gap": 3,
+          "reorder_delay_us": 464000,
+          "mtu_max": 1452
+        },
+        "target_mbps": 10.0,
+        "current": {
+          "cc": "bbr",
+          "bbr_options": "Q0.0001:F0.25:",
+          "mtu_max": 1452,
+          "udp_gso": false,
+          "reorder_gap": 128,
+          "reorder_delay_us": 450000
+        },
+        "mtu_evidence": {
+          "mtu_max": 1452,
+          "confidence": "quic-and-df",
+          "quic_udp_payload_mtu": 1424,
+          "quic_ip_mtu_proven": 1452,
+          "icmp_df_max_ip_mtu": 1452,
+          "icmp_safety_margin_bytes": 48
+        }
+      }
+    }
+  },
+  "notes": [
+    "该结果不会自动修改线上配置。",
+    "insufficient-load 表示必须补带负载 QUIC 探针和灰度。",
+    "动态选路只对新会话生效，固定出口不变。"
+  ]
+}

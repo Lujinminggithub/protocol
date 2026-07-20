@@ -102,6 +102,13 @@ int nb_udp_reassembly_feed(nb_udp_reassembly_t* state, const nb_udp_wire_view_t*
     out->route_length=s->route_length;out->sequence=s->sequence;s->active=0;return 1;
 }
 
+int nb_udp_control_grace_expired(uint64_t control_closed_at, uint64_t last_active,
+    uint64_t now_us, uint64_t grace_us){
+    if(control_closed_at==0||grace_us==0)return 0;
+    uint64_t reference=last_active>control_closed_at?last_active:control_closed_at;
+    return now_us>reference&&now_us-reference>=grace_us;
+}
+
 int nb_socks_udp_parse(const uint8_t* data, size_t length, char* host, size_t host_cap,
     int* port, const uint8_t** payload, size_t* payload_length){
     if(data==NULL||host==NULL||host_cap==0||port==NULL||payload==NULL||payload_length==NULL||

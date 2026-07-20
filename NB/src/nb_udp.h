@@ -12,6 +12,11 @@
 #define NB_UDP_FRAGMENT_PAYLOAD 1000
 #define NB_UDP_MAX_PAYLOAD 65507
 #define NB_UDP_REASSEMBLY_SLOTS 8
+/* Some mobile proxy clients close the SOCKS UDP control TCP connection after
+ * setup while continuing to use the negotiated UDP relay. Keep the association
+ * while either UDP direction is active, then reclaim it on the normal idle
+ * horizon. */
+#define NB_UDP_CONTROL_GRACE_US 120000000ULL
 
 typedef struct {
     uint8_t type;
@@ -62,6 +67,8 @@ void nb_udp_reassembly_init(nb_udp_reassembly_t* state);
 void nb_udp_reassembly_dispose(nb_udp_reassembly_t* state);
 int nb_udp_reassembly_feed(nb_udp_reassembly_t* state, const nb_udp_wire_view_t* fragment,
     uint64_t now_us, nb_udp_reassembled_t* out);
+int nb_udp_control_grace_expired(uint64_t control_closed_at, uint64_t last_active,
+    uint64_t now_us, uint64_t grace_us);
 
 int nb_socks_udp_parse(const uint8_t* data, size_t length, char* host, size_t host_cap,
     int* port, const uint8_t** payload, size_t* payload_length);

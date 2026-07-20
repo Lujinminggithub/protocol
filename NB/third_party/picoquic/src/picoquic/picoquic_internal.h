@@ -945,6 +945,7 @@ typedef struct st_picoquic_pacing_t {
     uint64_t quantum_max;
     uint64_t rate_max;
     int bandwidth_pause;
+    uint8_t max_burst_packets;
     /* High precision variables should only be used inside pacing.c */
     int64_t bucket_nanosec;
     int64_t packet_time_nanosec;
@@ -1417,6 +1418,13 @@ typedef struct st_picoquic_cnx_t {
     uint64_t min_ack_delay_local;
     uint64_t loss_reorder_gap; /* packet threshold for declaring ordered loss; 0 uses default */
     uint64_t loss_reorder_delay; /* minimum RACK delay in microseconds; 0 uses default */
+    uint64_t loss_reorder_gap_floor;
+    uint64_t loss_reorder_delay_floor;
+    uint64_t reorder_gap_samples[32];
+    uint64_t reorder_delay_samples[32];
+    uint8_t reorder_sample_count;
+    uint8_t reorder_sample_next;
+    unsigned int is_media_connection : 1;
     unsigned int cwin_blocked : 1;
     unsigned int flow_blocked : 1;
     unsigned int stream_blocked : 1;

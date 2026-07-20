@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-17T07:38:12.200967+00:00",
+  "line": "gz-83-hk-216-kz-1",
+  "fixed_exit": "kz-1",
+  "probe_mode": "passive-runtime",
+  "status": "candidate",
+  "segments": {
+    "entry_middle": {
+      "source_role": "entry",
+      "target": "172.16.31.28",
+      "icmp": {
+        "loss_pct": 0.0,
+        "rtt_min_ms": 4.383,
+        "rtt_avg_ms": 4.457,
+        "rtt_max_ms": 4.98,
+        "rtt_mdev_ms": 0.105
+      },
+      "quic": {
+        "windows_total": 80,
+        "windows_valid": 0,
+        "packets_observed": 0,
+        "rtt_p50_ms": 0.0,
+        "rtt_p95_ms": 0.0,
+        "rtt_p99_ms": 0.0,
+        "jitter_p95_ms": 0.0,
+        "effective_loss_mean_pct": 0.0,
+        "effective_loss_p95_pct": 0.0,
+        "reorder_gap_max": 0,
+        "reorder_delay_max_ms": 0.0,
+        "blocked_windows": 0
+      },
+      "candidate": {
+        "confidence": "insufficient-load",
+        "auto_apply_allowed": false,
+        "cc": "cubic",
+        "cwin_max_bytes": 524288,
+        "reorder_gap": 128,
+        "reorder_delay_us": 450000,
+        "provisional": {
+          "cc": "cubic",
+          "cwin_max_bytes": 262144,
+          "reorder_gap": 3,
+          "reorder_delay_us": 10000
+        },
+        "target_mbps": 10.0,
+        "current": {
+          "cc": "cubic",
+          "cwin_max_bytes": 524288,
+          "udp_port_min": 20000,
+          "udp_port_max": 21023,
+          "reorder_gap": 128,
+          "reorder_delay_us": 450000
+        }
+      }
+    },
+    "middle_exit": {
+      "source_role": "middle",
+      "target": "2.135.147.106",
+      "icmp": {
+        "loss_pct": 0.0,
+        "rtt_min_ms": 232.174,
+        "rtt_avg_ms": 238.968,
+        "rtt_max_ms": 250.911,
+        "rtt_mdev_ms": 6.395
+      },
+      "quic": {
+        "windows_total": 0,
+        "windows_valid": 0,
+        "packets_observed": 0,
+        "rtt_p50_ms": 0.0,
+        "rtt_p95_ms": 0.0,
+        "rtt_p99_ms": 0.0,
+        "jitter_p95_ms": 0.0,
+        "effective_loss_mean_pct": 0.0,
+        "effective_loss_p95_pct": 0.0,
+        "reorder_gap_max": 0,
+        "reorder_delay_max_ms": 0.0,
+        "blocked_windows": 0
+      },
+      "candidate": {
+        "confidence": "insufficient-load",
+        "auto_apply_allowed": false,
+        "cc": "bbr",
+        "cwin_max_bytes": null,
+        "reorder_gap": 128,
+        "reorder_delay_us": 450000,
+        "provisional": {
+          "cc": "cubic",
+          "cwin_max_bytes": 262144,
+          "reorder_gap": 3,
+          "reorder_delay_us": 10000
+        },
+        "target_mbps": 10.0,
+        "current": {
+          "cc": "bbr",
+          "bbr_options": "Q0.0001:F0.25:",
+          "reorder_gap": 128,
+          "reorder_delay_us": 450000
+        }
+      }
+    }
+  },
+  "notes": [
+    "该结果不会自动修改线上配置。",
+    "insufficient-load 表示必须补带负载 QUIC 探针和灰度。",
+    "动态选路只对新会话生效，固定出口不变。"
+  ]
+}

@@ -1,6 +1,7 @@
 #include "nb_policy.h"
 
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,16 +17,17 @@ typedef struct {
 } nb_tiktok_rule_t;
 
 static const char* g_default_rules[][5] = {
-    {"api*",        "ctrl",  "latency", "off",  "8"},
-    {"im-api*",     "ctrl",  "latency", "off",  "8"},
-    {"tnc*",        "ctrl",  "latency", "off",  "8"},
-    {"log*",        "ctrl",  "latency", "off",  "8"},
-    {"logger*",     "ctrl",  "latency", "off",  "8"},
-    {"mcs*",        "ctrl",  "latency", "off",  "8"},
-    {"mon*",        "ctrl",  "latency", "off",  "8"},
-    {"common-sign*","ctrl",  "latency", "off",  "8"},
+    {"api*",        "ctrl",  "latency", "off",  "2"},
+    {"im-api*",     "ctrl",  "latency", "off",  "2"},
+    {"tnc*",        "ctrl",  "latency", "off",  "2"},
+    {"log*",        "ctrl",  "latency", "off",  "2"},
+    {"logger*",     "ctrl",  "latency", "off",  "2"},
+    {"mcs*",        "ctrl",  "latency", "off",  "2"},
+    {"mon*",        "ctrl",  "latency", "off",  "2"},
+    {"common-sign*","ctrl",  "latency", "off",  "2"},
     {"rtc-access*", "media", "latency", "auto", "4"},
     {"rtc*",        "media", "latency", "auto", "4"},
+    {"live-netacc*","media", "latency", "auto", "4"},
     {"frontier*",   "media", "latency", "auto", "4"},
     {"webcast*",    "media", "latency", "auto", "4"},
     {"pull-f5*",    "media", "latency", "auto", "4"},
@@ -157,11 +159,42 @@ void nb_flow_policy_default(nb_flow_policy_t* out){
     snprintf(out->rule_name, sizeof(out->rule_name), "default-bulk");
 }
 
+static int is_tiktok_udp_media_port(int port){
+    switch(port){
+    case 50000:
+    case 50001:
+    case 50008:
+    case 50009:
+    case 50020:
+    case 50021:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out){
-    (void)port;
     if(!g_policy_inited) nb_policy_init(NULL);
     nb_flow_policy_default(out);
     if(host == NULL || host[0] == 0) return 0;
+    if(is_tiktok_udp_media_port(port)){
+        out->matched = 1;
+        out->flow_class = NB_FLOW_CLASS_MEDIA;
+        out->lane_hint = NB_FLOW_LANE_LATENCY;
+        out->fec_hint = NB_FLOW_FEC_AUTO;
+        out->prio = NB_PRIO_MEDIA;
+        snprintf(out->rule_name, sizeof(out->rule_name), "udp-media-port");
+        return 1;
+    }
+    if(port == 443){
+        struct in_addr v4;
+        struct in6_addr v6;
+        if(inet_pton(AF_INET, host, &v4) == 1 || inet_pton(AF_INET6, host, &v6) == 1){
+            out->matched = 1;
+            snprintf(out->rule_name, sizeof(out->rule_name), "raw-ip-443");
+            return 1;
+        }
+    }
     for(size_t i=0; i<g_rule_count; i++){
         if(match_pattern_ci(host, g_rules[i].pattern)){
             out->matched = 1;
@@ -169,7 +202,7 @@ int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out){
             out->lane_hint = g_rules[i].lane_hint;
             out->fec_hint = g_rules[i].fec_hint;
             out->prio = g_rules[i].prio;
-            size_t rule_len=strnlen(g_rules[i].pattern,sizeof(g_rules[i].pattern));
+            size_t rule_len=strlen(g_rules[i].pattern);
             if(rule_len>=sizeof(out->rule_name))rule_len=sizeof(out->rule_name)-1;
             memcpy(out->rule_name,g_rules[i].pattern,rule_len);out->rule_name[rule_len]=0;
             return 1;
@@ -179,11 +212,11 @@ int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out){
 }
 
 int nb_prio_is_latency(int prio){
-    return prio <= NB_PRIO_CTRL;
+    return prio <= NB_PRIO_MEDIA;
 }
 
 int nb_prio_is_fec_candidate(int prio){
-    return prio <= NB_PRIO_MEDIA;
+    return prio == NB_PRIO_MEDIA;
 }
 
 const char* nb_flow_class_name(nb_flow_class_t c){

@@ -62,12 +62,12 @@ stream 首部第一行（文本 + `\n`），语义 = 接收节点出发的剩余
 
 **关键约束**：picoquic 的 quic context 非线程安全，一个 context 一个线程驱动。多核扩展需每线程独立 context + SO_REUSEPORT（见 05）。
 
-## 5. 连接池 `cnx_pool_t`（P0-2）
+## 5. 连接池 `cnx_pool_t`（P0-2，当前单连接基线）
 
-entry/middle 到下一跳维护 `POOL_SIZE=6` 条并行 QUIC 连接，每条独立 cwin/pacing/flow-control。
+代码保留连接池结构，但当前 entry/middle 到下一跳使用 `POOL_SIZE=1`，以避免多个独立拥塞控制实例在同一直播负载下竞争。后续只有经过主动探针、容量评估和 A/B 灰度后，才允许按线路配置扩池。
 - `cnx[POOL_SIZE]`：连接(NULL=空槽待建/已关)
 - `next_sid[POOL_SIZE]`：每条独立的 client bidi stream id 分配(0,4,8..)
-- 分区：前 `LAT_LANES=2` 条为**直播专用道**(round-robin, `rr_lat`)；后 4 条批量道(`rr`)。`pool_pick(pool, is_latency)`。
+- 当前媒体流从全部可用连接按质量选择，不再使用固定前三条或 `LAT_LANES` 硬分区；单连接基线下由连接内 deadline/WFQ 与 pacing 隔离控制、媒体和 bulk。
 - `pool_ensure` 惰性建/重建空槽；`pool_init` 建满；close 回调置 NULL 下次惰性重建。
 
 ## 6. 异步 DNS 子系统（P0-1）
@@ -88,7 +88,7 @@ exit 的 `getaddrinfo` 阻塞，移出事件循环：
 
 - 拥塞：`picoquic_bbr_algorithm`(bbr.c = BBRv3)
 - `initial_max_streams_bidi=2000`
-- `initial_max_stream_data_bidi_local/remote=8MiB`(单流吞吐≈窗口/RTT,三跳~300ms下1MiB限26Mbps,8MiB→~200Mbps)
+- `initial_max_stream_data_bidi_local/remote=128KiB`。middle 仅对媒体上游流使用 picoquic 应用流控；媒体下行队列高低水位为 `256/128KiB`，真实队龄目标为 `500ms`，每次最多增发 `32KiB` 信用。非媒体流在 route 分类后恢复 picoquic 自动流控。背压沿 middle→entry→客户端 TCP 传播，不再用大单流窗口吸收秒级积压。
 - `initial_max_data=64MiB`(连接级,支撑多流)
 - `max_ack_delay=5ms`(默认25ms,更快ACK降RTT)
 - UDP socket `SO_RCVBUFFORCE/SO_SNDBUFFORCE=16MB`(实际32MB,绕过rmem_max)

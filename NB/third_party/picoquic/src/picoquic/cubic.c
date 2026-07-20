@@ -42,6 +42,7 @@ typedef struct st_picoquic_cubic_state_t {
     uint64_t previous_alg_state;
     uint64_t previous_ssthresh;
     uint64_t previous_cwin;
+    uint64_t last_media_repeat_recovery;
     double K;
     double W_max;
     double W_last_max;
@@ -49,6 +50,27 @@ typedef struct st_picoquic_cubic_state_t {
     uint64_t ssthresh;
     picoquic_min_max_rtt_t rtt_filter;
 } picoquic_cubic_state_t;
+
+static void cubic_apply_cwin_max(picoquic_cnx_t* cnx, picoquic_path_t* path_x,
+    picoquic_cubic_state_t* cubic_state)
+{
+    uint64_t cwin_max = cnx->quic->cwin_max;
+    if (cwin_max == UINT64_MAX) return;
+
+    double packet_max = (double)cwin_max / (double)path_x->send_mtu;
+    if (path_x->cwin > cwin_max) path_x->cwin = cwin_max;
+    if (cubic_state->W_reno > (double)cwin_max) cubic_state->W_reno = (double)cwin_max;
+    if (cubic_state->W_max > packet_max) cubic_state->W_max = packet_max;
+    if (cubic_state->W_last_max > packet_max) cubic_state->W_last_max = packet_max;
+    if (cubic_state->previous_cwin > cwin_max) cubic_state->previous_cwin = cwin_max;
+    if (cubic_state->ssthresh != UINT64_MAX && cubic_state->ssthresh > cwin_max) {
+        cubic_state->ssthresh = cwin_max;
+    }
+    if (cubic_state->previous_ssthresh != UINT64_MAX &&
+        cubic_state->previous_ssthresh > cwin_max) {
+        cubic_state->previous_ssthresh = cwin_max;
+    }
+}
 
 static void cubic_reset(picoquic_cubic_state_t* cubic_state, picoquic_path_t* path_x, uint64_t current_time) {
     memset(&cubic_state->rtt_filter, 0, sizeof(picoquic_min_max_rtt_t));
@@ -149,6 +171,14 @@ static void cubic_enter_recovery(picoquic_cnx_t * cnx,
     picoquic_cubic_state_t* cubic_state,
     uint64_t current_time)
 {
+    uint64_t prior_cwin=path_x->cwin;
+    if(cnx->is_media_connection&&notification==picoquic_congestion_notification_repeat){
+        uint64_t recovery_rtt=path_x->smoothed_rtt?path_x->smoothed_rtt:path_x->rtt_min;
+        if(recovery_rtt<1000)recovery_rtt=1000;
+        if(cubic_state->last_media_repeat_recovery!=0&&
+            current_time<cubic_state->last_media_repeat_recovery+recovery_rtt)return;
+        cubic_state->last_media_repeat_recovery=current_time;
+    }
     cubic_state->recovery_sequence = picoquic_cc_get_sequence_number(cnx, path_x);
     cubic_state->previous_start_of_epoch = cubic_state->start_of_epoch;
     cubic_state->previous_alg_state = cubic_state->alg_state;
@@ -201,6 +231,13 @@ static void cubic_enter_recovery(picoquic_cnx_t * cnx,
             path_x->cwin = win_cubic;
         }
     }
+    if(cnx->is_media_connection&&notification==picoquic_congestion_notification_repeat){
+        uint64_t floor=prior_cwin/2;
+        if(floor<PICOQUIC_CWIN_MINIMUM)floor=PICOQUIC_CWIN_MINIMUM;
+        if(path_x->cwin<floor)path_x->cwin=floor;
+        if(cubic_state->ssthresh!=UINT64_MAX&&cubic_state->ssthresh<floor)cubic_state->ssthresh=floor;
+        if(cubic_state->W_reno<(double)floor)cubic_state->W_reno=(double)floor;
+    }
 }
 
 /* On spurious repeat notification, restore the previous congestion control.
@@ -231,6 +268,7 @@ static void cubic_correct_spurious(picoquic_path_t* path_x,
             path_x->cwin = cubic_state->previous_cwin;
             cubic_state->W_reno = (double)cubic_state->previous_cwin;
         }
+        cubic_state->last_media_repeat_recovery=0;
     }
 }
 
@@ -415,6 +453,8 @@ static void cubic_notify(
                 break;
 
         }
+
+        cubic_apply_cwin_max(cnx, path_x, cubic_state);
 
         /* Compute pacing data */
         picoquic_update_pacing_data(path_x, cubic_state->alg_state == picoquic_cubic_alg_slow_start &&

@@ -8,6 +8,9 @@
 - 已核验的 `known_hosts` 文件；
 - 私有 CA、三个角色证书和 SOCKS 用户凭据；
 - entry 与 exit 的 fail-closed 白名单。
+- 广州构建机已安装 `gcc/g++`、`cmake`、`make` 和 OpenSSL 开发包。
+
+当前 `tools/lab-hosts.json` 指定 `build_host=entry`、`compile_dir=/opt/compile`。构建过程只在广州 `/opt/compile` 展开源码和生成中间文件，三端运行目录仍为 `/etc/NB`。`build` 完成后，脚本先把二进制下载到本地 `build/nb_node`，`deploy-socks` 再从本地统一分发，因此香港和 KZ 不需要安装编译器。
 
 ```powershell
 $env:NB_SSH_PASSWORD_ENTRY = "..."
@@ -21,6 +24,16 @@ python tools/security_setup.py
 python tools/deploy.py build
 python tools/deploy.py deploy-socks
 ```
+
+需要重建 picoquic 静态库时：
+
+```powershell
+$env:NB_REBUILD_PICOQUIC = "1"
+python tools/deploy.py build
+Remove-Item Env:NB_REBUILD_PICOQUIC
+```
+
+`/opt/compile` 是可重建目录，不应放置 CA 私钥、SOCKS 明文密码或线上运行日志。`/etc/NB` 是节点运行目录，不再承担源码构建职责。
 
 `tools/security_setup.py` 不会覆盖已有安全目录。`ca.key` 只保留在部署机，节点仅接收 CA 公钥、自己的证书和私钥。
 

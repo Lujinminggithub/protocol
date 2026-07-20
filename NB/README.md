@@ -8,7 +8,7 @@ NB 是基于 picoquic 的可级联 TCP-over-QUIC 三跳传输系统。当前 V1.
 - 只有受控测试显式设置 `NB_FEC_V15_ACTIVE=on` 时，纠错型 FEC 才接管候选媒体流。
 - 发送路径统一使用 `picoquic_callback_prepare_to_send`，不存在 `picoquic_add_to_stream` 遗留。
 - 每个进程使用 `epoll`、环形发送队列、TCP 高低水位背压和 O(1) FEC session 索引。
-- 部署默认每个角色启动 2 个独立 worker，使用 `SO_REUSEPORT` 接收内核分流。
+- worker 数量由 `tools/lab-hosts.json` 分角色配置；当前基线为 entry 1、middle 1、exit 2。
 - entry 可按权重选择多个出口；middle 按下一跳地址维护最多 8 个独立 QUIC 连接池。
 
 ## FEC V1.5
@@ -40,6 +40,20 @@ FEC 已独立到 `src/nb_fec.c`，数据面采用 QUIC datagram 的 source/repai
 
 ## 构建与部署
 
+当前拓扑固定使用广州 entry 作为构建机。源码上传到广州的 `/opt/compile`，完成 CMake 和 picoquic 静态库构建后，`nb_node` 会下载到本地 `build/`，再由部署脚本分发到三端 `/etc/NB`。构建目录与运行目录相互独立，清理 `/opt/compile` 不影响正在运行的服务。
+
+构建机需要预装 `gcc/g++`、`cmake`、`make`、OpenSSL 开发包和 pthread 开发环境。构建机、middle、exit 必须使用兼容的 Linux x86_64 ABI。
+
+拓扑文件中的关键配置如下：
+
+```json
+"build_host": "entry",
+"paths": {
+  "compile_dir": "/opt/compile",
+  "work_dir": "/etc/NB"
+}
+```
+
 ```powershell
 # 1. 设置 SSH 凭据和主机指纹文件
 $env:NB_SSH_PASSWORD_ENTRY = "..."
@@ -52,7 +66,7 @@ $env:NB_SOCKS_USERNAME = "..."
 $env:NB_SOCKS_PASSWORD = "..."
 python tools/security_setup.py
 
-# 3. 构建并部署
+# 3. 在广州 /opt/compile 构建，下载产物后分发部署
 python tools/deploy.py build
 python tools/deploy.py deploy-socks
 ```
@@ -86,6 +100,18 @@ bash scripts/runtri.sh
 # FEC 自动测试与 netem 矩阵
 python tools/v15_fec_test.py --help
 python tools/netem_matrix.py --help
+
+# 开线后只读探针：生成候选线路参数，不自动应用
+python tools/line_probe.py --ping-samples 30 --target-mbps 10
+
+# 主动 QUIC 探针：真实经过 SOCKS 和三跳 QUIC，先校验 echo，再执行受控 sink 负载
+# 需要设置 NB_SOCKS_USERNAME 和 NB_SOCKS_PASSWORD
+python tools/line_probe.py --active --duration 90 --target-mbps 10
 ```
+
+候选配置包含逐段 IPv4 DF MTU 探测、运行中 QUIC payload MTU 证据及推荐的 `mtu_max`。
+探针只生成候选文件，不直接修改线上参数。
+
+当前生效线路参数和算法记录在 `tools/line-profiles/gz-hk-kz.json`；探针输出默认写入 `build/line-profile-candidate.json`。
 
 代码级测试覆盖 FEC 协议、144 组 RS 擦除组合、环形队列、认证、控制 socket、出口路由和 worker 监督器。真实三跳、netem 和手机直播仍属于部署后的阶段验收。

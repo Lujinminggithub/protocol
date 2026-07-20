@@ -27,5 +27,17 @@ int main(void){
     CHECK(nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)==0);
     CHECK(strcmp(host,"rtc.example")==0&&port==443&&payload_len==100&&memcmp(payload,source,100)==0);
     socks[2]=1;CHECK(nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)!=0);
+    CHECK(!nb_udp_control_grace_expired(100,100,100+NB_UDP_CONTROL_GRACE_US-1,
+        NB_UDP_CONTROL_GRACE_US));
+    CHECK(nb_udp_control_grace_expired(100,100,100+NB_UDP_CONTROL_GRACE_US,
+        NB_UDP_CONTROL_GRACE_US));
+    CHECK(!nb_udp_control_grace_expired(100,1000,1000+NB_UDP_CONTROL_GRACE_US-1,
+        NB_UDP_CONTROL_GRACE_US));
+    CHECK(nb_udp_control_grace_expired(100,1000,1000+NB_UDP_CONTROL_GRACE_US,
+        NB_UDP_CONTROL_GRACE_US));
+    CHECK(!nb_udp_control_grace_expired(100,1000,1000+NB_UDP_CONTROL_GRACE_US/2,
+        NB_UDP_CONTROL_GRACE_US));
+    CHECK(!nb_udp_control_grace_expired(100,1000+NB_UDP_CONTROL_GRACE_US/2,
+        1000+NB_UDP_CONTROL_GRACE_US,NB_UDP_CONTROL_GRACE_US));
     puts("nb_udp_test: ok");return 0;
 }

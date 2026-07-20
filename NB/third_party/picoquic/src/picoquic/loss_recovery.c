@@ -335,8 +335,19 @@ static size_t picoquic_retransmit_needed_packet(picoquic_cnx_t* cnx, picoquic_pa
             picoquic_dequeue_retransmit_packet(cnx, pkt_ctx, old_p, 1, 0);
             *continue_next = 1;
         }
+        else if (!picoquic_is_packet_ack_eliciting(old_p)) {
+            /* ACK-only packets are tracked for ACK-of-ACK processing, but the
+             * peer is not required to acknowledge them. Packet-threshold gaps
+             * therefore only retire this bookkeeping state; they are not loss
+             * signals and must not reach MTU or congestion-control accounting. */
+            if (old_p->send_path != NULL && cnx->is_multipath_enabled) {
+                old_p->send_path->is_ack_lost = 1;
+            }
+            picoquic_dequeue_retransmit_packet(cnx, pkt_ctx, old_p, 1, 0);
+            length = 0;
+            *continue_next = 1;
+        }
         else {
-            /* check if this is an ACK only packet */
             int packet_is_pure_ack = 1;
 
             /* Parse the old packet, queue frames for retransmit, perhaps copy some

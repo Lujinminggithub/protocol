@@ -32,6 +32,7 @@ void picoquic_pacing_init(picoquic_pacing_t* pacing, uint64_t current_time)
     pacing->bucket_max = 16;
     pacing->packet_time_nanosec = 1;
     pacing->packet_time_microsec = 1;
+    pacing->max_burst_packets = 0;
 }
 
 /* Update the leaky bucket used for pacing.
@@ -80,8 +81,10 @@ int picoquic_is_authorized_by_pacing(picoquic_pacing_t * pacing, uint64_t curren
         if (packet_train_mode || pacing->bandwidth_pause) {
             bucket_required = pacing->bucket_max;
 
-            if (bucket_required > 10 * pacing->packet_time_nanosec) {
-                bucket_required = 10 * pacing->packet_time_nanosec;
+            int64_t train_packets = pacing->max_burst_packets > 0 ? pacing->max_burst_packets : 10;
+            int64_t train_limit = train_packets * pacing->packet_time_nanosec;
+            if (bucket_required > train_limit) {
+                bucket_required = train_limit;
             }
 
             bucket_required -= pacing->bucket_nanosec;
@@ -177,6 +180,11 @@ void picoquic_update_pacing_parameters(picoquic_pacing_t * pacing, double pacing
         }
     }
 
+    if (pacing->max_burst_packets > 0) {
+        int64_t burst_max = (int64_t)pacing->max_burst_packets * pacing->packet_time_nanosec;
+        if (pacing->bucket_max > burst_max) pacing->bucket_max = burst_max;
+    }
+
     if (pacing->bucket_nanosec > pacing->bucket_max) {
         pacing->bucket_nanosec = pacing->bucket_max;
     }
@@ -236,6 +244,11 @@ void picoquic_update_pacing_window(picoquic_pacing_t * pacing, int slow_start, u
             pacing_rate *= 1.25;
         }
         picoquic_update_pacing_parameters(pacing, pacing_rate, quantum, send_mtu, smoothed_rtt, signalled_path);
+    }
+    if (pacing->max_burst_packets > 0) {
+        int64_t burst_max = (int64_t)pacing->max_burst_packets * pacing->packet_time_nanosec;
+        if (pacing->bucket_max > burst_max) pacing->bucket_max = burst_max;
+        if (pacing->bucket_nanosec > pacing->bucket_max) pacing->bucket_nanosec = pacing->bucket_max;
     }
 }
 

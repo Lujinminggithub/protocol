@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 #define NB_PRIO_MEDIA 4
-#define NB_PRIO_CTRL 8
+#define NB_PRIO_CTRL 2
 #define NB_PRIO_BULK 20
 
 typedef enum {

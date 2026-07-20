@@ -2609,6 +2609,48 @@ int picoquic_parse_ack_header(uint8_t const* bytes, size_t bytes_max,
     return ret;
 }
 
+static uint64_t picoquic_reorder_percentile(uint64_t* values, uint8_t count, unsigned int percentile)
+{
+    uint64_t sorted[32];
+    for (uint8_t i = 0; i < count; i++) sorted[i] = values[i];
+    for (uint8_t i = 1; i < count; i++) {
+        uint64_t value = sorted[i];
+        uint8_t j = i;
+        while (j > 0 && sorted[j - 1] > value) { sorted[j] = sorted[j - 1]; j--; }
+        sorted[j] = value;
+    }
+    unsigned int at = ((unsigned int)count * percentile + 99u) / 100u;
+    return sorted[at > 0 ? at - 1 : 0];
+}
+
+static void picoquic_update_adaptive_reorder_tolerance(picoquic_cnx_t* cnx,
+    uint64_t reorder_gap, uint64_t reorder_delay)
+{
+    uint8_t at = cnx->reorder_sample_next;
+    cnx->reorder_gap_samples[at] = reorder_gap;
+    cnx->reorder_delay_samples[at] = reorder_delay;
+    cnx->reorder_sample_next = (uint8_t)((at + 1) % 32);
+    if (cnx->reorder_sample_count < 32) cnx->reorder_sample_count++;
+    if (cnx->reorder_sample_count < 8) return;
+
+    uint64_t gap_p95 = picoquic_reorder_percentile(cnx->reorder_gap_samples, cnx->reorder_sample_count, 95);
+    uint64_t gap_p99 = picoquic_reorder_percentile(cnx->reorder_gap_samples, cnx->reorder_sample_count, 99);
+    uint64_t delay_p95 = picoquic_reorder_percentile(cnx->reorder_delay_samples, cnx->reorder_sample_count, 95);
+    uint64_t delay_p99 = picoquic_reorder_percentile(cnx->reorder_delay_samples, cnx->reorder_sample_count, 99);
+    uint64_t gap_target = gap_p99 + gap_p99 / 8 + 8;
+    uint64_t delay_target = delay_p99 + delay_p99 / 8 + 20000;
+    if (gap_target < gap_p95 + 4) gap_target = gap_p95 + 4;
+    if (delay_target < delay_p95 + 10000) delay_target = delay_p95 + 10000;
+    if (gap_target < cnx->loss_reorder_gap_floor) gap_target = cnx->loss_reorder_gap_floor;
+    if (delay_target < cnx->loss_reorder_delay_floor) delay_target = cnx->loss_reorder_delay_floor;
+    if (gap_target > 1024) gap_target = 1024;
+    if (delay_target > 1000000) delay_target = 1000000;
+    if (gap_target >= cnx->loss_reorder_gap) cnx->loss_reorder_gap = gap_target;
+    else cnx->loss_reorder_gap = (7 * cnx->loss_reorder_gap + gap_target) / 8;
+    if (delay_target >= cnx->loss_reorder_delay) cnx->loss_reorder_delay = delay_target;
+    else cnx->loss_reorder_delay = (7 * cnx->loss_reorder_delay + delay_target) / 8;
+}
+
 picoquic_packet_t* picoquic_check_spurious_retransmission(picoquic_cnx_t* cnx,
     picoquic_packet_context_enum pc, picoquic_packet_context_t * pkt_ctx,
     uint64_t start_of_range, uint64_t end_of_range, uint64_t current_time,
@@ -2663,6 +2705,7 @@ picoquic_packet_t* picoquic_check_spurious_retransmission(picoquic_cnx_t* cnx,
                 if (reorder_gap > old_path->max_reorder_gap) {
                     old_path->max_reorder_gap = reorder_gap;
                 }
+                picoquic_update_adaptive_reorder_tolerance(cnx, reorder_gap, reorder_delay);
 
                 if (old_path->total_bytes_lost > p->length) {
                     old_path->total_bytes_lost -= p->length;

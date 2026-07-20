@@ -1,0 +1,1 @@
+hysteria2://NBab51000_7Qm4Jx9vK2pR6sT8@106.75.169.83:51000/?sni=hy2-ab.internal&insecure=1#HY2-GZ-HK-KZ-AB

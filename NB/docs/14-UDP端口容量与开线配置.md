@@ -89,3 +89,31 @@ TCP SOCKS 监听端口仍单独放行，例如 `1080/TCP`。广州到香港继�
 6. UDP flow 关闭日志中的上下行包数和字节数均大于零。
 
 只有完成以上六项，才能判定 UDP 媒体面真正通过三跳。
+
+## 7. TikTok 目标媒体端口
+
+`20000-21023/UDP` 是手机连接 entry 时使用的 SOCKS5 UDP relay 监听范围，不能替代 TikTok 服务端目标端口的访问策略。
+
+2026-07-17 手机直播实测命中的 TikTok 裸 IP UDP 目标端口为：
+
+```text
+50000/UDP
+50001/UDP
+50008/UDP
+50009/UDP
+50020/UDP
+50021/UDP
+```
+
+这些端口必须同时满足两个条件：
+
+1. fail-closed 白名单显式放行。
+2. `nb_tiktok_flow_classify()` 将其归类为 `media/latency/prio=4`。
+
+不得把整个高位 UDP 端口段直接加入白名单。发现新目标端口时，应先由 entry 的 `UDP relay policy drop` 日志确认目标地址、端口和流量特征，再按精确端口扩展并补回归测试。
+
+## 8. UDP ASSOCIATE 控制连接兼容
+
+部分手机代理客户端会在 UDP 探测首轮结束后很快关闭 SOCKS5 UDP ASSOCIATE 的 TCP 控制连接，而跨洲链路上的 UDP 回包此时可能仍在途中。entry 在控制连接关闭后保留默认 5 秒的空闲宽限期：关闭 TCP 控制 fd，但继续保留已经认证的 UDP relay socket、客户端地址和子 flow；宽限期内有 UDP 收发活动时，从最近活动时间重新计算回收时间。
+
+该机制不放宽客户端来源校验和目标白名单。宽限期结束后，entry 统一关闭 relay 及其子 flow。日志使用 `control closed`、`grace expired` 和细分后的 datagram reject 阶段记录生命周期。

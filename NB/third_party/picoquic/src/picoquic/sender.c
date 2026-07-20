@@ -2851,7 +2851,11 @@ int picoquic_prepare_packet_ready(picoquic_cnx_t* cnx, picoquic_path_t* path_x, 
      * are queued in the connection context as `cnx->data_repeat_first` when data 
      * frames need to be repeated, and under `cnx->first_misc_frame` when other
      * individual frames need repetition. */
-    if (cnx->first_misc_frame == NULL && 
+    /* Media connections pace retransmissions too. Bypassing the bucket here
+     * accumulated a large catch-up burst after recovery on long RTT paths. */
+    int retransmit_pacing_ok = !cnx->is_media_connection ||
+        picoquic_is_sending_authorized_by_pacing(cnx,path_x,current_time,next_wake_time);
+    if (cnx->first_misc_frame == NULL && retransmit_pacing_ok &&
         (length = picoquic_retransmit_needed(cnx, pc, path_x, current_time, next_wake_time, packet, 
         send_buffer_min_max, &header_length)) > 0) {
         /* Check whether it makes sense to add an ACK at the end of the retransmission */

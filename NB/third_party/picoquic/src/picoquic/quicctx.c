@@ -5073,7 +5073,26 @@ int picoquic_set_loss_reorder_tolerance(picoquic_cnx_t* cnx, uint64_t packet_gap
     }
     cnx->loss_reorder_gap = packet_gap;
     cnx->loss_reorder_delay = delay_microseconds;
+    cnx->loss_reorder_gap_floor = packet_gap;
+    cnx->loss_reorder_delay_floor = delay_microseconds;
+    cnx->reorder_sample_count = 0;
+    cnx->reorder_sample_next = 0;
     return 0;
+}
+
+void picoquic_set_media_mode(picoquic_cnx_t* cnx, int enabled)
+{
+    PICOQUIC_THREAD_CHECK(cnx->quic);
+    cnx->is_media_connection = enabled != 0;
+    cnx->datagram_priority = enabled ? 4 : cnx->quic->default_datagram_priority;
+    for (int i = 0; i < cnx->nb_paths; i++) {
+        picoquic_pacing_t* pacing = &cnx->path[i]->pacing;
+        pacing->max_burst_packets = enabled ? 2 : 0;
+        if (enabled && pacing->bucket_max > 2 * pacing->packet_time_nanosec) {
+            pacing->bucket_max = 2 * pacing->packet_time_nanosec;
+        }
+        if (pacing->bucket_nanosec > pacing->bucket_max) pacing->bucket_nanosec = pacing->bucket_max;
+    }
 }
 
 void picoquic_set_priority_limit_for_bypass(picoquic_cnx_t* cnx, uint8_t priority_limit)

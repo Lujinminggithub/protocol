@@ -44,25 +44,27 @@
 
 **验证**：exit 日志 `async DNS: 4 workers ready` + `resolving(async)` + `target connected`。
 
-## D. P0-2 多连接池
+## D. P0-2 多连接池（历史实现，当前回退为单连接）
 
 **问题**：单 down_cnx 所有流共享一个 cwnd/pacing/flow-control。TikTok 爆发式并发排队；单点故障全死。
 
-**方案**：`POOL_SIZE=6` 连接池，round-robin。`open_downstream_cnx`→`pool_ensure/pool_init/pool_pick`。close 回调从池移除惰性重建。
+**历史方案**：曾使用 `POOL_SIZE=6` 连接池和 round-robin。实测存在多个拥塞控制实例竞争，因此当前编译基线为 `POOL_SIZE=1`；池结构、`pool_ensure/pool_init/pool_pick` 和惰性重建仍保留，待控制面基于线路容量灰度决定是否扩池。
 
-**验证**：entry/middle 各 `cnx pool ready 6/6`，coldtest 60/60。
+**当前验证**：entry/middle 应记录单连接池就绪；不得再以 `6/6` 作为现网验收条件。
 
 ## E. P0-3 流优先级 + 直播专用道
 
 **问题**：直播(webcast/rtc)与视频下载竞争，bufferbloat 致直播延迟漂移。
 
-**方案**：`classify_target` 按域名(webcast/pull/live/flv/rtmp/rtc)→prio。首部 `<prio>;` 端到端，三跳 `picoquic_set_stream_priority`。连接池前 `LAT_LANES=2` 条直播专用道。
+**当前方案**：`nb_policy` 按 TikTok 规则、裸 IP/端口和持续吞吐分类并输出 prio/lane/FEC/route。首部 `<prio>;` 端到端传递；单连接内使用控制、媒体、bulk 调度及媒体 pacing，不再固定 `LAT_LANES`。
 
 **验证**：exit 日志 `livestream.com→prio=4`、`google→prio=20`。
 
 ## F. 窗口/Buffer
 
-- `max_stream_data 1MiB→8MiB`：单流 26Mbps(1MiB/300ms三跳RTT限)→~200Mbps。
+- `initial_max_stream_data=128KiB`：middle 仅对 media 入站流关闭 picoquic 自动扩窗，下游队列低于 `128KiB` 且队龄低于 `500ms` 时按最多 `32KiB` 增发信用；达到 `256KiB` 或 `500ms` 时暂停扩窗并把压力传回 entry TCP。ctrl/bulk 在分类完成后恢复自动流控。
+- TCP 高低水位中，只有 media 使用队龄阈值；ctrl/bulk 仅按队列字节数触发，避免长 RTT 下小控制包因年龄超过阈值被暂停。
+- SOCKS UDP 关联记录原始收包、来源 IP 拒绝、格式错误和策略拒绝计数；关联关闭日志可直接判断客户端是否向 relay 地址发送过数据报。
 - `max_data 16→64MiB`；`max_ack_delay 25→5ms`。
 - UDP `SO_RCVBUFFORCE 16MB`(实际32MB)：抗突发丢包。
 

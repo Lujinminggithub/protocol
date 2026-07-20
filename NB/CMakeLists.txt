@@ -54,6 +54,16 @@ if(BUILD_TESTING)
   target_include_directories(nb_udp_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_udp_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp COMMAND nb_udp_test)
+
+  add_executable(nb_policy_test tools/test_policy.c src/nb_policy.c)
+  target_include_directories(nb_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_policy_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_policy COMMAND nb_policy_test)
+
+  add_executable(nb_live_test tools/test_live.c src/nb_live.c)
+  target_include_directories(nb_live_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_live_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_live COMMAND nb_live_test)
 endif()
 
 string(TOLOWER "${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}" NB_PLATFORM)
@@ -73,7 +83,7 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_fec.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_control.c src/nb_routes.c src/nb_udp.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_fec.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_control.c src/nb_routes.c src/nb_udp.c src/log/log4c.c)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
 target_compile_options(nb_node PRIVATE -O2 -Wall)
 target_include_directories(nb_node PRIVATE

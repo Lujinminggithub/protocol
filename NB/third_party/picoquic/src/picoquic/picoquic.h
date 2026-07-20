@@ -1858,6 +1858,9 @@ void picoquic_set_congestion_algorithm(picoquic_cnx_t* cnx, picoquic_congestion_
  * A packet gap of 0 restores the default threshold of 3 packets. A delay of
  * 0 restores the default RACK delay. This does not change the PTO timer. */
 int picoquic_set_loss_reorder_tolerance(picoquic_cnx_t* cnx, uint64_t packet_gap, uint64_t delay_microseconds);
+/* Marks a connection as carrying latency-sensitive media. This enables a
+ * bounded pacing bucket and media-aware congestion recovery. */
+void picoquic_set_media_mode(picoquic_cnx_t* cnx, int enabled);
 void picoquic_set_congestion_algorithm_ex(picoquic_cnx_t* cnx, picoquic_congestion_algorithm_t const* alg, char const* alg_option_string);
 
 /* The experimental API 'picoquic_set_priority_limit_for_bypass' 
