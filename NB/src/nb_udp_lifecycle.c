@@ -54,7 +54,8 @@ void nb_udp_lifecycle_sent(nb_udp_lifecycle_t* state,size_t token,uint64_t now_u
 
 int nb_udp_lifecycle_ack(nb_udp_lifecycle_t* state,uintptr_t link,uint32_t session_id){
     nb_udp_lifecycle_item_t* item=find_item(state,link,NB_UDP_TYPE_CLOSE,session_id);
-    if(!item)return 0;memset(item,0,sizeof(*item));return 1;
+    if(!item)return 0;
+    memset(item,0,sizeof(*item));return 1;
 }
 
 uintptr_t nb_udp_lifecycle_mark_due(nb_udp_lifecycle_t* state,uint64_t now_us){
@@ -81,5 +82,6 @@ void nb_udp_lifecycle_forget_link(nb_udp_lifecycle_t* state,uintptr_t link){
 
 size_t nb_udp_lifecycle_count(const nb_udp_lifecycle_t* state){
     size_t count=0;if(!state)return 0;
-    for(size_t i=0;i<NB_UDP_LIFECYCLE_CAP;i++)count+=state->items[i].active!=0;return count;
+    for(size_t i=0;i<NB_UDP_LIFECYCLE_CAP;i++)count+=state->items[i].active!=0;
+    return count;
 }

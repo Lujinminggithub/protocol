@@ -11,7 +11,7 @@
     {
       "line_id": "gz-hk-kz-5m-01",
       "hosts_file": "tools/lab-hosts.json",
-      "baseline_profile": "tools/line-profiles/gz-hk-kz.json",
+      "baseline_profile": "build/line-profiles/active.json",
       "package_mbps": 5,
       "client": {
         "name": "NB-KZ-5M-01",

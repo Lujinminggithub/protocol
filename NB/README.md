@@ -114,6 +114,6 @@ python tools/line_probe.py --active --duration 90 --target-mbps 10
 候选配置包含逐段 IPv4 DF MTU 探测、运行中 QUIC payload MTU 证据及推荐的 `mtu_max`。
 探针只生成候选文件，不直接修改线上参数。
 
-当前生效线路参数和算法记录在 `tools/line-profiles/gz-hk-kz.json`；探针输出默认写入 `build/line-profile-candidate.json`。
+当前生效线路参数属于本地部署配置，默认放在被 Git 忽略的 `build/line-profiles/active.json`，也可通过 `NB_LINE_PROFILE_FILE` 指定；探针输出默认写入 `build/line-profile-candidate.json`。仓库不保存包含真实节点地址或凭据的线路 profile。
 
 代码级测试覆盖 FEC 协议、144 组 RS 擦除组合、环形队列、认证、控制 socket、出口路由和 worker 监督器。真实三跳、netem 和手机直播仍属于部署后的阶段验收。

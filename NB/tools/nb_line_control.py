@@ -20,7 +20,7 @@ import line_probe
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_HOSTS = ROOT / "tools" / "lab-hosts.json"
-DEFAULT_PROFILE = ROOT / "tools" / "line-profiles" / "gz-hk-kz.json"
+DEFAULT_PROFILE = ROOT / "build" / "line-profiles" / "active.json"
 
 
 def _canonical(value: dict) -> bytes:

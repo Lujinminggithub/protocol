@@ -11,7 +11,7 @@
     {
       "line_id": "gz-83-hk-216-kz-1-15m-01",
       "hosts_file": "tools/lab-hosts.json",
-      "baseline_profile": "tools/line-profiles/gz-hk-kz.json",
+      "baseline_profile": "build/line-profiles/active.json",
       "package_mbps": 15,
       "client": {
         "name": "NB-KZ-15M-01",

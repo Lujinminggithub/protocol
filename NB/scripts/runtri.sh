@@ -16,6 +16,14 @@ if [ ! -x "$NB" ]; then
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_BUILD_TYPE=Release
   cmake --build "$ROOT/build" -j"$(nproc)"
 fi
+mkdir -p "$TMP/cfg"
+cp "$NB" "$TMP/nb_node"
+NB="$TMP/nb_node"
+cat >"$TMP/cfg/log4c.json" <<EOF
+{
+  "log_dir": "$TMP"
+}
+EOF
 
 cat >"$TMP/pki/node.ext" <<'EOF'
 subjectAltName=DNS:nb.internal
@@ -52,7 +60,7 @@ chmod 600 "$TMP/socks.users"
 echo HELLO_NB_TUNNEL_OK >"$TMP/www/test.txt"
 head -c 300000 /dev/urandom | base64 >"$TMP/www/big.txt"
 
-(cd "$TMP/www" && python3 -m http.server "$HTTP_PORT" >"$TMP/http.log" 2>&1) &
+(cd "$TMP/www" && python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >"$TMP/http.log" 2>&1) &
 python3 - "$HTTP_PORT" >"$TMP/udp-target.log" 2>&1 <<'PY' &
 import socket,sys,time
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",int(sys.argv[1])))
@@ -191,9 +199,9 @@ udp.sendto(packet,(host,port));reply,_=udp.recvfrom(65535);assert reply.endswith
 tcp.close();udp.close();time.sleep(5)
 print("RESULT PASS: SOCKS UDP lifecycle trigger")
 PY
-grep -q 'middle udp flow close.*reason=udp-peer-close' "$TMP/middle.log"
-grep -q 'exit udp flow close.*reason=udp-peer-close' "$TMP/exit.log"
-if grep -q 'udp datagram reject stage=handler rc=-10' "$TMP/entry.log"; then
+grep -q 'middle udp flow close.*reason=udp-peer-close' "$TMP/nb-middle.log"
+grep -q 'exit udp flow close.*reason=udp-peer-close' "$TMP/nb-exit.log"
+if grep -q 'udp datagram reject stage=handler rc=-10' "$TMP/nb-entry.log"; then
   echo "ERROR: stale S2C UDP datagram reached released entry child" >&2;exit 1
 fi
 echo "RESULT PASS: UDP child close synchronized across entry/middle/exit"

@@ -17,9 +17,13 @@ def candidate():
 
 def main():
     old=os.environ.get("NB_PROFILE_SIGNING_KEY");os.environ["NB_PROFILE_SIGNING_KEY"]="x"*32
+    original_profile=control.DEFAULT_PROFILE
     try:
         with tempfile.TemporaryDirectory(prefix="nb-control-") as tmp:
             root=pathlib.Path(tmp);source=root/"candidate.json";approved=root/"approved.json"
+            control.DEFAULT_PROFILE=root/"baseline-profile.json"
+            control.DEFAULT_PROFILE.write_text(json.dumps({"schema_version":3,"line_id":"test",
+                "status":"active-baseline","transport":{"entry_middle":{},"middle_exit":{}}}),encoding="utf-8")
             source.write_text(json.dumps(candidate()),encoding="utf-8")
             doc=control.approve(source,approved,"tester");control.verify_approval(doc)
             hosts,profile,state=control.prepare_canary(approved,root/"canary")
@@ -78,6 +82,7 @@ def main():
                 control.DEFAULT_HOSTS,control.DEFAULT_PROFILE=old_hosts,old_profile
                 control._current_deployment=old_current
     finally:
+        control.DEFAULT_PROFILE=original_profile
         if old is None:os.environ.pop("NB_PROFILE_SIGNING_KEY",None)
         else:os.environ["NB_PROFILE_SIGNING_KEY"]=old
     print("RESULT PASS")

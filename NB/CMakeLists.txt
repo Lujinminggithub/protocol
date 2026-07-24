@@ -61,6 +61,12 @@ if(BUILD_TESTING)
   target_compile_options(nb_udp_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp COMMAND nb_udp_test)
 
+  add_executable(nb_udp_io_test tools/test_udp_io.c src/nb_udp_io.c)
+  target_include_directories(nb_udp_io_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(nb_udp_io_test PRIVATE _GNU_SOURCE)
+  target_compile_options(nb_udp_io_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_udp_io COMMAND nb_udp_io_test)
+
   add_executable(nb_udp_lifecycle_test tools/test_udp_lifecycle.c src/nb_udp.c src/nb_udp_lifecycle.c)
   target_include_directories(nb_udp_lifecycle_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_udp_lifecycle_test PRIVATE -O2 -Wall -Wextra)
@@ -124,7 +130,7 @@ if(BUILD_TESTING)
 
   foreach(_nb_test_target
       nb_fec_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test
-      nb_auth_async_test nb_routes_test nb_udp_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_metrics_test
+      nb_auth_async_test nb_routes_test nb_udp_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_metrics_test
       nb_session_index_test nb_bridge_test nb_send_test nb_path_test
       nb_pool_health_test nb_dns_test nb_tenant_test nb_whitelist_test)
     target_compile_options(${_nb_test_target} PRIVATE -UNDEBUG -Werror)
@@ -148,9 +154,9 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_dns.c src/nb_fec.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_udp.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_dns.c src/nb_fec.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_udp.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
-target_compile_options(nb_node PRIVATE -O2 -Wall)
+target_compile_options(nb_node PRIVATE -O2 -Wall -Wextra -Werror)
 target_include_directories(nb_node PRIVATE
   ${CMAKE_SOURCE_DIR}/src
   ${PQ_DIR}/src/picoquic

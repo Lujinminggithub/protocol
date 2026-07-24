@@ -3,4 +3,6 @@
 /build/*.pem
 /build/*.key
 /build/*.users
-
+/build/line-profiles/
+/tools/line-profiles/
+__pycache__/
