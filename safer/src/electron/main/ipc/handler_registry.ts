@@ -42,6 +42,7 @@ import {
   markQueuedEventSent,
   requeueAbandonedEvents,
   startEventPolling,
+  stopEventPolling,
 } from '../modules/dlp_events'
 import { getAddon, isAddonLoaded } from '../modules/native_loader'
 import {
@@ -144,48 +145,59 @@ export function registerHandlers(): void {
         const kernelComm = addon.dlp.kernel_comm
         const driverLoader = addon.dlp.driver_loader
 
+        let loadState: any = null
+        try {
+          loadState = driverLoader?.getLoadState?.() || null
+        } catch {
+          loadState = null
+        }
+
         let driverLoaded = false
         try {
-          driverLoaded = !!driverLoader?.isLoaded?.()
+          driverLoaded = loadState?.loaded ?? !!driverLoader?.isLoaded?.()
         } catch {
           driverLoaded = false
         }
 
-        if (!driverLoaded) {
-          try {
-            driverLoaded = !!kernelComm?.connect?.()
-          } catch {
-            driverLoaded = false
-          }
+        let connected = false
+        try {
+          connected = !!kernelComm?.connect?.()
+        } catch {
+          connected = false
         }
+        driverLoaded = driverLoaded || connected
 
-        if (driverLoaded) {
-          try {
-            kernelComm?.connect?.()
-          } catch {
-            // Ignore reconnect failures here.
-          }
-          if (!isPolling()) {
-            startEventPolling()
-          }
+        if (connected && !isPolling()) {
+          startEventPolling()
         }
 
         let status: any = null
-        if (driverLoaded && kernelComm?.getDriverStatus) {
+        if (connected && kernelComm?.getDriverStatus) {
           try {
             status = kernelComm.getDriverStatus()
           } catch {
             status = null
           }
         }
+        driverLoaded = driverLoaded || status?.driverLoaded === true
+        const connectionState = kernelComm?.getConnectionState?.()
+        const connectionError = connectionState?.lastError
+          || (connectionState?.lastErrorCode
+            ? `${connectionState.lastErrorStage || 'device'}: Win32 ${connectionState.lastErrorCode}`
+            : null)
 
         return {
-          driverLoaded: status?.driverLoaded ?? driverLoaded,
-          fileFilterActive: status?.fileFilterActive ?? driverLoaded,
-          // 当前驱动采用 WFP 初始化失败即整体加载失败策略；驱动已加载时，
-          // 短暂的状态 IOCTL 失败不应被误报成“网络过滤未加载”。
-          networkFilterActive: status?.networkFilterActive ?? driverLoaded,
-          lastError: status?.lastErrorCode ? `0x${Number(status.lastErrorCode).toString(16).padStart(8, '0')}` : null,
+          driverLoaded,
+          fileFilterActive:
+            status?.fileFilterActive ?? loadState?.filterManagerLoaded ?? driverLoaded,
+          networkFilterActive: status?.networkFilterActive ?? false,
+          lastError: status?.lastErrorCode
+            ? `0x${Number(status.lastErrorCode).toString(16).padStart(8, '0')}`
+            : driverLoaded && !connected
+              ? connectionError || 'DEVICE_CONNECTION_UNAVAILABLE'
+              : null,
+          deviceConnected: connected,
+          deviceControlAvailable: connectionState?.canControl === true,
           localProxyRunning: !!getLocalProxyStatus().running,
         }
       }
@@ -208,12 +220,25 @@ export function registerHandlers(): void {
       if (addon && isAddonLoaded()) {
         const result = addon.dlp.driver_loader.load(getDriverSysPath())
         if (result?.success) {
-          addon.dlp.kernel_comm?.connect?.()
+          const connected = !!addon.dlp.kernel_comm?.connect?.()
+          if (!connected) {
+            const connectionState = addon.dlp.kernel_comm?.getConnectionState?.()
+            if (!result.alreadyRunning) {
+              addon.dlp.driver_loader?.unload?.()
+            }
+            return {
+              success: false,
+              alreadyRunning: !!result.alreadyRunning,
+              error: connectionState?.lastError || 'driver is loaded but the device connection failed',
+            }
+          }
           applyDefaultQuarantine(addon)
           const policyResult = applyPolicyToKernel(addon, getPersistedPolicy())
           if (!policyResult.success) {
             addon.dlp.kernel_comm?.disconnect?.()
-            addon.dlp.driver_loader?.unload?.()
+            if (!result.alreadyRunning) {
+              addon.dlp.driver_loader?.unload?.()
+            }
             return { success: false, error: `driver loaded but policy restore failed: ${policyResult.error}` }
           }
           updateLocalProxyPolicy(policyResult.policy)
@@ -241,15 +266,18 @@ export function registerHandlers(): void {
       const addon = getAddon()
       await stopLocalProxy()
       if (addon && isAddonLoaded()) {
+        await stopEventPolling()
         addon.dlp.kernel_comm?.disconnect?.()
-        addon.dlp.driver_loader.unload()
-        return { success: true }
+        const result = addon.dlp.driver_loader.unload()
+        return result?.success
+          ? { success: true }
+          : { success: false, error: result?.error || 'driver unload failed' }
       }
     } catch (error: any) {
       console.warn('[DLP] unload driver failed:', error?.message || error)
     }
 
-    return { success: true }
+    return { success: false, error: 'native addon not loaded' }
   })
 
   ipcMain.handle('dlp:get-policy', () => {

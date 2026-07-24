@@ -24,6 +24,13 @@ export interface NativeAddon {
     kernel_comm: {
       connect: () => any
       disconnect: () => any
+      getConnectionState: () => {
+        connected: boolean
+        canControl: boolean
+        lastErrorCode: number
+        lastErrorStage: string
+        lastError: string
+      }
       sendIoctl: (code: number, data: string) => any
       getDriverStatus: () => any
       getProtectionChallenge: (ttlSeconds?: number) => any
@@ -47,6 +54,12 @@ export interface NativeAddon {
       load: (sysPath?: string) => any
       unload: () => any
       isLoaded: () => any
+      getLoadState: () => {
+        loaded: boolean
+        filterManagerLoaded: boolean
+        serviceRunning: boolean
+        deviceReachable: boolean
+      }
     }
     file_filter_handler: {
       handleEvent: (...args: any[]) => any

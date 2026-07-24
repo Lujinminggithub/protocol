@@ -350,9 +350,18 @@ export function startEventPolling(intervalMs: number = 1000): void {
   console.log('[DlpEvents] polling started')
 }
 
-export function stopEventPolling(): void {
+export async function stopEventPolling(): Promise<void> {
   pollingActive = false
-  pollLoopPromise = null
+  const pendingLoop = pollLoopPromise
+  if (pendingLoop) {
+    try {
+      await pendingLoop
+    } finally {
+      if (pollLoopPromise === pendingLoop) {
+        pollLoopPromise = null
+      }
+    }
+  }
 }
 
 export function isPolling(): boolean {

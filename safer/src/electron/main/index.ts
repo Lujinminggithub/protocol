@@ -56,12 +56,21 @@ async function autoLoadDriver(): Promise<void> {
     const sysPath = join(process.resourcesPath, 'driver', 'PersonalSafer.sys')
     const result = addon.dlp.driver_loader.load(sysPath)
     if (result?.success) {
-      addon.dlp.kernel_comm?.connect?.()
+      const connected = !!addon.dlp.kernel_comm?.connect?.()
+      if (!connected) {
+        console.error('[AutoLoad] driver is loaded but the device connection failed')
+        if (!result.alreadyRunning) {
+          addon.dlp.driver_loader?.unload?.()
+        }
+        return
+      }
       const policyResult = applyPolicyToKernel(addon, getPersistedPolicy())
       if (!policyResult.success) {
         console.error('[AutoLoad] persisted policy restore failed:', policyResult.error)
         addon.dlp.kernel_comm?.disconnect?.()
-        addon.dlp.driver_loader?.unload?.()
+        if (!result.alreadyRunning) {
+          addon.dlp.driver_loader?.unload?.()
+        }
         return
       }
       updateLocalProxyPolicy(policyResult.policy)

@@ -246,7 +246,7 @@ public:
     void Execute() override {
         HANDLE waitHandle = CreateFileW(
             kDevicePath,
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             NULL,
             OPEN_EXISTING,
@@ -475,8 +475,24 @@ static DWORD FindTcpOwnerPidV6(
 Napi::Value ConnectToDevice(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (g_commState.isConnected) {
-        return Napi::Boolean::New(env, true);
+    if (g_commState.isConnected && g_commState.deviceHandle != INVALID_HANDLE_VALUE) {
+        DWORD bytesReturned = 0;
+        if (DeviceIoControl(
+                g_commState.deviceHandle,
+                IOCTL_PS_HEARTBEAT,
+                nullptr,
+                0,
+                nullptr,
+                0,
+                &bytesReturned,
+                nullptr)) {
+            return Napi::Boolean::New(env, true);
+        }
+
+        CloseHandle(g_commState.deviceHandle);
+        g_commState.deviceHandle = INVALID_HANDLE_VALUE;
+        g_commState.isConnected = false;
+        g_commState.canControl = false;
     }
 
     g_commState.deviceHandle = CreateFileW(
@@ -490,20 +506,45 @@ Napi::Value ConnectToDevice(const Napi::CallbackInfo& info) {
     );
 
     if (g_commState.deviceHandle == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        g_commState.lastError = "无法连接到驱动设备 (错误码: " + std::to_string(error) + ")";
-        return Napi::Boolean::New(env, false);
-    }
-
-    if (!SendProtectControl(g_commState.deviceHandle, PS_PROTECT_CONTROL_INITIALIZE)) {
-        g_commState.lastError = "PersonalSafer protection bootstrap failed: " + std::to_string(GetLastError());
-        CloseHandle(g_commState.deviceHandle);
-        g_commState.deviceHandle = INVALID_HANDLE_VALUE;
-        return Napi::Boolean::New(env, false);
+        const DWORD readWriteError = GetLastError();
+        g_commState.deviceHandle = CreateFileW(
+            kDevicePath,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+        if (g_commState.deviceHandle == INVALID_HANDLE_VALUE) {
+            const DWORD readOnlyError = GetLastError();
+            g_commState.lastErrorCode = readOnlyError;
+            g_commState.lastErrorStage = "open_device";
+            g_commState.lastError =
+                "CreateFile(\\\\.\\PersonalSafer) failed (read/write=" +
+                std::to_string(readWriteError) + ", read-only=" +
+                std::to_string(readOnlyError) + ")";
+            return Napi::Boolean::New(env, false);
+        }
+        g_commState.canControl = false;
+    } else {
+        g_commState.canControl = true;
     }
 
     g_commState.isConnected = true;
+    g_commState.lastErrorCode = ERROR_SUCCESS;
+    g_commState.lastErrorStage.clear();
+    g_commState.lastError.clear();
     return Napi::Boolean::New(env, true);
+}
+
+Napi::Value GetConnectionState(const Napi::CallbackInfo& info) {
+    Napi::Object state = Napi::Object::New(info.Env());
+    state.Set("connected", Napi::Boolean::New(info.Env(), g_commState.isConnected));
+    state.Set("canControl", Napi::Boolean::New(info.Env(), g_commState.canControl));
+    state.Set("lastErrorCode", Napi::Number::New(info.Env(), g_commState.lastErrorCode));
+    state.Set("lastErrorStage", Napi::String::New(info.Env(), g_commState.lastErrorStage));
+    state.Set("lastError", Napi::String::New(info.Env(), g_commState.lastError));
+    return state;
 }
 
 /*++
@@ -524,6 +565,7 @@ Napi::Value DisconnectFromDevice(const Napi::CallbackInfo& info) {
         g_commState.pipeHandle = INVALID_HANDLE_VALUE;
     }
     g_commState.isConnected = false;
+    g_commState.canControl = false;
     g_commState.isPipeConnected = false;
 
     return Napi::Boolean::New(env, true);
@@ -1297,6 +1339,7 @@ Napi::Value ReadNetEventsBatch(const Napi::CallbackInfo& info) {
 Napi::Object InitKernelCommAddon(Napi::Env env, Napi::Object exports) {
     exports.Set("connect", Napi::Function::New(env, ConnectToDevice));
     exports.Set("disconnect", Napi::Function::New(env, DisconnectFromDevice));
+    exports.Set("getConnectionState", Napi::Function::New(env, GetConnectionState));
     exports.Set("sendIoctl", Napi::Function::New(env, SendIoctl));
     exports.Set("getDriverStatus", Napi::Function::New(env, GetDriverStatus));
     exports.Set("getProtectionChallenge", Napi::Function::New(env, GetProtectionChallenge));

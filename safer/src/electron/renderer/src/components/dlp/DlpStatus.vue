@@ -108,7 +108,10 @@ onUnmounted(() => {
 async function toggleLoadDriver() {
   saveMessage.value = ''
   if (store.status.driverLoaded) {
-    await store.unloadDriver()
+    const result = await store.unloadDriver()
+    if (!result?.success) {
+      saveMessage.value = result?.error || '驱动卸载失败'
+    }
   } else {
     const result = await store.loadDriver()
     if (!result?.success) {
@@ -167,8 +170,8 @@ async function savePolicy() {
     <section class="status-section">
       <div class="section-heading">
         <h2>DLP 防护状态</h2>
-        <button class="driver-button" :class="{ danger: store.status.driverLoaded }" :disabled="store.loading" @click="toggleLoadDriver">
-          {{ store.status.driverLoaded ? '卸载驱动' : '加载驱动' }}
+        <button class="driver-button" :class="{ danger: store.status.driverLoaded }" :disabled="store.operationPending" @click="toggleLoadDriver">
+          {{ store.operationPending ? '处理中...' : (store.status.driverLoaded ? '卸载驱动' : '加载驱动') }}
         </button>
       </div>
 

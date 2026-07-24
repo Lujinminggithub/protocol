@@ -1777,58 +1777,13 @@ PreWrite(
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext
     )
 {
-    PPS_QUARANTINE_WRITE_CONTEXT writeContext = NULL;
-    NTSTATUS status;
-    PDLP_FILE_EVENT event;
-    FLT_PREOP_CALLBACK_STATUS preopStatus;
-
     UNREFERENCED_PARAMETER(CompletionContext);
     PAGED_CODE();
 
+    /* Cache Manager paging writes can arrive while NTFS FCB resources are held.
+       Never query names, issue nested file I/O, or wait for policy on this path. */
     if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO)) {
-        PFLT_FILE_NAME_INFORMATION protectedName = NULL;
-
-        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
-        }
-
-        status = FltGetFileNameInformationUnsafe(
-            FltObjects->FileObject,
-            FltObjects->Instance,
-            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-            &protectedName);
-        if (NT_SUCCESS(status) && protectedName != NULL) {
-            if (ProtectIsPathProtected(protectedName->Name.Buffer)) {
-                FltReleaseFileNameInformation(protectedName);
-                Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-                Data->IoStatus.Information = 0;
-                return FLT_PREOP_COMPLETE;
-            }
-            FltReleaseFileNameInformation(protectedName);
-        }
-
-        status = FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject, &writeContext);
-        if (!NT_SUCCESS(status) || writeContext == NULL) {
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
-        }
-
-        if (writeContext->RedirectedByCreate) {
-            FltReleaseContext(writeContext);
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
-        }
-
-        event = FileEventAllocate();
-        if (event == NULL) {
-            FltReleaseContext(writeContext);
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
-        }
-        InitializeContextOnlyFileEvent(event, writeContext);
-        event->FileSize = Data->Iopb->Parameters.Write.Length;
-        preopStatus = PerformSyntheticQuarantineWrite(Data, FltObjects, writeContext, event);
-        FileEventEnqueue(event);
-        FileEventFree(event);
-        FltReleaseContext(writeContext);
-        return preopStatus;
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     if (Data->RequestorMode != UserMode) {

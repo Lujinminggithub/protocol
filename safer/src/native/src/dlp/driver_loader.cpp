@@ -1,293 +1,433 @@
-/*
- * driver_loader.cpp - MiniFilter 驱动加载/卸载实现
- *
- * 通过 SCM 创建“文件系统驱动(filesys)”服务、写入 MiniFilter 必需的
- * Instances/Altitude 注册表，然后用 FilterLoad 加载。
- * .sys 源路径由 JS 侧传入（打包后位于 resources/driver/）。
- */
+/* PersonalSafer MiniFilter service management and load-state detection. */
 
 #include "driver_loader.h"
+
 #include <windows.h>
 #include <winsvc.h>
 #include <fltuser.h>
 #include <string>
+#include <vector>
 
 #pragma comment(lib, "fltlib.lib")
 #pragma comment(lib, "advapi32.lib")
 
 static const wchar_t* kServiceName = L"PersonalSafer";
 static const wchar_t* kDisplayName = L"PersonalSafer Security Driver";
-static const wchar_t* kAltitude    = L"379950";                 // 必须与 driver.h 的 PS_ALTITUDE 一致
+static const wchar_t* kAltitude = L"379950";
 static const wchar_t* kInstanceName = L"PersonalSafer Instance";
+static const wchar_t* kDevicePath = L"\\\\.\\PersonalSafer";
 
-// ---- 工具: 管理员检查 ----
+struct DriverLoadState {
+    bool filterManagerLoaded;
+    bool serviceRunning;
+    bool deviceReachable;
+
+    bool Loaded() const {
+        return filterManagerLoaded || serviceRunning || deviceReachable;
+    }
+};
+
 static bool IsRunningAsAdmin() {
     BOOL isAdmin = FALSE;
-    PSID adminGroup = NULL;
-    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-    if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
-            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
-        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+    PSID adminGroup = nullptr;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(
+            &ntAuthority,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0,
+            &adminGroup)) {
+        CheckTokenMembership(nullptr, adminGroup, &isAdmin);
         FreeSid(adminGroup);
     }
     return isAdmin != FALSE;
 }
 
-// ---- 工具: 启用某项特权(如 SeLoadDriverPrivilege) ----
-static bool EnablePrivilege(LPCWSTR privName) {
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+static bool EnablePrivilege(LPCWSTR privilegeName) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &token)) {
         return false;
     }
-    LUID luid;
-    bool ok = false;
-    if (LookupPrivilegeValueW(NULL, privName, &luid)) {
-        TOKEN_PRIVILEGES tp;
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
-        ok = (GetLastError() == ERROR_SUCCESS);
+
+    LUID luid = {};
+    bool enabled = false;
+    if (LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
+        TOKEN_PRIVILEGES privileges = {};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        SetLastError(ERROR_SUCCESS);
+        AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+        enabled = GetLastError() == ERROR_SUCCESS;
     }
-    CloseHandle(hToken);
-    return ok;
+    CloseHandle(token);
+    return enabled;
+}
+
+static bool SetRegistryString(HKEY key, const wchar_t* name, const wchar_t* value) {
+    return RegSetValueExW(
+        key,
+        name,
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(value),
+        static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 }
 
 static bool SetupMiniFilterRegistryPath(const wchar_t* instancesPath) {
-    HKEY hInstances = NULL;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, instancesPath, 0, NULL,
-            REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hInstances, NULL)
-            != ERROR_SUCCESS) {
+    HKEY instancesKey = nullptr;
+    if (RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            instancesPath,
+            0,
+            nullptr,
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS,
+            nullptr,
+            &instancesKey,
+            nullptr) != ERROR_SUCCESS) {
         return false;
     }
 
-    LSTATUS result = RegSetValueExW(hInstances, L"DefaultInstance", 0, REG_SZ,
-        (const BYTE*)kInstanceName,
-        (DWORD)((wcslen(kInstanceName) + 1) * sizeof(wchar_t)));
-    RegCloseKey(hInstances);
-    if (result != ERROR_SUCCESS) {
+    bool success = SetRegistryString(instancesKey, L"DefaultInstance", kInstanceName);
+    RegCloseKey(instancesKey);
+    if (!success) return false;
+
+    const std::wstring instancePath =
+        std::wstring(instancesPath) + L"\\" + kInstanceName;
+    HKEY instanceKey = nullptr;
+    if (RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            instancePath.c_str(),
+            0,
+            nullptr,
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS,
+            nullptr,
+            &instanceKey,
+            nullptr) != ERROR_SUCCESS) {
         return false;
     }
 
-    HKEY hInst = NULL;
-    std::wstring instPath = std::wstring(instancesPath) + L"\\" + kInstanceName;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, instPath.c_str(), 0, NULL,
-            REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hInst, NULL)
-            != ERROR_SUCCESS) {
-        return false;
-    }
-
-    result = RegSetValueExW(hInst, L"Altitude", 0, REG_SZ,
-        (const BYTE*)kAltitude,
-        (DWORD)((wcslen(kAltitude) + 1) * sizeof(wchar_t)));
     DWORD flags = 0;
-    if (result == ERROR_SUCCESS) {
-        result = RegSetValueExW(hInst, L"Flags", 0, REG_DWORD,
-            (const BYTE*)&flags, sizeof(flags));
-    }
-    RegCloseKey(hInst);
-    return result == ERROR_SUCCESS;
+    success = SetRegistryString(instanceKey, L"Altitude", kAltitude) &&
+        RegSetValueExW(
+            instanceKey,
+            L"Flags",
+            0,
+            REG_DWORD,
+            reinterpret_cast<const BYTE*>(&flags),
+            sizeof(flags)) == ERROR_SUCCESS;
+    RegCloseKey(instanceKey);
+    return success;
 }
 
-// Write both layouts for Windows 10 and Windows 11 24H2 compatibility.
 static bool SetupMiniFilterRegistry() {
-    const wchar_t* legacyPath =
+    static const wchar_t* kServiceParameters =
+        L"SYSTEM\\CurrentControlSet\\Services\\PersonalSafer\\Parameters";
+    static const wchar_t* kLegacyInstances =
         L"SYSTEM\\CurrentControlSet\\Services\\PersonalSafer\\Instances";
-    const wchar_t* parametersPath =
+    static const wchar_t* kParameterInstances =
         L"SYSTEM\\CurrentControlSet\\Services\\PersonalSafer\\Parameters\\Instances";
-    return SetupMiniFilterRegistryPath(legacyPath) &&
-        SetupMiniFilterRegistryPath(parametersPath);
+
+    HKEY parametersKey = nullptr;
+    if (RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            kServiceParameters,
+            0,
+            nullptr,
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS,
+            nullptr,
+            &parametersKey,
+            nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD supportedFeatures = 3;
+    const bool parametersWritten = RegSetValueExW(
+        parametersKey,
+        L"SupportedFeatures",
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&supportedFeatures),
+        sizeof(supportedFeatures)) == ERROR_SUCCESS;
+    RegCloseKey(parametersKey);
+
+    return parametersWritten &&
+        SetupMiniFilterRegistryPath(kLegacyInstances) &&
+        SetupMiniFilterRegistryPath(kParameterInstances);
 }
 
-static Napi::Object MakeResult(Napi::Env env, bool success, const std::string& err = "") {
-    Napi::Object r = Napi::Object::New(env);
-    r.Set("success", Napi::Boolean::New(env, success));
-    if (!err.empty()) r.Set("error", Napi::String::New(env, err));
-    return r;
-}
-
-static bool IsMiniFilterLoaded() {
-    HANDLE hFilterFind = NULL;
-    BYTE buffer[1024];
+static bool IsFilterManagerLoaded() {
+    HANDLE findHandle = nullptr;
+    std::vector<BYTE> buffer(64 * 1024);
     ULONG bytesReturned = 0;
-    bool loaded = false;
+    HRESULT result = FilterFindFirst(
+        FilterFullInformation,
+        buffer.data(),
+        static_cast<DWORD>(buffer.size()),
+        &bytesReturned,
+        &findHandle);
 
-    HRESULT hr = FilterFindFirst(FilterFullInformation, buffer, sizeof(buffer),
-        &bytesReturned, &hFilterFind);
-    while (SUCCEEDED(hr)) {
-        PFILTER_FULL_INFORMATION fi = reinterpret_cast<PFILTER_FULL_INFORMATION>(buffer);
-        std::wstring name(fi->FilterNameBuffer, fi->FilterNameLength / sizeof(WCHAR));
-        if (name == kServiceName) {
-            loaded = true;
-            break;
+    while (SUCCEEDED(result)) {
+        const auto* info = reinterpret_cast<const FILTER_FULL_INFORMATION*>(buffer.data());
+        const std::wstring filterName(
+            info->FilterNameBuffer,
+            info->FilterNameLength / sizeof(wchar_t));
+        if (_wcsicmp(filterName.c_str(), kServiceName) == 0) {
+            FilterFindClose(findHandle);
+            return true;
         }
-        hr = FilterFindNext(hFilterFind, FilterFullInformation, buffer,
-            sizeof(buffer), &bytesReturned);
+
+        result = FilterFindNext(
+            findHandle,
+            FilterFullInformation,
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()),
+            &bytesReturned);
     }
-    if (hFilterFind != NULL) {
-        FilterFindClose(hFilterFind);
-    }
-    return loaded;
+
+    if (findHandle != nullptr) FilterFindClose(findHandle);
+    return false;
 }
 
-/*++
- * LoadDriver(sysPath?)
- *
- * 加载 MiniFilter 驱动。sysPath 为 .sys 源文件绝对路径（可选，
- * JS 侧传入打包后的 resources/driver/PersonalSafer.sys）。
- * --*/
+static bool IsServiceRunning() {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm == nullptr) return false;
+
+    SC_HANDLE service = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS);
+    if (service == nullptr) {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status = {};
+    DWORD bytesNeeded = 0;
+    const bool queried = QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&status),
+        sizeof(status),
+        &bytesNeeded) != FALSE;
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+
+    return queried &&
+        (status.dwCurrentState == SERVICE_RUNNING ||
+         status.dwCurrentState == SERVICE_START_PENDING);
+}
+
+static bool IsDeviceReachable() {
+    HANDLE device = CreateFileW(
+        kDevicePath,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (device == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(device);
+    return true;
+}
+
+static DriverLoadState QueryDriverLoadState() {
+    DriverLoadState state = {};
+    state.filterManagerLoaded = IsFilterManagerLoaded();
+    state.serviceRunning = IsServiceRunning();
+    state.deviceReachable = IsDeviceReachable();
+    return state;
+}
+
+static Napi::Object MakeResult(
+    Napi::Env env,
+    bool success,
+    const std::string& error = std::string()) {
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("success", Napi::Boolean::New(env, success));
+    if (!error.empty()) result.Set("error", Napi::String::New(env, error));
+    return result;
+}
+
 Napi::Value LoadDriver(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-
     if (!IsRunningAsAdmin()) {
-        return MakeResult(env, false, "需要管理员权限加载驱动");
+        return MakeResult(env, false, "Administrator privileges are required to load the driver");
     }
 
-    if (IsMiniFilterLoaded()) {
-        Napi::Object r = MakeResult(env, true);
-        r.Set("alreadyRunning", Napi::Boolean::New(env, true));
-        return r;
+    DriverLoadState initialState = QueryDriverLoadState();
+    if (initialState.filterManagerLoaded || initialState.deviceReachable) {
+        Napi::Object result = MakeResult(env, true);
+        result.Set("alreadyRunning", Napi::Boolean::New(env, true));
+        return result;
     }
 
-    // 目标: %SystemRoot%\System32\drivers\PersonalSafer.sys
-    wchar_t sysDir[MAX_PATH] = {0};
-    GetSystemDirectoryW(sysDir, MAX_PATH);
-    std::wstring destSys = std::wstring(sysDir) + L"\\drivers\\PersonalSafer.sys";
+    wchar_t systemDirectory[MAX_PATH] = {};
+    if (GetSystemDirectoryW(systemDirectory, MAX_PATH) == 0) {
+        return MakeResult(env, false, "Unable to resolve the Windows system directory");
+    }
+    const std::wstring destination =
+        std::wstring(systemDirectory) + L"\\drivers\\PersonalSafer.sys";
 
-    // 若 JS 传入了源路径，则复制到系统目录
     if (info.Length() >= 1 && info[0].IsString()) {
-        std::u16string s = info[0].As<Napi::String>().Utf16Value();
-        std::wstring srcSys(s.begin(), s.end());
-        if (!srcSys.empty()) {
-            if (!CopyFileW(srcSys.c_str(), destSys.c_str(), FALSE)) {
-                DWORD e = GetLastError();
-                return MakeResult(env, false,
-                    "复制驱动文件失败 (错误码: " + std::to_string(e) + ")");
-            }
+        const std::u16string sourceUtf16 = info[0].As<Napi::String>().Utf16Value();
+        const std::wstring source(sourceUtf16.begin(), sourceUtf16.end());
+        if (!source.empty() && _wcsicmp(source.c_str(), destination.c_str()) != 0 &&
+            !CopyFileW(source.c_str(), destination.c_str(), FALSE)) {
+            return MakeResult(
+                env,
+                false,
+                "Unable to copy the driver image (Win32 error " +
+                    std::to_string(GetLastError()) + ")");
         }
     }
 
     EnablePrivilege(L"SeLoadDriverPrivilege");
-
-    // 创建/打开“文件系统驱动”服务
-    SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    if (hSCM == NULL) {
-        return MakeResult(env, false, "无法打开 SCM (错误码: " +
-            std::to_string(GetLastError()) + ")");
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+    if (scm == nullptr) {
+        return MakeResult(
+            env,
+            false,
+            "Unable to open SCM (Win32 error " + std::to_string(GetLastError()) + ")");
     }
 
-    SC_HANDLE hService = OpenServiceW(hSCM, kServiceName, SERVICE_ALL_ACCESS);
-    bool existingService = hService != NULL;
-    if (hService == NULL) {
-        hService = CreateServiceW(
-            hSCM, kServiceName, kDisplayName,
+    SC_HANDLE service = OpenServiceW(scm, kServiceName, SERVICE_ALL_ACCESS);
+    if (service == nullptr) {
+        static const wchar_t dependencies[] = L"FltMgr\0\0";
+        service = CreateServiceW(
+            scm,
+            kServiceName,
+            kDisplayName,
             SERVICE_ALL_ACCESS,
-            SERVICE_FILE_SYSTEM_DRIVER,   // MiniFilter 必须为文件系统驱动
+            SERVICE_FILE_SYSTEM_DRIVER,
             SERVICE_DEMAND_START,
             SERVICE_ERROR_NORMAL,
-            destSys.c_str(),
-            L"FSFilter Activity Monitor", NULL, L"FltMgr\0", NULL, NULL
-        );
-        if (hService == NULL) {
-            DWORD e = GetLastError();
-            CloseServiceHandle(hSCM);
-            return MakeResult(env, false,
-                "无法创建驱动服务 (错误码: " + std::to_string(e) + ")");
+            destination.c_str(),
+            L"FSFilter Activity Monitor",
+            nullptr,
+            dependencies,
+            nullptr,
+            nullptr);
+        if (service == nullptr) {
+            const DWORD error = GetLastError();
+            CloseServiceHandle(scm);
+            return MakeResult(
+                env,
+                false,
+                "Unable to create the driver service (Win32 error " +
+                    std::to_string(error) + ")");
         }
-    }
-
-    if (existingService) {
-        SERVICE_STATUS_PROCESS serviceStatus = {};
+    } else {
+        SERVICE_STATUS_PROCESS status = {};
         DWORD bytesNeeded = 0;
-        if (!QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
-                reinterpret_cast<LPBYTE>(&serviceStatus), sizeof(serviceStatus), &bytesNeeded)) {
-            DWORD e = GetLastError();
-            CloseServiceHandle(hService);
-            CloseServiceHandle(hSCM);
-            return MakeResult(env, false,
-                "无法查询驱动服务状态 (错误码: " + std::to_string(e) + ")");
+        if (!QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                reinterpret_cast<LPBYTE>(&status),
+                sizeof(status),
+                &bytesNeeded)) {
+            const DWORD error = GetLastError();
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            return MakeResult(
+                env,
+                false,
+                "Unable to query the driver service (Win32 error " +
+                    std::to_string(error) + ")");
         }
 
-        if (serviceStatus.dwCurrentState == SERVICE_STOPPED &&
-            !ChangeServiceConfigW(hService,
-                SERVICE_FILE_SYSTEM_DRIVER,
-                SERVICE_DEMAND_START,
-                SERVICE_ERROR_NORMAL,
-                destSys.c_str(),
-                L"FSFilter Activity Monitor", NULL, L"FltMgr\0", NULL, NULL,
-                kDisplayName)) {
-            DWORD e = GetLastError();
-            CloseServiceHandle(hService);
-            CloseServiceHandle(hSCM);
-            return MakeResult(env, false,
-                "无法更新驱动服务配置 (错误码: " + std::to_string(e) + ")");
+        if (status.dwCurrentState == SERVICE_STOPPED) {
+            static const wchar_t dependencies[] = L"FltMgr\0\0";
+            if (!ChangeServiceConfigW(
+                    service,
+                    SERVICE_FILE_SYSTEM_DRIVER,
+                    SERVICE_DEMAND_START,
+                    SERVICE_ERROR_NORMAL,
+                    destination.c_str(),
+                    L"FSFilter Activity Monitor",
+                    nullptr,
+                    dependencies,
+                    nullptr,
+                    nullptr,
+                    kDisplayName)) {
+                const DWORD error = GetLastError();
+                CloseServiceHandle(service);
+                CloseServiceHandle(scm);
+                return MakeResult(
+                    env,
+                    false,
+                    "Unable to update the driver service (Win32 error " +
+                        std::to_string(error) + ")");
+            }
         }
     }
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
 
-    // MiniFilter 必需的 Instances/Altitude 注册表
     if (!SetupMiniFilterRegistry()) {
-        return MakeResult(env, false, "写入 MiniFilter 注册表失败");
+        return MakeResult(env, false, "Unable to write the MiniFilter registry configuration");
     }
 
-    // 用 FilterLoad 加载 MiniFilter（等价于 fltmc load）
-    HRESULT hr = FilterLoad(kServiceName);
-    if (hr == S_OK || IsMiniFilterLoaded()) {
-        Napi::Object r = MakeResult(env, true);
-        r.Set("alreadyRunning", Napi::Boolean::New(env,
-            hr != S_OK));
-        return r;
+    const HRESULT loadResult = FilterLoad(kServiceName);
+    const DriverLoadState finalState = QueryDriverLoadState();
+    if (loadResult == S_OK || finalState.Loaded()) {
+        Napi::Object result = MakeResult(env, true);
+        result.Set("alreadyRunning", Napi::Boolean::New(env, loadResult != S_OK));
+        return result;
     }
 
-    char buf[32];
-    sprintf_s(buf, "0x%08lX", (unsigned long)hr);
-    return MakeResult(env, false, std::string("FilterLoad 失败 (HRESULT: ") + buf +
-        ")，常见: 0x801F0011=实例配置, 0x800705B4=超时/驱动未响应, 0xC000037A/签名相关=未禁用驱动签名");
+    char resultBuffer[32] = {};
+    sprintf_s(resultBuffer, "0x%08lX", static_cast<unsigned long>(loadResult));
+    return MakeResult(
+        env,
+        false,
+        std::string("FilterLoad failed (HRESULT ") + resultBuffer + ")");
 }
 
-/*++
- * UnloadDriver - 卸载 MiniFilter 并删除服务
- * --*/
 Napi::Value UnloadDriver(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-
     if (!IsRunningAsAdmin()) {
-        return MakeResult(env, false, "需要管理员权限卸载驱动");
+        return MakeResult(env, false, "Administrator privileges are required to unload the driver");
     }
 
-    // 卸载 MiniFilter（忽略“未加载”错误）
-    FilterUnload(kServiceName);
-
-    // 删除服务
-    SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    if (hSCM != NULL) {
-        SC_HANDLE hService = OpenServiceW(hSCM, kServiceName, DELETE);
-        if (hService != NULL) {
-            DeleteService(hService);
-            CloseServiceHandle(hService);
-        }
-        CloseServiceHandle(hSCM);
+    const HRESULT unloadResult = FilterUnload(kServiceName);
+    const DriverLoadState finalState = QueryDriverLoadState();
+    if (!finalState.Loaded()) {
+        return MakeResult(env, true);
     }
 
-    return MakeResult(env, true);
+    char resultBuffer[32] = {};
+    sprintf_s(resultBuffer, "0x%08lX", static_cast<unsigned long>(unloadResult));
+    return MakeResult(
+        env,
+        false,
+        std::string("FilterUnload failed (HRESULT ") + resultBuffer + ")");
 }
 
-/*++
- * IsDriverLoaded - 通过过滤器管理器查询是否已加载
- * --*/
 Napi::Value IsDriverLoaded(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    return Napi::Boolean::New(env, IsMiniFilterLoaded());
+    return Napi::Boolean::New(info.Env(), QueryDriverLoadState().Loaded());
 }
 
-/*++
- * InitDriverLoaderAddon
- * --*/
+static Napi::Value GetDriverLoadState(const Napi::CallbackInfo& info) {
+    const DriverLoadState state = QueryDriverLoadState();
+    Napi::Object result = Napi::Object::New(info.Env());
+    result.Set("loaded", Napi::Boolean::New(info.Env(), state.Loaded()));
+    result.Set(
+        "filterManagerLoaded",
+        Napi::Boolean::New(info.Env(), state.filterManagerLoaded));
+    result.Set("serviceRunning", Napi::Boolean::New(info.Env(), state.serviceRunning));
+    result.Set("deviceReachable", Napi::Boolean::New(info.Env(), state.deviceReachable));
+    return result;
+}
+
 Napi::Object InitDriverLoaderAddon(Napi::Env env, Napi::Object exports) {
     exports.Set("load", Napi::Function::New(env, LoadDriver));
     exports.Set("unload", Napi::Function::New(env, UnloadDriver));
     exports.Set("isLoaded", Napi::Function::New(env, IsDriverLoaded));
+    exports.Set("getLoadState", Napi::Function::New(env, GetDriverLoadState));
     return exports;
 }

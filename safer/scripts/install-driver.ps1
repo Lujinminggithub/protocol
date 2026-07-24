@@ -2,7 +2,7 @@
 
 param(
     [string]$SysPath = '',
-    [string]$InfPath = ''
+    [switch]$SkipStart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,9 +18,6 @@ if (-not $isAdmin) {
 if (-not $SysPath) {
     $SysPath = Join-Path $PSScriptRoot '..\build\kernel\x64\Release\PersonalSafer.sys'
 }
-if (-not $InfPath) {
-    $InfPath = Join-Path $PSScriptRoot '..\src\kernel\inf\PersonalSafer.inf'
-}
 if (-not (Test-Path -LiteralPath $SysPath)) {
     throw "Driver not found: $SysPath"
 }
@@ -30,15 +27,37 @@ $driverDest = Join-Path $env:SystemRoot 'System32\drivers\PersonalSafer.sys'
 Write-Host "Copying driver to $driverDest ..." -ForegroundColor Yellow
 Copy-Item -LiteralPath $resolvedSysPath -Destination $driverDest -Force
 
-if ($InfPath -and (Test-Path -LiteralPath $InfPath)) {
-    $resolvedInfPath = (Resolve-Path -LiteralPath $InfPath).Path
-    Write-Host "Installing driver INF: $resolvedInfPath" -ForegroundColor Yellow
-    & pnputil.exe /add-driver $resolvedInfPath /install
-    if ($LASTEXITCODE -ne 0) { throw "pnputil failed: $LASTEXITCODE" }
+$serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+$parametersKey = Join-Path $serviceKey 'Parameters'
+$parametersInstancesKey = Join-Path $parametersKey 'Instances'
+$legacyInstancesKey = Join-Path $serviceKey 'Instances'
+$instanceName = 'PersonalSafer Instance'
+$altitude = '379950'
+
+New-Item -Path $serviceKey -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name DisplayName -Value 'PersonalSafer Security Minifilter' -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name Description -Value 'PersonalSafer file and network security minifilter' -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name Type -Value 2 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name Start -Value 3 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name ErrorControl -Value 1 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name ImagePath -Value '\SystemRoot\System32\drivers\PersonalSafer.sys' -PropertyType ExpandString -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name Group -Value 'FSFilter Activity Monitor' -PropertyType String -Force | Out-Null
+New-ItemProperty -Path $serviceKey -Name DependOnService -Value @('FltMgr') -PropertyType MultiString -Force | Out-Null
+
+New-Item -Path $parametersKey -Force | Out-Null
+New-ItemProperty -Path $parametersKey -Name SupportedFeatures -Value 3 -PropertyType DWord -Force | Out-Null
+foreach ($instancesKey in @($parametersInstancesKey, $legacyInstancesKey)) {
+    $instanceKey = Join-Path $instancesKey $instanceName
+    New-Item -Path $instanceKey -Force | Out-Null
+    New-ItemProperty -Path $instancesKey -Name DefaultInstance -Value $instanceName -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $instanceKey -Name Altitude -Value $altitude -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $instanceKey -Name Flags -Value 0 -PropertyType DWord -Force | Out-Null
 }
 
-Write-Host "Starting driver service: $serviceName" -ForegroundColor Yellow
-& sc.exe start $serviceName
-if ($LASTEXITCODE -ne 0) { throw "sc.exe start failed: $LASTEXITCODE" }
+if (-not $SkipStart) {
+    Write-Host "Starting driver service: $serviceName" -ForegroundColor Yellow
+    & fltmc.exe load $serviceName
+    if ($LASTEXITCODE -ne 0) { throw "fltmc load failed: $LASTEXITCODE" }
+}
 
-Write-Host '=== Driver installed and started successfully ===' -ForegroundColor Green
+Write-Host '=== Driver files and service registry installed successfully ===' -ForegroundColor Green

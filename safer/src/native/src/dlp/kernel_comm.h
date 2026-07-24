@@ -14,17 +14,22 @@ struct KernelCommState {
     HANDLE deviceHandle;
     HANDLE pipeHandle;
     bool isConnected;
+    bool canControl;
     bool isPipeConnected;
+    DWORD lastErrorCode;
+    std::string lastErrorStage;
     std::string lastError;
 
     KernelCommState() : deviceHandle(INVALID_HANDLE_VALUE),
                         pipeHandle(INVALID_HANDLE_VALUE),
-                        isConnected(false), isPipeConnected(false) {}
+                        isConnected(false), canControl(false),
+                        isPipeConnected(false), lastErrorCode(ERROR_SUCCESS) {}
 };
 
 Napi::Object InitKernelCommAddon(Napi::Env env, Napi::Object exports);
 Napi::Value ConnectToDevice(const Napi::CallbackInfo& info);
 Napi::Value DisconnectFromDevice(const Napi::CallbackInfo& info);
+Napi::Value GetConnectionState(const Napi::CallbackInfo& info);
 Napi::Value SendIoctl(const Napi::CallbackInfo& info);
 Napi::Value GetDriverStatus(const Napi::CallbackInfo& info);
 Napi::Value WaitForEvents(const Napi::CallbackInfo& info);

@@ -61,6 +61,7 @@ export const useDlpStore = defineStore('dlp', () => {
     fileExtensions: ['.exe', '.dll', '.docx', '.xlsx', '.pdf', '.zip']
   })
   const loading = ref(false)
+  const operationPending = ref(false)
 
   const statusText = ref('未连接')
 
@@ -130,7 +131,7 @@ export const useDlpStore = defineStore('dlp', () => {
   }
 
   async function loadDriver() {
-    loading.value = true
+    operationPending.value = true
     try {
       const result = await window.saferAPI.dlp.loadDriver()
       if (result.success) {
@@ -138,13 +139,19 @@ export const useDlpStore = defineStore('dlp', () => {
       }
       return result
     } finally {
-      loading.value = false
+      operationPending.value = false
     }
   }
 
   async function unloadDriver() {
-    await window.saferAPI.dlp.unloadDriver()
-    await loadStatus()
+    operationPending.value = true
+    try {
+      const result = await window.saferAPI.dlp.unloadDriver()
+      await loadStatus()
+      return result
+    } finally {
+      operationPending.value = false
+    }
   }
 
   async function savePolicy(newPolicy: DlpPolicy) {
@@ -196,7 +203,7 @@ export const useDlpStore = defineStore('dlp', () => {
   }
 
   return {
-    status, policy, loading, statusText,
+    status, policy, loading, operationPending, statusText,
     loadStatus, loadPolicy, loadDriver, unloadDriver, savePolicy,
     startAutoRefresh, stopAutoRefresh
   }
