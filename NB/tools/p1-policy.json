@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "fixed_exit": "kz-1",
+  "tenants": [
+    {"name": "nbmobile", "max_tcp": 256, "max_udp": 64, "rate_kbps": 20000, "quota_mb": 0}
+  ],
+  "routes": [
+    {"name": "kz-primary", "host": "2.135.147.106", "port": 4443, "weight": 1, "capacity": 512, "fixed_exit": "kz-1"}
+  ]
+}

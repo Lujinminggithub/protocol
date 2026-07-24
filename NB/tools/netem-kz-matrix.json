@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {"name": "loss-0", "category": "loss", "loss_pct": 0},
+    {"name": "loss-1", "category": "loss", "loss_pct": 1},
+    {"name": "loss-2", "category": "loss", "loss_pct": 2},
+    {"name": "loss-3", "category": "loss", "loss_pct": 3},
+    {"name": "loss-5", "category": "loss", "loss_pct": 5},
+    {"name": "loss-8", "category": "loss", "loss_pct": 8},
+    {"name": "delay-20", "category": "delay", "delay_ms": 20},
+    {"name": "delay-40", "category": "delay", "delay_ms": 40},
+    {"name": "delay-60", "category": "delay", "delay_ms": 60},
+    {"name": "delay-80", "category": "delay", "delay_ms": 80},
+    {"name": "delay-120", "category": "delay", "delay_ms": 120},
+    {"name": "jitter-5", "category": "jitter", "delay_ms": 20, "jitter_ms": 5},
+    {"name": "jitter-10", "category": "jitter", "delay_ms": 20, "jitter_ms": 10},
+    {"name": "jitter-20", "category": "jitter", "delay_ms": 20, "jitter_ms": 20},
+    {"name": "jitter-40", "category": "jitter", "delay_ms": 40, "jitter_ms": 40},
+    {"name": "reorder-1", "category": "reorder", "delay_ms": 20, "reorder_pct": 1},
+    {"name": "reorder-3", "category": "reorder", "delay_ms": 20, "reorder_pct": 3},
+    {"name": "reorder-5", "category": "reorder", "delay_ms": 20, "reorder_pct": 5},
+    {"name": "reorder-10", "category": "reorder", "delay_ms": 20, "reorder_pct": 10}
+  ]
+}

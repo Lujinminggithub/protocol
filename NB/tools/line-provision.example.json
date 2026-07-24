@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "headroom_ratio": 1.25,
+    "probe": {
+      "duration": 90,
+      "ping_samples": 30
+    }
+  },
+  "lines": [
+    {
+      "line_id": "gz-hk-kz-5m-01",
+      "hosts_file": "tools/lab-hosts.json",
+      "baseline_profile": "tools/line-profiles/gz-hk-kz.json",
+      "package_mbps": 5,
+      "client": {
+        "name": "NB-KZ-5M-01",
+        "port": 1080,
+        "username": "nbmobile",
+        "password_env": "NB_CLIENT_PASSWORD_KZ_01"
+      }
+    }
+  ]
+}

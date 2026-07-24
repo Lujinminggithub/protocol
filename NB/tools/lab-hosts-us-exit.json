@@ -1,0 +1,20 @@
+{
+  "entry":  {"name":"gz-170", "host":"106.75.134.170", "domain":"tgg1.linkbobo.com", "port":22, "user":"root", "password_env":"NB_SSH_PASSWORD_ENTRY"},
+  "middle": {"name":"hk-37", "host":"152.32.187.37", "port":22, "user":"root", "password_env":"NB_SSH_PASSWORD_MIDDLE"},
+  "exit":   {"name":"us-154-44-88-2", "host":"154.44.88.2", "port":22, "user":"root", "password_env":"NB_SSH_PASSWORD_EXIT", "outip":"154.44.88.184"},
+  "build_host": "entry",
+  "release_retention": 5,
+  "client": {"socks_port":1023, "udp_port_min":20000, "udp_port_max":21023},
+  "workers": {"entry":1, "middle":1, "exit":2},
+  "transport": {
+    "entry":  {"cc":"cubic", "cwin_max_bytes":524288, "mtu_max":1452, "udp_gso":false, "udp_port_min":20000, "udp_port_max":21023, "reorder_gap":128, "reorder_delay_us":450000},
+    "middle": {"cc":"bbr", "bbr_options":"Q0.0001:F0.25:", "mtu_max":1452, "udp_gso":false, "reorder_gap":128, "reorder_delay_us":450000},
+    "exit":   {"cc":"bbr", "bbr_options":"Q0.0001:", "mtu_max":1452, "udp_gso":false}
+  },
+  "paths": {
+    "compile_dir":"/opt/compile",
+    "work_dir":"/etc/NB",
+    "picoquic":"/etc/NB/third_party/picoquic",
+    "certs":"/etc/NB/certs"
+  }
+}

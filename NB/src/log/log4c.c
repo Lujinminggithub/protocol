@@ -517,8 +517,10 @@ static void log4c_cleanup_directory(void)
                 files = tmp;
             }
 
-            strncpy(files[count].path, fpath, sizeof(files[count].path) - 1);
-            files[count].path[sizeof(files[count].path) - 1] = '\0';
+            size_t path_len = strlen(fpath);
+            if (path_len >= sizeof(files[count].path)) path_len = sizeof(files[count].path) - 1;
+            memcpy(files[count].path, fpath, path_len);
+            files[count].path[path_len] = '\0';
             files[count].mtime = st.st_mtime;
             files[count].size = (unsigned long long)st.st_size;
             count++;
@@ -568,8 +570,10 @@ static void log4c_cleanup_directory(void)
             files = tmp;
         }
 
-        strncpy(files[count].path, fpath, sizeof(files[count].path) - 1);
-        files[count].path[sizeof(files[count].path) - 1] = '\0';
+        size_t path_len = strlen(fpath);
+        if (path_len >= sizeof(files[count].path)) path_len = sizeof(files[count].path) - 1;
+        memcpy(files[count].path, fpath, path_len);
+        files[count].path[path_len] = '\0';
         files[count].mtime = st.st_mtime;
         files[count].size = (unsigned long long)st.st_size;
         count++;

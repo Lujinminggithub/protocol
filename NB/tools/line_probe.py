@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -130,11 +131,18 @@ def recommend(summary: dict, current: dict, target_mbps: float,
     bdp = target_mbps * 1_000_000 / 8.0 * rtt / 1000.0
     cwin = int(max(256 * 1024, min(8 * 1024 * 1024, bdp * 2.0)))
     cwin = int(math.ceil(cwin / 65536.0) * 65536)
+    current_cwin = int(current.get("cwin_max_bytes", 0) or 0)
+    if current.get("cc") == "cubic":
+        cwin = max(cwin, current_cwin)
 
     observed_gap = summary["reorder_gap_max"]
     observed_delay = summary["reorder_delay_max_ms"]
     gap = max(3, int(math.ceil(observed_gap * 1.25)))
     delay_ms = max(2.0 * rtt, observed_delay * 1.25 + max(10.0, 0.25 * rtt))
+    # A short clean probe can justify adding protection, but cannot prove that an
+    # existing reordering allowance is safe to remove.
+    gap = max(gap, int(current.get("reorder_gap", 0) or 0))
+    delay_ms = max(delay_ms, int(current.get("reorder_delay_us", 0) or 0) / 1000.0)
     gap = min(1024, gap)
     delay_us = min(1_000_000, int(math.ceil(delay_ms) * 1000))
 
@@ -172,6 +180,27 @@ def recommend(summary: dict, current: dict, target_mbps: float,
     }
 
 
+def evaluate_admission(active_probe: dict | None, target_mbps: float,
+                       min_throughput_ratio: float = 0.90) -> dict:
+    reasons = []
+    active_probe = active_probe or {}
+    integrity = active_probe.get("integrity") or {}
+    load = active_probe.get("load") or {}
+    achieved = float(load.get("achieved_mbps", 0) or 0)
+    if integrity.get("integrity") != "ok":
+        reasons.append("payload-integrity")
+    if load.get("integrity") != "count-ok":
+        reasons.append("load-integrity")
+    if achieved < target_mbps * min_throughput_ratio:
+        reasons.append("insufficient-throughput")
+    return {
+        "status": "admitted" if not reasons else "rejected",
+        "reasons": reasons,
+        "target_mbps": target_mbps,
+        "achieved_mbps": achieved,
+        "throughput_ratio": achieved / target_mbps if target_mbps > 0 else 0.0,
+        "minimum_throughput_ratio": min_throughput_ratio,
+    }
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -182,13 +211,13 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def socks_connect(host: str, port: int, target: str) -> socket.socket:
+def socks_connect(host: str, port: int, target: str, io_timeout: float = 30) -> socket.socket:
     username = os.environ.get("NB_SOCKS_USERNAME", "").encode()
     password = os.environ.get("NB_SOCKS_PASSWORD", "").encode()
     if not username or not password or len(username) > 255 or len(password) > 255:
         raise RuntimeError("主动探针需要 NB_SOCKS_USERNAME 和 NB_SOCKS_PASSWORD")
     sock = socket.create_connection((host, port), timeout=15)
-    sock.settimeout(30)
+    sock.settimeout(io_timeout)
     sock.sendall(b"\x05\x01\x02")
     if recv_exact(sock, 2) != b"\x05\x02":
         sock.close(); raise RuntimeError("SOCKS 服务未接受用户名认证")
@@ -212,10 +241,11 @@ def socks_connect(host: str, port: int, target: str) -> socket.socket:
     return sock
 
 
-def run_integrity_probe(entry_host: str, socks_port: int, size: int = 256 * 1024) -> dict:
+def run_integrity_probe(entry_host: str, socks_port: int, size: int = 256 * 1024,
+                        io_timeout: float = 30) -> dict:
     payload = bytes((index * 31 + 17) & 0xff for index in range(4096))
     expected = (payload * math.ceil(size / len(payload)))[:size]
-    sock = socks_connect(entry_host, socks_port, PROBE_ECHO_HOST)
+    sock = socks_connect(entry_host, socks_port, PROBE_ECHO_HOST, io_timeout)
     started = time.monotonic(); sock.sendall(expected); sock.shutdown(socket.SHUT_WR)
     received = bytearray()
     while True:
@@ -228,12 +258,13 @@ def run_integrity_probe(entry_host: str, socks_port: int, size: int = 256 * 1024
     return {"bytes": size, "elapsed_s": elapsed, "integrity": "ok"}
 
 
-def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duration_s: int) -> dict:
-    sock = socks_connect(entry_host, socks_port, PROBE_SINK_HOST)
+def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duration_s: int,
+                   stop_event=None, io_timeout: float = 30) -> dict:
+    sock = socks_connect(entry_host, socks_port, PROBE_SINK_HOST, io_timeout)
     chunk = bytes((index * 13 + 29) & 0xff for index in range(16 * 1024))
     target_bytes = int(target_mbps * 1_000_000 / 8.0 * duration_s)
     started = time.monotonic(); sent = 0
-    while sent < target_bytes:
+    while sent < target_bytes and not (stop_event and stop_event.is_set()):
         now = time.monotonic()
         allowed = int(target_mbps * 1_000_000 / 8.0 * (now - started + 0.02))
         if sent >= allowed:
@@ -253,19 +284,32 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
     if received != sent:
         raise RuntimeError(f"主动探针计数失败: sent={sent} exit={received} response={response[:100]!r}")
     return {"bytes": sent, "elapsed_s": elapsed,
-        "achieved_mbps": sent * 8.0 / elapsed / 1_000_000.0, "integrity": "count-ok"}
+        "achieved_mbps": sent * 8.0 / elapsed / 1_000_000.0,
+        "integrity": "cancelled" if stop_event and stop_event.is_set() else "count-ok"}
+
+
+def remote_log_path(connection, role: str) -> str:
+    command = (
+        f"bin=$(readlink -f {deploy.WORK}/nb_node 2>/dev/null); "
+        "dir=$(dirname \"$bin\"); "
+        f"if test -f \"$dir/cfg/log4c.json\"; then echo {deploy.WORK}/logs/nb-{role}.log; "
+        f"else echo \"$dir/logs/nb-{role}.log\"; fi"
+    )
+    return deploy.run(connection, command).strip()
 
 
 def log_offset(role: str) -> int:
     connection = deploy.connect(role)
-    value = deploy.run(connection, f"wc -c < {deploy.WORK}/logs/nb-{role}.log").strip()
+    path = remote_log_path(connection, role)
+    value = deploy.run(connection, f"wc -c < {path}").strip()
     connection.close()
     return int(value or 0)
 
 
 def log_since(role: str, offset: int) -> str:
     connection = deploy.connect(role)
-    text = deploy.run(connection, f"tail -c +{offset + 1} {deploy.WORK}/logs/nb-{role}.log")
+    path = remote_log_path(connection, role)
+    text = deploy.run(connection, f"tail -c +{offset + 1} {path}")
     connection.close()
     return text
 
@@ -326,16 +370,29 @@ def collect_segment(source_role: str, target: str, samples: int, target_mbps: fl
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ping-samples", type=int, default=30)
-    parser.add_argument("--target-mbps", type=float, default=10.0)
+    rate = parser.add_mutually_exclusive_group()
+    rate.add_argument("--target-mbps", type=float,
+        help="直接指定主动探针速率；兼容旧调用，不代表可售套餐")
+    rate.add_argument("--package-mbps", type=float,
+        help="待开通套餐带宽，探针会按 headroom 倍率做容量准入")
+    parser.add_argument("--headroom-ratio", type=float, default=1.25,
+        help="套餐容量资格测试余量，默认 1.25")
     parser.add_argument("--active", action="store_true", help="通过真实三跳 QUIC 产生受控负载")
     parser.add_argument("--duration", type=int, default=90, help="主动负载持续秒数")
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
+    if args.headroom_ratio < 1.0 or args.headroom_ratio > 2.0:
+        raise SystemExit("--headroom-ratio 必须在 1.0..2.0")
+    package_mbps = args.package_mbps
+    target_mbps = (package_mbps * args.headroom_ratio if package_mbps is not None
+                   else (args.target_mbps if args.target_mbps is not None else 10.0))
+    if package_mbps is not None and (package_mbps < 1.0 or package_mbps > 1000):
+        raise SystemExit("--package-mbps 必须在 1..1000")
     if args.ping_samples < 10 or args.ping_samples > 300:
         raise SystemExit("--ping-samples 必须在 10..300")
-    if args.target_mbps <= 0.1 or args.target_mbps > 1000:
-        raise SystemExit("--target-mbps 必须在 0.1..1000")
+    if target_mbps <= 0.1 or target_mbps > 2000:
+        raise SystemExit("探针目标速率必须在 0.1..2000 Mbps")
     if args.duration < 10 or args.duration > 600:
         raise SystemExit("--duration 必须在 10..600")
 
@@ -348,19 +405,19 @@ def main() -> None:
         offsets = {role: log_offset(role) for role in ("entry", "middle")}
         integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
         load = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
-            args.target_mbps, args.duration)
+            target_mbps, args.duration)
         time.sleep(12)
         active_logs = {role: log_since(role, offsets[role]) for role in offsets}
         active_result = {"integrity": integrity, "load": load}
 
-    entry_segment = collect_segment("entry", middle_target, args.ping_samples, args.target_mbps)
-    middle_segment = collect_segment("middle", exit_host["host"], args.ping_samples, args.target_mbps)
+    entry_segment = collect_segment("entry", middle_target, args.ping_samples, target_mbps)
+    middle_segment = collect_segment("middle", exit_host["host"], args.ping_samples, target_mbps)
     if active_logs is not None:
         for role, segment in (("entry", entry_segment), ("middle", middle_segment)):
             summary = summarize_linkq(parse_linkq(active_logs[role]))
             segment["quic"] = summary
             segment["candidate"] = recommend(summary,
-                deploy.LAB.get("transport", {}).get(role, {}), args.target_mbps,
+                deploy.LAB.get("transport", {}).get(role, {}), target_mbps,
                 segment.get("mtu"))
 
     result = {
@@ -370,7 +427,19 @@ def main() -> None:
         "fixed_exit": exit_host["name"],
         "probe_mode": "active-quic" if args.active else "passive-runtime",
         "status": "candidate",
+        "baseline_hosts_sha256": hashlib.sha256(deploy.LAB_FILE.read_bytes()).hexdigest(),
+        "baseline_profile_sha256": hashlib.sha256(deploy.LINE_PROFILE.read_bytes()).hexdigest() if deploy.LINE_PROFILE.is_file() else None,
         "active_probe": active_result,
+        "service_package": {
+            "committed_mbps": package_mbps,
+            "qualification_mbps": target_mbps,
+            "headroom_ratio": args.headroom_ratio if package_mbps is not None else None,
+        },
+        "admission": evaluate_admission(active_result, target_mbps) if args.active else {
+            "status": "not-evaluated",
+            "reasons": ["active-quic-required"],
+            "target_mbps": target_mbps,
+        },
         "segments": {
             "entry_middle": entry_segment,
             "middle_exit": middle_segment,

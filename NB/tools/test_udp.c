@@ -22,6 +22,10 @@ int main(void){
     CHECK(complete.payload_length==sizeof(source));CHECK(memcmp(complete.payload,source,sizeof(source))==0);
     CHECK(strcmp(complete.route,route)==0);nb_udp_reassembly_dispose(&rs);
 
+    { uint8_t payload=0;int n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_CLOSE,7,0,0,1,1,
+          route,strlen(route),&payload,1);nb_udp_wire_view_t view;
+      CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0&&view.type==NB_UDP_TYPE_CLOSE); }
+
     uint8_t socks[3000];int sn=nb_socks_udp_encode(socks,sizeof(socks),"rtc.example",443,source,100);
     CHECK(sn>0);char host[256];int port=0;const uint8_t* payload=NULL;size_t payload_len=0;
     CHECK(nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)==0);

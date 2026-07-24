@@ -1,31 +1,6 @@
-/*
- * Newbility(NB) 传输节点 —— 统一 entry / middle / exit 三角色
- *
- * 基于 picoquic(BBRv2) 的 TCP-over-QUIC 隧道节点。一份二进制,靠 -r 选角色:
- *   entry : 本地 TCP listen/accept, 复用一条到第一跳的 QUIC 长连接,
- *           每个 TCP 连接开一个 QUIC bidi stream, stream 首部发 source-route,
- *           TCP <-> QUIC stream 双向泵。
- *   middle: QUIC server 收上一跳 stream, 读首部第一段 H:host:port ->
- *           动态连下一跳 QUIC(地址来自首部,不预配), 转发剩余 route + 数据,
- *           上游 QUIC stream <-> 下游 QUIC stream 双向转发。中间节点无状态,
- *           路径完全由 entry 下发的 route 决定(适配"卖线路/动态选路")。
- *   exit  : QUIC server 收上一跳 stream, 读首部第一段 T:host:port ->
- *           connect 目标 TCP, QUIC stream <-> 目标 TCP 双向泵。
- *
- * source-route 首部(stream 第一行文本 + '\n'), 语义 = 接收节点出发的剩余路径:
- *   "H:nexthop:qport,...,T:targethost:targetport"
- *   H: 前缀 = 下一 QUIC 跳的地址(middle 消费第一个 H, 转发其余);
- *   T: 前缀 = 最终 TCP 目标(exit 消费)。
- *   两跳(entry 直连 exit): route 仅含 "T:target:port"(无 H)。
- *
- * 自定义事件循环: select(udp_fd + tcp_fds), 用 picoquic_incoming_packet /
- * picoquic_prepare_next_packet / picoquic_get_next_wake_delay 驱动 QUIC。
- *
- * 统一数据模型(left = 靠 client 一侧, right = 靠 target 一侧):
- *   entry : left=TCP(客户端)      right=下游 QUIC(第一跳)
- *   middle: left=上游 QUIC(上一跳) right=下游 QUIC(下一跳)
- *   exit  : left=上游 QUIC(上一跳) right=TCP(目标)
- */
+/* NB entry/middle/exit unified node. Source route format:
+ * H:next-hop:port,...,T:target:port. The epoll loop drives picoquic and
+ * bridges the client side to the target side through prepare_to_send. */
 #include <stdint.h>
 #include <limits.h>
 #include <stdio.h>
@@ -60,11 +35,23 @@
 #include "nb_fec.h"
 #include "nb_ring.h"
 #include "nb_auth.h"
+#include "nb_auth_async.h"
+#include "nb_tenant.h"
 #include "nb_control.h"
 #include "nb_routes.h"
 #include "nb_policy.h"
 #include "nb_live.h"
+#include "nb_metrics.h"
+#include "nb_session_index.h"
+#include "nb_session.h"
+#include "nb_runtime.h"
+#include "nb_bridge.h"
+#include "nb_send.h"
+#include "nb_path.h"
+#include "nb_dns.h"
 #include "nb_udp.h"
+#include "nb_udp_lifecycle.h"
+#include "nb_whitelist.h"
 #include "log/log4c.h"
 
 #define NB_ALPN "nb/1"          /* Newbility(NB) 新传输协议 ALPN */
@@ -73,7 +60,7 @@
 #define NB_PROBE_SINK_HOST "nb-probe-sink.internal"
 #define NB_PROBE_ECHO_HOST "nb-probe-echo.internal"
 #define BUFCAP (256*1024)
-#define MAX_CONN 1024
+#define MAX_CONN NB_MAX_CONNECTIONS
 #define NB_Q2T_MAX (16*1024*1024)   /* 过载保护: 单流 q2t 待写缓冲硬上限 16MB, 超限=对端TCP卡死 */
 #define NB_QTX_MAX (16*1024*1024)   /* 过载保护: 单流 QUIC 侧应用发送缓冲硬上限 16MB */
 #define NB_TCP_TX_HIGH (2*1024*1024)
@@ -86,8 +73,8 @@
 #define NB_ROUTE_BOOTSTRAP_PRIO 0       /* latency 流仅在发送 route header 时临时提权 */
 #define IDLE_TIMEOUT_US (120*1000000ULL)  /* 流空闲(无数据)超时兜底回收, 防僵尸流累积拖死复用连接 */
 #define SOCKS_AUTH_CACHE_TTL_US (300*1000000ULL)
-#define POOL_SIZE 1                        /* A/B 稳定基线：每跳仅一个 QUIC 拥塞控制实例 */
-#define NB_MAX_POOLS 8
+#define POOL_SIZE NB_POOL_SIZE              /* A/B 稳定基线：每跳仅一个 QUIC 拥塞控制实例 */
+#define NB_MAX_POOLS NB_MAX_PATH_POOLS
 #define BULK_POOL_START 3                  /* 批量流优先使用后半池；实时流可选择全池 */
 #define NB_FEC_CTRL_PREFIX "FC:"
 #define NB_FEC_CTRL_START  "FC:START"
@@ -103,222 +90,17 @@ typedef enum {
     nb_fec_dgram_source = 3,
     nb_fec_dgram_repair = 4
 } nb_fec_dgram_type_t;
-
-typedef enum { ROLE_ENTRY = 0, ROLE_MIDDLE = 1, ROLE_EXIT = 2 } nb_role_t;
-
 /* 每条被代理的流: left 侧 <-> right 侧, 双向缓冲/配对。 */
-typedef struct proxy_stream {
-    int in_use;
-    uint32_t id;                 /* 本地流水号(日志追踪用) */
-    /* 上游(left) QUIC: middle/exit 收上一跳的 server stream */
-    picoquic_cnx_t* up_cnx;
-    uint64_t up_stream_id;
-    /* 下游(right) QUIC: entry/middle 到下一跳的 client stream */
-    picoquic_cnx_t* down_cnx;
-    uint64_t down_stream_id;
-    int down_pool_idx;            /* 该下游主 stream 所在连接池槽位, 供附加控制流复用 */
-    int down_pool_id;             /* 下一跳连接池注册表索引 */
-    int down_opened;             /* 下游 stream 首部已发 */
-    /* TCP: entry=客户端 conn; exit=目标 conn; -1=无 */
-    int tcp_fd;
-    int tcp_connecting;          /* exit: 非阻塞 connect 进行中 */
-    /* 首部解析(middle/exit 收 up 首部) */
-    int hdr_done;
-    char hdr[600];
-    size_t hdr_len;
-    /* qtx: 面向 QUIC 的待发送缓冲。V1.5 起主数据路径改走 prepare_to_send，避免 add_to_stream
-     * 额外排队复制。down_tx=left->right(发下游), up_tx=right->left(写回上游)。 */
-    nb_ring_t down_tx;
-    nb_live_queue_clock_t down_tx_clock;
-    int down_tx_fin;
-    uint8_t down_prefix[420];
-    size_t down_prefix_len;
-    size_t down_prefix_off;
-    nb_ring_t up_tx;
-    nb_live_queue_clock_t up_tx_clock;
-    int up_tx_fin;
-    /* q2t: 面向 TCP 的待写缓冲(entry 写回客户端 / exit 写目标)。动态增长, 永不丢数据;
-     * 总量上限由 QUIC connection flow control(max_data) 自然背压 */
-    nb_ring_t q2t;
-    nb_live_queue_clock_t q2t_clock;
-    int q2t_fin;                 /* 待对 TCP 做半关 */
-    int need_teardown;           /* 过载保护: q2t 超限, 主循环兜底回收(不在回调栈内拆) */
-    int tcp_eof;                 /* 本地 TCP 读到 EOF */
-    int tcp_read_paused;
-    int upstream_fc_enabled;
-    int upstream_fc_blocked;
-    int probe_mode;              /* exit 内部探针: 1=sink/count, 2=echo */
-    uint64_t probe_bytes;
-    /* fin 追踪(去程 left->right, 回程 right->left) */
-    int up_fin_seen;             /* 收到 left QUIC fin(仅 middle/exit) */
-    int down_fin_seen;           /* 收到 right QUIC fin(仅 entry/middle) */
-    char route[300];             /* 本 stream 的 route 首部(日志) */
-    uint64_t last_active;        /* 最近一次有数据活动的时刻(us), 空闲超时兜底回收用 */
-    int dns_pending;             /* exit: 该流的 target 域名正在异步 DNS 解析中 */
-    int target_port;             /* exit: DNS 解析完成后 connect 用的端口 */
-    int prio;                    /* 流优先级(例如 ctrl=2 / media=4 / bulk=20), 首部 <prio>; 端到端传递 */
-    nb_flow_class_t flow_class;  /* 白名单通过后, TikTok 内部分流分类(ctrl/media/bulk/unknown) */
-    nb_flow_lane_t lane_hint;    /* 分流器给出的 lane 建议(latency/bulk) */
-    nb_flow_fec_t fec_hint;      /* 分流器给出的 FEC 建议(auto/off/force) */
-    char flow_rule[64];          /* 命中的 TikTok 规则名 */
-    /* ===== V1.5 纠错型 FEC sidecar 骨架 =====
-     * 保持当前 TCP-over-QUIC 主路径不变，在坏跳 middle<->exit 内部额外建立：
-     * 1) 一条可靠控制流(FEC START/ACK/NACK/RETX/FIN/RST)
-     * 2) 一条连接级 datagram sidecar(先打通 HELLO/ACK 骨架，后续再承载 source/repair symbol) */
-    int fec_sidecar_mode;        /* 当前逻辑流是否已切换为 V1.5 sidecar 数据面 */
-    int fec_ctrl_only;           /* 该 ps 仅服务于 FEC 控制流(如 exit 收到的控制会话) */
-    uint32_t fec_session_id;     /* V1.5 FEC 会话 ID */
-    picoquic_cnx_t* fec_ctrl_cnx;/* middle 本地额外打开的 FEC 控制流所在线路 */
-    uint64_t fec_ctrl_stream_id;
-    int fec_ctrl_opened;
-    int fec_ctrl_peer_ready;
-    int fec_rx_to_down;          /* sidecar 接收恢复后应继续往下游转发(如 entry->middle 保护段) */
-    char fec_route[300];         /* sidecar 会话携带的坏跳目标 route(一般为 T:host:port) */
-    char fec_ctrl_rxbuf[4096];
-    size_t fec_ctrl_rxlen;
-    picoquic_cnx_t* fec_dg_cnx;  /* sidecar datagram 所属连接(目前与控制流/坏跳数据流同 cnx) */
-    uint8_t* fec_dg_tx;
-    size_t fec_dg_tx_len;
-    size_t fec_dg_tx_cap;
-    uint8_t* fec_stage_tx;
-    size_t fec_stage_tx_len;
-    size_t fec_stage_tx_cap;
-    int fec_stage_tx_fin;
-    uint64_t fec_dg_sent;
-    uint64_t fec_dg_recv;
-    uint64_t fec_dg_acked;
-    uint64_t fec_dg_lost;
-    nb_fec_session_t* fec_engine;
-    /* SOCKS5 入口(仅 entry -S): 握手阶段 0=greeting 1=request 2=直通 */
-    int socks_stage;
-    uint8_t socks_buf[512];
-    size_t socks_len;
-    uint64_t created_at;
-    uint64_t first_c2s_at;
-    uint64_t first_s2c_at;
-    uint64_t bytes_c2s;
-    uint64_t bytes_s2c;
-    uint64_t media_metrics_at;
-    uint64_t media_metrics_c2s;
-    uint64_t media_metrics_s2c;
-    size_t media_down_q_peak;
-    size_t media_up_q_peak;
-    size_t media_q2t_peak;
-    unsigned int high_uplink_windows;
-    nb_live_flow_runtime_t live_runtime;
-    int sched_throttled;
-    uint64_t target_connect_at;
-    uint64_t target_connect_done_at;
-    uint64_t socks_greeting_at;
-    uint64_t socks_auth_at;
-    uint64_t socks_request_at;
-    uint64_t downstream_open_at;
-    uint64_t down_prefix_queued_at;
-    uint64_t down_prefix_prepare_at;
-    uint64_t first_down_queue_at;
-    uint64_t first_down_prepare_at;
-    uint64_t first_up_queue_at;
-    uint64_t first_up_prepare_at;
-    uint64_t first_q2t_queue_at;
-    uint64_t first_q2t_flush_at;
-    int target_connect_state;    /* 0=n/a, 1=pending, 2=ok, 3=failed */
-    char peer_addr[96];
-    char close_reason[48];
-    int udp_mode;
-    int udp_association;
-    int udp_fd;
-    uint32_t udp_session_id;
-    uint32_t udp_parent_id;
-    uint32_t udp_tx_sequence;
-    char udp_target_host[256];
-    int udp_target_port;
-    struct sockaddr_storage udp_tcp_peer;
-    socklen_t udp_tcp_peer_len;
-    struct sockaddr_storage udp_client_peer;
-    socklen_t udp_client_peer_len;
-    int udp_client_peer_set;
-    uint8_t* udp_down_tx;
-    size_t udp_down_tx_len;
-    size_t udp_down_tx_cap;
-    uint8_t* udp_up_tx;
-    size_t udp_up_tx_len;
-    size_t udp_up_tx_cap;
-    uint8_t* udp_pending_tx;
-    size_t udp_pending_tx_len;
-    size_t udp_pending_tx_cap;
-    nb_udp_reassembly_t udp_reassembly;
-    uint64_t udp_packets_c2s;
-    uint64_t udp_packets_s2c;
-    uint64_t udp_assoc_raw_rx;
-    uint64_t udp_assoc_reject_ip;
-    uint64_t udp_assoc_malformed;
-    uint64_t udp_assoc_policy_drop;
-    uint64_t udp_assoc_first_raw_at;
-    uint64_t udp_control_closed_at;
-    uint64_t udp_first_local_c2s_at;
-    uint64_t udp_first_c2s_rx_at;
-    uint64_t udp_first_c2s_prepare_at;
-    uint64_t udp_target_ready_at;
-    uint64_t udp_first_target_send_at;
-    uint64_t udp_first_target_rx_at;
-    uint64_t udp_first_s2c_rx_at;
-    uint64_t udp_first_s2c_prepare_at;
-    uint64_t udp_first_local_s2c_at;
-} proxy_stream_t;
 
 /* 到下一跳的 QUIC 连接池: 每条连接独立 congestion window / pacing / flow-control,
  * 新 stream round-robin 分散到各连接, 使总吞吐叠加而非稀释, 且单连接故障/僵死不影响全局。 */
-typedef struct cnx_pool {
-    picoquic_cnx_t* cnx[POOL_SIZE];  /* 池中连接(NULL=空槽, 待建/已关) */
-    uint64_t next_sid[POOL_SIZE];    /* 每条连接独立的 client bidi stream id 分配 0,4,8... */
-    struct sockaddr_storage addr;    /* 下一跳地址 */
-    int configured;                  /* addr 已配、池已初始化 */
-    int rr;                          /* 批量道 round-robin 游标 */
-    int rr_lat;                      /* 直播专用道 round-robin 游标 */
-    double recent_loss[POOL_SIZE];   /* 最近一个采样窗(增量)的有效丢包率(%) */
-    uint64_t recent_rtt[POOL_SIZE];  /* 最近一次 linkq 采样的 RTT(us) */
-    uint64_t recent_rtt_max[POOL_SIZE]; /* 最近一次 linkq 采样的最大 RTT(us) */
-    uint64_t recent_sent[POOL_SIZE]; /* 最近一个采样窗(增量)的发包数 */
-    uint64_t last_sent_total[POOL_SIZE]; /* 上次采样时的累计 sent */
-    uint64_t last_lost_total[POOL_SIZE]; /* 上次采样时的累计 lost */
-    uint64_t last_timer_total[POOL_SIZE]; /* 上次采样时的累计 timer loss */
-    uint64_t last_spurious_total[POOL_SIZE]; /* 上次采样时的累计 spurious_losses */
-    uint64_t last_retrans_total[POOL_SIZE]; /* 上次采样时的累计实际重传 */
-    uint64_t last_preempt_total[POOL_SIZE]; /* 上次采样时的累计预防性重传 */
-    uint64_t recent_rtt_var[POOL_SIZE]; /* 最近一次采样窗对应的 RTT 抖动(us) */
-    uint64_t recent_ts[POOL_SIZE];   /* 最近一次 linkq 采样时间(us), 0=暂无样本 */
-    int fec_latched;                 /* FEC 观察门控的回滞状态 */
-} cnx_pool_t;
 
-typedef struct nb_global {
-    nb_role_t role;
-    picoquic_quic_t* quic;
-    int udp_fd;                          /* QUIC UDP socket */
-    int epoll_fd;
-    int control_fd;
-    struct sockaddr_storage local_addr;  /* incoming_packet 的 addr_to */
-    struct sockaddr_storage outbound_addr; /* exit 目标 TCP 的指定源地址 */
-    int outbound_configured;
-    /* entry: 本地 TCP listen */
-    int tcp_listen_fd;
-    char route_str[300];                 /* entry: 发给第一跳的 route(固定 target 模式) */
-    int socks_enabled;                   /* entry: SOCKS5 入口(动态 target) */
-    char mid_route[256];                 /* entry SOCKS 模式: 中间跳前缀 "H:kz:4443"(可空=两跳) */
-    nb_routes_t exit_routes;
-    int exit_routes_enabled;
-    /* entry/middle: 到下一跳的 QUIC 连接池(每条独立 cwnd/pacing/flow-control, round-robin 分流) */
-    cnx_pool_t pools[NB_MAX_POOLS];
-    int pool_count;
-    struct sockaddr_storage next_addr;    /* entry: 第一跳地址(启动配, pool_init 用) */
-    int next_configured;                  /* entry: next_addr 已配 */
-    uint32_t next_ps_id;                  /* proxy_stream 流水号分配 */
-    proxy_stream_t streams[MAX_CONN];
-} nb_global_t;
 
 static nb_global_t G;
 static uint64_t g_run_id;
 static nb_auth_users_t g_socks_users;
 static int g_socks_auth_enabled=0;
+static nb_tenants_t g_tenants;static int g_tenants_enabled=0;
 static struct in_addr g_socks_udp_advertise_addr;
 static int g_socks_udp_advertise_configured=0;
 static uint16_t g_socks_udp_port_min=0;
@@ -328,6 +110,7 @@ static int g_ps_inuse=0, g_ps_peak=0;   /* 过载保护: 在用流数 + 峰值 *
 static int g_udp_gso_enabled=1;
 static uint64_t g_reorder_gap=3;
 static uint64_t g_reorder_delay_us=0;
+static nb_pool_health_config_t g_pool_health_cfg={750000ULL,5000000ULL,12000000ULL,30000000ULL};
 static int g_fec_v15_observe=1;         /* 默认只观测门控，不接管业务数据；NB_FEC_V15=off/0 可关闭观测 */
 static int g_fec_v15_active=0;          /* 仅 NB_FEC_V15_ACTIVE=on/1 显式启用 sidecar 数据面 */
 static int g_fec_v15_force=0;           /* V1.5 测试强开: 忽略 line_bad, 便于代码级测试 */
@@ -337,6 +120,9 @@ static uint64_t g_fec_v15_drop_src=0;
 static uint64_t g_fec_v15_drop_repair=0;
 static nb_fec_config_t g_fec_cfg;
 static nb_fec_metrics_t g_fec_metrics_done;
+static nb_metrics_state_t g_metrics_state;
+static nb_session_index_t g_session_index;static nb_udp_lifecycle_t g_udp_lifecycle;
+static uint64_t g_udp_control_grace_us=NB_UDP_CONTROL_GRACE_US;
 #define NB_FEC_SESSION_INDEX_CAP 2048u
 typedef struct { uint32_t sid; proxy_stream_t* stream; } nb_fec_session_index_t;
 static nb_fec_session_index_t g_fec_session_index[NB_FEC_SESSION_INDEX_CAP];
@@ -355,6 +141,10 @@ static nb_live_sched_t* sched_for_cnx(picoquic_cnx_t* cnx,int create){
     }
     return NULL;
 }
+
+static void udp_lifecycle_wake_due(uint64_t now_us){uintptr_t link;while((link=nb_udp_lifecycle_mark_due(&g_udp_lifecycle,now_us))!=0)(void)picoquic_mark_datagram_ready((picoquic_cnx_t*)link,1);}
+static int udp_lifecycle_schedule(picoquic_cnx_t* cnx,uint8_t type,uint32_t session_id,const char* route){if(cnx==NULL||session_id==0||route==NULL||!*route)return -1;uint64_t now=picoquic_current_time();int rc=nb_udp_lifecycle_schedule(&g_udp_lifecycle,(uintptr_t)cnx,type,session_id,route,now);if(rc==0)udp_lifecycle_wake_due(now);return rc;}
+static void udp_lifecycle_forget_cnx(picoquic_cnx_t* cnx){nb_udp_lifecycle_forget_link(&g_udp_lifecycle,(uintptr_t)cnx);}
 
 static void sched_forget_cnx(picoquic_cnx_t* cnx){
     for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==cnx){memset(&g_sched_cnx[i],0,sizeof(g_sched_cnx[i]));return;}
@@ -388,9 +178,11 @@ static void sched_refresh_stream(proxy_stream_t* p,uint64_t now){
     }
 }
 #define NB_EPOLL_TAG_UDP 1ULL
+#define NB_EPOLL_TAG_CLIENT_UDP 5ULL
 #define NB_EPOLL_TAG_DNS 2ULL
 #define NB_EPOLL_TAG_LISTEN 3ULL
 #define NB_EPOLL_TAG_CONTROL 4ULL
+#define NB_EPOLL_TAG_AUTH 6ULL
 #define NB_EPOLL_TAG_STREAM (1ULL<<63)
 #define NB_EPOLL_TAG_UDP_SESSION (1ULL<<62)
 
@@ -436,17 +228,9 @@ static uint32_t fec_session_id_new(void){
     return 0;
 }
 
-/* ===== 异步 DNS 子系统 =====
- * exit 的 target 域名解析(getaddrinfo)是阻塞调用; 若在单线程事件循环内同步执行, 高并发下
- * 每个新域名解析会冻结整个事件循环 -> 所有视频/直播流暂停 -> 直播规律性卡顿。
- * 改为独立 worker 线程池: 主线程提交请求 -> worker getaddrinfo -> 结果入完成队列 + self-pipe
- * 唤醒 select -> 主线程发起非阻塞 connect。用 proxy_stream 流水号 ps_id 关联(不跨线程传指针),
- * 避免解析期间流被释放的 use-after-free。 */
-#define DNS_QCAP 4096
 #define DNS_WORKERS 4
-
-typedef struct dns_req { uint32_t ps_id; int port; char host[256]; } dns_req_t;
-typedef struct dns_res { uint32_t ps_id; int port; int ok; struct sockaddr_storage addr; socklen_t addrlen; } dns_res_t;
+#define AUTH_WORKERS 4
+typedef nb_dns_result_t dns_res_t;
 
 static int queue_down(proxy_stream_t* p, const uint8_t* d, size_t n, int fin);
 static void middle_upstream_fc_set(proxy_stream_t* p, int enabled);
@@ -457,87 +241,17 @@ static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin);
 static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr);
 static int pool_get_or_create(struct sockaddr_storage* addr);
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol);
-static int fec_parse_target_route(const char* route, char* host, size_t host_cap, int* port);
+#define parse_port_strict nb_bridge_parse_port
+#define parse_target_from_route nb_bridge_parse_target
+#define fec_parse_target_route nb_bridge_parse_target_exact
+#define udp_route_consume_h nb_bridge_consume_hop
+#define dns_submit nb_dns_submit
+#define dns_pop_result nb_dns_pop
 static int epoll_tcp_update(proxy_stream_t* p, int add);
-
-static struct {
-    dns_req_t req[DNS_QCAP]; int rq_head, rq_tail;   /* 请求环形队列 */
-    dns_res_t res[DNS_QCAP]; int rs_head, rs_tail;   /* 完成环形队列 */
-    pthread_mutex_t mu; pthread_cond_t cv;
-    int pipe_rd, pipe_wr;                            /* self-pipe 唤醒主 select */
-    int started;
-} DNS;
-
-static int dns_q_next(int i){ return (i+1)%DNS_QCAP; }
-
-/* worker: 阻塞取请求 -> getaddrinfo -> 结果入完成队列 + 写 self-pipe 唤醒主循环 */
-static void* dns_worker(void* arg){
-    (void)arg;
-    for(;;){
-        dns_req_t rq;
-        pthread_mutex_lock(&DNS.mu);
-        while(DNS.rq_head==DNS.rq_tail) pthread_cond_wait(&DNS.cv,&DNS.mu);
-        rq=DNS.req[DNS.rq_head]; DNS.rq_head=dns_q_next(DNS.rq_head);
-        pthread_mutex_unlock(&DNS.mu);
-
-        struct addrinfo hints, *res=NULL; char ports[16];
-        memset(&hints,0,sizeof(hints));
-        hints.ai_family=G.outbound_configured?G.outbound_addr.ss_family:AF_UNSPEC;
-        hints.ai_socktype=SOCK_STREAM;
-        snprintf(ports,sizeof(ports),"%d",rq.port);
-        dns_res_t out; memset(&out,0,sizeof(out)); out.ps_id=rq.ps_id; out.port=rq.port;
-        if(getaddrinfo(rq.host,ports,&hints,&res)==0 && res){
-            memcpy(&out.addr,res->ai_addr,res->ai_addrlen); out.addrlen=res->ai_addrlen; out.ok=1;
-            freeaddrinfo(res);
-        }
-        pthread_mutex_lock(&DNS.mu);
-        int nt=dns_q_next(DNS.rs_tail);
-        if(nt!=DNS.rs_head){ DNS.res[DNS.rs_tail]=out; DNS.rs_tail=nt; } /* 满则丢弃, 该流靠空闲超时回收 */
-        pthread_mutex_unlock(&DNS.mu);
-        ssize_t w=write(DNS.pipe_wr,"x",1); (void)w;
-    }
-    return NULL;
-}
-
-/* 初始化 DNS 线程池 + self-pipe */
-static int dns_init(void){
-    int pf[2];
-    if(pipe(pf)!=0){ log4c_error("dns pipe fail: %s",strerror(errno)); return -1; }
-    DNS.pipe_rd=pf[0]; DNS.pipe_wr=pf[1];
-    fcntl(DNS.pipe_rd,F_SETFL,fcntl(DNS.pipe_rd,F_GETFL,0)|O_NONBLOCK);
-    fcntl(DNS.pipe_wr,F_SETFL,fcntl(DNS.pipe_wr,F_GETFL,0)|O_NONBLOCK);
-    pthread_mutex_init(&DNS.mu,NULL); pthread_cond_init(&DNS.cv,NULL);
-    for(int i=0;i<DNS_WORKERS;i++){ pthread_t t; if(pthread_create(&t,NULL,dns_worker,NULL)==0) pthread_detach(t); }
-    DNS.started=1;
-    log4c_info("async DNS: %d workers ready",DNS_WORKERS);
-    return 0;
-}
-
-/* 主线程提交解析请求(非阻塞)。0=入队, -1=队满 */
-static int dns_submit(uint32_t ps_id, const char* host, int port){
-    pthread_mutex_lock(&DNS.mu);
-    int nt=dns_q_next(DNS.rq_tail);
-    if(nt==DNS.rq_head){ pthread_mutex_unlock(&DNS.mu); return -1; }
-    DNS.req[DNS.rq_tail].ps_id=ps_id; DNS.req[DNS.rq_tail].port=port;
-    snprintf(DNS.req[DNS.rq_tail].host,sizeof(DNS.req[DNS.rq_tail].host),"%s",host);
-    DNS.rq_tail=nt;
-    pthread_cond_signal(&DNS.cv);
-    pthread_mutex_unlock(&DNS.mu);
-    return 0;
-}
-
-/* 主线程取一个完成结果(非阻塞)。1=取到, 0=空 */
-static int dns_pop_result(dns_res_t* out){
-    pthread_mutex_lock(&DNS.mu);
-    if(DNS.rs_head==DNS.rs_tail){ pthread_mutex_unlock(&DNS.mu); return 0; }
-    *out=DNS.res[DNS.rs_head]; DNS.rs_head=dns_q_next(DNS.rs_head);
-    pthread_mutex_unlock(&DNS.mu);
-    return 1;
-}
 
 /* ---- 工具 ---- */
 static int set_nonblock(int fd){ int fl=fcntl(fd,F_GETFL,0); return fl<0?-1:fcntl(fd,F_SETFL,fl|O_NONBLOCK); }
-static const char* role_name(nb_role_t r){ return r==ROLE_ENTRY?"entry":(r==ROLE_MIDDLE?"middle":"exit"); }
+static const char* role_name(nb_role_t r){ return nb_bridge_role_name((int)r); }
 
 static const char* cc_state_name(const char* alg,uint64_t state){
     if(alg&&(!strcmp(alg,"cubic")||!strcmp(alg,"dcubic"))){
@@ -554,22 +268,81 @@ static const char* cc_state_name(const char* alg,uint64_t state){
 static int prio_is_latency(int prio){ return nb_prio_is_latency(prio); }
 static int prio_is_fec_candidate(int prio){ return nb_prio_is_fec_candidate(prio); }
 
+static const char* control_env_id(const char* name,const char* fallback){
+    const char* value=getenv(name);if(value==NULL||value[0]==0)return fallback;
+    for(const unsigned char* p=(const unsigned char*)value;*p;p++){
+        if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'||*p=='.'||*p=='-'))return fallback;
+    }
+    return value;
+}
+
+static uint64_t env_ms_to_us(const char* name,uint64_t fallback_ms,uint64_t minimum_ms,uint64_t maximum_ms){
+    const char* value=getenv(name);if(value==NULL||value[0]==0)return fallback_ms*1000ULL;
+    char* end=NULL;errno=0;unsigned long long parsed=strtoull(value,&end,10);
+    if(errno||end==value||*end||parsed<minimum_ms||parsed>maximum_ms){
+        log4c_warn("ignore invalid %s=%s range=%llu..%llums",name,value,
+            (unsigned long long)minimum_ms,(unsigned long long)maximum_ms);
+        return fallback_ms*1000ULL;
+    }
+    return (uint64_t)parsed*1000ULL;
+}
+
 static int control_render(const char* command,char* out,size_t cap,void* ctx){
     (void)ctx;
     const char* worker=getenv("NB_WORKER_ID");if(!worker)worker="0";
+    const char* release=control_env_id("NB_RELEASE_ID","unversioned");
+    const char* profile=control_env_id("NB_LINE_PROFILE_ID","unversioned");
+    const char* schema_text=getenv("NB_LINE_PROFILE_SCHEMA");char* schema_end=NULL;
+    long schema_long=schema_text?strtol(schema_text,&schema_end,10):0;
+    int profile_schema=(schema_text&&schema_end&&*schema_end==0&&schema_long>=0&&schema_long<=999999)?(int)schema_long:0;
     if(!strcmp(command,"health")||!strcmp(command,"GET /health")){
-        return snprintf(out,cap,"{\"status\":\"ok\",\"role\":\"%s\",\"worker\":\"%s\"}\n",role_name(G.role),worker);
+        return snprintf(out,cap,"{\"status\":\"ok\",\"role\":\"%s\",\"worker\":\"%s\",\"release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d}\n",
+            role_name(G.role),worker,release,profile,profile_schema);
     }
     if(!strcmp(command,"metrics")||!strcmp(command,"GET /metrics")){
-        return snprintf(out,cap,
-            "{\"role\":\"%s\",\"worker\":\"%s\",\"sessions\":%d,\"sessions_peak\":%d,\"pools\":%d,"
-            "\"exit_routes\":%zu,\"fec_observe\":%d,\"fec_active\":%d,\"fec_tx_blocks\":%llu,\"fec_rx_blocks\":%llu,"
-            "\"fec_recovered\":%llu,\"fec_nack\":%llu,\"fec_retx\":%llu}\n",
-            role_name(G.role),worker,g_ps_inuse,g_ps_peak,G.pool_count,G.exit_routes.count,g_fec_v15_observe,g_fec_v15_active,
-            (unsigned long long)g_fec_metrics_done.blocks_encoded,(unsigned long long)g_fec_metrics_done.blocks_delivered,
-            (unsigned long long)g_fec_metrics_done.blocks_recovered,(unsigned long long)g_fec_metrics_done.nack_sent,
-            (unsigned long long)g_fec_metrics_done.retx_sent);
+        uint64_t now=picoquic_current_time();nb_metrics_snapshot_t snapshot;
+        nb_metrics_snapshot_init(&snapshot,&g_metrics_state,(uint64_t)g_ps_inuse,(uint64_t)g_ps_peak,
+            (uint64_t)G.pool_count,(uint64_t)G.exit_routes.count);
+        for(int pool=0;pool<G.pool_count;pool++)for(int slot=0;slot<POOL_SIZE;slot++){
+            cnx_pool_t* cp=&G.pools[pool];
+            if(cp->cnx[slot]&&cp->recent_sent[slot]>0)nb_metrics_snapshot_add_link(&snapshot,
+                cp->recent_loss[slot],cp->recent_rtt[slot],cp->recent_rtt_var[slot],cp->recent_sent[slot]);
+            if(cp->cnx[slot]){
+                picoquic_cnx_t* cnx=cp->cnx[slot];picoquic_path_quality_t quality;memset(&quality,0,sizeof(quality));
+                picoquic_get_default_path_quality(cnx,&quality);uint64_t cc_state=0,cc_parameter=0;
+                picoquic_path_t* path=(cnx->nb_paths>0)?cnx->path[0]:NULL;
+                if(path&&path->congestion_alg_state&&cnx->congestion_alg&&cnx->congestion_alg->alg_observe)
+                    cnx->congestion_alg->alg_observe(path,&cc_state,&cc_parameter);
+                const char* cc=(cnx->congestion_alg&&cnx->congestion_alg->congestion_algorithm_id)?cnx->congestion_alg->congestion_algorithm_id:"none";
+                nb_metrics_snapshot_add_transport(&snapshot,cc,cc_state,quality.lost,quality.spurious_losses,
+                    quality.timer_losses,quality.max_reorder_gap,quality.max_reorder_delay,quality.cwin,
+                    quality.bytes_in_transit,quality.pacing_rate,cnx->cwin_blocked||cnx->flow_blocked||cnx->stream_blocked);
+            }
+        }
+        nb_fec_metrics_t fm=g_fec_metrics_done;
+        for(int i=0;i<MAX_CONN;i++){
+            proxy_stream_t* p=&G.streams[i];if(!p->in_use)continue;
+            size_t down=p->udp_mode?p->udp_down_tx_len:p->down_tx.len;
+            size_t up=p->udp_mode?p->udp_up_tx_len:p->up_tx.len;
+            size_t q2t=p->udp_mode?p->udp_pending_tx_len:p->q2t.len;
+            uint64_t down_age=p->udp_mode?0:nb_live_queue_age_us(&p->down_tx_clock,p->down_tx.len,now);
+            uint64_t up_age=p->udp_mode?0:nb_live_queue_age_us(&p->up_tx_clock,p->up_tx.len,now);
+            uint64_t q2t_age=p->udp_mode?0:nb_live_queue_age_us(&p->q2t_clock,p->q2t.len,now);
+            uint64_t c2s_wait=(p->first_c2s_at?p->first_c2s_at:now)-p->created_at;
+            uint64_t s2c_wait=(p->first_s2c_at?p->first_s2c_at:now)-p->created_at;
+            nb_metrics_snapshot_add_stream(&snapshot,(int)p->flow_class,p->udp_mode,p->tcp_connecting,
+                p->tcp_read_paused,p->upstream_fc_blocked,p->target_connect_state==3,p->bytes_c2s,p->bytes_s2c,
+                down,up,q2t,down_age,up_age,q2t_age,c2s_wait,s2c_wait);
+            if(p->fec_engine!=NULL)fec_metrics_add(&fm,nb_fec_metrics(p->fec_engine));
+        }
+        nb_metrics_fec_t fec={g_fec_v15_observe,g_fec_v15_active,fm.blocks_encoded,fm.blocks_delivered,
+            fm.blocks_recovered,fm.nack_sent,fm.retx_sent};
+        return nb_metrics_render_json(out,cap,role_name(G.role),worker,release,profile,profile_schema,&snapshot,&fec);
     }
+    if(!strcmp(command,"tenants")||!strcmp(command,"GET /tenants"))return nb_tenants_render_json(&g_tenants,out,cap);
+    if(!strcmp(command,"routes")||!strcmp(command,"GET /routes"))return nb_routes_render_json(&G.exit_routes,out,cap,picoquic_current_time());
+    int route_command=nb_routes_control_command(&G.exit_routes,command,out,cap,picoquic_current_time(),30000000ULL);
+    if(route_command>=0)return route_command;
     return -1;
 }
 
@@ -578,119 +351,10 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
  * entry 收到 SOCKS CONNECT(host:port): 命中(域名后缀 / IP CIDR / 端口)才允许走隧道, 未命中直接拒绝。
  * 目的: 防止无关流量走三跳线路占带宽 + 降低安全风险。启动加载 + 文件 mtime 热重载。entry 单线程, 无锁。
  * 规则: host命中(域名或IP) AND port命中; 某类白名单为空 = 该维度不限制。 */
-#define WL_MAX 1024
-typedef struct { uint32_t net, mask; } wl_cidr_t;
-typedef struct {
-    char domain[WL_MAX][128]; int n_dom;   /* 域名后缀 */
-    wl_cidr_t ip[WL_MAX];     int n_ip;    /* IPv4 CIDR */
-    uint16_t port[WL_MAX];    int n_port;  /* 端口 */
-    int enabled;                           /* 有配置文件才启用 */
-    char path[256];
-    time_t mtime;
-} wl_state_t;
-static wl_state_t WL;
-
-static int wl_domain_hit(const char* host){
-    size_t hl=strlen(host);
-    for(int i=0;i<WL.n_dom;i++){
-        size_t dl=strlen(WL.domain[i]);
-        if(hl==dl && strcasecmp(host,WL.domain[i])==0) return 1;                       /* 完全相等 */
-        if(hl>dl && host[hl-dl-1]=='.' && strcasecmp(host+hl-dl,WL.domain[i])==0) return 1; /* .后缀边界对齐 */
-    }
-    return 0;
-}
-static int wl_ip_hit(const char* host){
-    struct in_addr a; if(inet_pton(AF_INET,host,&a)!=1) return 0;
-    uint32_t ip=ntohl(a.s_addr);
-    for(int i=0;i<WL.n_ip;i++) if((ip & WL.ip[i].mask)==WL.ip[i].net) return 1;
-    return 0;
-}
-static int wl_port_hit(int port){
-    if(WL.n_port==0) return 1;                       /* 未配端口 = 不限制端口 */
-    for(int i=0;i<WL.n_port;i++) if(WL.port[i]==(uint16_t)port) return 1;
-    return 0;
-}
-/* 命中判定: 未启用=全放行; host 是 IP 字面量走 CIDR, 否则走域名后缀 */
 static int whitelist_allowed(const char* host, int port){
     if(port==NB_PROBE_PORT && host!=NULL &&
         (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)))return 1;
-    if(!WL.enabled) return 1;
-    if(!wl_port_hit(port)) return 0;
-    struct in_addr a;
-    /* 每个维度独立, 该维度未配=不限制。修复: 只配域名白名单时, IP 直连目标(如直播媒体流)不应被误拦。 */
-    if(inet_pton(AF_INET,host,&a)==1) return WL.n_ip==0 ? 1 : wl_ip_hit(host);
-    return WL.n_dom==0 ? 1 : wl_domain_hit(host);
-}
-static int wl_load(const char* path){
-    FILE* f=fopen(path,"r");
-    if(!f){ log4c_error("whitelist %s open fail: %s",path,strerror(errno)); return -1; }
-    wl_state_t next;
-    memset(&next,0,sizeof(next));
-    snprintf(next.path,sizeof(next.path),"%s",path);
-    char line[512];
-    while(fgets(line,sizeof(line),f)){
-        char* p=line; while(*p==' '||*p=='\t')p++;
-        if(*p=='#'||*p=='\n'||*p=='\r'||*p==0) continue;
-        char kw[16], val[256];
-        if(sscanf(p,"%15s %255s",kw,val)!=2) continue;
-        if(!strcmp(kw,"domain")){
-            size_t n=strlen(val);
-            if(n==0||n>=sizeof(next.domain[0])){fclose(f);log4c_error("whitelist invalid domain length");return -1;}
-            if(next.n_dom<WL_MAX){memcpy(next.domain[next.n_dom],val,n+1);next.n_dom++;}
-        }
-        else if(!strcmp(kw,"port")){
-            int port=atoi(val);
-            if(port<=0||port>65535){fclose(f);log4c_error("whitelist invalid port: %s",val);return -1;}
-            if(next.n_port<WL_MAX) next.port[next.n_port++]=(uint16_t)port;
-        }
-        else if(!strcmp(kw,"ip")){
-            int len=32; char* slash=strchr(val,'/'); if(slash){ *slash=0; len=atoi(slash+1); }
-            struct in_addr a;
-            if(inet_pton(AF_INET,val,&a)==1 && len>=0 && len<=32 && next.n_ip<WL_MAX){
-                uint32_t mask = len==0?0u:(0xFFFFFFFFu << (32-len));
-                next.ip[next.n_ip].mask=mask; next.ip[next.n_ip].net=ntohl(a.s_addr)&mask; next.n_ip++;
-            } else {fclose(f);log4c_error("whitelist invalid cidr: %s",val);return -1;}
-        }
-        else {fclose(f);log4c_error("whitelist unknown directive: %s",kw);return -1;}
-    }
-    fclose(f);
-    if(next.n_dom==0&&next.n_ip==0){log4c_error("whitelist has no domain or cidr rules: %s",path);return -1;}
-    struct stat st;if(stat(path,&st)==0)next.mtime=st.st_mtime;
-    next.enabled=1;
-    WL=next;
-    log4c_info("whitelist loaded: %d domains, %d cidrs, %d ports (%s)",WL.n_dom,WL.n_ip,WL.n_port,path);
-    return 0;
-}
-static int wl_init(const char* path){
-    if(!path||!path[0]) return 0;
-    return wl_load(path);
-}
-static void wl_reload_if_changed(void){
-    if(!WL.path[0]) return;
-    struct stat st;
-    if(stat(WL.path,&st)==0 && st.st_mtime!=WL.mtime){
-        if(wl_load(WL.path)!=0) log4c_error("whitelist reload rejected; keeping previous rules");
-    }
-}
-
-static int parse_port_strict(const char* text,int* port){
-    char* end=NULL;long value=strtol(text,&end,10);
-    if(text==end||*end||value<=0||value>65535)return -1;
-    *port=(int)value;return 0;
-}
-
-static int parse_target_from_route(const char* route, char* host, size_t host_cap, int* port){
-    const char* t = strstr(route, "T:");
-    if(t == NULL) return -1;
-    char tmp[300];
-    const char* start=t+2;const char* comma=strchr(start,',');size_t len=comma?(size_t)(comma-start):strlen(start);
-    if(len==0||len>=sizeof(tmp))return -1;
-    memcpy(tmp,start,len);tmp[len]=0;
-    char* c = strrchr(tmp, ':');
-    if(c == NULL) return -1;
-    *c = 0;
-    size_t host_len=strlen(tmp);if(host_len==0||host_len>=host_cap)return -1;memcpy(host,tmp,host_len+1);
-    return parse_port_strict(c+1,port);
+    return nb_whitelist_allowed(host,port);
 }
 
 static void flow_policy_for_host(const char* host, int port, nb_flow_policy_t* out){
@@ -766,6 +430,7 @@ static void ps_demote_bulk(proxy_stream_t* p,const char* rule,double rate_kbps){
 }
 
 static void ps_update_runtime_policy(proxy_stream_t* p,uint64_t now){
+    if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);p->tenant_accounted_up=p->bytes_c2s;p->tenant_accounted_down=p->bytes_s2c;}
     double c2s=0,s2c=0;
     nb_live_flow_action_t action=nb_live_flow_observe(&p->live_runtime,p->flow_class,
         p->bytes_c2s,p->bytes_s2c,now,&c2s,&s2c);
@@ -776,6 +441,7 @@ static void ps_update_runtime_policy(proxy_stream_t* p,uint64_t now){
 static void ps_note_payload(proxy_stream_t* p, int c2s, size_t len){
     if(p == NULL || len == 0) return;
     uint64_t now = picoquic_current_time();
+    p->last_active = now;
     uint64_t* total = c2s ? &p->bytes_c2s : &p->bytes_s2c;
     uint64_t* first = c2s ? &p->first_c2s_at : &p->first_s2c_at;
     *total += len;
@@ -971,50 +637,84 @@ static proxy_stream_t* ps_alloc(void){
         G.streams[i].in_use=1; G.streams[i].tcp_fd=-1; G.streams[i].udp_fd=-1; G.streams[i].id=++G.next_ps_id;
         G.streams[i].down_pool_idx=-1;
         G.streams[i].down_pool_id=-1;
+        G.streams[i].tenant_index=-1;
+        G.streams[i].route_index=-1;
         G.streams[i].last_active=picoquic_current_time();
         G.streams[i].created_at=G.streams[i].last_active;
         nb_udp_reassembly_init(&G.streams[i].udp_reassembly);
+        (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_ID,G.streams[i].id,0,0,&G.streams[i]);
         g_ps_inuse++; if(g_ps_inuse>g_ps_peak) g_ps_peak=g_ps_inuse;
         return &G.streams[i]; }
     return NULL;
 }
 static void ps_touch(proxy_stream_t* p){ p->last_active=picoquic_current_time(); }
+static void ps_index_refresh(proxy_stream_t* p){
+    if(p==NULL||!p->in_use)return;
+    (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_ID,p->id,0,0,p);
+    if(p->up_cnx){
+        (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_UP_STREAM,(uintptr_t)p->up_cnx,p->up_stream_id,0,p);
+        if(p->udp_mode&&!p->udp_association)(void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_UDP_UP,(uintptr_t)p->up_cnx,p->udp_session_id,0,p);
+    }
+    if(p->down_cnx){
+        (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_DOWN_STREAM,(uintptr_t)p->down_cnx,p->down_stream_id,0,p);
+        if(p->udp_mode&&!p->udp_association)(void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_UDP_DOWN,(uintptr_t)p->down_cnx,p->udp_session_id,0,p);
+    }
+    if(p->fec_ctrl_cnx)(void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_DOWN_STREAM,(uintptr_t)p->fec_ctrl_cnx,p->fec_ctrl_stream_id,0,p);
+    if(p->udp_parent_id&&p->udp_target_host[0]){
+        (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_UDP_CHILD,p->udp_parent_id,
+            nb_session_index_hash_text(p->udp_target_host),(uint64_t)(unsigned)p->udp_target_port,p);
+    }
+}
 static proxy_stream_t* ps_find_by_fec_session(uint32_t sid){
     proxy_stream_t* p=fec_session_index_find(sid);
     return p!=NULL&&p->in_use?p:NULL;
 }
 static proxy_stream_t* ps_find_by_up(picoquic_cnx_t* cnx, uint64_t sid){
+    proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_UP_STREAM,(uintptr_t)cnx,sid,0);
+    if(indexed&&indexed->in_use&&indexed->up_cnx==cnx&&indexed->up_stream_id==sid)return indexed;
     int i; for(i=0;i<MAX_CONN;i++){ proxy_stream_t* p=&G.streams[i];
-        if(p->in_use && p->up_cnx==cnx && p->up_stream_id==sid) return p; }
+        if(p->in_use && p->up_cnx==cnx && p->up_stream_id==sid){ps_index_refresh(p);return p;} }
     return NULL;
 }
 static proxy_stream_t* ps_find_by_down(picoquic_cnx_t* cnx, uint64_t sid){
+    proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_DOWN_STREAM,(uintptr_t)cnx,sid,0);
+    if(indexed&&indexed->in_use&&((indexed->down_cnx==cnx&&indexed->down_stream_id==sid)||
+        (indexed->fec_ctrl_cnx==cnx&&indexed->fec_ctrl_stream_id==sid)))return indexed;
     int i; for(i=0;i<MAX_CONN;i++){ proxy_stream_t* p=&G.streams[i];
         if(p->in_use && ((p->down_cnx==cnx && p->down_stream_id==sid) ||
-            (p->fec_ctrl_cnx==cnx && p->fec_ctrl_stream_id==sid))) return p; }
+            (p->fec_ctrl_cnx==cnx && p->fec_ctrl_stream_id==sid))){ps_index_refresh(p);return p;} }
     return NULL;
 }
 static proxy_stream_t* ps_find_by_id(uint32_t id){
-    int i; for(i=0;i<MAX_CONN;i++) if(G.streams[i].in_use && G.streams[i].id==id) return &G.streams[i];
+    proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_ID,id,0,0);
+    if(indexed&&indexed->in_use&&indexed->id==id)return indexed;
+    int i; for(i=0;i<MAX_CONN;i++) if(G.streams[i].in_use && G.streams[i].id==id){ps_index_refresh(&G.streams[i]);return &G.streams[i];}
     return NULL;
 }
 
 static proxy_stream_t* ps_find_udp_up(picoquic_cnx_t* cnx,uint32_t session_id){
+    proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_UDP_UP,(uintptr_t)cnx,session_id,0);
+    if(indexed&&indexed->in_use&&indexed->udp_mode&&indexed->udp_session_id==session_id&&indexed->up_cnx==cnx)return indexed;
     for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
-        if(p->in_use&&p->udp_mode&&!p->udp_association&&p->udp_session_id==session_id&&p->up_cnx==cnx)return p;}
+        if(p->in_use&&p->udp_mode&&!p->udp_association&&p->udp_session_id==session_id&&p->up_cnx==cnx){ps_index_refresh(p);return p;}}
     return NULL;
 }
 
 static proxy_stream_t* ps_find_udp_down(picoquic_cnx_t* cnx,uint32_t session_id){
+    proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_UDP_DOWN,(uintptr_t)cnx,session_id,0);
+    if(indexed&&indexed->in_use&&indexed->udp_mode&&indexed->udp_session_id==session_id&&indexed->down_cnx==cnx)return indexed;
     for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
-        if(p->in_use&&p->udp_mode&&!p->udp_association&&p->udp_session_id==session_id&&p->down_cnx==cnx)return p;}
+        if(p->in_use&&p->udp_mode&&!p->udp_association&&p->udp_session_id==session_id&&p->down_cnx==cnx){ps_index_refresh(p);return p;}}
     return NULL;
 }
 
 static proxy_stream_t* ps_find_udp_child(uint32_t parent_id,const char* host,int port){
+    proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_UDP_CHILD,parent_id,
+        nb_session_index_hash_text(host),(uint64_t)(unsigned)port);
+    if(indexed&&indexed->in_use&&indexed->udp_parent_id==parent_id&&indexed->udp_target_port==port&&!strcasecmp(indexed->udp_target_host,host))return indexed;
     for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
         if(p->in_use&&p->udp_mode&&!p->udp_association&&p->udp_parent_id==parent_id&&
-            p->udp_target_port==port&&!strcasecmp(p->udp_target_host,host))return p;}
+            p->udp_target_port==port&&!strcasecmp(p->udp_target_host,host)){ps_index_refresh(p);return p;}}
     return NULL;
 }
 
@@ -1051,6 +751,11 @@ static void ps_clear_stream_ctx_once(picoquic_cnx_t* cnx, uint64_t sid,
 static void ps_free(proxy_stream_t* p){
     if(!p->in_use) return;               /* 幂等: 防拆流/回调重入导致 double free */
     if(p->close_reason[0] == 0) ps_set_close_reason(p, "released");
+    if(p->udp_mode&&!p->udp_association&&!p->udp_close_received){if(G.role!=ROLE_EXIT)(void)udp_lifecycle_schedule(p->down_cnx,NB_UDP_TYPE_CLOSE,p->udp_session_id,p->route);if(G.role!=ROLE_ENTRY)(void)udp_lifecycle_schedule(p->up_cnx,NB_UDP_TYPE_CLOSE,p->udp_session_id,p->route);}
+    if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);if(p->tenant_acquired)nb_tenant_release(&g_tenants,p->tenant_index,p->tenant_udp);}
+    /* Business-session lifetime is not a route-health signal. Active probes own health updates. */
+    if(G.role==ROLE_ENTRY&&p->route_index>=0)nb_routes_finish_session(&G.exit_routes,(size_t)p->route_index);
+    nb_metrics_note_close(&g_metrics_state,p->close_reason);
     if(p->udp_mode && !p->udp_association){
         log4c_info("%s udp flow close id=%u usid=%u reason=%s age=%.1fms packets=%llu/%llu bytes=%llu/%llu milestones_ms=local_c2s:%.1f,c2s_rx:%.1f,c2s_prepare:%.1f,target_ready:%.1f,target_send:%.1f,target_rx:%.1f,s2c_rx:%.1f,s2c_prepare:%.1f,local_s2c:%.1f target=%s:%d route=%s",
             role_name(G.role),p->id,p->udp_session_id,p->close_reason,
@@ -1113,6 +818,7 @@ static void ps_free(proxy_stream_t* p){
     if(p->fec_engine!=NULL) fec_metrics_add(&g_fec_metrics_done,nb_fec_metrics(p->fec_engine));
     nb_fec_session_destroy(p->fec_engine); p->fec_engine=NULL;
     nb_ring_dispose(&p->q2t);
+    nb_session_index_remove_value(&g_session_index,p);
     if(g_ps_inuse>0) g_ps_inuse--;
     p->in_use=0;
 }
@@ -1135,12 +841,9 @@ static void ps_teardown_reason(proxy_stream_t* p, const char* reason){
 
 /* q2t 动态追加(永不丢数据; 背压靠 QUIC connection flow control 限总量) */
 static int q2t_append(proxy_stream_t* p, const uint8_t* d, size_t n){
-    size_t previous=p->q2t.len;
-    if(nb_ring_append(&p->q2t,d,n,NB_Q2T_MAX)!=0){
+    if(nb_send_append(&p->q2t,&p->q2t_clock,d,n,NB_Q2T_MAX,picoquic_current_time(),&p->media_q2t_peak)!=0){
         log4c_warn("id=%u q2t over limit %zu+%zu > %d",p->id,p->q2t.len,n,NB_Q2T_MAX);return -1;
     }
-    if(p->q2t.len>p->media_q2t_peak)p->media_q2t_peak=p->q2t.len;
-    nb_live_queue_appended(&p->q2t_clock,previous,n,picoquic_current_time());
     if(n>0 && p->first_q2t_queue_at==0) p->first_q2t_queue_at=picoquic_current_time();
     return 0;
 }
@@ -1473,17 +1176,6 @@ static void fec_ctrl_feed_bytes(proxy_stream_t* p, uint8_t* data, size_t n, int 
     }
 }
 
-static int fec_parse_target_route(const char* route, char* host, size_t host_cap, int* port){
-    if(strncmp(route, "T:", 2) != 0) return -1;
-    char tmp[300];
-    size_t len=strlen(route+2);if(len==0||len>=sizeof(tmp))return -1;memcpy(tmp,route+2,len+1);
-    char* c = strrchr(tmp, ':');
-    if(c == NULL) return -1;
-    *c = 0;
-    size_t host_len=strlen(tmp);if(host_len==0||host_len>=host_cap)return -1;memcpy(host,tmp,host_len+1);
-    return parse_port_strict(c+1,port);
-}
-
 static void middle_upstream_fc_set(proxy_stream_t* p,int enabled){
     if(G.role!=ROLE_MIDDLE||p==NULL||p->up_cnx==NULL||p->udp_mode)return;
     enabled=enabled!=0;
@@ -1531,14 +1223,11 @@ static void middle_upstream_fc_update(proxy_stream_t* p,uint64_t now_us){
 }
 
 static int queue_down(proxy_stream_t* p, const uint8_t* d, size_t n, int fin){
-    size_t previous=p->down_tx.len;
-    if(nb_ring_append(&p->down_tx,d,n,NB_QTX_MAX)!=0){
+    uint64_t now=picoquic_current_time();
+    if(nb_send_append(&p->down_tx,&p->down_tx_clock,d,n,NB_QTX_MAX,now,&p->media_down_q_peak)!=0){
         p->need_teardown = 1;
         return -1;
     }
-    if(p->down_tx.len>p->media_down_q_peak)p->media_down_q_peak=p->down_tx.len;
-    uint64_t now=picoquic_current_time();
-    nb_live_queue_appended(&p->down_tx_clock,previous,n,now);
     middle_upstream_fc_update(p,now);
     if(n>0 && p->first_down_queue_at==0){
         p->first_down_queue_at=picoquic_current_time();
@@ -1568,13 +1257,10 @@ static int queue_down_prefix(proxy_stream_t* p, const uint8_t* d, size_t n){
 }
 
 static int queue_up(proxy_stream_t* p, const uint8_t* d, size_t n, int fin){
-    size_t previous=p->up_tx.len;
-    if(nb_ring_append(&p->up_tx,d,n,NB_QTX_MAX)!=0){
+    if(nb_send_append(&p->up_tx,&p->up_tx_clock,d,n,NB_QTX_MAX,picoquic_current_time(),&p->media_up_q_peak)!=0){
         p->need_teardown = 1;
         return -1;
     }
-    if(p->up_tx.len>p->media_up_q_peak)p->media_up_q_peak=p->up_tx.len;
-    nb_live_queue_appended(&p->up_tx_clock,previous,n,picoquic_current_time());
     if(n>0 && p->first_up_queue_at==0){
         p->first_up_queue_at=picoquic_current_time();
         if(ps_is_rtc_webcast(p)) log4c_info("%s tcp trace id=%u stage=s2c-queue age=%.1fms bytes=%zu q=%zu route=%s",
@@ -1612,7 +1298,6 @@ static int udp_connect_addr(struct sockaddr* sa,socklen_t sl){
     if(connect(fd,sa,sl)!=0){close(fd);return -1;}return fd;
 }
 
-/* 前置声明 */
 static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes, size_t length,
     picoquic_call_back_event_t ev, void* cb_ctx, void* v_stream_ctx);
 static int epoll_udp_update(proxy_stream_t* p,int add);
@@ -1652,6 +1337,7 @@ static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr){
     memset(pool->last_preempt_total, 0, sizeof(pool->last_preempt_total));
     memset(pool->recent_rtt_var, 0, sizeof(pool->recent_rtt_var));
     memset(pool->recent_ts, 0, sizeof(pool->recent_ts));
+    memset(pool->health, 0, sizeof(pool->health));
     pool->fec_latched = 0;
     int ok=0; for(int i=0;i<POOL_SIZE;i++) if(pool_ensure(pool,i)==0) ok++;
     pool->configured=1;
@@ -1713,8 +1399,9 @@ static int pool_pick_all_rr(cnx_pool_t* pool, int avoid_idx){
 #define REALTIME_HEALTHY_JITTER_US 40000ULL
 
 static int pool_quality_fresh(cnx_pool_t* pool, int idx, uint64_t now){
-    return pool->recent_ts[idx] != 0 && now >= pool->recent_ts[idx] &&
-        now - pool->recent_ts[idx] <= 30000000ULL; /* 30s 内样本视为新鲜 */
+    nb_path_quality_t sample={pool->recent_loss[idx],pool->recent_rtt[idx],pool->recent_rtt_var[idx],
+        pool->recent_sent[idx],pool->recent_ts[idx],idx};
+    return nb_path_quality_fresh(&sample,now,30000000ULL); /* 30s 内样本视为新鲜 */
 }
 
 static int pool_quality_sampled(cnx_pool_t* pool, int idx, uint64_t now){
@@ -1722,20 +1409,15 @@ static int pool_quality_sampled(cnx_pool_t* pool, int idx, uint64_t now){
 }
 
 static double pool_quality_loss_score(cnx_pool_t* pool, int idx){
-    double confidence=(double)pool->recent_sent[idx]/(double)FEC_MIN_SENT_PKTS;
-    if(confidence>1.0)confidence=1.0;
-    return pool->recent_loss[idx]*confidence+REALTIME_LOSS_PRIOR_PCT*(1.0-confidence);
+    nb_path_quality_t sample={pool->recent_loss[idx],pool->recent_rtt[idx],pool->recent_rtt_var[idx],
+        pool->recent_sent[idx],pool->recent_ts[idx],idx};
+    return nb_path_loss_score(&sample,FEC_MIN_SENT_PKTS,REALTIME_LOSS_PRIOR_PCT);
 }
 
 static int pool_quality_better(cnx_pool_t* pool, int a, int b, uint64_t now){
-    int af = pool_quality_fresh(pool, a, now), bf = pool_quality_fresh(pool, b, now);
-    if(af != bf) return af > bf;
-    if(!af && !bf) return a < b;
-    double as=pool_quality_loss_score(pool,a),bs=pool_quality_loss_score(pool,b);
-    if(as != bs) return as < bs;
-    if(pool->recent_rtt_var[a] != pool->recent_rtt_var[b]) return pool->recent_rtt_var[a] < pool->recent_rtt_var[b];
-    if(pool->recent_rtt[a] != pool->recent_rtt[b]) return pool->recent_rtt[a] < pool->recent_rtt[b];
-    return a < b;
+    nb_path_quality_t sa={pool->recent_loss[a],pool->recent_rtt[a],pool->recent_rtt_var[a],pool->recent_sent[a],pool->recent_ts[a],a};
+    nb_path_quality_t sb={pool->recent_loss[b],pool->recent_rtt[b],pool->recent_rtt_var[b],pool->recent_sent[b],pool->recent_ts[b],b};
+    return nb_path_quality_better(&sa,&sb,now,30000000ULL,FEC_MIN_SENT_PKTS,REALTIME_LOSS_PRIOR_PCT);
 }
 
 static int pool_quality_best(cnx_pool_t* pool, int avoid_idx, int require_sampled){
@@ -1863,6 +1545,62 @@ static int pool_pick(cnx_pool_t* pool, int is_latency){
 }
 
 /* 分配下游 stream 并发首部(带 <prio>; 标记端到端传递)+ 设该 stream 优先级。 */
+static uint64_t pool_slot_queue_age(picoquic_cnx_t* cnx,uint64_t now,int* eligible){
+    uint64_t oldest=0;*eligible=0;
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];if(!p->in_use||p->down_cnx!=cnx)continue;
+        if(p->flow_class!=NB_FLOW_CLASS_MEDIA&&p->lane_hint!=NB_FLOW_LANE_LATENCY&&
+            p->probe_mode==0&&strstr(p->route,"nb-probe-")==NULL)continue;
+        uint64_t age=0;
+        if(p->udp_mode){
+            const uint8_t* data=NULL;size_t length=0;uint64_t queued_at=0;
+            if(dgramq_peek(p->udp_down_tx,p->udp_down_tx_len,&data,&length,&queued_at)&&
+                queued_at&&now>=queued_at)age=now-queued_at;
+        }else age=nb_live_queue_age_us(&p->down_tx_clock,p->down_tx.len,now);
+        if(age>oldest)oldest=age;
+        (*eligible)++;
+    }
+    return oldest;
+}
+static int pool_slot_streams(picoquic_cnx_t* cnx){int n=0;for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use&&G.streams[i].down_cnx==cnx)n++;return n;}
+
+static void pool_retire_slot(cnx_pool_t* pool,int pool_id,int idx,uint64_t queue_age,uint64_t pto){
+    picoquic_cnx_t* old=pool->cnx[idx];if(old==NULL)return;
+    pool->cnx[idx]=NULL;nb_pool_slot_reset_quality(pool,idx);int streams=0;
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(p->in_use&&(p->down_cnx==old||p->fec_ctrl_cnx==old||p->fec_dg_cnx==old)){
+            streams++;ps_teardown_reason(p,"pool-degraded-retire");
+        }
+    }
+    udp_lifecycle_forget_cnx(old);sched_forget_cnx(old);picoquic_close(old,0x4e4252ULL);
+    g_metrics_state.pool_retire_total++;
+    int replacement=pool_ensure(pool,idx);
+    log4c_warn("pool[%d:%d] degraded retire queue_age=%.1fms pto=%llu streams=%d replacement=%s cooldown=%.1fs",
+        pool_id,idx,queue_age/1000.0,(unsigned long long)pto,streams,replacement==0?"started":"failed",
+        g_pool_health_cfg.cooldown_us/1000000.0);
+}
+
+static void pool_health_tick(uint64_t now){
+    static uint64_t last=0;if(last&&now-last<250000ULL)return;last=now;
+    for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
+        cnx_pool_t* pool=&G.pools[pool_id];picoquic_cnx_t* cnx=pool->cnx[idx];if(cnx==NULL)continue;
+        int eligible=0;uint64_t age=pool_slot_queue_age(cnx,now,&eligible);
+        picoquic_path_t* path=cnx->nb_paths?cnx->path[0]:NULL;uint64_t pto=path?path->nb_retransmit:0,suppressed=0;
+        int streams=pool_slot_streams(cnx);
+        int connection_candidate=pto>=2;
+        int health_eligible=(eligible>0&&streams>0)||connection_candidate;
+        uint64_t health_age=connection_candidate&&age<g_pool_health_cfg.queue_age_threshold_us
+            ?g_pool_health_cfg.queue_age_threshold_us:age;
+        int blocked=cnx->cwin_blocked||cnx->stream_blocked;if(G.role==ROLE_MIDDLE)blocked=blocked||cnx->flow_blocked||age>=g_pool_health_cfg.queue_age_threshold_us*2;
+        /* 连续 PTO 可处理无活动 stream 的失效槽，但仍须同时通过 ACK 进展、hold 和冷却门槛。 */
+        int retire=nb_pool_health_evaluate(pool,idx,&g_pool_health_cfg,now,health_eligible,
+            health_age,blocked||connection_candidate,path?path->delivered:0,&suppressed);
+        if(retire)pool_retire_slot(pool,pool_id,idx,age,pto);
+        g_metrics_state.pool_retire_suppressed+=suppressed;
+    }
+}
+
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol){
     if(p->down_pool_id<0||p->down_pool_id>=G.pool_count){log4c_error("id=%u has no downstream pool",p->id);return -1;}
     cnx_pool_t* pool=&G.pools[p->down_pool_id];
@@ -1902,6 +1640,7 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     p->down_cnx=c; p->prio=prio; p->down_pool_idx=idx;
     if(pol&&pol->flow_class==NB_FLOW_CLASS_MEDIA)picoquic_set_media_mode(c,1);
     p->down_stream_id=pool->next_sid[idx]; pool->next_sid[idx]+=4; /* 该连接独立的 client bidi */
+    ps_index_refresh(p);
     p->downstream_open_at=picoquic_current_time();
     picoquic_set_app_stream_ctx(c,p->down_stream_id,p);
     picoquic_set_stream_priority(c,p->down_stream_id,
@@ -1939,7 +1678,6 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     return 0;
 }
 
-/* 去程转发: left -> right */
 static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
     ps_touch(p);
     ps_note_payload(p, 1, n);
@@ -1961,7 +1699,6 @@ static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
         }
     }
 }
-/* 回程转发: right -> left */
 static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
     ps_touch(p);
     ps_note_payload(p, 0, n);
@@ -1984,19 +1721,6 @@ static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
     }
 }
 
-static int udp_route_consume_h(const char* route,char* next_host,size_t host_cap,int* next_port,
-    char* rest,size_t rest_cap){
-    if(route==NULL||strncmp(route,"H:",2)!=0)return -1;
-    const char* comma=strchr(route,',');
-    if(comma==NULL||comma[1]==0)return -1;
-    size_t first_len=(size_t)(comma-route);
-    if(first_len<4||first_len>=NB_UDP_ROUTE_MAX||strlen(comma+1)>=rest_cap)return -1;
-    char first[NB_UDP_ROUTE_MAX];memcpy(first,route,first_len);first[first_len]=0;
-    char* colon=strrchr(first+2,':');if(colon==NULL)return -1;*colon=0;
-    if(first[2]==0||strlen(first+2)>=host_cap||parse_port_strict(colon+1,next_port)!=0)return -1;
-    snprintf(next_host,host_cap,"%s",first+2);snprintf(rest,rest_cap,"%s",comma+1);return 0;
-}
-
 static proxy_stream_t* udp_middle_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view,
     const char* route,char* rest,size_t rest_cap){
     char next_host[256];int next_port=0;
@@ -2014,6 +1738,7 @@ static proxy_stream_t* udp_middle_open(picoquic_cnx_t* cnx,const nb_udp_wire_vie
     cnx_pool_t* pool=&G.pools[p->down_pool_id];int idx=pool_pick(pool,pol.lane_hint==NB_FLOW_LANE_LATENCY);
     if(idx<0){ps_set_close_reason(p,"udp-middle-no-path");ps_free(p);return NULL;}
     p->down_cnx=pool->cnx[idx];p->down_pool_idx=idx;snprintf(p->route,sizeof(p->route),"%s",rest);
+    ps_index_refresh(p);
     if(pol.flow_class==NB_FLOW_CLASS_MEDIA)picoquic_set_media_mode(p->down_cnx,1);
     log4c_info("middle udp flow open id=%u usid=%u target=%s:%d route=%s",
         p->id,p->udp_session_id,p->udp_target_host,p->udp_target_port,p->route);return p;
@@ -2024,6 +1749,7 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
     if(!whitelist_allowed(host,port))return NULL;
     proxy_stream_t* p=ps_alloc();if(p==NULL)return NULL;
     p->udp_mode=1;p->udp_session_id=view->session_id;p->up_cnx=cnx;
+    ps_index_refresh(p);
     snprintf(p->route,sizeof(p->route),"%s",route);snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);
     p->udp_target_port=port;p->target_port=port;nb_flow_policy_t pol;flow_policy_for_host(host,port,&pol);apply_flow_policy(p,&pol);
     if(dns_submit(p->id,host,port)!=0){ps_set_close_reason(p,"udp-dns-queue-full");ps_free(p);return NULL;}
@@ -2069,6 +1795,14 @@ static int udp_deliver_reassembled(proxy_stream_t* p,const nb_udp_reassembled_t*
 static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view){
     char route[NB_UDP_ROUTE_MAX];if(view->route_length>=sizeof(route))return -2;
     memcpy(route,view->route,view->route_length);route[view->route_length]=0;
+    if(view->type==NB_UDP_TYPE_CLOSE_ACK){(void)nb_udp_lifecycle_ack(&g_udp_lifecycle,(uintptr_t)cnx,view->session_id);return 0;}
+    if(view->type==NB_UDP_TYPE_CLOSE){
+        proxy_stream_t* p=NULL;(void)udp_lifecycle_schedule(cnx,NB_UDP_TYPE_CLOSE_ACK,view->session_id,route);
+        if(G.role==ROLE_ENTRY)p=ps_find_udp_down(cnx,view->session_id);else if(G.role==ROLE_EXIT)p=ps_find_udp_up(cnx,view->session_id);
+        else {p=ps_find_udp_up(cnx,view->session_id);if(p==NULL)p=ps_find_udp_down(cnx,view->session_id);}
+        if(p==NULL)return 0;picoquic_cnx_t* opposite=p->up_cnx==cnx?p->down_cnx:p->up_cnx;if(opposite!=NULL)(void)udp_lifecycle_schedule(opposite,NB_UDP_TYPE_CLOSE,p->udp_session_id,p->route);
+        p->udp_close_received=1;ps_teardown_reason(p,"udp-peer-close");return 0;
+    }
     if(view->type==NB_UDP_TYPE_C2S){
         if(G.role==ROLE_MIDDLE){
             proxy_stream_t* p=ps_find_udp_up(cnx,view->session_id);char rest[NB_UDP_ROUTE_MAX];
@@ -2131,7 +1865,7 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin){
             if(p->probe_mode==2&&queue_up(p,bytes,len,0)!=0)return -1;
         }
         if(fin){
-            p->up_fin_seen=1;
+            p->up_fin_seen=1;p->tcp_eof=1;
             if(p->probe_mode==1){
                 char ack[96];int n=snprintf(ack,sizeof(ack),"NBPROBE OK bytes=%llu\n",
                     (unsigned long long)p->probe_bytes);
@@ -2248,7 +1982,7 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin){
             if(p->probe_mode==2&&queue_up(p,bytes+off,len-off,0)!=0)return -1;
         }else fwd_down(p,bytes+off,len-off,0);
     }
-    if(fin){ p->up_fin_seen=1;
+    if(fin){ p->up_fin_seen=1;if(p->probe_mode)p->tcp_eof=1;
         if(p->probe_mode==1){
             char ack[96];int n=snprintf(ack,sizeof(ack),"NBPROBE OK bytes=%llu\n",
                 (unsigned long long)p->probe_bytes);
@@ -2296,6 +2030,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
             p=ps_alloc(); if(!p){ log4c_warn("stream table full, reset sid=%llu",(unsigned long long)stream_id);
                 picoquic_discard_stream(cnx,stream_id,0); break; }
             p->up_cnx=cnx; p->up_stream_id=stream_id;
+            ps_index_refresh(p);
             picoquic_set_app_stream_ctx(cnx,stream_id,p);
             if(G.role==ROLE_MIDDLE){
                 int fc_ret=picoquic_set_app_flow_control(cnx,stream_id,1);
@@ -2353,8 +2088,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         role_name(G.role),p->id,trace_delta_ms(p->first_down_prepare_at,p->created_at),
                         trace_delta_ms(p->first_down_prepare_at,p->first_down_queue_at),nb,p->down_tx.len,length,p->route);
                 }
-                (void)nb_ring_copyout(&p->down_tx,dst,nb);
-                nb_live_queue_consumed(&p->down_tx_clock,nb,p->down_tx.len);
+                (void)nb_send_copyout(&p->down_tx,&p->down_tx_clock,dst,nb);
                 middle_upstream_fc_update(p,picoquic_current_time());
                 ps_touch(p);
             } else if(dst == NULL && (nb > 0 || is_fin)) {
@@ -2378,8 +2112,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         role_name(G.role),p->id,trace_delta_ms(p->first_up_prepare_at,p->created_at),
                         trace_delta_ms(p->first_up_prepare_at,p->first_up_queue_at),nb,p->up_tx.len,length,p->route);
                 }
-                (void)nb_ring_copyout(&p->up_tx,dst,nb);
-                nb_live_queue_consumed(&p->up_tx_clock,nb,p->up_tx.len);
+                (void)nb_send_copyout(&p->up_tx,&p->up_tx_clock,dst,nb);
                 ps_touch(p);
             } else if(dst == NULL && (nb > 0 || is_fin)) {
                 log4c_warn("id=%u provide up buffer fail sid=%llu", p->id, (unsigned long long)stream_id);
@@ -2392,6 +2125,10 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_prepare_datagram: {
         int handled = 0;
         static uint32_t datagram_rr=0;uint64_t now=picoquic_current_time();
+        { const uint8_t* control=NULL;size_t control_len=0,token=0;
+          if(nb_udp_lifecycle_next(&g_udp_lifecycle,(uintptr_t)cnx,now,&control,&control_len,&token)){
+            if(control_len<=length){uint8_t* dst=picoquic_provide_datagram_buffer_ex(bytes,control_len,picoquic_datagram_not_active);if(dst!=NULL){memcpy(dst,control,control_len);nb_udp_lifecycle_sent(&g_udp_lifecycle,token,now);handled=1;}}
+            else {(void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_not_active);handled=1;} } }
         for(int media_pass=0;media_pass<2&&!handled;media_pass++){
           for(int scan=0;scan<MAX_CONN&&!handled;scan++){
             int i=(int)((datagram_rr+(uint32_t)scan)%MAX_CONN);
@@ -2545,13 +2282,9 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
         }
         for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(i=0;i<POOL_SIZE;i++)if(G.pools[pool_id].cnx[i]==cnx){
             cnx_pool_t* pool=&G.pools[pool_id];
-            pool->cnx[i]=NULL;pool->recent_loss[i]=0;pool->recent_rtt[i]=0;pool->recent_rtt_max[i]=0;
-            pool->recent_sent[i]=0;pool->last_sent_total[i]=0;pool->last_lost_total[i]=0;
-            pool->last_timer_total[i]=0;pool->last_spurious_total[i]=0;
-            pool->last_retrans_total[i]=0;pool->last_preempt_total[i]=0;
-            pool->recent_rtt_var[i]=0;pool->recent_ts[i]=0;
+            pool->cnx[i]=NULL;nb_pool_slot_reset_quality(pool,i);pool->health[i].degraded_since_us=0;
         }
-        sched_forget_cnx(cnx);picoquic_set_callback(cnx,NULL,NULL); break; }
+        udp_lifecycle_forget_cnx(cnx);sched_forget_cnx(cnx);picoquic_set_callback(cnx,NULL,NULL); break; }
     default: break;
     }
     return 0;
@@ -2585,7 +2318,6 @@ static int socks_udp_bind_socket(struct sockaddr_in* bound){
     errno=EADDRINUSE;return -1;
 }
 
-/* entry: 接受一个 TCP 客户端连接 */
 static void entry_accept(void){
     struct sockaddr_storage peer;
     socklen_t peer_len=sizeof(peer);
@@ -2617,15 +2349,37 @@ static void entry_accept(void){
     log4c_info("entry id=%u accept fd=%d -> down_sid=%llu route=%s",p->id,fd,(unsigned long long)p->down_stream_id,G.route_str);
 }
 
+static int socks_auth_finish(proxy_stream_t* p,const char* username,int credential_valid,
+    int cache_hit,uint64_t worker_us){
+    int tenant=g_tenants_enabled?nb_tenant_find(&g_tenants,username):-1;
+    int valid=credential_valid&&(!g_tenants_enabled||tenant>=0);
+    uint8_t response[2]={1,valid?0:1};(void)send(p->tcp_fd,response,2,MSG_NOSIGNAL);
+    if(!valid){
+        log4c_warn("entry id=%u socks authentication failed peer=%s user=%s worker=%.1fms",
+            p->id,p->peer_addr,username,worker_us/1000.0);
+        ps_set_close_reason(p,"socks-auth-failed");ps_free(p);return 0;
+    }
+    p->tenant_index=tenant;snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",username);
+    p->socks_auth_worker_us=worker_us;p->socks_auth_at=picoquic_current_time();p->socks_stage=2;
+    log4c_debug("entry id=%u socks authenticated user=%s cache=%s worker=%.1fms",
+        p->id,username,cache_hit?"hit":"miss",worker_us/1000.0);
+    if(epoll_tcp_update(p,0)!=0){ps_set_close_reason(p,"socks-auth-epoll");ps_free(p);return 0;}
+    return 1;
+}
+
 /* entry SOCKS5 入口: 推进握手, 完成后用动态 target 开 QUIC stream。 */
 static void socks_handshake(proxy_stream_t* p){
+    if(p->socks_auth_pending)return;
     uint8_t buf[512];
+    size_t buffered=p->socks_len;
     ssize_t n=recv(p->tcp_fd,buf,sizeof(buf),0);
-    if(n<=0){ /* EOF 或错误(非 EAGAIN) -> 握手阶段客户端断开, 回收 */
+    if(n<=0){ /* 已缓存流水线 request 时，EAGAIN 仍继续解析现有缓冲。 */
         if(n==0||(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)) ps_teardown(p);
-        return; }
-    if(p->socks_len+(size_t)n>sizeof(p->socks_buf)){ log4c_warn("id=%u socks buf overflow",p->id); ps_free(p); return; }
-    memcpy(p->socks_buf+p->socks_len,buf,(size_t)n); p->socks_len+=(size_t)n;
+        if(buffered==0||n==0)return;
+    }else{
+        if(p->socks_len+(size_t)n>sizeof(p->socks_buf)){ log4c_warn("id=%u socks buf overflow",p->id); ps_free(p); return; }
+        memcpy(p->socks_buf+p->socks_len,buf,(size_t)n); p->socks_len+=(size_t)n;
+    }
 
     if(p->socks_stage==0){ /* greeting: VER NMETHODS METHODS... */
         if(p->socks_len<2) return;
@@ -2656,16 +2410,31 @@ static void socks_handshake(proxy_stream_t* p){
         size_t plen=p->socks_buf[2+ulen],used=3+ulen+plen;
         if(plen==0||p->socks_len<used)return;
         char username[NB_AUTH_NAME_MAX];memcpy(username,p->socks_buf+2,ulen);username[ulen]=0;
-        int cache_hit=0;
-        int valid=nb_auth_user_verify_cached(&g_socks_users,username,p->socks_buf+3+ulen,plen,
-            picoquic_current_time(),SOCKS_AUTH_CACHE_TTL_US,&cache_hit);
-        uint8_t r[2]={1,valid?0:1};(void)send(p->tcp_fd,r,2,MSG_NOSIGNAL);
+        unsigned char fingerprint[NB_AUTH_FINGERPRINT_LEN];uint64_t auth_now=picoquic_current_time();
+        int fingerprint_ok=nb_auth_fingerprint(&g_socks_users,username,p->socks_buf+3+ulen,plen,fingerprint);
+        int cache_hit=fingerprint_ok&&nb_auth_cache_lookup(&g_socks_users,fingerprint,auth_now);
+        int coalesced=0;
+        if(!cache_hit&&fingerprint_ok)for(int i=0;i<MAX_CONN;i++){
+            proxy_stream_t* pending=&G.streams[i];
+            if(pending!=p&&pending->in_use&&pending->socks_auth_pending&&
+                memcmp(pending->socks_auth_fingerprint,fingerprint,sizeof(fingerprint))==0){coalesced=1;break;}
+        }
+        int submitted=(cache_hit||coalesced)?0:nb_auth_async_submit(p->id,username,p->socks_buf+3+ulen,plen);
         memset(p->socks_buf+3+ulen,0,plen);
         memmove(p->socks_buf,p->socks_buf+used,p->socks_len-used);p->socks_len-=used;
-        if(!valid){log4c_warn("entry id=%u socks authentication failed peer=%s user=%s",p->id,p->peer_addr,username);ps_free(p);return;}
-        log4c_debug("entry id=%u socks authenticated user=%s cache=%s",p->id,username,cache_hit?"hit":"miss");
-        p->socks_auth_at=picoquic_current_time();
-        p->socks_stage=2;
+        if(cache_hit){if(!socks_auth_finish(p,username,1,1,0))return;}
+        else if(submitted==0){
+            p->socks_auth_pending=1;snprintf(p->socks_auth_username,sizeof(p->socks_auth_username),"%s",username);
+            memcpy(p->socks_auth_fingerprint,fingerprint,sizeof(fingerprint));
+            memset(fingerprint,0,sizeof(fingerprint));
+            if(coalesced)log4c_debug("entry id=%u socks authentication coalesced user=%s",p->id,username);
+            if(epoll_tcp_update(p,0)!=0){ps_set_close_reason(p,"socks-auth-epoll");ps_free(p);}return;
+        }else{
+            memset(fingerprint,0,sizeof(fingerprint));
+            log4c_warn("entry id=%u socks authentication queue unavailable peer=%s user=%s",p->id,p->peer_addr,username);
+            (void)socks_auth_finish(p,username,0,0,0);return;
+        }
+        memset(fingerprint,0,sizeof(fingerprint));
     }
     if(p->socks_stage==2){ /* request: VER CMD RSV ATYP ADDR PORT */
         if(p->socks_len<4) return;
@@ -2692,6 +2461,7 @@ static void socks_handshake(proxy_stream_t* p){
             trace_delta_ms(p->socks_auth_at,p->socks_greeting_at),
             trace_delta_ms(p->socks_request_at,p->socks_auth_at?p->socks_auth_at:p->socks_greeting_at));
         if(cmd==0x03){
+            if(g_tenants_enabled&&nb_tenant_acquire(&g_tenants,p->tenant_index,1,picoquic_current_time())!=0){uint8_t r[10]={5,2,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"tenant-udp-quota");ps_free(p);return;}p->tenant_acquired=g_tenants_enabled;p->tenant_udp=1;
             struct sockaddr_in bind_addr;int ufd=socks_udp_bind_socket(&bind_addr);
             if(ufd<0){
                 int saved=errno;if(ufd>=0)close(ufd);
@@ -2730,9 +2500,12 @@ static void socks_handshake(proxy_stream_t* p){
                 p->id,p->peer_addr,socks_cmd_name(cmd),cmd,socks_atyp_name(atyp),atyp,host,port);
             uint8_t r[10]={0x05,0x07,0,0x01,0,0,0,0,0,0}; (void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);
             ps_set_close_reason(p,"socks-unsupported-command");ps_free(p);return; }
+        if(g_tenants_enabled&&nb_tenant_acquire(&g_tenants,p->tenant_index,0,picoquic_current_time())!=0){uint8_t r[10]={5,2,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"tenant-tcp-quota");ps_free(p);return;}p->tenant_acquired=g_tenants_enabled;
         if(!whitelist_allowed(host,port)){ /* 白名单外 -> 拒绝(0x02 not allowed by ruleset), 不占三跳线路 */
             log4c_debug("entry id=%u BLOCKED %s:%d (not in whitelist)",p->id,host,port);
             uint8_t r[10]={0x05,0x02,0,0x01,0,0,0,0,0,0}; (void)send(p->tcp_fd,r,10,MSG_NOSIGNAL); ps_free(p); return; }
+        const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(p->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
+        if(G.exit_routes_enabled&&!selected){uint8_t r[10]={5,1,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"no-healthy-route");ps_free(p);return;}if(selected){p->route_index=nb_routes_acquire(&G.exit_routes,selected);if(p->route_index<0){ps_free(p);return;}}
         if(port==NB_PROBE_PORT&&(!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)))
             p->probe_mode=3; /* entry 等待探针响应 FIN，不能在客户端半关闭后立即拆流 */
         uint8_t rep[10]={0x05,0x00,0x00,0x01,0,0,0,0,0,0}; /* 成功, BND 全 0 */
@@ -2740,7 +2513,6 @@ static void socks_handshake(proxy_stream_t* p){
         memmove(p->socks_buf,p->socks_buf+need,p->socks_len-need); p->socks_len-=need;
         /* 构造 route: 中间跳前缀(可空) + 动态 target */
         char route[300];
-        const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick(&G.exit_routes):NULL;
         const char* mid=selected?selected->hop:G.mid_route;
         int route_len=mid[0]
             ? snprintf(route,sizeof(route),"%s,T:%s:%d",mid,host,port)
@@ -2765,7 +2537,6 @@ static void socks_handshake(proxy_stream_t* p){
     }
 }
 
-/* 把面向 TCP 的待写缓冲(q2t) flush 到 TCP fd */
 static void flush_q2t(proxy_stream_t* p){
     if(p->tcp_fd<0) return;
     while(p->q2t.len>0){
@@ -2779,20 +2550,22 @@ static void flush_q2t(proxy_stream_t* p){
                     trace_delta_ms(p->first_q2t_flush_at,p->created_at),
                     trace_delta_ms(p->first_q2t_flush_at,p->first_q2t_queue_at),n,p->q2t.len,p->route);
             }
-            nb_ring_consume(&p->q2t,(size_t)n); ps_touch(p);
-            nb_live_queue_consumed(&p->q2t_clock,(size_t)n,p->q2t.len);
+            nb_send_consume(&p->q2t,&p->q2t_clock,(size_t)n); ps_touch(p);
         }
         else if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK){
             /* 本地 TCP 已死(EPIPE/ECONNRESET/...): 待写数据无处可去, 丢弃并标记 EOF -> 触发回收,
              * 否则 q2t 恒非空使 maybe_free 永不满足, 流泄漏。 */
             log4c_debug("id=%u q2t send err=%s, drop %zu & teardown",p->id,strerror(errno),p->q2t.len);
             ps_set_close_reason(p,"tcp-send-error");
-            p->tcp_eof=1; nb_ring_clear(&p->q2t);nb_live_queue_consumed(&p->q2t_clock,0,0);
+            p->tcp_eof=1; nb_send_clear(&p->q2t,&p->q2t_clock);
             break;
         }
         else break; /* EAGAIN: 等下轮可写 */
     }
-    if(p->q2t.len==0 && p->q2t_fin){ shutdown(p->tcp_fd,SHUT_WR); p->q2t_fin=0; }
+    if(p->q2t.len==0 && p->q2t_fin){
+        shutdown(p->tcp_fd,SHUT_WR);p->q2t_fin=0;
+        if(G.role==ROLE_ENTRY&&p->probe_mode==3){ps_teardown_reason(p,"probe-complete");return;}
+    }
 }
 
 static int tcp_read_allowed(proxy_stream_t* p){
@@ -2801,6 +2574,8 @@ static int tcp_read_allowed(proxy_stream_t* p){
     size_t stage_q=p->fec_stage_tx_len;
     size_t dg_q=p->fec_dg_tx_len;
     uint64_t now=picoquic_current_time();
+    if(p->tenant_throttled_until>now)return 0;
+    p->tenant_throttled_until=0;
     nb_live_queue_limits_t limits=nb_live_queue_limits(p->flow_class,p->udp_mode);
     uint64_t queue_age=nb_live_queue_age_us(main_clock,main_q,now);
     int age_limited=p->flow_class==NB_FLOW_CLASS_MEDIA;
@@ -2825,7 +2600,9 @@ static int tcp_read_allowed(proxy_stream_t* p){
 static int epoll_tcp_update(proxy_stream_t* p,int add){
     if(G.epoll_fd<0||p==NULL||!p->in_use||p->tcp_fd<0)return -1;
     uint32_t events=EPOLLERR|EPOLLHUP|EPOLLRDHUP;
-    if((G.socks_enabled&&p->socks_stage<3)||p->tcp_connecting||tcp_read_allowed(p))events|=EPOLLIN;
+    if(G.socks_enabled&&p->socks_stage<3){
+        if(!p->socks_auth_pending)events|=EPOLLIN;
+    }else if(p->tcp_connecting||tcp_read_allowed(p))events|=EPOLLIN;
     if(p->q2t.len>0||p->tcp_connecting)events|=EPOLLOUT;
     size_t index=(size_t)(p-G.streams);if(index>=MAX_CONN)return -1;
     struct epoll_event ev;memset(&ev,0,sizeof(ev));ev.events=events;
@@ -2844,22 +2621,27 @@ static int epoll_udp_update(proxy_stream_t* p,int add){
     return epoll_ctl(G.epoll_fd,add?EPOLL_CTL_ADD:EPOLL_CTL_MOD,p->udp_fd,&ev);
 }
 
-static proxy_stream_t* udp_entry_child_get(proxy_stream_t* parent,const char* host,int port){
+static proxy_stream_t* udp_entry_child_get(proxy_stream_t* parent,const char* host,int port,const char** reject_reason){
+    if(reject_reason!=NULL)*reject_reason=NULL;
     proxy_stream_t* p=ps_find_udp_child(parent->id,host,port);if(p!=NULL)return p;
-    if(!whitelist_allowed(host,port))return NULL;
-    p=ps_alloc();if(p==NULL)return NULL;p->udp_mode=1;p->udp_parent_id=parent->id;
+    if(!whitelist_allowed(host,port)){if(reject_reason!=NULL)*reject_reason="policy";return NULL;}
+    p=ps_alloc();if(p==NULL){if(reject_reason!=NULL)*reject_reason="session-capacity";return NULL;}p->udp_mode=1;p->udp_parent_id=parent->id;
+    p->tenant_index=parent->tenant_index;snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",parent->tenant_name);
     p->udp_session_id=udp_session_id_new();p->down_pool_id=0;
-    if(p->udp_session_id==0||G.pool_count<=0){ps_set_close_reason(p,"udp-child-init-fail");ps_free(p);return NULL;}
+    if(p->udp_session_id==0||G.pool_count<=0){if(reject_reason!=NULL)*reject_reason="child-init";ps_set_close_reason(p,"udp-child-init-fail");ps_free(p);return NULL;}
     snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);p->udp_target_port=port;
-    const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick(&G.exit_routes):NULL;
+    ps_index_refresh(p);
+    const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(parent->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
+    if(G.exit_routes_enabled&&!selected){if(reject_reason!=NULL)*reject_reason="no-healthy-route";ps_set_close_reason(p,"udp-no-healthy-route");ps_free(p);return NULL;}if(selected){p->route_index=nb_routes_acquire(&G.exit_routes,selected);if(p->route_index<0){if(reject_reason!=NULL)*reject_reason="route-capacity";ps_set_close_reason(p,"udp-route-capacity");ps_free(p);return NULL;}}
     const char* mid=selected?selected->hop:G.mid_route;
     int n=mid[0]?snprintf(p->route,sizeof(p->route),"%s,T:%s:%d",mid,host,port):
         snprintf(p->route,sizeof(p->route),"T:%s:%d",host,port);
-    if(n<=0||(size_t)n>=sizeof(p->route)){ps_set_close_reason(p,"udp-route-overflow");ps_free(p);return NULL;}
+    if(n<=0||(size_t)n>=sizeof(p->route)){if(reject_reason!=NULL)*reject_reason="route-overflow";ps_set_close_reason(p,"udp-route-overflow");ps_free(p);return NULL;}
     nb_flow_policy_t pol;flow_policy_for_host(host,port,&pol);apply_flow_policy(p,&pol);
     cnx_pool_t* pool=&G.pools[0];int idx=pool_pick(pool,pol.lane_hint==NB_FLOW_LANE_LATENCY);
-    if(idx<0){ps_set_close_reason(p,"udp-no-downstream");ps_free(p);return NULL;}
+    if(idx<0){if(reject_reason!=NULL)*reject_reason="no-downstream";ps_set_close_reason(p,"udp-no-downstream");ps_free(p);return NULL;}
     p->down_cnx=pool->cnx[idx];p->down_pool_idx=idx;
+    ps_index_refresh(p);
     if(pol.flow_class==NB_FLOW_CLASS_MEDIA)picoquic_set_media_mode(p->down_cnx,1);
     log4c_info("entry udp flow open id=%u parent=%u usid=%u peer=%s target=%s:%d class=%s route=%s",
         p->id,parent->id,p->udp_session_id,parent->peer_addr,host,port,nb_flow_class_name(pol.flow_class),p->route);
@@ -2893,11 +2675,14 @@ static void udp_local_drain(proxy_stream_t* p){
                 p->udp_assoc_malformed++;
                 log4c_warn("entry UDP relay malformed id=%u bytes=%zd",p->id,n);continue;
             }
-            proxy_stream_t* child=udp_entry_child_get(p,host,port);if(child==NULL){
-                p->udp_assoc_policy_drop++;
-                if(p->udp_assoc_policy_drop==1)log4c_warn("entry UDP relay policy drop id=%u target=%s:%d",p->id,host,port);
+            const char* reject_reason=NULL;
+            proxy_stream_t* child=udp_entry_child_get(p,host,port,&reject_reason);if(child==NULL){
+                if(reject_reason!=NULL&&!strcmp(reject_reason,"policy"))p->udp_assoc_policy_drop++;
+                log4c_warn("entry UDP relay drop id=%u target=%s:%d reason=%s",p->id,host,port,reject_reason?reject_reason:"unknown");
                 continue;
             }
+            if(g_tenants_enabled&&nb_tenant_allowance(&g_tenants,child->tenant_index,payload_len,picoquic_current_time())<payload_len){p->udp_assoc_policy_drop++;continue;}
+            if(g_tenants_enabled)nb_tenant_consume(&g_tenants,child->tenant_index,payload_len);
             if(child->udp_first_local_c2s_at==0){
                 child->udp_first_local_c2s_at=picoquic_current_time();
                 log4c_info("entry udp trace id=%u usid=%u stage=phone-first-rx association_age=%.1fms flow_age=%.1fms bytes=%zu target=%s:%d",
@@ -2927,12 +2712,13 @@ static void udp_local_drain(proxy_stream_t* p){
     }
 }
 
-/* 从 TCP fd 读 -> add_to_stream 到 QUIC。entry: 写下游; exit: 写上游(回程)。 */
 static void pump_tcp(proxy_stream_t* p){
     uint8_t buf[16384]; ssize_t n;
     for(;;){
-        n=recv(p->tcp_fd,buf,sizeof(buf),0);
+        size_t limit=g_tenants_enabled?nb_tenant_allowance(&g_tenants,p->tenant_index,sizeof(buf),picoquic_current_time()):sizeof(buf);if(limit==0){p->tenant_throttled_until=picoquic_current_time()+10000ULL;break;}
+        n=recv(p->tcp_fd,buf,limit,0);
         if(n>0){
+            if(g_tenants_enabled)nb_tenant_consume(&g_tenants,p->tenant_index,(size_t)n);
             if(G.role==ROLE_ENTRY) fwd_down(p,buf,(size_t)n,0); else fwd_up(p,buf,(size_t)n,0);
             if(p->need_teardown||!tcp_read_allowed(p))break;
         }
@@ -2950,7 +2736,7 @@ static void pump_tcp(proxy_stream_t* p){
 
 /* 判定并释放已完成的流。
  * 关键: 真实服务器(HTTP keep-alive)响应完不主动关 TCP, 若死等"双向 FIN 齐全"则流永不回收 -> 泄漏。
- * 但反向的坑更隐蔽: exit 侧回程响应是 add_to_stream 排队在上游 QUIC stream 里的(不占 q2t),
+ * 但反向的坑更隐蔽: exit 侧回程响应位于 up_tx 发送环中(不占 q2t),
  * target 一关(tcp_eof)队列往往还没发完; 若此时 discard 会截断回程(大文件只传一部分)。故:
  *   1) 双向数据方向都结束 且 q2t 排空 -> 优雅回收;
  *   2) 仅 ENTRY: client TCP 关闭即事务结束, 回程无处可送, 主动 teardown(丢回程 OK, 且连锁 reset 清下游);
@@ -2959,7 +2745,11 @@ static void pump_tcp(proxy_stream_t* p){
 static void maybe_free(proxy_stream_t* p){
     int left_done  = (G.role==ROLE_ENTRY)? p->tcp_eof : p->up_fin_seen;
     int right_done = (G.role==ROLE_EXIT) ? p->tcp_eof : p->down_fin_seen;
-    if(left_done && right_done && p->q2t.len==0){ ps_teardown_reason(p,"bidirectional-fin"); return; }
+    size_t prefix_left=(p->down_prefix_len>=p->down_prefix_off)
+        ?p->down_prefix_len-p->down_prefix_off:0;
+    int reliable_pending=prefix_left>0||p->down_tx.len>0||p->up_tx.len>0||p->q2t.len>0||
+        p->down_tx_fin||p->up_tx_fin||p->fec_stage_tx_len>0||p->fec_stage_tx_fin||p->fec_dg_tx_len>0;
+    if(left_done && right_done && !reliable_pending){ ps_teardown_reason(p,"bidirectional-fin"); return; }
     if(G.role==ROLE_ENTRY && p->tcp_eof && p->q2t.len==0 && p->probe_mode==0){
         ps_teardown_reason(p,"entry-client-eof"); return;
     }
@@ -2968,7 +2758,7 @@ static void maybe_free(proxy_stream_t* p){
 /* P1-2a: recvmmsg 批量收 UDP -> 降低高包率(大流量)下的接收 syscall 开销。
  * 单线程事件循环, 用 function-local static 缓冲复用, 一次 syscall 收多达 UDP_RECV_BATCH 个包。 */
 #define UDP_RECV_BATCH 32
-static void udp_drain(uint64_t now){
+static void udp_drain_fd(int fd,const struct sockaddr_storage* local,uint64_t now){
     static struct mmsghdr msgs[UDP_RECV_BATCH];
     static struct iovec iovs[UDP_RECV_BATCH];
     static uint8_t bufs[UDP_RECV_BATCH][1536];
@@ -2984,11 +2774,11 @@ static void udp_drain(uint64_t now){
     }
     for(;;){
         for(int i=0;i<UDP_RECV_BATCH;i++) msgs[i].msg_hdr.msg_namelen=sizeof(froms[i]); /* namelen 是 in/out, 每次重置 */
-        int got=recvmmsg(G.udp_fd,msgs,UDP_RECV_BATCH,0,NULL);
-        if(got<=0) break;
+        int got=recvmmsg(fd,msgs,UDP_RECV_BATCH,0,NULL);
+        if(got<=0){if(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)nb_metrics_note_udp_error(&g_metrics_state,0);break;}
         for(int m=0;m<got;m++)
             picoquic_incoming_packet(G.quic,bufs[m],(size_t)msgs[m].msg_len,
-                (struct sockaddr*)&froms[m],(struct sockaddr*)&G.local_addr,0,0,now);
+                (struct sockaddr*)&froms[m],(struct sockaddr*)local,0,0,now);
         if(got<UDP_RECV_BATCH) break; /* 已排空 */
     }
 }
@@ -3003,9 +2793,9 @@ static int addr_eq(const struct sockaddr_storage* a, const struct sockaddr_stora
     const struct sockaddr_in6*x=(const void*)a,*y=(const void*)b;
     return x->sin6_port==y->sin6_port && memcmp(&x->sin6_addr,&y->sin6_addr,16)==0;
 }
-static void udp_send_gso(uint8_t* buf, size_t len, int segsz, struct sockaddr* to, socklen_t tolen){
+static void udp_send_gso(int fd,uint8_t* buf, size_t len, int segsz, struct sockaddr* to, socklen_t tolen){
     if(len==0||segsz<=0) return;
-    if(len<=(size_t)segsz){ (void)sendto(G.udp_fd,buf,len,0,to,tolen); return; } /* 单段无需 GSO */
+    if(len<=(size_t)segsz){ if(sendto(fd,buf,len,0,to,tolen)<0)nb_metrics_note_udp_error(&g_metrics_state,1); return; } /* 单段无需 GSO */
     struct msghdr mh; memset(&mh,0,sizeof(mh));
     struct iovec iov={buf,len}; mh.msg_name=to; mh.msg_namelen=tolen; mh.msg_iov=&iov; mh.msg_iovlen=1;
     char cbuf[CMSG_SPACE(sizeof(uint16_t))]; memset(cbuf,0,sizeof(cbuf));
@@ -3013,20 +2803,22 @@ static void udp_send_gso(uint8_t* buf, size_t len, int segsz, struct sockaddr* t
     struct cmsghdr* cm=CMSG_FIRSTHDR(&mh);
     cm->cmsg_level=SOL_UDP; cm->cmsg_type=UDP_SEGMENT; cm->cmsg_len=CMSG_LEN(sizeof(uint16_t));
     *((uint16_t*)CMSG_DATA(cm))=(uint16_t)segsz;
-    if(sendmsg(G.udp_fd,&mh,0)>=0) return;
+    if(sendmsg(fd,&mh,0)>=0) return;
     for(size_t off=0;off<len;off+=segsz){ size_t s=(len-off<(size_t)segsz)?(len-off):(size_t)segsz;
-        (void)sendto(G.udp_fd,buf+off,s,0,to,tolen); } /* 回退逐段 */
+        if(sendto(fd,buf+off,s,0,to,tolen)<0)nb_metrics_note_udp_error(&g_metrics_state,1); } /* 回退逐段 */
 }
 static void udp_send_batch(uint64_t now){
-    uint8_t gbuf[64*1536]; size_t glen=0; int gseg=0; struct sockaddr_storage gto; socklen_t gtolen=0;
+    uint8_t gbuf[64*1536]; size_t glen=0; int gseg=0,gfd=-1; struct sockaddr_storage gto; socklen_t gtolen=0;
     for(;;){
         uint8_t sb[1536]; size_t sl=0; struct sockaddr_storage to,fr; int ifx=0;
         picoquic_connection_id_t lc; picoquic_cnx_t* lcnx=NULL;
         int r=picoquic_prepare_next_packet(G.quic,now,sb,sizeof(sb),&sl,&to,&fr,&ifx,&lc,&lcnx);
         if(r!=0||sl==0) break;
+        int fd=(G.role==ROLE_MIDDLE&&pool_contains_cnx(lcnx))?G.client_udp_fd:G.udp_fd;
         socklen_t tl=(to.ss_family==AF_INET)?sizeof(struct sockaddr_in):sizeof(struct sockaddr_in6);
         if(!g_udp_gso_enabled){
-            if(sendto(G.udp_fd,sb,sl,0,(struct sockaddr*)&to,tl)<0){
+            if(sendto(fd,sb,sl,0,(struct sockaddr*)&to,tl)<0){
+                nb_metrics_note_udp_error(&g_metrics_state,1);
                 static uint64_t last_warn=0;
                 if(now-last_warn>=1000000ULL){
                     last_warn=now;
@@ -3035,23 +2827,23 @@ static void udp_send_batch(uint64_t now){
             }
             continue;
         }
-        if(glen==0){ memcpy(&gto,&to,tl); gtolen=tl; gseg=(int)sl; memcpy(gbuf,sb,sl); glen=sl; }
-        else if(addr_eq(&to,&gto) && (int)sl<=gseg && glen+sl<=sizeof(gbuf)){
+        if(glen==0){ memcpy(&gto,&to,tl); gtolen=tl; gseg=(int)sl;gfd=fd; memcpy(gbuf,sb,sl); glen=sl; }
+        else if(fd==gfd&&addr_eq(&to,&gto) && (int)sl<=gseg && glen+sl<=sizeof(gbuf)){
             memcpy(gbuf+glen,sb,sl); glen+=sl;
-            if((int)sl<gseg){ udp_send_gso(gbuf,glen,gseg,(struct sockaddr*)&gto,gtolen); glen=0; gseg=0; } /* 末段更小 -> flush */
+            if((int)sl<gseg){ udp_send_gso(gfd,gbuf,glen,gseg,(struct sockaddr*)&gto,gtolen); glen=0; gseg=0; } /* 末段更小 -> flush */
         } else { /* 目的/段大小变化或缓冲满 -> flush 后新起一批 */
-            udp_send_gso(gbuf,glen,gseg,(struct sockaddr*)&gto,gtolen);
-            memcpy(&gto,&to,tl); gtolen=tl; gseg=(int)sl; memcpy(gbuf,sb,sl); glen=sl;
+            udp_send_gso(gfd,gbuf,glen,gseg,(struct sockaddr*)&gto,gtolen);
+            memcpy(&gto,&to,tl); gtolen=tl; gseg=(int)sl;gfd=fd; memcpy(gbuf,sb,sl); glen=sl;
         }
     }
-    if(glen>0) udp_send_gso(gbuf,glen,gseg,(struct sockaddr*)&gto,gtolen);
+    if(glen>0) udp_send_gso(gfd,gbuf,glen,gseg,(struct sockaddr*)&gto,gtolen);
 }
 
 static void usage(const char* prog){
     fprintf(stderr,
         "Usage:\n"
         "  entry(固定target): %s -r entry -l <tcp_port> -n <hop1_host> -N <hop1_qport> -R <route> -c <cert> -k <key> -a <ca>\n"
-        "  entry(SOCKS5入口): %s -r entry -l <socks_port> -n <hop1_host> -N <hop1_qport> -S -U <users> [-M <mid_route>] -c <cert> -k <key> -a <ca>\n"
+        "  entry(SOCKS5入口): %s -r entry -l <socks_port> -n <hop1_host> -N <hop1_qport> -S -U <users> -Q <tenants> [-M <mid_route>] -c <cert> -k <key> -a <ca>\n"
         "  middle           : %s -r middle -p <quic_port> -c <cert> -k <key> -a <ca>\n"
         "  exit             : %s -r exit   -p <quic_port> -c <cert> -k <key> -a <ca>\n"
         "  route(发给第一跳): \"H:hop2:qport,...,T:target:port\" (两跳仅 \"T:target:port\")\n"
@@ -3065,13 +2857,14 @@ int main(int argc,char**argv){
     const char* rolestr=NULL; const char* next_host=NULL;
     const char* cert=NULL; const char* key=NULL; const char* cert_root=NULL; const char* route=NULL;
     const char* users_path=NULL;
+    const char* tenants_path=NULL;
     const char* control_path_arg=NULL;
     const char* exit_routes_path=NULL;
     const char* outbound_ip=NULL;
     char control_path[108];
     const char* wl_path=NULL;
     const char* tiktok_rules_path=NULL;
-    memset(&G,0,sizeof(G)); G.tcp_listen_fd=-1; G.udp_fd=-1; G.epoll_fd=-1;G.control_fd=-1;
+    memset(&G,0,sizeof(G)); G.tcp_listen_fd=-1; G.udp_fd=-1;G.client_udp_fd=-1; G.epoll_fd=-1;G.control_fd=-1;
 
     for(i=1;i<argc;i++){
         if(!strcmp(argv[i],"-r")&&i+1<argc) rolestr=argv[++i];
@@ -3088,6 +2881,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"-k")&&i+1<argc) key=argv[++i];
         else if(!strcmp(argv[i],"-a")&&i+1<argc) cert_root=argv[++i];
         else if(!strcmp(argv[i],"-U")&&i+1<argc) users_path=argv[++i];
+        else if(!strcmp(argv[i],"-Q")&&i+1<argc) tenants_path=argv[++i];
         else if(!strcmp(argv[i],"-C")&&i+1<argc) control_path_arg=argv[++i];
         else if(!strcmp(argv[i],"-E")&&i+1<argc) exit_routes_path=argv[++i];
         else if(!strcmp(argv[i],"-o")&&i+1<argc) outbound_ip=argv[++i];
@@ -3097,9 +2891,9 @@ int main(int argc,char**argv){
     else if(!strcmp(rolestr,"middle")) G.role=ROLE_MIDDLE;
     else if(!strcmp(rolestr,"exit")) G.role=ROLE_EXIT;
     else { usage(argv[0]); return 1; }
-    { const char* worker=getenv("NB_WORKER_ID");if(!worker)worker="0";
+    { const char* worker=getenv("NB_WORKER_ID");if(!worker)worker="0";const char* dir=getenv("NB_CONTROL_DIR");if(!dir||!dir[0])dir="/run";
       int n=control_path_arg?snprintf(control_path,sizeof(control_path),"%s",control_path_arg)
-          :snprintf(control_path,sizeof(control_path),"/run/nb-%s-%s.ctl",role_name(G.role),worker);
+          :snprintf(control_path,sizeof(control_path),"%s/nb-%s-%s.ctl",dir,role_name(G.role),worker);
       if(n<0||(size_t)n>=sizeof(control_path)){fprintf(stderr,"control socket path too long\n");return 1;} }
 
     { char pname[32]; snprintf(pname,sizeof(pname),"nb-%s",role_name(G.role)); log4c_init(pname);
@@ -3121,6 +2915,15 @@ int main(int argc,char**argv){
       if(rd&&rd[0])g_reorder_delay_us=strtoull(rd,NULL,10);
       if(G.role==ROLE_ENTRY || G.role==ROLE_MIDDLE)log4c_info("%s loss reorder tolerance: gap=%llu delay=%lluus (PTO unchanged)",
           role_name(G.role),(unsigned long long)g_reorder_gap,(unsigned long long)g_reorder_delay_us); }
+    if(G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE){
+      g_pool_health_cfg.queue_age_threshold_us=env_ms_to_us("NB_POOL_RETIRE_QUEUE_MS",750,200,5000);g_pool_health_cfg.hold_us=env_ms_to_us("NB_POOL_RETIRE_HOLD_MS",5000,1000,60000);
+      g_pool_health_cfg.progress_grace_us=env_ms_to_us("NB_POOL_RETIRE_STALL_MS",12000,5000,60000);
+      g_pool_health_cfg.cooldown_us=env_ms_to_us("NB_POOL_RETIRE_COOLDOWN_MS",30000,5000,300000);
+      log4c_info("pool recovery: queue=%.1fms hold=%.1fs stall=%.1fs cooldown=%.1fs",
+          g_pool_health_cfg.queue_age_threshold_us/1000.0,g_pool_health_cfg.hold_us/1000000.0,
+          g_pool_health_cfg.progress_grace_us/1000000.0,g_pool_health_cfg.cooldown_us/1000000.0);
+    }
+    if(G.role==ROLE_ENTRY)g_udp_control_grace_us=env_ms_to_us("NB_UDP_CONTROL_GRACE_MS",120000,100,120000);
 
     { const char* fe=getenv("NB_FEC");
       if(fe&&fe[0])log4c_warn("NB_FEC is retired and ignored; use NB_FEC_V15_ACTIVE only for controlled tests"); }
@@ -3155,10 +2958,10 @@ int main(int argc,char**argv){
           (unsigned long long)g_fec_cfg.nack_retry_us,g_fec_cfg.max_nack_retries);
     }
 
-    if(wl_init(wl_path)!=0){
-        log4c_error("whitelist requested but could not be loaded; refusing to start");
+    { char whitelist_error[256];if(nb_whitelist_init(wl_path,whitelist_error,sizeof(whitelist_error))!=0){
+        log4c_error("whitelist requested but could not be loaded: %s; refusing to start",whitelist_error);
         log4c_shutdown();return 1;
-    }
+    } }
     nb_policy_init(tiktok_rules_path ? tiktok_rules_path : getenv("NB_TIKTOK_RULES"));
 
     int insecure_test=0;
@@ -3210,6 +3013,7 @@ int main(int argc,char**argv){
             }
             g_socks_auth_enabled=1;log4c_info("SOCKS authentication loaded users=%zu",g_socks_users.count);
         }
+        if(tenants_path){char error[256];if(nb_tenants_load(&g_tenants,tenants_path,error,sizeof(error))!=0){log4c_error("tenant config rejected: %s",error);log4c_shutdown();return 1;}g_tenants_enabled=1;log4c_info("tenant quotas loaded tenants=%zu",g_tenants.count);}
         if(exit_routes_path){
             char error[256];
             if(nb_routes_load(&G.exit_routes,exit_routes_path,error,sizeof(error))!=0){
@@ -3327,6 +3131,7 @@ int main(int argc,char**argv){
       getsockname(G.udp_fd,(struct sockaddr*)&G.local_addr,&ll);
       if(G.local_addr.ss_family==AF_INET){ struct sockaddr_in* s4=(struct sockaddr_in*)&G.local_addr;
         if(s4->sin_addr.s_addr==INADDR_ANY) s4->sin_addr.s_addr=htonl(INADDR_LOOPBACK); } }
+    if(G.role==ROLE_MIDDLE){struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=INADDR_ANY;G.client_udp_fd=socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);if(G.client_udp_fd<0||bind(G.client_udp_fd,(struct sockaddr*)&a,sizeof(a))<0){log4c_error("middle client udp bind failed: %s",strerror(errno));return 1;}set_nonblock(G.client_udp_fd);socklen_t ll=sizeof(G.client_local_addr);getsockname(G.client_udp_fd,(struct sockaddr*)&G.client_local_addr,&ll);}
 
     if(G.role==ROLE_ENTRY){
         G.tcp_listen_fd=socket(AF_INET,SOCK_STREAM,0);
@@ -3349,7 +3154,12 @@ int main(int argc,char**argv){
             (getenv("NB_CC")&&getenv("NB_CC")[0])?getenv("NB_CC"):"bbr");
     }
 
-    if(dns_init()!=0){ log4c_error("async DNS init fail"); log4c_shutdown(); return 1; }
+    if(nb_dns_init(G.outbound_configured?G.outbound_addr.ss_family:AF_UNSPEC,DNS_WORKERS)!=0){ log4c_error("async DNS init fail"); log4c_shutdown(); return 1; }
+    log4c_info("async DNS: %d workers ready",DNS_WORKERS);
+    if(g_socks_auth_enabled&&nb_auth_async_init(&g_socks_users,AUTH_WORKERS)!=0){
+        log4c_error("async SOCKS authentication init fail");log4c_shutdown();return 1;
+    }
+    if(g_socks_auth_enabled)log4c_info("async SOCKS authentication: %d workers ready",AUTH_WORKERS);
     G.epoll_fd=epoll_create1(EPOLL_CLOEXEC);
     if(G.epoll_fd<0){log4c_error("epoll_create1 fail: %s",strerror(errno));log4c_shutdown();return 1;}
     { char error[256];G.control_fd=nb_control_open(control_path,error,sizeof(error));
@@ -3359,8 +3169,11 @@ int main(int argc,char**argv){
         struct epoll_event ev;memset(&ev,0,sizeof(ev));ev.events=EPOLLIN|EPOLLERR;
         ev.data.u64=NB_EPOLL_TAG_UDP;
         if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.udp_fd,&ev)!=0){log4c_error("epoll add udp fail: %s",strerror(errno));return 1;}
+        if(G.client_udp_fd>=0){ev.data.u64=NB_EPOLL_TAG_CLIENT_UDP;if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.client_udp_fd,&ev)!=0)return 1;}
         ev.data.u64=NB_EPOLL_TAG_DNS;
-        if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,DNS.pipe_rd,&ev)!=0){log4c_error("epoll add dns fail: %s",strerror(errno));return 1;}
+        if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_dns_result_fd(),&ev)!=0){log4c_error("epoll add dns fail: %s",strerror(errno));return 1;}
+        if(g_socks_auth_enabled){ev.data.u64=NB_EPOLL_TAG_AUTH;
+            if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_auth_async_result_fd(),&ev)!=0){log4c_error("epoll add auth fail: %s",strerror(errno));return 1;}}
         if(G.tcp_listen_fd>=0){ev.data.u64=NB_EPOLL_TAG_LISTEN;
             if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.tcp_listen_fd,&ev)!=0){log4c_error("epoll add listen fail: %s",strerror(errno));return 1;}}
         ev.data.u64=NB_EPOLL_TAG_CONTROL;
@@ -3373,14 +3186,16 @@ int main(int argc,char**argv){
     uint64_t loop_iterations=0,loop_over_5ms=0,loop_over_20ms=0;
     for(;;){
         uint64_t now=picoquic_current_time();
+        udp_lifecycle_wake_due(now);
         int64_t wd=picoquic_get_next_wake_delay(G.quic,now,1000000); /* us, cap 1s */
         for(i=0;i<MAX_CONN;i++){
             proxy_stream_t* p=&G.streams[i];if(!p->in_use||p->fec_engine==NULL)continue;
             uint64_t dl=nb_fec_next_deadline(p->fec_engine);if(dl==0)continue;
             int64_t fwd=(dl<=now)?0:(int64_t)(dl-now);if(fwd<wd)wd=fwd;
         }
+        { uint64_t dl=nb_udp_lifecycle_next_deadline(&g_udp_lifecycle);if(dl){int64_t d=(dl<=now)?0:(int64_t)(dl-now);if(d<wd)wd=d;} }
         int wait_ms=(wd<=0)?0:(int)((wd+999)/1000);if(wait_ms>1000)wait_ms=1000;
-        uint64_t wait_started=now;
+        uint64_t wait_started=now,iteration_wake_late=0;
         struct epoll_event events[256];
         int event_count=epoll_wait(G.epoll_fd,events,(int)(sizeof(events)/sizeof(events[0])),wait_ms);
         if(event_count<0&&errno!=EINTR){log4c_error("epoll_wait fail: %s",strerror(errno));break;}
@@ -3390,13 +3205,33 @@ int main(int argc,char**argv){
         if(event_count==0){
             uint64_t expected=(uint64_t)wait_ms*1000ULL,elapsed=now-wait_started;
             uint64_t late=elapsed>expected?elapsed-expected:0;
+            iteration_wake_late=late;
             if(late>loop_wake_late_max)loop_wake_late_max=late;
         }
         for(int ei=0;ei<event_count;ei++){
             uint64_t tag=events[ei].data.u64;uint32_t ee=events[ei].events;
-            if(tag==NB_EPOLL_TAG_UDP){udp_drain(now);continue;}
+            if(tag==NB_EPOLL_TAG_UDP){udp_drain_fd(G.udp_fd,&G.local_addr,now);continue;}
+            if(tag==NB_EPOLL_TAG_CLIENT_UDP){udp_drain_fd(G.client_udp_fd,&G.client_local_addr,now);continue;}
+            if(tag==NB_EPOLL_TAG_AUTH){
+                char drain[256];while(read(nb_auth_async_result_fd(),drain,sizeof(drain))>0){}
+                nb_auth_async_result_t result;
+                while(nb_auth_async_pop(&result)){
+                    if(result.valid)nb_auth_cache_store(&g_socks_users,result.fingerprint,
+                        picoquic_current_time(),SOCKS_AUTH_CACHE_TTL_US);
+                    for(int i=0;i<MAX_CONN;i++){
+                        proxy_stream_t* p=&G.streams[i];
+                        if(!p->in_use||!p->socks_auth_pending||
+                            memcmp(p->socks_auth_fingerprint,result.fingerprint,sizeof(result.fingerprint))!=0)continue;
+                        p->socks_auth_pending=0;p->socks_auth_username[0]=0;
+                        memset(p->socks_auth_fingerprint,0,sizeof(p->socks_auth_fingerprint));
+                        if(socks_auth_finish(p,result.username,result.valid,0,result.work_us)&&p->socks_len>0)socks_handshake(p);
+                    }
+                    memset(&result,0,sizeof(result));
+                }
+                continue;
+            }
             if(tag==NB_EPOLL_TAG_DNS){
-                char drain[256];while(read(DNS.pipe_rd,drain,sizeof(drain))>0){}
+                char drain[256];while(read(nb_dns_result_fd(),drain,sizeof(drain))>0){}
                 dns_res_t r;
                 while(dns_pop_result(&r)){
                     proxy_stream_t* p=ps_find_by_id(r.ps_id);
@@ -3491,16 +3326,23 @@ int main(int argc,char**argv){
                         if(G.epoll_fd>=0)epoll_ctl(G.epoll_fd,EPOLL_CTL_DEL,p->tcp_fd,NULL);
                         close(p->tcp_fd);p->tcp_fd=-1;p->udp_control_closed_at=now;
                         log4c_info("entry UDP ASSOCIATE control closed id=%u grace=%.1fs raw_rx=%llu peer=%s",
-                            p->id,NB_UDP_CONTROL_GRACE_US/1000000.0,
+                            p->id,g_udp_control_grace_us/1000000.0,
                             (unsigned long long)p->udp_assoc_raw_rx,p->peer_addr);
                     }
-                }else if(G.socks_enabled&&p->socks_stage<3)socks_handshake(p);else pump_tcp(p);
+                }else if(G.socks_enabled&&p->socks_stage<3){
+                    if(p->socks_auth_pending){
+                        if(ee&(EPOLLRDHUP|EPOLLHUP|EPOLLERR))ps_teardown_reason(p,"socks-auth-peer-close");
+                    }else socks_handshake(p);
+                }else pump_tcp(p);
             }
             if(p->in_use&&p->tcp_fd>=0&&(ee&EPOLLOUT))flush_q2t(p);
             if(p->in_use)maybe_free(p);
         }
         /* middle: 无 TCP 的流也要判释放 */
-        if(G.role==ROLE_MIDDLE){ for(i=0;i<MAX_CONN;i++){ proxy_stream_t*p=&G.streams[i]; if(p->in_use&&p->tcp_fd<0) maybe_free(p); } }
+        for(i=0;i<MAX_CONN;i++){
+            proxy_stream_t*p=&G.streams[i];
+            if(p->in_use&&p->tcp_fd<0&&(G.role==ROLE_MIDDLE||p->probe_mode))maybe_free(p);
+        }
         /* V1.5 FEC sidecar: 部分 block 超时封口，避免小流量永远攒不满 K 个 symbol 而不发。 */
         { uint64_t fnow=picoquic_current_time();
           for(i=0;i<MAX_CONN;i++){ proxy_stream_t* p=&G.streams[i];
@@ -3515,7 +3357,7 @@ int main(int argc,char**argv){
         { uint64_t tnow=picoquic_current_time();
           for(i=0;i<MAX_CONN;i++){ proxy_stream_t*p=&G.streams[i];
             if(p->in_use&&p->udp_association&&p->udp_control_closed_at&&
-                nb_udp_control_grace_expired(p->udp_control_closed_at,p->last_active,tnow,NB_UDP_CONTROL_GRACE_US)){
+                nb_udp_control_grace_expired(p->udp_control_closed_at,p->last_active,tnow,g_udp_control_grace_us)){
                 log4c_info("entry UDP ASSOCIATE grace expired id=%u idle=%.1fms raw_rx=%llu peer=%s",
                     p->id,(tnow-p->last_active)/1000.0,(unsigned long long)p->udp_assoc_raw_rx,p->peer_addr);
                 ps_teardown_reason(p,"udp-control-grace-expired");
@@ -3533,10 +3375,13 @@ int main(int argc,char**argv){
               ps_update_runtime_policy(&G.streams[i],metrics_now);
               sched_refresh_stream(&G.streams[i],metrics_now);
               ps_log_media_metrics(&G.streams[i],metrics_now);
-          } }
+          }
+          if(G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE)pool_health_tick(metrics_now);
+        }
         /* 白名单热重载(限流 ~5s 检查一次文件 mtime) */
-        if(WL.path[0]){ static uint64_t wl_last=0; uint64_t tn=picoquic_current_time();
-            if(tn - wl_last > 5000000ULL){ wl_last=tn; wl_reload_if_changed(); } }
+        if(nb_whitelist_configured()){ static uint64_t wl_last=0; uint64_t tn=picoquic_current_time();
+            if(tn-wl_last>5000000ULL){char error[256];wl_last=tn;
+                if(nb_whitelist_reload_if_changed(error,sizeof(error))<0)log4c_error("whitelist reload rejected; keeping previous rules: %s",error); } }
         /* 链路质量观测(每10s): 记录到下一跳各连接的 RTT/丢包, 定位抖动/丢包在哪跳(FEC 动态冗余输入)。
          * entry 观测 entry->middle 段, middle 观测 middle->exit 段, 两段全覆盖。 */
         if(G.pool_count>0){ static uint64_t lq_last=0; uint64_t tn=picoquic_current_time();
@@ -3643,6 +3488,7 @@ int main(int argc,char**argv){
         /* 发送和 FEC tick 可能改变队列水位，循环末统一刷新 TCP EPOLLIN/EPOLLOUT。 */
         for(i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];if(p->in_use&&p->tcp_fd>=0)(void)epoll_tcp_update(p,0);}
         { uint64_t loop_end=picoquic_current_time();uint64_t busy=loop_end-busy_started;
+          nb_metrics_note_loop(&g_metrics_state,busy,iteration_wake_late);
           loop_iterations++;if(busy>loop_busy_max)loop_busy_max=busy;
           if(busy>=5000)loop_over_5ms++;
           if(busy>=20000)loop_over_20ms++;

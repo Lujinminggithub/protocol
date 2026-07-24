@@ -1,0 +1,104 @@
+{
+  "schema_version": 3,
+  "line_id": "gz-83-hk-216-kz-1",
+  "status": "active-baseline",
+  "fixed_exit": "kz-1",
+  "active_path": [
+    "gz-83",
+    "hk-216",
+    "kz-1"
+  ],
+  "candidate_entries": [
+    "gz-83"
+  ],
+  "candidate_relays": [
+    "hk-216"
+  ],
+  "transport": {
+    "pool_size": 1,
+    "workers": {
+      "entry": 1,
+      "middle": 1,
+      "exit": 2
+    },
+    "entry_middle": {
+      "address": "172.16.31.28:4443",
+      "cc": "cubic",
+      "cwin_max_bytes": 524288,
+      "mtu_max": 1452,
+      "reorder_gap": 128,
+      "reorder_delay_us": 450000
+    },
+    "middle_exit": {
+      "address": "2.135.147.106:4443",
+      "cc": "bbr",
+      "bbr_options": "Q0.0001:F0.25:",
+      "mtu_max": 1452,
+      "reorder_gap": 128,
+      "reorder_delay_us": 462000
+    },
+    "exit": {
+      "cc": "bbr",
+      "bbr_options": "Q0.0001:",
+      "mtu_max": 1452
+    },
+    "pacing": {
+      "media_max_burst_mtu": 2,
+      "gso": false
+    },
+    "udp": {
+      "control_grace_us": 120000000,
+      "port_min": 20000,
+      "port_max": 21023
+    },
+    "scheduler": {
+      "mode": "media-aware-token-priority",
+      "ctrl_priority": 2,
+      "ctrl_throttled_priority": 6,
+      "media_priority": 4,
+      "bulk_priority": 20,
+      "ctrl_rate_bps": 1000000,
+      "ctrl_burst_bytes": 32768
+    },
+    "queue_limits": {
+      "ctrl_high": 65536,
+      "ctrl_low": 32768,
+      "media_high": 262144,
+      "media_low": 65536,
+      "bulk_high": 1048576,
+      "bulk_low": 524288,
+      "udp_media_deadline_us": 200000
+    },
+    "fec": {
+      "observe": true,
+      "active": false,
+      "codec": "RS(k,r)",
+      "k": 4,
+      "r": 2
+    }
+  },
+  "algorithms": {
+    "classification": "TikTok rules plus raw-IP/443 fast high-uplink promotion",
+    "reorder": "32-sample late-ACK/spurious window, P95/P99, minimum 8 samples, fast raise and slow decay",
+    "loss": "effective loss excludes spurious; media requires at least 20 MTU and two material-loss RTTs",
+    "bbr_media_recovery": "bw_lo floor 70%, inflight_lo floor 60%, recovery at most one effective RTT",
+    "cubic_limit": "hard clamp to cwin_max; media repeat-loss reduces at most once per RTT with a 50% prior-cwin floor",
+    "media_pacing": "2 MTU bucket; retransmission is paced separately; datagrams use media-first round-robin and a 200ms stale deadline",
+    "runtime_classification": "1s windows; sustained ctrl above 128Kbps demotes to bulk; unknown uplink above 256Kbps promotes to media",
+    "observability": "queue age plus event-loop busy/wake lag; linkq grouped by run/worker/cid",
+    "ack_only_loss_filter": "ACK-only packets are excluded from effective loss and congestion notification on every loss-detection path"
+  },
+  "probe_policy": {
+    "minimum_packets": 10000,
+    "minimum_valid_windows": 6,
+    "load_factor": 1.25,
+    "auto_apply": false,
+    "requires_canary": true
+  },
+  "validation": {
+    "latest_soak_minutes": 37,
+    "latest_soak_result": "stable",
+    "coverage": "morning window only",
+    "remaining": "repeat during the historically unstable afternoon window and run viewer-side quality sampling"
+  }
+}

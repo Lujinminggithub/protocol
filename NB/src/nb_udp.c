@@ -12,6 +12,11 @@ static void put32(uint8_t* p, uint32_t v){ p[0]=(uint8_t)(v>>24);p[1]=(uint8_t)(
 static uint16_t get16(const uint8_t* p){ return (uint16_t)(((uint16_t)p[0]<<8)|p[1]); }
 static uint32_t get32(const uint8_t* p){ return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 
+int nb_udp_wire_type_valid(uint8_t type){
+    return type==NB_UDP_TYPE_C2S||type==NB_UDP_TYPE_S2C||
+        type==NB_UDP_TYPE_CLOSE||type==NB_UDP_TYPE_CLOSE_ACK;
+}
+
 uint16_t nb_udp_fragment_count(size_t payload_length){
     if(payload_length == 0 || payload_length > NB_UDP_MAX_PAYLOAD) return 0;
     return (uint16_t)((payload_length + NB_UDP_FRAGMENT_PAYLOAD - 1) / NB_UDP_FRAGMENT_PAYLOAD);
@@ -21,7 +26,7 @@ int nb_udp_wire_encode(uint8_t* out, size_t cap, uint8_t type,
     uint32_t session_id, uint32_t sequence, uint16_t fragment_index,
     uint16_t fragment_count, uint16_t total_length, const char* route,
     uint16_t route_length, const uint8_t* payload, uint16_t payload_length){
-    if(out==NULL||session_id==0||(type!=NB_UDP_TYPE_C2S&&type!=NB_UDP_TYPE_S2C)||
+    if(out==NULL||session_id==0||!nb_udp_wire_type_valid(type)||
         fragment_count==0||fragment_count>66||fragment_index>=fragment_count||
         total_length==0||route==NULL||route_length==0||route_length>=NB_UDP_ROUTE_MAX||
         payload==NULL||payload_length==0||payload_length>NB_UDP_FRAGMENT_PAYLOAD||
@@ -45,7 +50,7 @@ int nb_udp_wire_decode(const uint8_t* data, size_t length, nb_udp_wire_view_t* o
     out->sequence=get32(data+12);out->fragment_index=get16(data+16);
     out->fragment_count=get16(data+18);out->total_length=get16(data+20);
     out->route_length=get16(data+22);
-    if((out->type!=NB_UDP_TYPE_C2S&&out->type!=NB_UDP_TYPE_S2C)||out->session_id==0||
+    if(!nb_udp_wire_type_valid(out->type)||out->session_id==0||
         out->fragment_count==0||out->fragment_count>66||out->fragment_index>=out->fragment_count||
         out->total_length==0||out->route_length==0||out->route_length>=NB_UDP_ROUTE_MAX||
         length<=(size_t)NB_UDP_WIRE_HEADER+out->route_length) return -1;

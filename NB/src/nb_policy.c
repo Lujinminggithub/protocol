@@ -107,9 +107,12 @@ static int match_pattern_ci(const char* host, const char* pattern){
 
 static void maybe_load_rule_file(const char* rules_path){
     FILE* f = NULL;
-    if(rules_path && rules_path[0]) f = fopen(rules_path, "r");
-    if(f == NULL) f = fopen("/root/nb/tiktok_flow_rules.conf", "r");
-    if(f == NULL) f = fopen("tiktok_flow_rules.conf", "r");
+    if(rules_path && rules_path[0]){
+        f = fopen(rules_path, "r");
+    }else{
+        f = fopen("/root/nb/tiktok_flow_rules.conf", "r");
+        if(f == NULL) f = fopen("tiktok_flow_rules.conf", "r");
+    }
     if(f == NULL) return;
 
     nb_tiktok_rule_t tmp[NB_MAX_TIKTOK_RULES];

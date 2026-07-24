@@ -10,7 +10,7 @@
 - entry 与 exit 的 fail-closed 白名单。
 - 广州构建机已安装 `gcc/g++`、`cmake`、`make` 和 OpenSSL 开发包。
 
-当前 `tools/lab-hosts.json` 指定 `build_host=entry`、`compile_dir=/opt/compile`。构建过程只在广州 `/opt/compile` 展开源码和生成中间文件，三端运行目录仍为 `/etc/NB`。`build` 完成后，脚本先把二进制下载到本地 `build/nb_node`，`deploy-socks` 再从本地统一分发，因此香港和 KZ 不需要安装编译器。
+当前 `tools/lab-hosts.json` 指定 `build_host=entry`、`compile_dir=/opt/compile`。构建过程只在广州 `/opt/compile` 展开源码和生成中间文件，三端运行目录仍为 `/etc/NB`。`build` 完成后，脚本把二进制下载到本地 `build/nb_node`，并生成 `build/release-manifest.json`。清单绑定二进制 SHA-256、构建输入摘要、拓扑和线路 profile；任一文件在构建后变化，`deploy-socks` 都会 fail-closed，要求重新构建。
 
 ```powershell
 $env:NB_SSH_PASSWORD_ENTRY = "..."
@@ -39,15 +39,26 @@ Remove-Item Env:NB_REBUILD_PICOQUIC
 
 ## 2. 部署行为
 
-`deploy-socks` 按 `exit -> middle -> entry` 顺序执行：
+`deploy-socks` 先在全部节点预上传，再按 `exit -> middle -> entry` 顺序激活：
 
-1. 分发 `nb_node` 和角色专属安全材料；
-2. 下发 TikTok 分流规则、白名单和出口路由文件；
-3. 原子安装 systemd unit；
-4. 按 hosts JSON 的 `workers` 数量启动监督器；
-5. 检查服务状态并执行带用户认证的 SOCKS 冒烟。
+1. 在三节点取得互斥部署锁，再将二进制和清单写入 `/etc/NB/releases/<deployment_id>/`，逐节点校验 SHA-256；`deployment_id` 由代码 release 和配置摘要组成；
+2. 保存当前二进制 symlink 和 systemd unit，所有节点预上传成功后才开始激活；
+3. supervisor、TikTok 规则、出口路由和新 unit 与 release 一起版本化；
+4. 通过原子 symlink 切换 `/etc/NB/nb_node`，按 hosts JSON 的 `workers` 数量重启；
+5. 检查 systemd、实际二进制哈希和每个 worker 的 control socket health；
+6. 三节点通过后执行带用户认证的 SOCKS 端到端冒烟；
+7. 任一步失败，按相反顺序恢复旧 symlink 和旧 unit，并重启已激活角色。
 
-部署不再回退 legacy 后台命令。任何证书、私钥、用户文件或白名单缺失都会导致启动失败。
+查看三端当前不可变部署，或精确恢复 canary 之前的完整二进制和参数：
+
+```powershell
+python tools/deploy.py current
+python tools/deploy.py rollback-socks --deployment-id <release配置摘要>
+```
+
+`rollback-socks` 不重新编译；它校验目标目录中的二进制和角色 unit，按 exit、middle、entry 激活并执行 health 与 SOCKS 冒烟。回滚过程中任一节点失败，会把已经切换的节点恢复到回滚开始前的 deployment，避免产生半回滚混跑。
+
+部署前必须设置 SOCKS 冒烟凭据，不能在重启完成后才发现无法验收。部署不再回退 legacy 后台命令。任何发布清单、证书、私钥、用户文件或白名单缺失都会导致启动失败。`deploy-tri` 只用于实验室，不得用于生产发布。
 
 ## 3. FEC 模式
 
@@ -79,7 +90,13 @@ entry 根据权重选择出口，middle 根据下一跳地址建立独立连接�
 ```powershell
 python tools/deploy.py logs
 python tools/nb_diag.py probe
+python tools/nb_diag.py bundle 500
+python tools/nb_observe.py
 ```
+
+`bundle` 不重启服务，按同一个本地 UTC 采集点拉取三端 release symlink/哈希、systemd 状态、进程、端口、资源、最近 30 分钟 journal、内核异常、NB 日志和所有 worker 的 health/metrics，并生成 `build/incidents/nb-incident-<UTC>.zip`。某一节点不可达时仍保留其余节点证据，并在 `summary.json` 标记采集缺口。
+
+`nb_observe.py` 对累计计数计算窗口差量。节点不可达、health 失败、deployment/profile 混跑立即触发；队龄、有效丢包、重排序、UDP 错误、异常关闭和 event-loop 延迟采用连续窗口判定。自动故障包有 10 分钟冷却，避免同一故障持续写满磁盘。
 
 每个 worker 提供本地控制 socket：
 
@@ -88,7 +105,7 @@ printf 'health\n' | socat - UNIX-CONNECT:/run/nb-middle-0.ctl
 printf 'metrics\n' | socat - UNIX-CONNECT:/run/nb-middle-0.ctl
 ```
 
-控制 socket 权限为 `0600`，当前只读，不提供远程修改配置。
+控制 socket 权限为 `0600`，当前只读，不提供远程修改配置。health 和 metrics 均返回当前 `release_id`、`line_profile` 与 `line_profile_schema`，用于核对三端是否运行同一发布和线路参数版本。
 
 ## 6. 测试顺序
 

@@ -40,7 +40,7 @@ FEC 已独立到 `src/nb_fec.c`，数据面采用 QUIC datagram 的 source/repai
 
 ## 构建与部署
 
-当前拓扑固定使用广州 entry 作为构建机。源码上传到广州的 `/opt/compile`，完成 CMake 和 picoquic 静态库构建后，`nb_node` 会下载到本地 `build/`，再由部署脚本分发到三端 `/etc/NB`。构建目录与运行目录相互独立，清理 `/opt/compile` 不影响正在运行的服务。
+当前拓扑固定使用广州 entry 作为构建机。源码上传到广州的 `/opt/compile`，完成全部 CTest、CMake 和 picoquic 静态库构建后，`nb_node` 会下载到本地 `build/`，同时生成 `release-manifest.json`。部署前强校验二进制、源码摘要、拓扑和线路 profile；代码 release 与配置摘要组成不可变 deployment ID，三端使用 `/etc/NB/releases/<deployment_id>/` 保存版本，并通过原子 symlink 激活。构建目录与运行目录相互独立，清理 `/opt/compile` 不影响正在运行的服务。
 
 构建机需要预装 `gcc/g++`、`cmake`、`make`、OpenSSL 开发包和 pthread 开发环境。构建机、middle、exit 必须使用兼容的 Linux x86_64 ABI。
 
@@ -70,6 +70,8 @@ python tools/security_setup.py
 python tools/deploy.py build
 python tools/deploy.py deploy-socks
 ```
+
+`deploy-socks` 会先完成三节点预上传和哈希校验，再按 exit、middle、entry 激活。systemd、实际二进制哈希、worker control socket 或端到端 SOCKS 冒烟任一失败时，已激活节点自动恢复上一版二进制和 unit。该流程不会自动部署本地尚未重新构建的源码状态。
 
 首次引导且尚未建立 known_hosts 时，可以显式设置 `NB_SSH_INSECURE=1`，完成指纹核验后应立即取消。
 

@@ -39,6 +39,12 @@ if(BUILD_TESTING)
   target_link_libraries(nb_auth_test OpenSSL::Crypto)
   add_test(NAME nb_auth COMMAND nb_auth_test)
 
+  add_executable(nb_auth_async_test tools/test_auth_async.c src/nb_auth.c src/nb_auth_async.c)
+  target_include_directories(nb_auth_async_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_auth_async_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_auth_async_test OpenSSL::Crypto Threads::Threads)
+  add_test(NAME nb_auth_async COMMAND nb_auth_async_test)
+
   add_executable(nb_control_test tools/test_control.c src/nb_control.c)
   target_include_directories(nb_control_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_definitions(nb_control_test PRIVATE _GNU_SOURCE)
@@ -55,6 +61,11 @@ if(BUILD_TESTING)
   target_compile_options(nb_udp_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp COMMAND nb_udp_test)
 
+  add_executable(nb_udp_lifecycle_test tools/test_udp_lifecycle.c src/nb_udp.c src/nb_udp_lifecycle.c)
+  target_include_directories(nb_udp_lifecycle_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_udp_lifecycle_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_udp_lifecycle COMMAND nb_udp_lifecycle_test)
+
   add_executable(nb_policy_test tools/test_policy.c src/nb_policy.c)
   target_include_directories(nb_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_policy_test PRIVATE -O2 -Wall -Wextra)
@@ -64,6 +75,60 @@ if(BUILD_TESTING)
   target_include_directories(nb_live_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_live_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_live COMMAND nb_live_test)
+
+  add_executable(nb_metrics_test tools/test_metrics.c src/nb_metrics.c)
+  target_include_directories(nb_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_metrics_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_metrics COMMAND nb_metrics_test)
+
+  add_executable(nb_session_index_test tools/test_session_index.c src/nb_session_index.c)
+  target_include_directories(nb_session_index_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_session_index_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_session_index COMMAND nb_session_index_test)
+
+  add_executable(nb_bridge_test tools/test_bridge.c src/nb_bridge.c)
+  target_include_directories(nb_bridge_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_bridge_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_bridge COMMAND nb_bridge_test)
+
+  add_executable(nb_send_test tools/test_send.c src/nb_send.c src/nb_ring.c src/nb_live.c)
+  target_include_directories(nb_send_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_send_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_send COMMAND nb_send_test)
+
+  add_executable(nb_path_test tools/test_path.c src/nb_path.c)
+  target_include_directories(nb_path_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_path_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_path COMMAND nb_path_test)
+
+  add_executable(nb_pool_health_test tools/test_pool_health.c src/nb_pool_health.c)
+  target_include_directories(nb_pool_health_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_pool_health_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_pool_health COMMAND nb_pool_health_test)
+
+  add_executable(nb_dns_test tools/test_dns.c src/nb_dns.c)
+  target_include_directories(nb_dns_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_dns_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_dns_test Threads::Threads)
+  add_test(NAME nb_dns COMMAND nb_dns_test)
+
+  add_executable(nb_tenant_test tools/test_tenant.c src/nb_tenant.c)
+  target_include_directories(nb_tenant_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_tenant_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_tenant COMMAND nb_tenant_test)
+
+  add_executable(nb_whitelist_test tools/test_whitelist.c src/nb_whitelist.c)
+  target_include_directories(nb_whitelist_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_whitelist_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_whitelist COMMAND nb_whitelist_test)
+
+  foreach(_nb_test_target
+      nb_fec_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test
+      nb_auth_async_test nb_routes_test nb_udp_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_metrics_test
+      nb_session_index_test nb_bridge_test nb_send_test nb_path_test
+      nb_pool_health_test nb_dns_test nb_tenant_test nb_whitelist_test)
+    target_compile_options(${_nb_test_target} PRIVATE -UNDEBUG -Werror)
+  endforeach()
 endif()
 
 string(TOLOWER "${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}" NB_PLATFORM)
@@ -83,7 +148,7 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_fec.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_control.c src/nb_routes.c src/nb_udp.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_dns.c src/nb_fec.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_udp.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
 target_compile_options(nb_node PRIVATE -O2 -Wall)
 target_include_directories(nb_node PRIVATE

@@ -7,6 +7,7 @@
 #define NB_AUTH_MAX_USERS 64
 #define NB_AUTH_NAME_MAX 64
 #define NB_AUTH_CACHE_MAX 16
+#define NB_AUTH_FINGERPRINT_LEN 32
 
 typedef struct {
     char name[NB_AUTH_NAME_MAX];
@@ -32,6 +33,13 @@ int nb_auth_check_private_file(const char* path, char* error, size_t error_cap);
 int nb_auth_users_load(nb_auth_users_t* out, const char* path, char* error, size_t error_cap);
 int nb_auth_user_verify(const nb_auth_users_t* users, const char* name,
     const unsigned char* password, size_t password_len);
+int nb_auth_fingerprint(const nb_auth_users_t* users, const char* name,
+    const unsigned char* password, size_t password_len,
+    unsigned char out[NB_AUTH_FINGERPRINT_LEN]);
+int nb_auth_cache_lookup(const nb_auth_users_t* users,
+    const unsigned char fingerprint[NB_AUTH_FINGERPRINT_LEN], uint64_t now);
+void nb_auth_cache_store(nb_auth_users_t* users,
+    const unsigned char fingerprint[NB_AUTH_FINGERPRINT_LEN], uint64_t now, uint64_t ttl);
 int nb_auth_user_verify_cached(nb_auth_users_t* users, const char* name,
     const unsigned char* password, size_t password_len, uint64_t now,
     uint64_t ttl, int* cache_hit);

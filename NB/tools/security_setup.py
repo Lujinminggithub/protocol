@@ -52,7 +52,9 @@ def generate(out: pathlib.Path, username: str, password: str) -> None:
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds, 32)
     users = out / "socks.users"
     users.write_text(f"{username}:{rounds}:{salt.hex()}:{digest.hex()}\n", encoding="ascii")
-    chmod_private(ca_key); chmod_private(users)
+    tenants = out / "tenant.conf"
+    tenants.write_text(f"tenant {username} 256 64 20000 0\n", encoding="ascii")
+    chmod_private(ca_key); chmod_private(users); chmod_private(tenants)
     print(f"安全材料已生成: {out}")
     print("ca.key 仅保留在部署机，不会分发到节点")
 

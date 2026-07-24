@@ -93,8 +93,9 @@ int nb_auth_user_verify(const nb_auth_users_t* users,const char* name,const unsi
     return found&&valid;
 }
 
-static int auth_fingerprint(const nb_auth_users_t* users,const char* name,
+int nb_auth_fingerprint(const nb_auth_users_t* users,const char* name,
     const unsigned char* password,size_t password_len,unsigned char out[32]){
+    if(users==NULL||name==NULL||password==NULL||password_len>255)return 0;
     EVP_MD_CTX* ctx=EVP_MD_CTX_new();unsigned int out_len=0;
     uint64_t name_len=(uint64_t)strlen(name),pass_len=(uint64_t)password_len;
     int ok=ctx!=NULL&&EVP_DigestInit_ex(ctx,EVP_sha256(),NULL)==1&&
@@ -107,27 +108,37 @@ static int auth_fingerprint(const nb_auth_users_t* users,const char* name,
     EVP_MD_CTX_free(ctx);return ok;
 }
 
-int nb_auth_user_verify_cached(nb_auth_users_t* users,const char* name,
-    const unsigned char* password,size_t password_len,uint64_t now,
-    uint64_t ttl,int* cache_hit){
-    unsigned char fingerprint[32];size_t slot=0;uint64_t oldest=UINT64_MAX;
-    if(cache_hit)*cache_hit=0;
-    if(users==NULL||name==NULL||password==NULL||password_len>255||ttl==0)
-        return nb_auth_user_verify(users,name,password,password_len);
-    if(!auth_fingerprint(users,name,password,password_len,fingerprint))return 0;
+int nb_auth_cache_lookup(const nb_auth_users_t* users,const unsigned char fingerprint[32],uint64_t now){
+    if(users==NULL||fingerprint==NULL)return 0;
+    for(size_t i=0;i<NB_AUTH_CACHE_MAX;i++)if(users->cache[i].expires_at>now&&
+        CRYPTO_memcmp(users->cache[i].fingerprint,fingerprint,32)==0)return 1;
+    return 0;
+}
+
+void nb_auth_cache_store(nb_auth_users_t* users,const unsigned char fingerprint[32],uint64_t now,uint64_t ttl){
+    if(users==NULL||fingerprint==NULL||ttl==0)return;
+    size_t slot=0;uint64_t oldest=UINT64_MAX;
     for(size_t i=0;i<NB_AUTH_CACHE_MAX;i++){
-        if(users->cache[i].expires_at>now&&
-            CRYPTO_memcmp(users->cache[i].fingerprint,fingerprint,sizeof(fingerprint))==0){
-            if(cache_hit)*cache_hit=1;
-            OPENSSL_cleanse(fingerprint,sizeof(fingerprint));return 1;
-        }
         if(users->cache[i].expires_at<=now){slot=i;oldest=0;}
         else if(oldest!=0&&users->cache[i].expires_at<oldest){oldest=users->cache[i].expires_at;slot=i;}
     }
-    int valid=nb_auth_user_verify(users,name,password,password_len);
-    if(valid){
-        memcpy(users->cache[slot].fingerprint,fingerprint,sizeof(fingerprint));
-        users->cache[slot].expires_at=(UINT64_MAX-now<ttl)?UINT64_MAX:now+ttl;
+    memcpy(users->cache[slot].fingerprint,fingerprint,32);
+    users->cache[slot].expires_at=(UINT64_MAX-now<ttl)?UINT64_MAX:now+ttl;
+}
+
+int nb_auth_user_verify_cached(nb_auth_users_t* users,const char* name,
+    const unsigned char* password,size_t password_len,uint64_t now,
+    uint64_t ttl,int* cache_hit){
+    unsigned char fingerprint[32];
+    if(cache_hit)*cache_hit=0;
+    if(users==NULL||name==NULL||password==NULL||password_len>255||ttl==0)
+        return nb_auth_user_verify(users,name,password,password_len);
+    if(!nb_auth_fingerprint(users,name,password,password_len,fingerprint))return 0;
+    if(nb_auth_cache_lookup(users,fingerprint,now)){
+        if(cache_hit)*cache_hit=1;
+        OPENSSL_cleanse(fingerprint,sizeof(fingerprint));return 1;
     }
+    int valid=nb_auth_user_verify(users,name,password,password_len);
+    if(valid)nb_auth_cache_store(users,fingerprint,now,ttl);
     OPENSSL_cleanse(fingerprint,sizeof(fingerprint));return valid;
 }

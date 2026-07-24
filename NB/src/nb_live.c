@@ -79,9 +79,10 @@ nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
     runtime->sampled_at=now_us;runtime->sampled_c2s=total_c2s;runtime->sampled_s2c=total_s2c;
     if(flow_class==NB_FLOW_CLASS_CTRL){
         runtime->high_uplink_windows=0;
-        if((ck>=128.0||sk>=128.0)&&(total_c2s+total_s2c)>=64*KIB)runtime->high_ctrl_windows++;
+        if(ck>=128.0||sk>=128.0)runtime->high_ctrl_windows++;
         else runtime->high_ctrl_windows=0;
-        return runtime->high_ctrl_windows>=2?NB_LIVE_FLOW_DEMOTE_BULK:NB_LIVE_FLOW_KEEP;
+        return runtime->high_ctrl_windows>=2&&(total_c2s+total_s2c)>=64*KIB?
+            NB_LIVE_FLOW_DEMOTE_BULK:NB_LIVE_FLOW_KEEP;
     }
     runtime->high_ctrl_windows=0;
     if(flow_class!=NB_FLOW_CLASS_MEDIA&&ck>=256.0)runtime->high_uplink_windows++;

@@ -733,6 +733,17 @@ static void BBRBoundCwndForModel(picoquic_bbr_state_t* bbr_state, picoquic_path_
     if (cap > bbr_state->inflight_lo) {
         cap = bbr_state->inflight_lo;
     }
+    if (path_x->cnx->is_media_connection && bbr_state->max_bw > 0 &&
+        bbr_state->min_rtt != UINT64_MAX) {
+        /* A random-loss inflight_hi sample must not pin a long-lived media
+         * connection below one recently proven BDP. Keeping one BDP remains
+         * conservative while allowing the measured delivery rate to recover. */
+        uint64_t media_bdp_floor = BBRInflightWithBw(bbr_state, path_x, 1.0,
+            bbr_state->max_bw);
+        if (cap < media_bdp_floor) {
+            cap = media_bdp_floor;
+        }
+    }
     if (cap < BBRMinPipeCwnd * path_x->send_mtu) {
         cap = BBRMinPipeCwnd * path_x->send_mtu;
     }

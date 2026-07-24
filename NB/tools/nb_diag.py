@@ -4,8 +4,13 @@
 用法:
   python tools/nb_diag.py probe          # 只读: 拉当前三跳日志统计 + entry 连接状态(不重启)
   python tools/nb_diag.py stress [N]     # 受控并发压测 N(默认20) + 三跳日志前后差量归因
+  python tools/nb_diag.py bundle [行数]  # 只读: 生成三端 UTC 对齐故障包(默认每端 500 行)
 """
 from __future__ import annotations
+import datetime as dt
+import json
+import pathlib
+import shutil
 import sys, time
 import deploy  # 复用 connect/run/_role_host/WORK
 
@@ -17,6 +22,89 @@ WORK = deploy.WORK
 LOG = lambda role: f"{WORK}/logs/nb-{role}.log"
 SOCKS_PORT = deploy.DEFAULT_SOCKS_PORT
 SOCKS_ARG = f"--socks5-hostname 127.0.0.1:{SOCKS_PORT}"
+
+
+def _control_snapshot(c, role):
+    workers = deploy._effective_workers(role)
+    script = (
+        "import json,socket;"
+        f"paths={[f'/run/nb-{role}-{worker}.ctl' for worker in range(workers)]!r};"
+        "results=[];"
+        "[(lambda p,cmd,s:(s.settimeout(2),s.connect(p),s.sendall((cmd+'\\n').encode()),results.append({'path':p,'command':cmd,'response':s.recv(8192).decode(errors='replace')}),s.close()))(p,cmd,socket.socket(socket.AF_UNIX)) for p in paths for cmd in ('health','metrics')];"
+        "print(json.dumps(results,ensure_ascii=False))"
+    )
+    return deploy.run(c, f"python3 -c {deploy.shlex.quote(script)}", tmo=20)
+
+
+def _incident_role_text(c, role, lines):
+    unit = deploy._service_name(role)
+    log = LOG(role)
+    release_link = f"{WORK}/nb_node"
+    snapshot = deploy.run(c,
+        "echo '=== HOST ==='; "
+        "echo UTC=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ); "
+        "echo HOST=$(hostname); echo KERNEL=$(uname -srmo); uptime; "
+        "echo '=== RELEASE ==='; "
+        f"echo TARGET=$(readlink {deploy.shlex.quote(release_link)} 2>/dev/null || echo regular-or-missing); "
+        f"sha256sum {deploy.shlex.quote(release_link)} 2>/dev/null || true; "
+        f"systemctl show {unit} -p ActiveState -p SubState -p MainPID -p NRestarts -p ExecMainStatus -p Environment --no-pager 2>&1; "
+        "echo '=== PROCESS ==='; pgrep -ax nb_node 2>/dev/null || true; "
+        "ps -eo pid,ppid,stat,pcpu,pmem,rss,vsz,lstart,cmd | grep '[n]b_node' || true; "
+        "echo '=== SOCKETS ==='; ss -s; ss -lntup 2>/dev/null | grep -E 'nb_node|:1080|:4443' || true; "
+        "echo '=== RESOURCES ==='; free -m; df -h / /etc 2>/dev/null; "
+        "echo '=== JOURNAL ==='; "
+        f"journalctl -u {unit} --since '-30 min' -n {lines} --no-pager -o short-iso-precise 2>&1; "
+        "echo '=== KERNEL SIGNALS ==='; "
+        "journalctl -k --since '-30 min' --no-pager -o short-iso-precise 2>/dev/null | grep -Ei 'oom|killed process|segfault|netdev watchdog|udp|drop' | tail -100 || true; "
+        "echo '=== NB LOG ==='; "
+        f"tail -{lines} {deploy.shlex.quote(log)} 2>/dev/null || true", tmo=60)
+    return snapshot + "\n=== CONTROL ===\n" + _control_snapshot(c, role)
+
+
+def incident_bundle(lines=500, output_root=None):
+    if not 50 <= lines <= 5000:
+        raise ValueError("故障包日志行数必须为 50..5000")
+    root = pathlib.Path(output_root) if output_root else deploy.BUILD_DIR / "incidents"
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bundle_dir = root / f"nb-incident-{stamp}"
+    bundle_dir.mkdir(parents=True, exist_ok=False)
+    summary = {
+        "schema_version": 1,
+        "collected_at_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "topology": str(deploy.LAB_FILE),
+        "work_dir": WORK,
+        "log_lines": lines,
+        "roles": {},
+        "errors": [],
+    }
+    for role in ("entry", "middle", "exit"):
+        client = None
+        filename = f"{role}.txt"
+        try:
+            client = deploy.connect(role)
+            text = _incident_role_text(client, role, lines)
+            (bundle_dir / filename).write_text(text, encoding="utf-8")
+            summary["roles"][role] = {"status": "collected", "file": filename}
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            (bundle_dir / filename).write_text(f"COLLECTION_FAILED {message}\n", encoding="utf-8")
+            summary["roles"][role] = {"status": "failed", "file": filename, "error": message}
+            summary["errors"].append({"role": role, "error": message})
+        finally:
+            if client is not None:
+                client.close()
+    for source in (deploy.RELEASE_MANIFEST, deploy.LINE_PROFILE):
+        if source.is_file():
+            shutil.copy2(source, bundle_dir / source.name)
+    (bundle_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    archive = pathlib.Path(shutil.make_archive(str(bundle_dir), "zip", root_dir=bundle_dir))
+    print(f"故障包目录: {bundle_dir}")
+    print(f"故障包归档: {archive}")
+    if summary["errors"]:
+        print(f"注意: {len(summary['errors'])} 个节点采集失败，详见 summary.json")
+    return bundle_dir, archive, summary
 
 
 def _stat_block(c, role):
@@ -144,4 +232,5 @@ if __name__ == "__main__":
     elif act == "stress": stress(int(sys.argv[2]) if len(sys.argv)>2 else 20)
     elif act == "coldtest": coldtest(int(sys.argv[2]) if len(sys.argv)>2 else 20)
     elif act == "throughput": throughput(int(sys.argv[2]) if len(sys.argv)>2 else 50)
+    elif act == "bundle": incident_bundle(int(sys.argv[2]) if len(sys.argv)>2 else 500)
     else: print(__doc__)

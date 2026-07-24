@@ -15,8 +15,11 @@ build_host/compile_dir，产物下载到本地后再统一分发，middle/exit �
 用法: python deploy.py <action> [--target host:port]
 """
 from __future__ import annotations
-import argparse, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex
+import argparse, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex, subprocess, logging, random
 import paramiko
+import nb_release
+
+logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -31,10 +34,13 @@ COMPILE_WORK = LAB["paths"].get("compile_dir", "/opt/compile")
 DEPLOY_CERTS = f"{WORK}/certs"        # 三跳统一部署证书路径
 BUILD_HOST = LAB.get("build_host", "entry")                 # 独立构建机角色，默认使用广州 entry
 BUILD_DIR = ROOT / "build"
+RELEASE_MANIFEST = BUILD_DIR / "release-manifest.json"
+LINE_PROFILE = pathlib.Path(os.environ.get("NB_LINE_PROFILE_FILE", str(ROOT / "tools" / "line-profiles" / "gz-hk-kz.json")))
 PLATFORM = "linux-x86_64"             # 目标平台(三跳均 x86_64)
 SECURITY_DIR = pathlib.Path(os.environ.get("NB_SECURITY_DIR", str(BUILD_DIR / "security")))
 DEFAULT_SOCKS_PORT = 1080
 WHITELIST_LOCAL = ROOT / "tools" / "whitelist.local.conf"
+LOG4C_RUNTIME_CONFIG = ROOT / "tools" / "log4c.runtime.json"
 
 # 白名单默认模板(仅首次部署推送到 exit; 之后以服务器 /root/nb/whitelist.conf 为准, 远程编辑即热重载)。
 # 语法: domain <后缀> | ip <a.b.c.d/len> | port <端口>; 命中(host AND port)才走隧道, 未命中拒绝。
@@ -87,14 +93,44 @@ def _configure_host_keys(client: paramiko.SSHClient) -> None:
         raise RuntimeError("缺少 NB_KNOWN_HOSTS；首次引导可显式设置 NB_SSH_INSECURE=1")
 
 
+def _bind_jump_lifecycle(client: paramiko.SSHClient, jump: paramiko.SSHClient | None) -> None:
+    """让目标连接关闭时同步关闭跳板，避免长期采集泄漏 sshd 会话。"""
+    setattr(client, "_jump", jump)
+    if jump is None:
+        return
+    original_close = client.close
+    closed = False
+
+    def close_with_jump() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        try:
+            original_close()
+        finally:
+            jump.close()
+
+    client.close = close_with_jump
+
+
+def ssh_retry_delay(attempt: int, base: float = 1.0, cap: float = 12.0,
+                    jitter: float | None = None) -> float:
+    """Bounded exponential backoff; attempt is zero based."""
+    value = min(cap, base * (2 ** max(0, attempt)))
+    factor = random.uniform(0.75, 1.25) if jitter is None else jitter
+    return max(0.0, min(cap, value * factor))
+
+
 def connect(role) -> paramiko.SSHClient:
     """建立 SSH(含 entry 跳板)。失败重试 3 次(全局规范: invoke 不中断)。"""
     h = _role_host(role)
     last = None
     for attempt in range(3):
+        c = None
+        jump = None
         try:
             sock = None
-            jump = None
             if h.get("jump_via"):
                 jrole = h["jump_via"]
                 jh = _role_host(jrole)
@@ -108,10 +144,18 @@ def connect(role) -> paramiko.SSHClient:
             c.connect(hostname=h["host"], port=h["port"], username=h["user"], password=_host_password(h),
                       timeout=25, banner_timeout=25, auth_timeout=25, allow_agent=False,
                       look_for_keys=False, sock=sock)
-            setattr(c, "_jump", jump)
+            _bind_jump_lifecycle(c, jump)
             return c
         except Exception as e:  # noqa
-            last = e; time.sleep(2)
+            last = e
+            if c is not None:
+                try: c.close()
+                except Exception: pass
+            if jump is not None:
+                try: jump.close()
+                except Exception: pass
+            if attempt < 2:
+                time.sleep(ssh_retry_delay(attempt))
     raise RuntimeError(f"connect {role}({h['name']}) failed after retries: {last}")
 
 
@@ -149,12 +193,212 @@ def fetch_bytes(c, path):
 
 def push_bytes(c, data, path, mode=0o644):
     run(c, f"mkdir -p $(dirname {path})")
-    tmp = f"{path}.tmp"
-    sf = c.open_sftp()
-    sf.putfo(io.BytesIO(data), tmp)
-    sf.chmod(tmp, mode)
-    sf.close()
+    tmp = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
+    sf = None
+    try:
+        sf = c.open_sftp()
+        sf.putfo(io.BytesIO(data), tmp)
+        sf.chmod(tmp, mode)
+    finally:
+        if sf is not None:
+            sf.close()
     run(c, f"mv -f {tmp} {path}")
+
+
+def _effective_workers(role):
+    workers = int(LAB.get("workers", {}).get(role, 1))
+    if not 1 <= workers <= 32:
+        raise ValueError(f"workers.{role} 必须为 1..32")
+    return workers
+
+
+def _acquire_deploy_lock(c, role, release_id):
+    lock = "/run/nb-deploy.lock"
+    output = run(c,
+        f"if test -d {lock} && find {lock} -mmin +30 -print -quit | grep -q .; then rm -rf {lock}; fi; "
+        f"if mkdir {lock} 2>/dev/null; then printf '%s %s UTC=%s\n' {shlex.quote(release_id)} {shlex.quote(role)} \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >{lock}/owner; echo LOCKED; "
+        f"else echo BUSY; cat {lock}/owner 2>/dev/null || true; fi")
+    if "LOCKED" not in output:
+        raise RuntimeError(f"{role} 已有部署事务执行中: {output.strip()}")
+
+
+def _release_deploy_lock(c):
+    run(c, "rm -rf /run/nb-deploy.lock")
+
+
+def _deployment_id(manifest):
+    return manifest.get("deployment_id") or manifest["release_id"]
+
+
+def _append_deploy_audit(c, role, event, manifest, previous=None, detail=None):
+    record = {
+        "at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        "role": role,
+        "host": _role_host(role)["name"],
+        "release_id": manifest["release_id"],
+        "deployment_id": _deployment_id(manifest),
+        "artifact_sha256": manifest["artifact"]["sha256"],
+        "previous": previous,
+        "detail": detail,
+    }
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    with (BUILD_DIR / "deploy-audit.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+    if c is not None:
+        remote = f"{WORK}/releases/deploy-audit.jsonl"
+        run(c, f"mkdir -p {shlex.quote(WORK + '/releases')}; printf '%s\\n' {shlex.quote(line)} >> {shlex.quote(remote)}; chmod 0600 {shlex.quote(remote)}")
+
+
+def _append_exact_rollback_audit(c,role,event,target,origin,detail=None):
+    record={"at_utc":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"event":event,
+            "role":role,"host":_role_host(role)["name"],"target_deployment_id":target,
+            "origin_deployment_id":origin,"detail":detail}
+    line=json.dumps(record,ensure_ascii=False,separators=(",",":"));BUILD_DIR.mkdir(parents=True,exist_ok=True)
+    with (BUILD_DIR/"deploy-audit.jsonl").open("a",encoding="utf-8") as stream:stream.write(line+"\n")
+    remote=f"{WORK}/releases/deploy-audit.jsonl"
+    run(c,f"printf '%s\\n' {shlex.quote(line)} >> {shlex.quote(remote)}; chmod 0600 {shlex.quote(remote)}")
+
+
+def _prune_releases(c, role, previous):
+    retain = int(LAB.get("release_retention", 5))
+    if not 2 <= retain <= 20:
+        raise ValueError("release_retention 必须为 2..20")
+    previous_name = pathlib.PurePosixPath(previous).parent.name if previous != "NONE" else ""
+    script = (
+        "import json,pathlib,re,shutil;"
+        f"root=pathlib.Path({str(WORK + '/releases')!r}).resolve();"
+        f"retain={retain};protected={{{previous_name!r}}};"
+        f"current=pathlib.Path({str(WORK + '/nb_node')!r}).resolve().parent.name;protected.add(current);"
+        "rx=re.compile(r'^(?:[0-9a-f]{16}(?:-[0-9a-f]{12})?|legacy-[0-9a-f]{16})$');"
+        "items=sorted(((p.stat().st_mtime,p) for p in root.iterdir() if p.is_dir() and rx.fullmatch(p.name)),reverse=True);"
+        "keep={p.name for _,p in items[:retain]}|protected;removed=[];"
+        "[(shutil.rmtree(p),removed.append(p.name)) for _,p in items if p.name not in keep and p.parent.resolve()==root];"
+        "print(json.dumps({'removed':removed,'kept':sorted(keep)}))"
+    )
+    output = run(c, f"python3 -c {shlex.quote(script)}", tmo=30).strip()
+    if not output.startswith("{"):
+        raise RuntimeError(f"{role} 发布保留清理失败: {output}")
+    return output
+
+
+def _line_profile_identity():
+    if not LINE_PROFILE.is_file():
+        return "unversioned", 0
+    profile = json.loads(LINE_PROFILE.read_text(encoding="utf-8"))
+    line_id = str(profile.get("line_id", "unversioned"))
+    schema = int(profile.get("schema_version", 0))
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+    if not line_id or any(ch not in allowed for ch in line_id) or not 0 <= schema <= 999999:
+        raise ValueError("线路 profile 的 line_id/schema_version 非法")
+    return line_id, schema
+
+
+def _stage_release(c, role, manifest, binary):
+    release_id = _deployment_id(manifest)
+    if not nb_release.RELEASE_NAME_RE.fullmatch(release_id) or release_id.startswith("legacy-"):
+        raise ValueError(f"非法 deployment_id: {release_id}")
+    release_dir = f"{WORK}/releases/{release_id}"
+    run(c, f"mkdir -p {shlex.quote(release_dir)}")
+    expected = manifest["artifact"]["sha256"]
+    artifact = f"{release_dir}/nb_node"
+    existing = run(c, f"test -f {shlex.quote(artifact)} && sha256sum {shlex.quote(artifact)} | awk '{{print $1}}' || true").strip()
+    if existing and existing != expected:
+        raise RuntimeError(f"{role} immutable release collision: {release_id}")
+    if not existing:
+        push_bytes(c, binary, artifact, mode=0o755)
+    push_bytes(c, RELEASE_MANIFEST.read_bytes(), f"{release_dir}/release-manifest.json", mode=0o644)
+    push_bytes(c, LOG4C_RUNTIME_CONFIG.read_bytes(), f"{release_dir}/cfg/log4c.json", mode=0o644)
+    verified = run(c, f"test \"$(sha256sum {shlex.quote(release_dir + '/nb_node')} | awk '{{print $1}}')\" = {shlex.quote(expected)} && echo VERIFIED")
+    if "VERIFIED" not in verified:
+        raise RuntimeError(f"{role} 发布产物远端哈希校验失败")
+
+    current = f"{WORK}/nb_node"
+    previous = run(c,
+        f"if test -L {shlex.quote(current)}; then echo PREVIOUS=$(readlink {shlex.quote(current)}); "
+        f"elif test -f {shlex.quote(current)}; then old=$(sha256sum {shlex.quote(current)} | awk '{{print $1}}'); "
+        f"short=$(printf '%s' \"$old\" | cut -c1-16); olddir={shlex.quote(WORK)}/releases/legacy-$short; "
+        f"mkdir -p \"$olddir\"; cp -p {shlex.quote(current)} \"$olddir/nb_node\"; echo PREVIOUS=releases/legacy-$short/nb_node; "
+        "else echo PREVIOUS=NONE; fi").strip().splitlines()
+    marker = next((line for line in reversed(previous) if line.startswith("PREVIOUS=")), None)
+    if marker is None:
+        raise RuntimeError(f"{role} 无法保存当前发布指针")
+    return marker.split("=", 1)[1]
+
+
+def _activate_release(c, release_id):
+    target = f"releases/{release_id}/nb_node"
+    temporary = f"{WORK}/.nb_node.next"
+    output = run(c, f"ln -sfn {shlex.quote(target)} {shlex.quote(temporary)} && "
+                    f"mv -Tf {shlex.quote(temporary)} {shlex.quote(WORK + '/nb_node')} && echo ACTIVATED")
+    if "ACTIVATED" not in output:
+        raise RuntimeError(f"远端原子切换失败: release={release_id}")
+
+
+def _backup_role_unit(c, role, release_id):
+    unit = f"/etc/systemd/system/nb-{role}.service"
+    backup = f"{WORK}/releases/{release_id}/previous-nb-{role}.service"
+    output = run(c, f"if test -f {shlex.quote(unit)}; then cp -p {shlex.quote(unit)} {shlex.quote(backup)}; "
+                    "echo UNIT_BACKED_UP; else echo UNIT_ABSENT; fi")
+    if "UNIT_BACKED_UP" in output:
+        return True
+    if "UNIT_ABSENT" in output:
+        return False
+    raise RuntimeError(f"{role} 无法备份当前 systemd unit")
+
+
+def _rollback_release(c, role, previous, release_id, had_unit):
+    unit = f"/etc/systemd/system/nb-{role}.service"
+    backup = f"{WORK}/releases/{release_id}/previous-nb-{role}.service"
+    if had_unit:
+        restored = run(c, f"cp -p {shlex.quote(backup)} {shlex.quote(unit)} && systemctl daemon-reload && echo UNIT_RESTORED")
+        if "UNIT_RESTORED" not in restored:
+            raise RuntimeError(f"{role} systemd unit 回滚失败")
+    else:
+        run(c, f"rm -f {shlex.quote(unit)} && systemctl daemon-reload")
+    if previous == "NONE":
+        _systemd_stop(c, role)
+        run(c, f"rm -f {shlex.quote(WORK + '/nb_node')}")
+        return "stopped(no previous release)"
+    temporary = f"{WORK}/.nb_node.rollback"
+    run(c, f"ln -sfn {shlex.quote(previous)} {shlex.quote(temporary)} && "
+           f"mv -Tf {shlex.quote(temporary)} {shlex.quote(WORK + '/nb_node')}")
+    return _systemd_restart(c, role, warmup=2.0)
+
+
+def _verify_release_health(c, role, manifest, warmup=8):
+    expected_hash = manifest["artifact"]["sha256"]
+    result = _verify_deployment_health(c, role, _deployment_id(manifest), warmup, expected_hash)
+    return result
+
+
+def _verify_deployment_health(c, role, deployment_id, warmup=8, expected_hash=None):
+    expected_workers = _effective_workers(role)
+    time.sleep(warmup)
+    state = run(c, f"systemctl is-active nb-{role}; "
+                   f"sha256sum {shlex.quote(WORK + '/nb_node')} | awk '{{print $1}}'").strip().splitlines()
+    if "active" not in state or (expected_hash is not None and expected_hash not in state):
+        raise RuntimeError(f"nb-{role} systemd/哈希健康门禁失败: {' '.join(state)}")
+    script = (
+        "import glob,json,socket,sys;"
+        f"paths={[f'/run/nb-{role}-{worker}.ctl' for worker in range(expected_workers)]!r};"
+        "responses=[];"
+        "[(lambda s,p:(s.settimeout(2),s.connect(p),s.sendall(b'health\\n'),responses.append(json.loads(s.recv(2048).decode())),s.close()))(socket.socket(socket.AF_UNIX),p) for p in paths];"
+        f"assert all(x.get('status')=='ok' and x.get('role')=='{role}' and x.get('release_id')=='{deployment_id}' for x in responses),responses;"
+        "print('HEALTH_OK')"
+    )
+    health = run(c, f"python3 -c {shlex.quote(script)}", tmo=15)
+    if "HEALTH_OK" not in health:
+        raise RuntimeError(f"nb-{role} 控制套接字健康门禁失败: {health.strip()}")
+    return f"deployment={deployment_id} workers={expected_workers} health=ok"
+
+
+def _remote_current_deployment(c, role):
+    output = run(c, f"readlink -f {shlex.quote(WORK + '/nb_node')} 2>/dev/null | xargs -r dirname | xargs -r basename").strip()
+    if not nb_release.RELEASE_NAME_RE.fullmatch(output) or output.startswith("legacy-"):
+        raise RuntimeError(f"{role} 当前 deployment 无法识别: {output or 'missing'}")
+    return output
 
 
 def _service_name(role):
@@ -182,10 +426,16 @@ def _systemd_stop(c, role):
 def _require_local_build():
     if not (BUILD_DIR / "nb_node").exists():
         sys.exit("本地缺少 build/nb_node，请先运行: python tools/deploy.py build")
+    if not RELEASE_MANIFEST.is_file():
+        sys.exit("本地缺少 build/release-manifest.json，请重新运行 build")
+    try:
+        return nb_release.load_and_validate_manifest(RELEASE_MANIFEST, ROOT, BUILD_DIR / "nb_node")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        sys.exit(f"发布清单校验失败: {error}")
 
 
 def _require_security_material():
-    required = [SECURITY_DIR / "ca.pem", SECURITY_DIR / "socks.users"]
+    required = [SECURITY_DIR / "ca.pem", SECURITY_DIR / "socks.users", SECURITY_DIR / "tenant.conf"]
     required += [SECURITY_DIR / f"{role}.{ext}" for role in ("entry", "middle", "exit") for ext in ("pem", "key")]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -198,6 +448,7 @@ def _remote_security(role):
         "cert": f"{DEPLOY_CERTS}/{role}.pem",
         "key": f"{DEPLOY_CERTS}/{role}.key",
         "users": f"{WORK}/socks.users",
+        "tenants": f"{WORK}/tenant.conf",
     }
 
 
@@ -209,6 +460,7 @@ def _push_security(c, role):
     push_bytes(c, (SECURITY_DIR / f"{role}.key").read_bytes(), paths["key"], mode=0o600)
     if role == "entry":
         push_bytes(c, (SECURITY_DIR / "socks.users").read_bytes(), paths["users"], mode=0o600)
+        push_bytes(c, (SECURITY_DIR / "tenant.conf").read_bytes(), paths["tenants"], mode=0o600)
 
 
 def _whitelist_remote():
@@ -223,16 +475,21 @@ def _exit_routes_remote():
     return f"{WORK}/exit_routes.conf"
 
 
-def _push_exit_routes(c):
+def _push_exit_routes(c, remote_path=None):
     exits=LAB.get("exits") or [{"name":_role_host("exit")["name"],"host":_role_host("exit")["host"],"port":4443,"weight":1}]
-    lines=["# route <name> <H:host:port> <weight>"]
+    lines=["# route <name> <H:host:port> <weight> <capacity; 0=unlimited>"]
     for item in exits:
         name=str(item["name"]);host=str(item["host"]);port=int(item.get("port",4443));weight=int(item.get("weight",1))
+        if item.get("fixed_exit",_role_host("exit")["name"])!=_role_host("exit")["name"]:
+            raise ValueError(f"出口路由越过固定 exit: {item}")
         if not name.replace("-","").replace("_","").isalnum() or not 1<=port<=65535 or not 1<=weight<=1000:
             raise ValueError(f"非法出口路由配置: {item}")
-        lines.append(f"route {name} H:{host}:{port} {weight}")
-    push_bytes(c,("\n".join(lines)+"\n").encode("ascii"),_exit_routes_remote(),mode=0o644)
-    return _exit_routes_remote()
+        capacity=int(item.get("capacity",0))
+        if not 0<=capacity<=100000: raise ValueError(f"非法出口容量: {item}")
+        lines.append(f"route {name} H:{host}:{port} {weight} {capacity}")
+    destination = remote_path or _exit_routes_remote()
+    push_bytes(c,("\n".join(lines)+"\n").encode("ascii"),destination,mode=0o644)
+    return destination
 
 
 def _ensure_remote_whitelist(c, role="exit"):
@@ -255,10 +512,10 @@ def _push_whitelist(c, local_path: pathlib.Path):
     return wl_remote
 
 
-def _push_tiktok_rules(c):
+def _push_tiktok_rules(c, remote_path=None):
     local_rules = ROOT / "tools" / "tiktok_flow_rules.conf"
     if local_rules.exists():
-        push_bytes(c, local_rules.read_bytes(), _tiktok_rules_remote())
+        push_bytes(c, local_rules.read_bytes(), remote_path or _tiktok_rules_remote())
 
 
 def _fec_override_path(role):
@@ -276,17 +533,18 @@ def _role_fec_enabled(c, role):
     return "NB_FEC_V15_ACTIVE=on" in out or "NB_FEC_V15_ACTIVE=1" in out
 
 
-def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None):
+def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_id=None, exit_routes=None):
     hk = _role_host("middle")
     kz = _role_host("exit")
     sec = _remote_security(role)
-    base = f"{WORK}/nb_node -r {role} -c {sec['cert']} -k {sec['key']} -a {sec['ca']}"
+    rules = f"{WORK}/releases/{release_id}/tiktok_flow_rules.conf" if release_id else _tiktok_rules_remote()
+    base = f"{WORK}/nb_node -r {role} -c {sec['cert']} -k {sec['key']} -a {sec['ca']} -F {rules}"
     if role == "entry":
         mid = f"H:{kz['host']}:4443"
         middle_data_host = hk.get("private_ip") or hk.get("jump_target_host") or hk["host"]
         if not wl_remote:
             raise ValueError("entry SOCKS 启动需要 whitelist 路径")
-        return f"{base} -l {socks_port} -n {middle_data_host} -N 4443 -S -U {sec['users']} -W {wl_remote} -M {shlex.quote(mid)} -E {_exit_routes_remote()}"
+        return f"{base} -l {socks_port} -n {middle_data_host} -N 4443 -S -U {sec['users']} -Q {sec['tenants']} -W {wl_remote} -M {shlex.quote(mid)} -E {exit_routes or _exit_routes_remote()}"
     if role == "middle":
         return f"{base} -p 4443"
     if role == "exit":
@@ -298,14 +556,9 @@ def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None):
     raise ValueError(f"unknown role: {role}")
 
 
-def _install_and_restart_role(c, role, command, warmup=2.0):
-    workers=int(LAB.get("workers",{}).get(role,1))
-    if not 1<=workers<=32:
-        raise ValueError(f"workers.{role} 必须为 1..32")
-    if role=="middle" and workers>1:
-        print("middle worker 强制降为 1：当前共享 UDP :4443 的客户端回包无法跨 picoquic context 分派")
-        workers=1
-    supervisor=f"{WORK}/nb_supervisor.py"
+def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None):
+    workers = _effective_workers(role)
+    supervisor = f"{WORK}/releases/{release_id}/nb_supervisor.py" if release_id else f"{WORK}/nb_supervisor.py"
     push_bytes(c,(ROOT/"tools"/"nb_supervisor.py").read_bytes(),supervisor,mode=0o755)
     exec_start=f"/usr/bin/python3 {supervisor} --workers {workers} -- {command}"
     transport=LAB.get("transport",{}).get(role,{})
@@ -327,6 +580,10 @@ def _install_and_restart_role(c, role, command, warmup=2.0):
     if not isinstance(udp_gso,bool):
         raise ValueError(f"transport.{role}.udp_gso 必须为 true 或 false")
     udp_gso_env=f"Environment=NB_UDP_GSO={'on' if udp_gso else 'off'}\n"
+    release_env = f"Environment=NB_RELEASE_ID={release_id}\n" if release_id else ""
+    line_id, line_schema = _line_profile_identity()
+    profile_env = (f"Environment=NB_LINE_PROFILE_ID={line_id}\n"
+                   f"Environment=NB_LINE_PROFILE_SCHEMA={line_schema}\n")
     udp_advertise_env=""
     if role=="entry":
         entry_host=_role_host("entry")
@@ -360,13 +617,15 @@ def _install_and_restart_role(c, role, command, warmup=2.0):
 Description=Newbility {role} node
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 Environment=NB_FEC_V15=on
 Environment=NB_CC={cc}
 Environment=NB_BBR_OPTIONS={bbr_options}
-{cwin_env}{mtu_env}{udp_gso_env}{udp_advertise_env}{reorder_env}ExecStart={exec_start}
+{cwin_env}{mtu_env}{udp_gso_env}{release_env}{profile_env}{udp_advertise_env}{reorder_env}ExecStart={exec_start}
 Restart=on-failure
 RestartSec=2
 KillMode=control-group
@@ -378,8 +637,9 @@ WantedBy=multi-user.target
 """
     remote = f"/etc/systemd/system/nb-{role}.service"
     push_bytes(c, unit.encode("utf-8"), remote, mode=0o644)
-    run(c, f"systemctl stop nb-{role} 2>/dev/null || true; rm -f /run/nb-{role}-*.ctl; "
-           f"systemctl daemon-reload && systemctl enable nb-{role} >/dev/null")
+    if release_id:
+        run(c, f"cp -p {shlex.quote(remote)} {shlex.quote(f'{WORK}/releases/{release_id}/nb-{role}.service')}")
+    run(c, f"systemctl daemon-reload && systemctl enable nb-{role} >/dev/null")
     state = _systemd_restart(c, role, warmup=warmup)
     if "active" not in state:
         detail = run(c, f"systemctl status nb-{role} --no-pager -l; journalctl -u nb-{role} -n 30 --no-pager")
@@ -449,7 +709,18 @@ def _smoke_socks(socks_port=DEFAULT_SOCKS_PORT):
     if actual!=kz_ip:raise RuntimeError(f"SOCKS 出口验证失败: expected={kz_ip}, actual={actual or '(empty)'}")
 
 
-REBUILD_PICOQUIC = os.environ.get("NB_REBUILD_PICOQUIC") == "1"
+PICOQUIC_PATCH_FILES = tuple(ROOT / path for path in (
+    "third_party/picoquic/src/picoquic/bbr.c",
+    "third_party/picoquic/src/picoquic/cubic.c",
+    "third_party/picoquic/src/picoquic/loss_recovery.c",
+))
+PICOQUIC_SOURCE_DIGEST = "\n".join(
+    f"{path.relative_to(ROOT).as_posix()} {nb_release.sha256_file(path)}"
+    for path in PICOQUIC_PATCH_FILES) + "\n"
+PICOQUIC_STAMP = ROOT / "third_party" / "picoquic" / "prebuilt" / PLATFORM / "source.sha256"
+REBUILD_PICOQUIC = (os.environ.get("NB_REBUILD_PICOQUIC") == "1" or
+    not PICOQUIC_STAMP.is_file() or
+    PICOQUIC_STAMP.read_text(encoding="ascii") != PICOQUIC_SOURCE_DIGEST)
 PICOQUIC_REBUILD_CMD = (
     f"rm -rf {COMPILE_WORK}/third_party/picoquic/prebuilt/{PLATFORM} "
     f"{COMPILE_WORK}/third_party/picoquic/src/build-{PLATFORM} "
@@ -458,17 +729,48 @@ PICOQUIC_REBUILD_CMD = (
 ) if REBUILD_PICOQUIC else ""
 BUILD_CMD = (
     PICOQUIC_REBUILD_CMD +
-    f"cd {COMPILE_WORK} && rm -rf build && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >/tmp/nbcmake.log 2>&1; "
-    f"cmake --build build -j$(nproc) >>/tmp/nbcmake.log 2>&1; echo cmake_rc=$?; tail -3 /tmp/nbcmake.log"
+    f"cd {COMPILE_WORK} && rm -rf build test-build && "
+    "cmake -S . -B test-build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON >/tmp/nbcmake.log 2>&1 && "
+    "ionice -c3 nice -n 10 cmake --build test-build -j2 >>/tmp/nbcmake.log 2>&1 && "
+    "ionice -c3 nice -n 10 ctest --test-dir test-build --output-on-failure >>/tmp/nbcmake.log 2>&1 && "
+    "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >>/tmp/nbcmake.log 2>&1 && "
+    "ionice -c3 nice -n 10 cmake --build build -j2 >>/tmp/nbcmake.log 2>&1 && "
+    "test -r tools/nb_supervisor.py -a -r scripts/runtri.sh && "
+    f"NB_MIDDLE_WORKERS={_effective_workers('middle')} NB_EXIT_WORKERS={_effective_workers('exit')} "
+    "NB_KEEP_TMP=1 NB_BIN=" + COMPILE_WORK + "/build/nb_node bash scripts/runtri.sh >>/tmp/nbcmake.log 2>&1; "
+    "rc=$?; echo NB_BUILD_GATE_RC=$rc; tail -40 /tmp/nbcmake.log; exit $rc"
 )
 
 # CMake 构建集: 自有源码 + CMakeLists + build_libs.sh + 目标平台预编译 .a(自包含, 零依赖 /root/poc)
 BUILD_FILES = {
+    "scripts/runtri.sh": ROOT / "scripts" / "runtri.sh",
+    "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
     "src/nb_node.c": SRC / "nb_node.c",
     "src/nb_policy.c": SRC / "nb_policy.c",
     "src/nb_policy.h": SRC / "nb_policy.h",
     "src/nb_live.c": SRC / "nb_live.c",
     "src/nb_live.h": SRC / "nb_live.h",
+    "src/nb_metrics.c": SRC / "nb_metrics.c",
+    "src/nb_metrics.h": SRC / "nb_metrics.h",
+    "src/nb_session_index.c": SRC / "nb_session_index.c",
+    "src/nb_session_index.h": SRC / "nb_session_index.h",
+    "src/nb_session.h": SRC / "nb_session.h",
+    "src/nb_runtime.h": SRC / "nb_runtime.h",
+    "src/nb_bridge.c": SRC / "nb_bridge.c",
+    "src/nb_bridge.h": SRC / "nb_bridge.h",
+    "src/nb_send.c": SRC / "nb_send.c",
+    "src/nb_send.h": SRC / "nb_send.h",
+    "src/nb_path.c": SRC / "nb_path.c",
+    "src/nb_path.h": SRC / "nb_path.h",
+    "src/nb_pool.h": SRC / "nb_pool.h",
+    "src/nb_pool.c": SRC / "nb_pool.c",
+    "src/nb_whitelist.c": SRC / "nb_whitelist.c",
+    "src/nb_whitelist.h": SRC / "nb_whitelist.h",
+    "tools/test_whitelist.c": ROOT / "tools" / "test_whitelist.c",
+    "src/nb_pool_health.c": SRC / "nb_pool_health.c",
+    "src/nb_pool_health.h": SRC / "nb_pool_health.h",
+    "src/nb_dns.c": SRC / "nb_dns.c",
+    "src/nb_dns.h": SRC / "nb_dns.h",
     "src/nb_fec_rs.c": SRC / "nb_fec_rs.c",
     "src/nb_fec_rs.h": SRC / "nb_fec_rs.h",
     "src/nb_fec.c": SRC / "nb_fec.c",
@@ -477,21 +779,37 @@ BUILD_FILES = {
     "src/nb_ring.h": SRC / "nb_ring.h",
     "src/nb_auth.c": SRC / "nb_auth.c",
     "src/nb_auth.h": SRC / "nb_auth.h",
+    "src/nb_auth_async.c": SRC / "nb_auth_async.c",
+    "src/nb_auth_async.h": SRC / "nb_auth_async.h",
     "src/nb_control.c": SRC / "nb_control.c",
     "src/nb_control.h": SRC / "nb_control.h",
     "src/nb_routes.c": SRC / "nb_routes.c",
     "src/nb_routes.h": SRC / "nb_routes.h",
+    "src/nb_tenant.c": SRC / "nb_tenant.c",
+    "src/nb_tenant.h": SRC / "nb_tenant.h",
     "src/nb_udp.c": SRC / "nb_udp.c",
     "src/nb_udp.h": SRC / "nb_udp.h",
+    "src/nb_udp_lifecycle.c": SRC / "nb_udp_lifecycle.c",
+    "src/nb_udp_lifecycle.h": SRC / "nb_udp_lifecycle.h",
     "tools/test_fec.c": ROOT / "tools" / "test_fec.c",
     "tools/test_fec_rs.c": ROOT / "tools" / "test_fec_rs.c",
     "tools/test_ring.c": ROOT / "tools" / "test_ring.c",
     "tools/test_auth.c": ROOT / "tools" / "test_auth.c",
+    "tools/test_auth_async.c": ROOT / "tools" / "test_auth_async.c",
     "tools/test_control.c": ROOT / "tools" / "test_control.c",
     "tools/test_routes.c": ROOT / "tools" / "test_routes.c",
     "tools/test_udp.c": ROOT / "tools" / "test_udp.c",
+    "tools/test_udp_lifecycle.c": ROOT / "tools" / "test_udp_lifecycle.c",
     "tools/test_policy.c": ROOT / "tools" / "test_policy.c",
     "tools/test_live.c": ROOT / "tools" / "test_live.c",
+    "tools/test_metrics.c": ROOT / "tools" / "test_metrics.c",
+    "tools/test_session_index.c": ROOT / "tools" / "test_session_index.c",
+    "tools/test_bridge.c": ROOT / "tools" / "test_bridge.c",
+    "tools/test_send.c": ROOT / "tools" / "test_send.c",
+    "tools/test_path.c": ROOT / "tools" / "test_path.c",
+    "tools/test_pool_health.c": ROOT / "tools" / "test_pool_health.c",
+    "tools/test_dns.c": ROOT / "tools" / "test_dns.c",
+    "tools/test_tenant.c": ROOT / "tools" / "test_tenant.c",
     "src/log/log4c.c": SRC / "log" / "log4c.c",
     "src/log/log4c.h": SRC / "log" / "log4c.h",
     "CMakeLists.txt": ROOT / "CMakeLists.txt",
@@ -518,6 +836,18 @@ if REBUILD_PICOQUIC:
             continue
         BUILD_FILES[_source_file.relative_to(ROOT).as_posix()] = _source_file
 
+RELEASE_INPUTS = dict(BUILD_FILES)
+RELEASE_INPUTS["tools/nb_supervisor.py"] = ROOT / "tools" / "nb_supervisor.py"
+RELEASE_INPUTS["tools/tiktok_flow_rules.conf"] = ROOT / "tools" / "tiktok_flow_rules.conf"
+RELEASE_INPUTS["tools/log4c.runtime.json"] = LOG4C_RUNTIME_CONFIG
+RELEASE_INPUTS["tools/nb_p1_control.py"] = ROOT / "tools" / "nb_p1_control.py"
+RELEASE_INPUTS["tools/security_rotate.py"] = ROOT / "tools" / "security_rotate.py"
+RUNTIME_CONFIGURATION_INPUTS = {
+    "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
+    "tools/tiktok_flow_rules.conf": ROOT / "tools" / "tiktok_flow_rules.conf",
+    "tools/log4c.runtime.json": LOG4C_RUNTIME_CONFIG,
+}
+
 
 def act_recon(roles):
     for r in roles:
@@ -533,6 +863,15 @@ def act_recon(roles):
 
 def act_build(roles):
     """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
+    tests = ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
+             "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
+             "test_line_provision.py", "test_line_open.py", "test_supervisor.py"]
+    for test in tests:
+        result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"本地 P0 发布门禁失败: {test}")
+    if "picoquic_add_to_stream(" in (SRC / "nb_node.c").read_text(encoding="utf-8"):
+        raise RuntimeError("主节点仍存在 picoquic_add_to_stream 调用")
     c = connect(BUILD_HOST); h = _role_host(BUILD_HOST)
     print(f"### build on {BUILD_HOST}({h['name']}) in {COMPILE_WORK} via CMake + vendored picoquic ...")
     deps = run(c, "for x in gcc g++ make cmake pkg-config; do command -v $x >/dev/null 2>&1 || echo MISSING:$x; done; "
@@ -540,14 +879,21 @@ def act_build(roles):
     if "MISSING:" in deps:
         c.close()
         raise RuntimeError(f"构建机 {h['name']} 缺少依赖: {', '.join(x.split(':', 1)[1] for x in deps.splitlines() if x.startswith('MISSING:'))}")
+    build_input_snapshot = nb_release.snapshot_inputs(ROOT, RELEASE_INPUTS)
     run(c, f"rm -rf {COMPILE_WORK}/src {COMPILE_WORK}/third_party {COMPILE_WORK}/CMakeLists.txt {COMPILE_WORK}/build; mkdir -p {COMPILE_WORK}")
     put_tar(c, BUILD_FILES, COMPILE_WORK)
     out = run(c, BUILD_CMD, tmo=300)
     print(out.strip()[-600:] if out.strip() else "(no output)")
+    if "NB_BUILD_GATE_RC=0" not in out:
+        c.close()
+        raise RuntimeError("正式构建或三跳回归未通过，拒绝生成部署产物")
     ok = run(c, f"ls -l {COMPILE_WORK}/build/nb_node 2>/dev/null && echo BUILD_OK || echo BUILD_FAIL")
     print(ok)
     if "BUILD_OK" not in ok:
         c.close(); sys.exit("编译失败, 中止")
+    if nb_release.snapshot_inputs(ROOT, RELEASE_INPUTS) != build_input_snapshot:
+        c.close()
+        raise RuntimeError("构建期间源码或运行时输入发生变化，产物已废弃，请重新构建")
     BUILD_DIR.mkdir(exist_ok=True)
     (BUILD_DIR / "nb_node").write_bytes(fetch_bytes(c, f"{COMPILE_WORK}/build/nb_node"))
     if REBUILD_PICOQUIC:
@@ -557,7 +903,14 @@ def act_build(roles):
                         "libpicotls-core.a", "libpicotls-minicrypto.a"):
             (local_prebuilt / archive).write_bytes(fetch_bytes(
                 c, f"{COMPILE_WORK}/third_party/picoquic/prebuilt/{PLATFORM}/{archive}"))
-    print(f"产物 -> {BUILD_DIR}: nb_node")
+        PICOQUIC_STAMP.write_text(PICOQUIC_SOURCE_DIGEST, encoding="ascii")
+    manifest = nb_release.create_manifest(
+        ROOT, BUILD_DIR / "nb_node", PLATFORM, RELEASE_INPUTS, LAB_FILE,
+        LINE_PROFILE if LINE_PROFILE.is_file() else None,
+        RUNTIME_CONFIGURATION_INPUTS,
+    )
+    nb_release.write_manifest(RELEASE_MANIFEST, manifest)
+    print(f"产物 -> {BUILD_DIR}: nb_node, release-manifest.json deployment={_deployment_id(manifest)}")
     c.close()
 
 
@@ -580,7 +933,7 @@ def act_stop(roles):
 def act_logs(roles):
     for r in roles:
         c = connect(r); h = _role_host(r)
-        out = run(c, f"tail -25 {WORK}/logs/nb-*.log 2>/dev/null || echo '(no log)'")
+        out = run(c, f"tail -25 {WORK}/logs/nb-{r}.log 2>/dev/null || echo '(no log)'")
         print(f"### {r}({h['name']}) log\n{out}")
         c.close()
 
@@ -627,45 +980,154 @@ def act_deploy_tri():
 
 
 def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
-    """分发本地 build/nb_node -> systemd 重启 exit/middle/entry -> SOCKS5 冒烟。"""
-    _require_local_build()
+    """预上传版本化产物 -> 原子重启 -> 健康门禁 -> 失败自动回滚。"""
+    manifest = _require_local_build()
     _require_security_material()
+    if not os.environ.get("NB_SOCKS_USERNAME") or not os.environ.get("NB_SOCKS_PASSWORD"):
+        raise RuntimeError("部署前必须设置 NB_SOCKS_USERNAME 和 NB_SOCKS_PASSWORD，以便健康门禁完成端到端冒烟")
     gz = _role_host("entry")
     bindata = (BUILD_DIR / "nb_node").read_bytes()
+    roles = ("exit", "middle", "entry")
+    clients = {}
+    previous = {}
+    unit_backups = {}
+    activated = []
+    locked = []
+    deployment_id = _deployment_id(manifest)
+    try:
+        for role in roles:
+            clients[role] = connect(role)
+            _acquire_deploy_lock(clients[role], role, deployment_id)
+            locked.append(role)
+            run(clients[role], f"mkdir -p {WORK}/logs")
+            previous[role] = _stage_release(clients[role], role, manifest, bindata)
+            unit_backups[role] = _backup_role_unit(clients[role], role, deployment_id)
+            _append_deploy_audit(clients[role], role, "staged", manifest, previous[role])
+            print(f"{role}: deployment={deployment_id} 预上传及哈希校验完成")
 
-    ck = connect("exit")
-    _systemd_stop(ck,"exit")
-    run(ck, f"mkdir -p {WORK}/logs")
-    push_bytes(ck, bindata, f"{WORK}/nb_node", mode=0o755)
-    _push_security(ck,"exit")
-    _push_tiktok_rules(ck)
-    wl_remote = _ensure_remote_whitelist(ck)
-    print("exit(kz):", _install_and_restart_role(ck, "exit", _node_command("exit", wl_remote=wl_remote)))
-    print(run(ck, f"tail -4 {WORK}/logs/nb-exit.log 2>/dev/null"))
-    ck.close()
+        commands = {}
+        release_dir = f"{WORK}/releases/{deployment_id}"
+        release_rules = f"{release_dir}/tiktok_flow_rules.conf"
+        release_routes = f"{release_dir}/exit_routes.conf"
 
-    cm = connect("middle")
-    _systemd_stop(cm,"middle")
-    push_bytes(cm, bindata, f"{WORK}/nb_node", mode=0o755)
-    _push_security(cm,"middle")
-    _push_tiktok_rules(cm)
-    print("middle(hk):", _install_and_restart_role(cm, "middle", _node_command("middle")))
-    print(run(cm, f"tail -4 {WORK}/logs/nb-middle.log 2>/dev/null"))
-    cm.close()
+        ck = clients["exit"]
+        _push_security(ck, "exit"); _push_tiktok_rules(ck, release_rules)
+        wl_remote = _ensure_remote_whitelist(ck)
+        commands["exit"] = _node_command("exit", wl_remote=wl_remote, release_id=deployment_id)
 
-    cg = connect("entry")
-    _systemd_stop(cg,"entry")
-    push_bytes(cg, bindata, f"{WORK}/nb_node", mode=0o755)
-    _push_security(cg,"entry")
-    _push_tiktok_rules(cg)
-    _push_exit_routes(cg)
-    entry_wl=_ensure_remote_whitelist(cg,role="entry")
-    print("entry(gz):", _install_and_restart_role(cg, "entry", _node_command("entry", socks_port=socks_port,wl_remote=entry_wl)))
-    print(run(cg, f"tail -4 {WORK}/logs/nb-entry.log 2>/dev/null"))
-    cg.close()
+        cm = clients["middle"]
+        _push_security(cm, "middle"); _push_tiktok_rules(cm, release_rules)
+        commands["middle"] = _node_command("middle", release_id=deployment_id)
 
-    _smoke_socks(socks_port)
-    print(f"\n>>> 手机配置: SOCKS5 -> {gz['host']}:{socks_port}，使用 NB_SOCKS_USERNAME 对应凭据")
+        cg = clients["entry"]
+        _push_security(cg, "entry"); _push_tiktok_rules(cg, release_rules)
+        _push_exit_routes(cg, release_routes);_push_exit_routes(cg, _exit_routes_remote())
+        entry_wl = _ensure_remote_whitelist(cg, role="entry")
+        commands["entry"] = _node_command(
+            "entry", socks_port=socks_port, wl_remote=entry_wl,
+            release_id=deployment_id, exit_routes=_exit_routes_remote(),
+        )
+
+        for role in roles:
+            client = clients[role]
+            _activate_release(client, deployment_id)
+            activated.append(role)
+            _append_deploy_audit(client, role, "activated", manifest, previous[role])
+            _install_and_restart_role(client, role, commands[role], release_id=deployment_id)
+            health = _verify_release_health(client, role, manifest)
+            _append_deploy_audit(client, role, "healthy", manifest, previous[role], health)
+            print(f"{role}: {health}")
+            print(run(client, f"tail -4 {WORK}/logs/nb-{role}.log 2>/dev/null"))
+
+        _smoke_socks(socks_port)
+        for role in roles:
+            _append_deploy_audit(clients[role], role, "completed", manifest, previous[role], "socks-smoke=ok")
+            print(f"{role}: release retention {_prune_releases(clients[role], role, previous[role])}")
+    except Exception:
+        for role in reversed(activated):
+            try:
+                state = _rollback_release(
+                    clients[role], role, previous[role], deployment_id, unit_backups[role]
+                )
+                _append_deploy_audit(clients[role], role, "rolled_back", manifest, previous[role], state)
+                print(f"{role}: 已回滚到 {previous[role]} ({state})")
+            except Exception as rollback_error:
+                print(f"{role}: 自动回滚失败: {rollback_error}", file=sys.stderr)
+        raise
+    finally:
+        for role in locked:
+            try:
+                _release_deploy_lock(clients[role])
+            except Exception as unlock_error:
+                retry = None
+                try:
+                    retry = connect(role)
+                    _release_deploy_lock(retry)
+                    print(f"{role}: deployment lock released through a fresh SSH connection")
+                    continue
+                except Exception as retry_error:
+                    unlock_error = RuntimeError(f"{unlock_error}; retry: {retry_error}")
+                finally:
+                    if retry is not None:
+                        retry.close()
+                print(f"{role}: 释放部署锁失败: {unlock_error}", file=sys.stderr)
+        for client in clients.values():
+            client.close()
+
+    print(f"\n>>> 部署 {deployment_id} 已通过三节点健康门禁")
+    print(f">>> 手机配置: SOCKS5 -> {gz['host']}:{socks_port}，使用 NB_SOCKS_USERNAME 对应凭据")
+
+
+def _activate_existing_deployment(c, role, deployment_id):
+    if not nb_release.RELEASE_NAME_RE.fullmatch(deployment_id) or deployment_id.startswith("legacy-"):
+        raise ValueError(f"非法 deployment_id: {deployment_id}")
+    directory=f"{WORK}/releases/{deployment_id}";unit=f"nb-{role}.service"
+    check=run(c,f"test -x {shlex.quote(directory + '/nb_node')} && test -f {shlex.quote(directory + '/' + unit)} && echo READY")
+    if "READY" not in check:raise RuntimeError(f"{role} 缺少不可变部署 {deployment_id}")
+    push_target=f"/etc/systemd/system/{unit}"
+    restored=run(c,f"cp -p {shlex.quote(directory + '/' + unit)} {shlex.quote(push_target)} && systemctl daemon-reload && echo UNIT_READY")
+    if "UNIT_READY" not in restored:raise RuntimeError(f"{role} 恢复 unit 失败")
+    _activate_release(c,deployment_id);_systemd_restart(c,role,warmup=2.0)
+    return _verify_deployment_health(c,role,deployment_id,warmup=3)
+
+
+def act_current_deployment():
+    current={}
+    for role in ("entry","middle","exit"):
+        c=connect(role)
+        try:current[role]=_remote_current_deployment(c,role)
+        finally:c.close()
+    print("CURRENT_JSON="+json.dumps(current,separators=(",",":")))
+
+
+def act_rollback_socks(deployment_id,socks_port=DEFAULT_SOCKS_PORT):
+    if not deployment_id:raise ValueError("rollback-socks 必须提供 --deployment-id")
+    if not os.environ.get("NB_SOCKS_USERNAME") or not os.environ.get("NB_SOCKS_PASSWORD"):
+        raise RuntimeError("精确回滚需要 SOCKS 凭据完成端到端门禁")
+    roles=("exit","middle","entry");clients={};origins={};locked=[];activated=[]
+    try:
+        for role in roles:
+            clients[role]=connect(role);origins[role]=_remote_current_deployment(clients[role],role)
+            _acquire_deploy_lock(clients[role],role,deployment_id);locked.append(role)
+        for role in roles:
+            health=_activate_existing_deployment(clients[role],role,deployment_id)
+            _append_exact_rollback_audit(clients[role],role,"exact-rollback-activated",deployment_id,origins[role],health)
+            print(f"{role}: {health}")
+            activated.append(role)
+        _smoke_socks(socks_port)
+    except Exception:
+        for role in reversed(activated):
+            try:
+                health=_activate_existing_deployment(clients[role],role,origins[role])
+                _append_exact_rollback_audit(clients[role],role,"exact-rollback-aborted",origins[role],deployment_id,health)
+            except Exception as error:print(f"{role}: 回滚事务恢复原 deployment 失败: {error}",file=sys.stderr)
+        raise
+    finally:
+        for role in locked:
+            try:_release_deploy_lock(clients[role])
+            except Exception:pass
+        for c in clients.values():c.close()
+    print(f">>> 已精确回滚并验证 deployment={deployment_id}")
 
 
 def act_wl_show():
@@ -685,17 +1147,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=[
         "recon", "build", "deploy-tri", "deploy-socks", "stop", "logs",
-        "wl-show", "wl-push", "fec-status", "fec-on", "fec-off"
+        "wl-show", "wl-push", "fec-status", "fec-on", "fec-off", "current", "rollback-socks"
     ])
     ap.add_argument("--roles", default="entry,middle,exit")
     ap.add_argument("--socks-port", type=int, default=DEFAULT_SOCKS_PORT)
     ap.add_argument("--whitelist", default=str(WHITELIST_LOCAL))
+    ap.add_argument("--deployment-id")
     a = ap.parse_args()
     roles = [r.strip() for r in a.roles.split(",") if r.strip()]
     if a.action == "recon": act_recon(roles)
     elif a.action == "build": act_build(roles)
     elif a.action == "deploy-tri": act_deploy_tri()
     elif a.action == "deploy-socks": act_deploy_socks(a.socks_port)
+    elif a.action == "current": act_current_deployment()
+    elif a.action == "rollback-socks": act_rollback_socks(a.deployment_id,a.socks_port)
     elif a.action == "stop": act_stop(roles)
     elif a.action == "logs": act_logs(roles)
     elif a.action == "wl-show": act_wl_show()

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "description": "P0 产品支持包络与准入边界；entry 额外单向 80ms 应拒绝，middle 仍应通过。",
+  "scenarios": [
+    {"name": "clean", "category": "baseline"},
+    {"name": "loss-1", "category": "loss", "loss_pct": 1},
+    {"name": "loss-3", "category": "loss", "loss_pct": 3},
+    {"name": "delay-20", "category": "delay", "delay_ms": 20},
+    {"name": "delay-40", "category": "delay", "delay_ms": 40},
+    {"name": "delay-60", "category": "delay", "delay_ms": 60},
+    {"name": "delay-80", "category": "delay", "delay_ms": 80,
+      "expected_by_segment": {"entry-middle": "reject", "middle-exit": "pass"}},
+    {"name": "jitter-5", "category": "jitter", "delay_ms": 20, "jitter_ms": 5},
+    {"name": "jitter-10", "category": "jitter", "delay_ms": 20, "jitter_ms": 10},
+    {"name": "reorder-1", "category": "reorder", "delay_ms": 20, "reorder_pct": 1},
+    {"name": "reorder-3", "category": "reorder", "delay_ms": 20, "reorder_pct": 3},
+    {"name": "reorder-5", "category": "reorder", "delay_ms": 20, "reorder_pct": 5}
+  ]
+}

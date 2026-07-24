@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-from line_probe import parse_linkq, parse_ping, recommend, recommend_mtu, summarize_linkq
+from line_probe import (evaluate_admission, parse_linkq, parse_ping, recommend,
+                        recommend_mtu, summarize_linkq)
 
 
 def main() -> None:
@@ -23,6 +24,19 @@ def main() -> None:
     assert candidate["mtu_max"] == 1452
     assert candidate["mtu_evidence"]["confidence"] == "quic-and-df"
 
+    clean = summarize_linkq(parse_linkq("\n".join([
+        line.replace("rtt=210.0ms", "rtt=5.0ms")
+            .replace("jit=20.0ms", "jit=0.2ms")
+            .replace("reorder=163.0ms/24", "reorder=0.0ms/0")
+    ] * 6)))
+    protected = recommend(clean, {
+        "cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452,
+        "reorder_gap": 128, "reorder_delay_us": 450000,
+    }, 10.0, mtu_probe)
+    assert protected["cwin_max_bytes"] == 524288
+    assert protected["reorder_gap"] == 128
+    assert protected["reorder_delay_us"] == 450000
+
     idle = summarize_linkq([])
     current = {"cc": "bbr", "mtu_max": 1400,
                "reorder_gap": 128, "reorder_delay_us": 450000}
@@ -33,6 +47,12 @@ def main() -> None:
     assert idle_candidate["mtu_max"] == 1400
     assert idle_candidate["auto_apply_allowed"] is False
     assert recommend_mtu(idle, None, current)["confidence"] == "unavailable-keep-current"
+    admitted = evaluate_admission({"integrity": {"integrity": "ok"},
+        "load": {"integrity": "count-ok", "achieved_mbps": 9.2}}, 10.0)
+    assert admitted["status"] == "admitted"
+    rejected = evaluate_admission({"integrity": {"integrity": "ok"},
+        "load": {"integrity": "count-ok", "achieved_mbps": 8.9}}, 10.0)
+    assert rejected["status"] == "rejected"
     print("line_probe tests passed")
 
 
