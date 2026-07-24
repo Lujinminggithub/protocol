@@ -8,6 +8,7 @@ import json
 import requests
 
 from src.providers.base import BaseProvider, ChatResult, ProviderError
+from src.video_pipeline import prompt_audit
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -37,10 +38,12 @@ class OpenAICompatibleProvider(BaseProvider):
     def chat(self, messages: list, timeout: int = 60, tools: list = None) -> ChatResult:
         """非流式请求，直接返回完整结果。"""
         url = f"{self.base_url}/chat/completions"
+        payload = self._build_payload(messages, stream=False, tools=tools)
+        prompt_audit.record("chat_prompt", payload, label=self.model)
         try:
             resp = requests.post(
                 url,
-                json=self._build_payload(messages, stream=False, tools=tools),
+                json=payload,
                 headers=self._headers(),
                 timeout=timeout,
             )

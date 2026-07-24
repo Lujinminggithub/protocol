@@ -12,25 +12,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def _fix_frozen_ca_bundle():
-    """PyInstaller 打包后 requests/urllib3 有时找不到 certifi 的 CA 证书包
-    (https://github.com/pyinstaller/pyinstaller/issues/6352)，导致所有 HTTPS
-    请求失败(报错 "Could not find a suitable TLS CA certificate bundle")。
+    """冻结打包环境下手动修正 certifi CA 包路径。
 
-    根因比表面看起来更深：certifi 的 Python 模块代码被 PyInstaller 打进了
-    主程序的 .pyz 压缩归档(因为 hiddenimports 声明了它)，而 certifi.where()
-    内部用 importlib.resources 机制定位 cacert.pem —— 但 cacert.pem 是通过
-    aisprite.spec 的 datas 单独放在文件系统的 certifi/ 目录，并不在 .pyz
-    归档内部，两者对不上。importlib.resources 会尝试"临时提取"一份，这个
-    临时文件短时间内可能凑巧能访问(单次调用测试因此会误判"已修复")，但
-    长时间多次调用后就会失效，这正是视频生成轮询到第几次才报错的原因。
-
-    因此这里完全不调用 certifi.where()，直接手动拼出 spec 里 datas 声明的
-    确定路径，从根源绕开这个不可靠的机制。
+    PyInstaller onefile 用 sys._MEIPASS。
+    Nuitka onefile/standalone 的数据文件与模块 __file__ 同目录，所以这里优先取
+    当前文件目录，而不是 sys.executable 所在目录。
     """
-    if not (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")):
-        return  # 开发环境用 pip 装的 certifi，路径本身就是对的，无需处理
+    if not getattr(sys, "frozen", False):
+        return
     try:
-        ca_path = os.path.join(sys._MEIPASS, "certifi", "cacert.pem")
+        if hasattr(sys, "_MEIPASS"):
+            base_dir = sys._MEIPASS
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        ca_path = os.path.join(base_dir, "certifi", "cacert.pem")
         if os.path.exists(ca_path):
             os.environ["SSL_CERT_FILE"] = ca_path
             os.environ["REQUESTS_CA_BUNDLE"] = ca_path

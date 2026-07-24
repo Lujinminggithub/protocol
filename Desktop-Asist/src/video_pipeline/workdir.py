@@ -14,6 +14,7 @@ from src.paths import USER_DATA_DIR
 from src.video_pipeline.base import Scene, PipelineConfig
 
 VIDEO_JOBS_DIR = os.path.join(USER_DATA_DIR, "video_jobs")
+PROMPTS_DIR = os.path.join(USER_DATA_DIR, "prompts")
 
 
 def job_dir(job_id: str) -> str:
@@ -28,6 +29,12 @@ def scene_dir(job_id: str, index: int) -> str:
 
 def ensure_job_dir(job_id: str) -> str:
     d = job_dir(job_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def prompt_dir(job_id: str) -> str:
+    d = os.path.join(PROMPTS_DIR, job_id)
     os.makedirs(d, exist_ok=True)
     return d
 

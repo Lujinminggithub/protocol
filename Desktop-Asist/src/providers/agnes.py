@@ -17,6 +17,7 @@ import requests
 
 from src.providers.openai_compatible import OpenAICompatibleProvider
 from src.providers.base import ProviderError
+from src.video_pipeline import prompt_audit
 
 
 class AgnesProvider(OpenAICompatibleProvider):
@@ -40,8 +41,9 @@ class AgnesProvider(OpenAICompatibleProvider):
     # ===== 图像生成(文生图/图生图) =====
 
     def generate_image(
-        self, prompt: str, size: str = "1024x1024", image_path: str = None,
-        prefer_url: bool = False, timeout: int = 60
+        self, prompt: str, size: str = "1K", image_path: str = None,
+        image_paths: list = None, ratio: str = None,
+        prefer_url: bool = False, timeout: int = 360
     ) -> dict:
         """调用 /images/generations。返回 {"url": ..., "b64_json": ...}。
 
@@ -50,10 +52,19 @@ class AgnesProvider(OpenAICompatibleProvider):
         """
         url = f"{self.base_url}/images/generations"
         payload = {"model": self.IMAGE_MODEL, "prompt": prompt, "size": size}
-        if image_path:
+        if ratio:
+            payload["ratio"] = ratio
+        reference_paths = [path for path in (image_paths or []) if path]
+        if image_path and image_path not in reference_paths:
+            reference_paths.insert(0, image_path)
+        if reference_paths:
             # 图生图: Agnes 要求把输入图放到 extra_body.image 中。
             payload["extra_body"] = {
-                "image": [self._file_to_data_uri(image_path)],
+                "image": [
+                    path if path.startswith(("https://", "http://", "data:"))
+                    else self._file_to_data_uri(path)
+                    for path in reference_paths
+                ],
                 "response_format": "url" if prefer_url else "b64_json",
             }
         elif prefer_url:
@@ -62,6 +73,8 @@ class AgnesProvider(OpenAICompatibleProvider):
             # 文生图默认: 顶层 return_base64=true 直接拿 base64(不要把 response_format
             # 放在顶层, 官方文档特别强调这一点)。prefer_url 时不设这个，走默认返回 url。
             payload["return_base64"] = True
+
+        prompt_audit.record("image_prompt", payload, label=self.IMAGE_MODEL)
 
         try:
             resp = requests.post(url, json=payload, headers=self._headers(), timeout=timeout)
@@ -91,6 +104,7 @@ class AgnesProvider(OpenAICompatibleProvider):
         height: int = 768,
         num_frames: int = 121,
         frame_rate: int = 24,
+        num_inference_steps: int = None,
         image_url: str = None,
         image_urls: list = None,
         mode: str = None,
@@ -105,6 +119,10 @@ class AgnesProvider(OpenAICompatibleProvider):
         mode: 单图模式放进顶层 mode；多关键帧模式放进 extra_body.mode。
         不传 image_url/image_urls 就是纯文生视频。
         """
+        if num_frames > 441 or num_frames < 1 or (num_frames - 1) % 8 != 0:
+            raise ProviderError("Agnes 视频帧数必须不超过 441，并满足 8n+1 规则。")
+        if not 1 <= frame_rate <= 60:
+            raise ProviderError("Agnes 视频帧率必须在 1-60 之间。")
         url = f"{self.base_url}/videos"
         payload = {
             "model": self.VIDEO_MODEL,
@@ -120,6 +138,8 @@ class AgnesProvider(OpenAICompatibleProvider):
             payload["mode"] = mode
         if seed is not None:
             payload["seed"] = seed
+        if num_inference_steps is not None:
+            payload["num_inference_steps"] = int(num_inference_steps)
         if negative_prompt:
             payload["negative_prompt"] = negative_prompt
         extra_body = {}
@@ -129,6 +149,7 @@ class AgnesProvider(OpenAICompatibleProvider):
             extra_body["mode"] = mode
         if extra_body:
             payload["extra_body"] = extra_body
+        prompt_audit.record("video_prompt", payload, label=self.VIDEO_MODEL)
         try:
             resp = requests.post(url, json=payload, headers=self._headers(), timeout=timeout)
             resp.raise_for_status()
@@ -169,10 +190,11 @@ class AgnesProvider(OpenAICompatibleProvider):
             )
             resp.raise_for_status()
             data = resp.json()
+            metadata = data.get("metadata") or {}
             return {
                 "status": data.get("status", "unknown"),
                 "progress": data.get("progress"),
-                "video_url": data.get("url") or data.get("video_url"),
+                "video_url": data.get("url") or data.get("video_url") or metadata.get("url"),
                 "error": data.get("error"),
                 "raw": data,
             }

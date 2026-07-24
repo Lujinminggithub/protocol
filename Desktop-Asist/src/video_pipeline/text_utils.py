@@ -56,3 +56,29 @@ def clean_text(text: str, *, max_len: int = None) -> str:
 def is_too_short_caption(text: str, min_chars: int = 4) -> bool:
     value = re.sub(r"\s+", "", text or "")
     return 0 < len(value) < min_chars
+
+
+def strict_chinese_caption(text: str, max_len: int = 120) -> str:
+    """Return display-safe Chinese subtitle text, rejecting unresolved mojibake/English output."""
+    value = clean_text(text, max_len=max_len)
+    replacements = {
+        "WiFi": "无线网络",
+        "WIFI": "无线网络",
+        "wifi": "无线网络",
+        "APP": "应用",
+        "App": "应用",
+        "AI": "人工智能",
+    }
+    for source, target in replacements.items():
+        value = value.replace(source, target)
+    rare_hits = sum(value.count(marker) for marker in (
+        "锛", "銆", "鐨", "涓", "闂", "瑙", "戠", "掑", "嗙", "閫",
+        "杩", "欐", "槸", "娈", "鐮", "Ã", "Â", "â€", "�",
+    ))
+    if "�" in value or rare_hits >= 2:
+        return ""
+    value = re.sub(r"[A-Za-z][A-Za-z0-9_'’-]*", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    if not re.search(r"[\u3400-\u9fff]", value):
+        return ""
+    return clean_text(value, max_len=max_len)

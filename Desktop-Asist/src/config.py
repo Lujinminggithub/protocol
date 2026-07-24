@@ -68,6 +68,9 @@ class Config:
             "narration_mode": "voice_subtitles",
             "enable_narration": True,
             "burn_subtitles": True,
+            "max_concurrent_scenes": 3,
+            "enable_multimodal_planning": True,
+            "prompt_debug_mode": True,
         },
         "temperature": 0.7,
         "max_tokens": 2048,
@@ -79,6 +82,7 @@ class Config:
         self._load()
 
     def _load(self):
+        ensure_user_data_dir()
         """从本地文件加载配置，并做透明迁移(旧扁平结构/旧模型名/明文Key)。"""
         migrated = False
         saved = {}

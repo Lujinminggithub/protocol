@@ -9,8 +9,10 @@ import os
 import re
 from datetime import timedelta
 
-from src.video_pipeline.ffmpeg_runtime import run_ffmpeg, probe_duration
-from src.video_pipeline.text_utils import clean_text, is_too_short_caption
+from src.video_pipeline.ffmpeg_runtime import run_ffmpeg, probe_duration, probe_has_audio
+from src.video_pipeline.text_utils import clean_text, is_too_short_caption, strict_chinese_caption
+
+DEFAULT_TRANSITION_SECONDS = 0.22
 
 
 def merge_audio_video(video_path: str, audio_path: str, out_path: str):
@@ -45,39 +47,13 @@ def normalize_clip(in_path: str, out_path: str, width: int, height: int, frame_r
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={frame_rate}"
     )
-    run_ffmpeg([
-        "-i", in_path,
-        "-vf", vf,
-        "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
-        "-preset", "medium", "-crf", "20",
-        "-c:a", "aac", "-ar", "48000", "-b:a", "128k", "-ac", "2",
-        out_path,
-    ])
-
-
-def make_placeholder_clip(out_path: str, width: int, height: int, frame_rate: int,
-                          seconds: float, audio_path: str = None, image_path: str = None):
-    """场景失败时的占位片段：有关键帧图用图定格，否则纯黑屏；音频用旁白或静音。
-
-    产物走的规格与 normalize_clip 一致，能直接进 concat。
-    """
-    seconds = max(1.0, seconds)
-    args = ["-y"] if False else []  # run_ffmpeg 已带 -y
-    if image_path and os.path.exists(image_path):
-        args += ["-loop", "1", "-i", image_path]
-    else:
-        args += ["-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={frame_rate}"]
-    if audio_path and os.path.exists(audio_path):
-        args += ["-i", audio_path]
-    else:
+    has_audio = probe_has_audio(in_path)
+    args = ["-i", in_path]
+    if not has_audio:
         args += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={frame_rate}"
-    )
     args += [
-        "-t", f"{seconds}",
         "-vf", vf,
+        "-map", "0:v:0", "-map", "0:a:0" if has_audio else "1:a:0",
         "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-preset", "medium", "-crf", "20",
         "-c:a", "aac", "-ar", "48000", "-b:a", "128k", "-ac", "2",
@@ -87,17 +63,51 @@ def make_placeholder_clip(out_path: str, width: int, height: int, frame_rate: in
     run_ffmpeg(args)
 
 
-def concat_clips(clip_paths: list, filelist_path: str, out_path: str):
-    """用 concat demuxer 顺序拼接(所有片段已统一转码为同规格，纯 stream copy)。"""
+def concat_clips(clip_paths: list, filelist_path: str, out_path: str,
+                 transition_seconds: float = DEFAULT_TRANSITION_SECONDS,
+                 frame_rate: int = 24):
+    """Join normalized clips with a short dissolve to suppress boundary flashes/repeated frames."""
+    if len(clip_paths) == 1:
+        run_ffmpeg(["-i", clip_paths[0], "-c", "copy", out_path])
+        return
+    durations = [probe_duration(path) for path in clip_paths]
+    if any(duration <= transition_seconds * 2 for duration in durations):
+        transition_seconds = 0.08
     with open(filelist_path, "w", encoding="utf-8") as f:
         for p in clip_paths:
             abspath = os.path.abspath(p).replace("\\", "/")
             f.write(f"file '{abspath}'\n")
-    run_ffmpeg([
-        "-f", "concat", "-safe", "0", "-i", filelist_path,
-        "-c", "copy",
+
+    args = []
+    for path in clip_paths:
+        args += ["-i", path]
+    filters = []
+    video_label = "0:v"
+    audio_label = "0:a"
+    accumulated = durations[0]
+    for index in range(1, len(clip_paths)):
+        next_video = f"vx{index}"
+        next_audio = f"ax{index}"
+        offset = max(0.01, accumulated - transition_seconds)
+        filters.append(
+            f"[{video_label}][{index}:v]xfade=transition=fade:duration={transition_seconds:.3f}:"
+            f"offset={offset:.3f}[{next_video}]"
+        )
+        filters.append(
+            f"[{audio_label}][{index}:a]acrossfade=d={transition_seconds:.3f}:c1=tri:c2=tri[{next_audio}]"
+        )
+        accumulated += durations[index] - transition_seconds
+        video_label = next_video
+        audio_label = next_audio
+    args += [
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{video_label}]", "-map", f"[{audio_label}]",
+        "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-preset", "medium", "-crf", "20",
+        "-c:a", "aac", "-ar", "48000", "-b:a", "128k", "-ac", "2",
         out_path,
-    ])
+    ]
+    run_ffmpeg(args)
 
 
 def _escape_subtitles_path(path: str) -> str:
@@ -109,7 +119,7 @@ def burn_subtitles(in_path: str, srt_path: str, out_path: str):
     """硬字幕烧录(不可关闭，分享兼容性最好)。"""
     escaped = _escape_subtitles_path(srt_path)
     vf = (
-        f"subtitles='{escaped}':force_style='FontName=Microsoft YaHei,"
+        f"subtitles='{escaped}':charenc=UTF-8:force_style='FontName=Microsoft YaHei,"
         "FontSize=20,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,"
         "BorderStyle=1,Outline=1,Shadow=0'"
     )
@@ -125,7 +135,9 @@ def burn_subtitles(in_path: str, srt_path: str, out_path: str):
 def mux_soft_subtitles(in_path: str, srt_path: str, out_path: str):
     """软字幕(封装成 mov_text 轨道，播放器可开关，但兼容性不如硬字幕)。"""
     run_ffmpeg([
-        "-i", in_path, "-i", srt_path,
+        "-i", in_path,
+        "-sub_charenc", "UTF-8",
+        "-i", srt_path,
         "-map", "0", "-map", "1",
         "-c", "copy", "-c:s", "mov_text",
         "-metadata:s:s:0", "language=chi",
@@ -135,10 +147,10 @@ def mux_soft_subtitles(in_path: str, srt_path: str, out_path: str):
 
 def write_plain_srt(text: str, duration: float, out_path: str):
     """Create a scene-level SRT when subtitles are needed without TTS timing."""
-    text = clean_text(text, max_len=120)
+    text = strict_chinese_caption(text, max_len=120)
     duration = max(1.0, float(duration or 1.0))
     if not text:
-        with open(out_path, "w", encoding="utf-8") as f:
+        with open(out_path, "w", encoding="utf-8-sig") as f:
             f.write("")
         return out_path
 
@@ -151,7 +163,39 @@ def write_plain_srt(text: str, duration: float, out_path: str):
         text = text[len(chunk):].lstrip("，。；、,. ")
 
     per = duration / max(1, len(chunks))
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8-sig") as f:
+        for idx, chunk in enumerate(chunks, 1):
+            start = timedelta(seconds=per * (idx - 1))
+            end = timedelta(seconds=per * idx)
+            f.write(f"{idx}\n{_fmt_ts(start)} --> {_fmt_ts(end)}\n{chunk}\n\n")
+    return out_path
+
+
+def write_scripted_srt(lines: list[str], duration: float, out_path: str):
+    """Create a scene-level SRT from structured narration/dialogue lines."""
+    normalized = []
+    for line in lines or []:
+        text = strict_chinese_caption(line, max_len=120)
+        if text:
+            normalized.append(text)
+    duration = max(1.0, float(duration or 1.0))
+    if not normalized:
+        with open(out_path, "w", encoding="utf-8-sig") as f:
+            f.write("")
+        return out_path
+
+    chunks = []
+    for line in normalized:
+        rest = line
+        while rest:
+            chunk = rest[:28].rstrip("，。；、,. ")
+            if not chunk:
+                chunk = rest[:28]
+            chunks.append(chunk)
+            rest = rest[len(chunk):].lstrip("，。；、,. ")
+
+    per = duration / max(1, len(chunks))
+    with open(out_path, "w", encoding="utf-8-sig") as f:
         for idx, chunk in enumerate(chunks, 1):
             start = timedelta(seconds=per * (idx - 1))
             end = timedelta(seconds=per * idx)
@@ -198,7 +242,7 @@ def _shift_srt(srt_text: str, offset: timedelta) -> list:
                 continue
             if seen_time:
                 text_lines.append(ln)
-        text = clean_text("".join(text_lines), max_len=80)
+        text = strict_chinese_caption("".join(text_lines), max_len=80)
         if text:
             cues.append((start, end, text))
     return cues
@@ -234,7 +278,8 @@ def _compact_cues(cues: list, max_chars: int = 28, min_chars: int = 4) -> list:
     return compacted
 
 
-def merge_srt(scene_srt_paths: list, scene_durations: list, out_path: str):
+def merge_srt(scene_srt_paths: list, scene_durations: list, out_path: str,
+              transition_seconds: float = DEFAULT_TRANSITION_SECONDS):
     """把各场景独立 SRT(相对0开始)按累计真实时长偏移后合并成全片 SRT。
 
     scene_durations 用 normalized 片段的 ffprobe 实测时长，避免累计误差。
@@ -242,16 +287,17 @@ def merge_srt(scene_srt_paths: list, scene_durations: list, out_path: str):
     """
     all_cues = []
     offset = timedelta(0)
-    for srt_path, dur in zip(scene_srt_paths, scene_durations):
+    for index, (srt_path, dur) in enumerate(zip(scene_srt_paths, scene_durations)):
         if srt_path and os.path.exists(srt_path):
             try:
-                with open(srt_path, "r", encoding="utf-8") as f:
+                with open(srt_path, "r", encoding="utf-8-sig") as f:
                     all_cues.extend(_compact_cues(_shift_srt(f.read(), offset)))
             except OSError:
                 pass
-        offset += timedelta(seconds=dur)
+        overlap = transition_seconds if index < len(scene_durations) - 1 else 0.0
+        offset += timedelta(seconds=max(0.0, dur - overlap))
 
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8-sig") as f:
         for i, (start, end, text) in enumerate(all_cues, 1):
             f.write(f"{i}\n{_fmt_ts(start)} --> {_fmt_ts(end)}\n{text}\n\n")
     return out_path
