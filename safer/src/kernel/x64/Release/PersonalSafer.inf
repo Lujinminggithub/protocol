@@ -6,7 +6,7 @@ Class       = "ActivityMonitor"
 ClassGuid   = {B86DFF51-A31E-4BAC-B3CF-E8CFE75C9FC2}
 Provider    = %ManufacturerName%
 CatalogFile =
-DriverVer = 07/24/2026,14.15.42.918
+DriverVer = 07/24/2026,14.31.12.480
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -33,11 +33,11 @@ AddReg          = PersonalSafer.AddRegistry
 [PersonalSafer.AddRegistry]
 HKR,"Parameters","SupportedFeatures",0x00010001,0x3
 HKR,"Parameters\Instances","DefaultInstance",0x00000000,%InstanceName%
-HKR,"Parameters\Instances\"%InstanceName%,"Altitude",0x00000000,%InstanceAltitude%
-HKR,"Parameters\Instances\"%InstanceName%,"Flags",0x00010001,0
+HKR,"Parameters\Instances\%InstanceName%","Altitude",0x00000000,%InstanceAltitude%
+HKR,"Parameters\Instances\%InstanceName%","Flags",0x00010001,0
 HKR,"Instances","DefaultInstance",0x00000000,%InstanceName%
-HKR,"Instances\"%InstanceName%,"Altitude",0x00000000,%InstanceAltitude%
-HKR,"Instances\"%InstanceName%,"Flags",0x00010001,0
+HKR,"Instances\%InstanceName%","Altitude",0x00000000,%InstanceAltitude%
+HKR,"Instances\%InstanceName%","Flags",0x00010001,0
 
 [PersonalSafer.DriverFiles]
 PersonalSafer.sys

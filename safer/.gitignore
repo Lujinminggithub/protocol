@@ -1,6 +1,9 @@
 # 构建产物
 build/
 dist/
+!src/electron/build/
+src/electron/build/*
+!src/electron/build/installer.nsh
 *.node
 *.obj
 *.pdb

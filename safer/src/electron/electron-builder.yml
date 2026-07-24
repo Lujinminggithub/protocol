@@ -29,6 +29,7 @@
   },
   "nsis": {
     "oneClick": false,
+    "perMachine": true,
     "allowToChangeInstallationDirectory": true,
     "runAfterFinish": false,
     "include": "build/installer.nsh",

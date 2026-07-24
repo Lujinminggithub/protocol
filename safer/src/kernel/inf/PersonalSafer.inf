@@ -33,11 +33,11 @@ AddReg          = PersonalSafer.AddRegistry
 [PersonalSafer.AddRegistry]
 HKR,"Parameters","SupportedFeatures",0x00010001,0x3
 HKR,"Parameters\Instances","DefaultInstance",0x00000000,%InstanceName%
-HKR,"Parameters\Instances\"%InstanceName%,"Altitude",0x00000000,%InstanceAltitude%
-HKR,"Parameters\Instances\"%InstanceName%,"Flags",0x00010001,0
+HKR,"Parameters\Instances\%InstanceName%","Altitude",0x00000000,%InstanceAltitude%
+HKR,"Parameters\Instances\%InstanceName%","Flags",0x00010001,0
 HKR,"Instances","DefaultInstance",0x00000000,%InstanceName%
-HKR,"Instances\"%InstanceName%,"Altitude",0x00000000,%InstanceAltitude%
-HKR,"Instances\"%InstanceName%,"Flags",0x00010001,0
+HKR,"Instances\%InstanceName%","Altitude",0x00000000,%InstanceAltitude%
+HKR,"Instances\%InstanceName%","Flags",0x00010001,0
 
 [PersonalSafer.DriverFiles]
 PersonalSafer.sys
