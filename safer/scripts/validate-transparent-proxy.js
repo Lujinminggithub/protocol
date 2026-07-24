@@ -89,9 +89,10 @@ async function main() {
       await runCommand('curl-https-transparent', 'C:\\WINDOWS\\system32\\curl.exe', ['-I', '--max-time', '20', 'https://example.com/'])
     }
 
-    await runCommand('curl-http-explicit', 'C:\\WINDOWS\\system32\\curl.exe', ['-I', '--proxy', 'http://127.0.0.1:8899', '--max-time', '20', 'http://example.com/'])
-    await runCommand('curl-https-explicit', 'C:\\WINDOWS\\system32\\curl.exe', ['-I', '--proxy', 'http://127.0.0.1:8899', '--max-time', '20', 'https://example.com/'])
-    await runCommand('curl-https-explicit-insecure', 'C:\\WINDOWS\\system32\\curl.exe', ['-k', '-I', '--proxy', 'http://127.0.0.1:8899', '--max-time', '20', 'https://example.com/'])
+    const httpResult = await runCommand('curl-http-explicit', 'C:\\WINDOWS\\system32\\curl.exe', ['-I', '--proxy', 'http://127.0.0.1:8899', '--max-time', '20', 'http://example.com/'])
+    if (httpResult.status !== 0) throw new Error('explicit HTTP proxy validation failed')
+    const httpsResult = await runCommand('curl-https-explicit', 'C:\\WINDOWS\\system32\\curl.exe', ['--ssl-no-revoke', '-I', '--proxy', 'http://127.0.0.1:8899', '--max-time', '20', 'https://example.com/'])
+    if (httpsResult.status !== 0) throw new Error('trusted explicit HTTPS proxy validation failed')
 
     const edgePath = spawnSync('where.exe', ['msedge.exe'], { encoding: 'utf8' })
     if (edgePath.status === 0) {

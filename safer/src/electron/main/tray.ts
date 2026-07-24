@@ -112,7 +112,7 @@ export function createTray(window: BrowserWindow): void {
 // 标记窗口即将退出（通过托盘菜单的"退出"选项）
 export function quitApp(): void {
   if (mainWindow) {
-    mainWindow._isQuitting = true
+    ;(mainWindow as any)._isQuitting = true
     mainWindow.close()
   } else {
     app.quit()

@@ -110,7 +110,7 @@ type DeliveryExportReport = {
   status: DeliveryStatus
   queueInfo: ReturnType<typeof getDeliveredQueueInfo>
   checkpoints: DeliveryBatchCheckpoint[]
-  archivedCheckpoints: DeliveryBatchCheckpoint[]
+  archivedCheckpoints: Array<{ archivedAt: string; reason: string; checkpoint: DeliveryBatchCheckpoint }>
   deadLetterQueue: PersistedDlpEvent[]
   deadLetterRecords: DeadLetterRecord[]
   deliveredRecords: Array<{ deliveredAt: string; results: DeliveryAttemptResult[]; event: PersistedDlpEvent }>
@@ -276,7 +276,9 @@ function normalizePipelineConfig(input: any): DeliveryPipelineConfig {
     ? input.sinks
     : [input && typeof input === 'object' ? input : createDefaultDeliverySinkConfig()]
   const strategy: DeliveryPipelineStrategy = input?.strategy === 'any' ? 'any' : base.strategy
-  const normalizedSinks = sinksInput.map((sink: any, index: number) => normalizeSinkConfig(sink, index))
+  const normalizedSinks: DeliverySinkConfig[] = sinksInput.map(
+    (sink: any, index: number) => normalizeSinkConfig(sink, index)
+  )
   const enabled = input?.enabled === true || normalizedSinks.some((sink) => sink.enabled)
 
   return {

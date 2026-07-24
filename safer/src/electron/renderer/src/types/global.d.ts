@@ -7,6 +7,7 @@ declare global {
         getMemory: () => Promise<any>
         getNetwork: () => Promise<any>
         getDisk: () => Promise<any>
+        getRegistryEvents: (limit?: number) => Promise<{ available: boolean; error: string | null; events: any[] }>
         onStart: (moduleName: string) => void
         onStop: (moduleName: string) => void
         onEvent: (callback: (data: any) => void) => void

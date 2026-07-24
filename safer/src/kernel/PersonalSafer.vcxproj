@@ -62,7 +62,7 @@
     <Link>
       <!-- MiniFilter APIs (FltXxx) 需链接 fltMgr.lib；WFP 管理/callout APIs
            (FwpmXxx/FwpsXxx) 需链接 fwpkclnt.lib。KMDF 工程默认不带这两个。 -->
-      <AdditionalDependencies>fltMgr.lib;fwpkclnt.lib;ntstrsafe.lib;cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltMgr.lib;fwpkclnt.lib;ntstrsafe.lib;cng.lib;Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>

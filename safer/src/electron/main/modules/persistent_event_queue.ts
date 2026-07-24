@@ -187,12 +187,12 @@ export function initializePersistentEventQueue(maxEvents: number): { events: Per
   }
 
   if (existsSync(getJournalPath())) {
-    try {
-      const lines = readFileSync(getJournalPath(), 'utf8')
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-      for (const line of lines) {
+    const rawJournal = readFileSync(getJournalPath(), 'utf8')
+    const lines = rawJournal.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    const validLines: string[] = []
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index]
+      try {
         const record = JSON.parse(line) as QueueJournalRecord
         if (record.op === 'append') {
           events.push(record.event)
@@ -202,11 +202,15 @@ export function initializePersistentEventQueue(maxEvents: number): { events: Per
         } else if (record.op === 'state') {
           applyStateRecord(events, record)
         }
+        validLines.push(line)
+      } catch {
+        const corruptPath = `${getJournalPath()}.corrupt-${Date.now()}`
+        writeFileSync(corruptPath, `${lines.slice(index).join('\n')}\n`, 'utf8')
+        writeFileSync(getJournalPath(), validLines.length > 0 ? `${validLines.join('\n')}\n` : '', 'utf8')
+        break
       }
-      appendedSinceCompact = lines.length
-    } catch {
-      appendedSinceCompact = 0
     }
+    appendedSinceCompact = validLines.length
   }
 
   events = trimEvents(events, maxEvents)

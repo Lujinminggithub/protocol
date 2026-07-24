@@ -1,6 +1,7 @@
-import { app } from 'electron'
+import { app, safeStorage } from 'electron'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import * as http from 'node:http'
 import * as http2 from 'node:http2'
 import * as https from 'node:https'
@@ -99,9 +100,10 @@ type WebSocketCompressionOptions = {
   serverNoContextTakeover: boolean
 }
 
-const ROOT_CA_SUBJECT = 'CN=PersonalSafer Local Root CA'
-const CERT_PASSWORD = 'PersonalSafer-MITM-2026!'
+const ROOT_CA_SUBJECT = 'CN=PersonalSafer Local Root CA V2'
+const LEGACY_ROOT_CA_SUBJECT = 'CN=PersonalSafer Local Root CA'
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+let certificatePassword: string | null = null
 
 const state: ProxyState = {
   running: false,
@@ -123,7 +125,7 @@ const state: ProxyState = {
 
 function getCertDir(): string {
   if (!state.certDir) {
-    state.certDir = join(app.getPath('userData'), 'mitm')
+    state.certDir = join(app.getPath('userData'), 'mitm-v2')
   }
   mkdirSync(state.certDir, { recursive: true })
   return state.certDir
@@ -145,8 +147,24 @@ function getRootCerPath(): string {
   return join(getCertDir(), 'root.cer')
 }
 
-function getRootPfxPath(): string {
-  return join(getCertDir(), 'root.pfx')
+function getCertificatePasswordPath(): string {
+  return join(getCertDir(), 'pfx-password.dpapi')
+}
+
+function getCertificatePassword(): string {
+  if (certificatePassword) return certificatePassword
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Windows credential protection is unavailable; refusing to create MITM keys')
+  }
+
+  const passwordPath = getCertificatePasswordPath()
+  if (existsSync(passwordPath)) {
+    certificatePassword = safeStorage.decryptString(readFileSync(passwordPath))
+  } else {
+    certificatePassword = randomBytes(32).toString('base64url')
+    writeFileSync(passwordPath, safeStorage.encryptString(certificatePassword), { mode: 0o600 })
+  }
+  return certificatePassword
 }
 
 function getLeafPfxPath(hostname: string): string {
@@ -155,23 +173,21 @@ function getLeafPfxPath(hostname: string): string {
 
 function ensureRootCertificate(): void {
   const rootCerPath = getRootCerPath()
-  const rootPfxPath = getRootPfxPath()
-
-  if (existsSync(rootCerPath) && existsSync(rootPfxPath)) {
-    return
-  }
+  const legacyPfxPath = join(app.getPath('userData'), 'mitm', 'root.pfx')
+  if (existsSync(legacyPfxPath)) unlinkSync(legacyPfxPath)
 
   const script = `
+$legacySubject = ${psQuote(LEGACY_ROOT_CA_SUBJECT)}
+@('Cert:\\CurrentUser\\Root','Cert:\\CurrentUser\\TrustedPublisher','Cert:\\CurrentUser\\My') | ForEach-Object {
+  Get-ChildItem $_ | Where-Object { $_.Subject -eq $legacySubject } | Remove-Item -Force
+}
 $subject = ${psQuote(ROOT_CA_SUBJECT)}
 $rootCer = ${psQuote(rootCerPath)}
-$rootPfx = ${psQuote(rootPfxPath)}
-$pwd = ConvertTo-SecureString ${psQuote(CERT_PASSWORD)} -AsPlainText -Force
 $cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $cert) {
-  $cert = New-SelfSignedCertificate -Type Custom -Subject $subject -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy Exportable -KeyUsage CertSign, CRLSign, DigitalSignature -TextExtension @('2.5.29.19={critical}{text}CA=true') -CertStoreLocation 'Cert:\\CurrentUser\\My' -NotAfter (Get-Date).AddYears(10)
+  $cert = New-SelfSignedCertificate -Type Custom -Subject $subject -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable -KeyUsage CertSign, CRLSign, DigitalSignature -TextExtension @('2.5.29.19={critical}{text}CA=true') -CertStoreLocation 'Cert:\\CurrentUser\\My' -NotAfter (Get-Date).AddYears(5)
 }
 Export-Certificate -Cert $cert -FilePath $rootCer -Force | Out-Null
-Export-PfxCertificate -Cert $cert -FilePath $rootPfx -Password $pwd -Force | Out-Null
 `
 
   runPowerShell(script)
@@ -190,10 +206,7 @@ Export-PfxCertificate -Cert $cert -FilePath $rootPfx -Password $pwd -Force | Out
 function ensureLeafCertificate(hostname: string): string {
   const normalizedHost = hostname.toLowerCase()
   const leafPfxPath = getLeafPfxPath(normalizedHost)
-
-  if (existsSync(leafPfxPath)) {
-    return leafPfxPath
-  }
+  const password = getCertificatePassword()
 
   ensureRootCertificate()
 
@@ -201,11 +214,11 @@ function ensureLeafCertificate(hostname: string): string {
 $hostName = ${psQuote(normalizedHost)}
 $subject = ${psQuote(ROOT_CA_SUBJECT)}
 $leafPfx = ${psQuote(leafPfxPath)}
-$pwd = ConvertTo-SecureString ${psQuote(CERT_PASSWORD)} -AsPlainText -Force
+$pwd = ConvertTo-SecureString ${psQuote(password)} -AsPlainText -Force
 $root = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $root) { throw 'Root CA missing' }
 $leafSubject = 'CN=' + $hostName
-$leaf = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $leafSubject } | Sort-Object NotAfter -Descending | Select-Object -First 1
+$leaf = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $leafSubject -and $_.Issuer -eq $root.Subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $leaf) {
   $leaf = New-SelfSignedCertificate -Type Custom -DnsName $hostName -Subject $leafSubject -Signer $root -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy Exportable -TextExtension @('2.5.29.19={critical}{text}CA=false','2.5.29.37={text}1.3.6.1.5.5.7.3.1') -CertStoreLocation 'Cert:\\CurrentUser\\My' -NotAfter (Get-Date).AddYears(2)
 }
@@ -226,7 +239,7 @@ function getSecureContext(hostname: string): tls.SecureContext {
   const pfxPath = ensureLeafCertificate(normalizedHost)
   const context = tls.createSecureContext({
     pfx: readFileSync(pfxPath),
-    passphrase: CERT_PASSWORD,
+    passphrase: getCertificatePassword(),
   })
   state.leafCache.set(normalizedHost, context)
   return context
@@ -834,7 +847,8 @@ async function proxyViaHttp1(
           host: targetUrl.host,
           'content-length': String(requestBody.length),
         },
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
+        servername: targetUrl.hostname,
       },
       async (upstreamRes) => {
         try {
@@ -867,7 +881,10 @@ async function proxyViaHttp2(
   const origin = `${targetUrl.protocol}//${targetUrl.host}`
 
   return new Promise<UpstreamResponse>((resolve, reject) => {
-    const session = http2.connect(origin, { rejectUnauthorized: false })
+    const session = http2.connect(origin, {
+      rejectUnauthorized: true,
+      servername: targetUrl.hostname,
+    })
     const headers: http2.OutgoingHttpHeaders = {
       ':method': req.method || 'GET',
       ':path': `${targetUrl.pathname}${targetUrl.search}`,
@@ -951,7 +968,7 @@ async function handleProxyRequest(
   forcedScheme?: 'http' | 'https'
 ): Promise<void> {
   let targetUrl: URL
-  let requestBody = Buffer.alloc(0)
+  let requestBody: Buffer<ArrayBufferLike> = Buffer.alloc(0)
 
   try {
     targetUrl = buildTargetUrl(req, forcedScheme)
@@ -1217,7 +1234,7 @@ function attachWebSocketInspector(
         }
 
         if (fin && messageState) {
-          let content = Buffer.concat(messageState.chunks)
+          let content: Buffer<ArrayBufferLike> = Buffer.concat(messageState.chunks)
           let inspectable = true
           if (messageState.compressed && compression.perMessageDeflate) {
             const noContextTakeover = direction === 'c2s'
@@ -1334,7 +1351,7 @@ function handleUpgrade(
       ? tls.connect(
           targetUrl.port ? Number(targetUrl.port) : 443,
           targetUrl.hostname,
-          { rejectUnauthorized: false },
+          { rejectUnauthorized: true, servername: targetUrl.hostname },
           () => {
             console.log(`[TransparentProxy] upstream websocket connect secure ${targetUrl.host}`)
             upstream.write(buildUpgradeRequest(targetUrl, req))
@@ -1487,7 +1504,7 @@ function createHttpsMitmServer(): tls.Server {
         }
       },
       pfx: readFileSync(getLeafPfxPath('localhost')),
-      passphrase: CERT_PASSWORD,
+      passphrase: getCertificatePassword(),
       ALPNProtocols: ['http/1.1'],
     },
     (secureSocket) => {
@@ -1552,18 +1569,18 @@ function attachProxyServers(): void {
   })
 
   state.httpServer.on('upgrade', (req, socket, head) => {
-    handleUpgrade(req, socket, head, 'http')
+    handleUpgrade(req, socket as net.Socket, head, 'http')
   })
 
   state.httpsParserServer.on('upgrade', (req, socket, head) => {
-    handleUpgrade(req, socket, head, 'https')
+    handleUpgrade(req, socket as net.Socket, head, 'https')
   })
 
   state.httpServer.on('connect', (req, clientSocket, head) => {
     const authority = String(req.url || '')
     const [host, portText] = authority.split(':')
     const port = Number(portText || 443)
-    const processInfo = lookupSocketProcess(clientSocket)
+    const processInfo = lookupSocketProcess(clientSocket as net.Socket)
 
     const shouldMitmPort =
       port === 443 ||

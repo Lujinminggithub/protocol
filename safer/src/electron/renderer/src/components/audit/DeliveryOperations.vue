@@ -151,6 +151,27 @@ async function exportReport() {
   )
 }
 
+const startWorker = () => runAction(
+  () => window.saferAPI.audit.startDeliveryWorker(),
+  'delivery worker 已启动'
+)
+const stopWorker = () => runAction(
+  () => window.saferAPI.audit.stopDeliveryWorker(),
+  'delivery worker 已停止'
+)
+const requeueDeadLetters = () => runAction(
+  () => window.saferAPI.audit.requeueAbandonedEvents(100),
+  '已重放 abandoned 事件'
+)
+const clearBackpressure = () => runAction(
+  () => window.saferAPI.audit.clearDeliveryBackpressure(),
+  '已清理 backpressure'
+)
+const clearCheckpoints = () => runAction(
+  () => window.saferAPI.audit.clearCompletedCheckpoints(),
+  '已清理已完成 checkpoint'
+)
+
 function resetConfigEditor() {
   configText.value = JSON.stringify(status.value?.pipeline || {}, null, 2)
   dirty.value = false
@@ -171,8 +192,8 @@ onMounted(() => {
       </div>
       <div class="ops-actions">
         <button class="ops-btn secondary" :disabled="loading || busy" @click="refresh()">刷新</button>
-        <button class="ops-btn" :disabled="loading || busy" @click="runAction(() => window.saferAPI.audit.startDeliveryWorker(), 'delivery worker 已启动')">启动 Worker</button>
-        <button class="ops-btn danger" :disabled="loading || busy" @click="runAction(() => window.saferAPI.audit.stopDeliveryWorker(), 'delivery worker 已停止')">停止 Worker</button>
+        <button class="ops-btn" :disabled="loading || busy" @click="startWorker">启动 Worker</button>
+        <button class="ops-btn danger" :disabled="loading || busy" @click="stopWorker">停止 Worker</button>
       </div>
     </div>
 
@@ -207,9 +228,9 @@ onMounted(() => {
         <span class="toolbar-text">{{ pipelineSummary || '-' }}</span>
       </div>
       <div class="toolbar-actions">
-        <button class="ops-btn secondary" :disabled="busy" @click="runAction(() => window.saferAPI.audit.requeueAbandonedEvents(100), '已重放 abandoned 事件')">重放 Dead Letter</button>
-        <button class="ops-btn secondary" :disabled="busy" @click="runAction(() => window.saferAPI.audit.clearDeliveryBackpressure(), '已清理 backpressure')">清理 Backpressure</button>
-        <button class="ops-btn secondary" :disabled="busy" @click="runAction(() => window.saferAPI.audit.clearCompletedCheckpoints(), '已清理已完成 checkpoint')">清理已完成 Checkpoint</button>
+        <button class="ops-btn secondary" :disabled="busy" @click="requeueDeadLetters">重放 Dead Letter</button>
+        <button class="ops-btn secondary" :disabled="busy" @click="clearBackpressure">清理 Backpressure</button>
+        <button class="ops-btn secondary" :disabled="busy" @click="clearCheckpoints">清理已完成 Checkpoint</button>
         <button class="ops-btn secondary" :disabled="busy" @click="exportReport()">导出报告</button>
       </div>
     </div>

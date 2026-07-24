@@ -978,6 +978,18 @@ PolicyEngineCleanup(VOID)
     DLP_LOG(DLP_DEBUG_INFO, "Policy engine cleaned up");
 }
 
+BOOLEAN
+PolicyEngineIsAuditEnabled(VOID)
+{
+    KIRQL oldIrql;
+    BOOLEAN enabled;
+
+    KeAcquireSpinLock(&gPolicyState.Lock, &oldIrql);
+    enabled = gPolicyState.Initialized && gPolicyState.Policy.AuditEnabled != 0;
+    KeReleaseSpinLock(&gPolicyState.Lock, oldIrql);
+    return enabled;
+}
+
 NTSTATUS
 PolicyEngineSetPolicy(
     _In_ PPOLICY_COMMAND Command

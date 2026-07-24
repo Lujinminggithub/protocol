@@ -5,6 +5,7 @@
 #include "file_event.h"
 #include "../common/shared_events.h"
 #include "../core/protect.h"
+#include "../policy/policy_engine.h"
 
 static FILE_EVENT_BUFFER gEventBuffer;
 static NPAGED_LOOKASIDE_LIST gFileEventLookaside;
@@ -84,6 +85,7 @@ FileEventEnqueue(
     if (Event == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+    if (!PolicyEngineIsAuditEnabled()) return STATUS_SUCCESS;
     if (ProtectShouldBypassDlp(Event->ProcessId)) return STATUS_SUCCESS;
 
     KeAcquireSpinLock(&gEventBuffer.BufferLock, &oldIrql);

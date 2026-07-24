@@ -36,14 +36,15 @@ __export(local_proxy_exports, {
   updateLocalProxyPolicy: () => updateLocalProxyPolicy
 });
 module.exports = __toCommonJS(local_proxy_exports);
-var import_electron2 = require("electron");
+var import_electron4 = require("electron");
 var import_node_child_process = require("node:child_process");
-var import_node_fs = require("node:fs");
+var import_node_fs2 = require("node:fs");
+var import_node_crypto = require("node:crypto");
 var http = __toESM(require("node:http"));
 var http2 = __toESM(require("node:http2"));
 var https = __toESM(require("node:https"));
 var net = __toESM(require("node:net"));
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 var tls = __toESM(require("node:tls"));
 var import_node_zlib = require("node:zlib");
 
@@ -109,13 +110,120 @@ function isAddonLoaded() {
   return !!cachedAddon;
 }
 
+// main/modules/quarantine_catalog.ts
+var import_electron2 = require("electron");
+
+// main/modules/persistent_event_queue.ts
+var import_electron3 = require("electron");
+var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
+var QUEUE_DIR = "dlp-queue";
+var SNAPSHOT_FILE = "snapshot.json";
+var JOURNAL_FILE = "journal.ndjson";
+var COMPACT_EVERY_RECORDS = 128;
+var COMPACT_FILE_BYTES = 1024 * 1024;
+var initialized = false;
+var appendedSinceCompact = 0;
+function getQueueDir() {
+  return (0, import_node_path.join)(import_electron3.app.getPath("userData"), QUEUE_DIR);
+}
+function getSnapshotPath() {
+  return (0, import_node_path.join)(getQueueDir(), SNAPSHOT_FILE);
+}
+function getJournalPath() {
+  return (0, import_node_path.join)(getQueueDir(), JOURNAL_FILE);
+}
+function ensureQueueDir() {
+  (0, import_node_fs.mkdirSync)(getQueueDir(), { recursive: true });
+}
+function writeAtomicJson(path, data) {
+  const temp = `${path}.tmp`;
+  (0, import_node_fs.writeFileSync)(temp, JSON.stringify(data, null, 2), "utf8");
+  (0, import_node_fs.renameSync)(temp, path);
+}
+function shouldCompactJournal() {
+  if (appendedSinceCompact >= COMPACT_EVERY_RECORDS) {
+    return true;
+  }
+  if (!(0, import_node_fs.existsSync)(getJournalPath())) {
+    return false;
+  }
+  try {
+    return (0, import_node_fs.statSync)(getJournalPath()).size >= COMPACT_FILE_BYTES;
+  } catch {
+    return false;
+  }
+}
+function appendJournalRecord(record) {
+  ensureQueueDir();
+  (0, import_node_fs.appendFileSync)(getJournalPath(), `${JSON.stringify(record)}
+`, "utf8");
+  appendedSinceCompact++;
+}
+function trimEvents(events2, maxEvents) {
+  if (events2.length <= maxEvents) {
+    return events2;
+  }
+  const pending = events2.filter((event) => event.state !== "sent");
+  if (pending.length >= maxEvents) {
+    return pending.slice(pending.length - maxEvents);
+  }
+  const sentBudget = maxEvents - pending.length;
+  const sent = events2.filter((event) => event.state === "sent");
+  return [...sent.slice(Math.max(0, sent.length - sentBudget)), ...pending];
+}
+function createPersistedEvent(base) {
+  return {
+    ...base,
+    state: "pending",
+    retryCount: 0,
+    firstAttemptAt: null,
+    lastAttemptAt: null,
+    ackAt: null,
+    nextAttemptAt: null,
+    leaseId: null,
+    leaseExpireAt: null,
+    error: null,
+    lastHttpStatus: null,
+    lastRemoteId: null,
+    sinkStates: {}
+  };
+}
+function appendPersistentEvent(event, currentEvents, nextId2, maxEvents) {
+  if (!initialized) {
+    return;
+  }
+  appendJournalRecord({ op: "append", event });
+  if (shouldCompactJournal()) {
+    compactPersistentEventQueue(currentEvents, nextId2, maxEvents);
+  }
+}
+function compactPersistentEventQueue(currentEvents, nextId2, maxEvents) {
+  if (!initialized) {
+    return;
+  }
+  ensureQueueDir();
+  const snapshotEvents = trimEvents(currentEvents.slice(), maxEvents);
+  writeAtomicJson(getSnapshotPath(), {
+    nextId: nextId2,
+    events: snapshotEvents,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  });
+  (0, import_node_fs.writeFileSync)(getJournalPath(), "", "utf8");
+  appendedSinceCompact = 0;
+}
+
 // main/modules/dlp_events.ts
 var MAX_EVENTS = 5e3;
 var events = [];
 var nextId = 1;
+var persistenceInitialized = false;
 function push(e) {
   events.push(e);
   if (events.length > MAX_EVENTS) events.splice(0, events.length - MAX_EVENTS);
+  if (persistenceInitialized) {
+    appendPersistentEvent(e, events, nextId, MAX_EVENTS);
+  }
 }
 function mirrorNetAudit(addon, ev, processName) {
   const eventType = ev.type === "http_request" ? 7 : ev.type === "http_response" ? 8 : ev.type === "ftp_command" ? 9 : ev.type === "sni_capture" ? 12 : ev.type === "network_disconnect" ? 6 : 6;
@@ -138,7 +246,7 @@ function recordExternalNetEvent(ev) {
   const addon = getAddon();
   const processName = ev?.processName || "local_proxy";
   mirrorNetAudit(addon, ev, processName);
-  push({
+  push(createPersistedEvent({
     id: nextId++,
     type: ev?.type || "network_connect",
     action: ev?.action || "logged",
@@ -146,13 +254,14 @@ function recordExternalNetEvent(ev) {
     pid: ev?.processId || process.pid,
     timestamp: ev?.timestamp || (/* @__PURE__ */ new Date()).toISOString(),
     details: ev?.details || ev?.url || ev?.sniDomain || `${ev?.remoteAddress || ""}:${ev?.remotePort || 0}`
-  });
+  }));
 }
 
 // main/modules/local_proxy.ts
-var ROOT_CA_SUBJECT = "CN=PersonalSafer Local Root CA";
-var CERT_PASSWORD = "PersonalSafer-MITM-2026!";
+var ROOT_CA_SUBJECT = "CN=PersonalSafer Local Root CA V2";
+var LEGACY_ROOT_CA_SUBJECT = "CN=PersonalSafer Local Root CA";
 var MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
+var certificatePassword = null;
 var state = {
   running: false,
   config: {
@@ -172,9 +281,9 @@ var state = {
 };
 function getCertDir() {
   if (!state.certDir) {
-    state.certDir = (0, import_node_path.join)(import_electron2.app.getPath("userData"), "mitm");
+    state.certDir = (0, import_node_path2.join)(import_electron4.app.getPath("userData"), "mitm-v2");
   }
-  (0, import_node_fs.mkdirSync)(state.certDir, { recursive: true });
+  (0, import_node_fs2.mkdirSync)(state.certDir, { recursive: true });
   return state.certDir;
 }
 function psQuote(value) {
@@ -188,31 +297,44 @@ function runPowerShell(script) {
   );
 }
 function getRootCerPath() {
-  return (0, import_node_path.join)(getCertDir(), "root.cer");
+  return (0, import_node_path2.join)(getCertDir(), "root.cer");
 }
-function getRootPfxPath() {
-  return (0, import_node_path.join)(getCertDir(), "root.pfx");
+function getCertificatePasswordPath() {
+  return (0, import_node_path2.join)(getCertDir(), "pfx-password.dpapi");
+}
+function getCertificatePassword() {
+  if (certificatePassword) return certificatePassword;
+  if (!import_electron4.safeStorage.isEncryptionAvailable()) {
+    throw new Error("Windows credential protection is unavailable; refusing to create MITM keys");
+  }
+  const passwordPath = getCertificatePasswordPath();
+  if ((0, import_node_fs2.existsSync)(passwordPath)) {
+    certificatePassword = import_electron4.safeStorage.decryptString((0, import_node_fs2.readFileSync)(passwordPath));
+  } else {
+    certificatePassword = (0, import_node_crypto.randomBytes)(32).toString("base64url");
+    (0, import_node_fs2.writeFileSync)(passwordPath, import_electron4.safeStorage.encryptString(certificatePassword), { mode: 384 });
+  }
+  return certificatePassword;
 }
 function getLeafPfxPath(hostname) {
-  return (0, import_node_path.join)(getCertDir(), `${hostname.replace(/[^a-zA-Z0-9.-]/g, "_")}.pfx`);
+  return (0, import_node_path2.join)(getCertDir(), `${hostname.replace(/[^a-zA-Z0-9.-]/g, "_")}.pfx`);
 }
 function ensureRootCertificate() {
   const rootCerPath = getRootCerPath();
-  const rootPfxPath = getRootPfxPath();
-  if ((0, import_node_fs.existsSync)(rootCerPath) && (0, import_node_fs.existsSync)(rootPfxPath)) {
-    return;
-  }
+  const legacyPfxPath = (0, import_node_path2.join)(import_electron4.app.getPath("userData"), "mitm", "root.pfx");
+  if ((0, import_node_fs2.existsSync)(legacyPfxPath)) (0, import_node_fs2.unlinkSync)(legacyPfxPath);
   const script = `
+$legacySubject = ${psQuote(LEGACY_ROOT_CA_SUBJECT)}
+@('Cert:\\CurrentUser\\Root','Cert:\\CurrentUser\\TrustedPublisher','Cert:\\CurrentUser\\My') | ForEach-Object {
+  Get-ChildItem $_ | Where-Object { $_.Subject -eq $legacySubject } | Remove-Item -Force
+}
 $subject = ${psQuote(ROOT_CA_SUBJECT)}
 $rootCer = ${psQuote(rootCerPath)}
-$rootPfx = ${psQuote(rootPfxPath)}
-$pwd = ConvertTo-SecureString ${psQuote(CERT_PASSWORD)} -AsPlainText -Force
 $cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $cert) {
-  $cert = New-SelfSignedCertificate -Type Custom -Subject $subject -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy Exportable -KeyUsage CertSign, CRLSign, DigitalSignature -TextExtension @('2.5.29.19={critical}{text}CA=true') -CertStoreLocation 'Cert:\\CurrentUser\\My' -NotAfter (Get-Date).AddYears(10)
+  $cert = New-SelfSignedCertificate -Type Custom -Subject $subject -KeyAlgorithm RSA -KeyLength 3072 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable -KeyUsage CertSign, CRLSign, DigitalSignature -TextExtension @('2.5.29.19={critical}{text}CA=true') -CertStoreLocation 'Cert:\\CurrentUser\\My' -NotAfter (Get-Date).AddYears(5)
 }
 Export-Certificate -Cert $cert -FilePath $rootCer -Force | Out-Null
-Export-PfxCertificate -Cert $cert -FilePath $rootPfx -Password $pwd -Force | Out-Null
 `;
   runPowerShell(script);
   try {
@@ -227,19 +349,17 @@ Export-PfxCertificate -Cert $cert -FilePath $rootPfx -Password $pwd -Force | Out
 function ensureLeafCertificate(hostname) {
   const normalizedHost = hostname.toLowerCase();
   const leafPfxPath = getLeafPfxPath(normalizedHost);
-  if ((0, import_node_fs.existsSync)(leafPfxPath)) {
-    return leafPfxPath;
-  }
+  const password = getCertificatePassword();
   ensureRootCertificate();
   const script = `
 $hostName = ${psQuote(normalizedHost)}
 $subject = ${psQuote(ROOT_CA_SUBJECT)}
 $leafPfx = ${psQuote(leafPfxPath)}
-$pwd = ConvertTo-SecureString ${psQuote(CERT_PASSWORD)} -AsPlainText -Force
+$pwd = ConvertTo-SecureString ${psQuote(password)} -AsPlainText -Force
 $root = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $root) { throw 'Root CA missing' }
 $leafSubject = 'CN=' + $hostName
-$leaf = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $leafSubject } | Sort-Object NotAfter -Descending | Select-Object -First 1
+$leaf = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $leafSubject -and $_.Issuer -eq $root.Subject } | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $leaf) {
   $leaf = New-SelfSignedCertificate -Type Custom -DnsName $hostName -Subject $leafSubject -Signer $root -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy Exportable -TextExtension @('2.5.29.19={critical}{text}CA=false','2.5.29.37={text}1.3.6.1.5.5.7.3.1') -CertStoreLocation 'Cert:\\CurrentUser\\My' -NotAfter (Get-Date).AddYears(2)
 }
@@ -256,8 +376,8 @@ function getSecureContext(hostname) {
   }
   const pfxPath = ensureLeafCertificate(normalizedHost);
   const context = tls.createSecureContext({
-    pfx: (0, import_node_fs.readFileSync)(pfxPath),
-    passphrase: CERT_PASSWORD
+    pfx: (0, import_node_fs2.readFileSync)(pfxPath),
+    passphrase: getCertificatePassword()
   });
   state.leafCache.set(normalizedHost, context);
   return context;
@@ -316,11 +436,180 @@ function collectJsonSemantics(input, basePath, out) {
     return;
   }
   if (input !== void 0 && input !== null) {
-    out.values.push(String(input));
+    const value = String(input);
+    out.values.push(value);
+    out.entries.push({
+      key: basePath.includes(".") ? basePath.slice(basePath.lastIndexOf(".") + 1) : basePath,
+      path: basePath,
+      value
+    });
   }
 }
+function normalizeJsonPathRule(rule) {
+  return rule.replace(/\[\]/g, "[*]");
+}
+function globMatchNoCase(text, pattern) {
+  let textIndex = 0;
+  let patternIndex = 0;
+  let starPattern = -1;
+  let starText = -1;
+  const foldedText = text.toLowerCase();
+  const foldedPattern = normalizeJsonPathRule(pattern).toLowerCase();
+  while (textIndex < foldedText.length) {
+    if (patternIndex < foldedPattern.length && foldedPattern[patternIndex] === "*") {
+      starPattern = ++patternIndex;
+      starText = textIndex;
+      continue;
+    }
+    if (patternIndex < foldedPattern.length && foldedPattern[patternIndex] === foldedText[textIndex]) {
+      patternIndex++;
+      textIndex++;
+      continue;
+    }
+    if (starPattern !== -1) {
+      patternIndex = starPattern;
+      textIndex = ++starText;
+      continue;
+    }
+    return false;
+  }
+  while (patternIndex < foldedPattern.length && foldedPattern[patternIndex] === "*") {
+    patternIndex++;
+  }
+  return patternIndex === foldedPattern.length;
+}
+function jsonPathRuleMatches(path, rule) {
+  if (!rule) {
+    return false;
+  }
+  return globMatchNoCase(path, rule) || containsNoCase(path, rule);
+}
+function parseJsonPredicateRule(rule) {
+  const leftBrace = rule.indexOf("{");
+  const rightBrace = leftBrace >= 0 ? rule.indexOf("}", leftBrace + 1) : -1;
+  if (leftBrace < 0 || rightBrace <= leftBrace + 1) {
+    return null;
+  }
+  const predicate = rule.slice(leftBrace + 1, rightBrace);
+  const prefixPattern = rule.slice(0, leftBrace);
+  const suffix = rule.slice(rightBrace + 1);
+  const groupParts = predicate.split("||").map((item) => item.trim()).filter(Boolean);
+  const groups = [];
+  for (const groupPart of groupParts) {
+    const parts = groupPart.split(/&&|,/).map((item) => item.trim()).filter(Boolean);
+    const conditions = [];
+    for (const part of parts) {
+      const operators = [
+        { token: "!=", operator: "ne" },
+        { token: ">=", operator: "ge" },
+        { token: "<=", operator: "le" },
+        { token: ">", operator: "gt" },
+        { token: "<", operator: "lt" },
+        { token: "=", operator: "eq" }
+      ];
+      let resolvedOperator = null;
+      let splitIndex = -1;
+      let separatorLength = 0;
+      for (const candidate of operators) {
+        const index = part.indexOf(candidate.token);
+        if (index > 0) {
+          resolvedOperator = candidate.operator;
+          splitIndex = index;
+          separatorLength = candidate.token.length;
+          break;
+        }
+      }
+      if (!resolvedOperator) {
+        return null;
+      }
+      if (splitIndex <= 0 || splitIndex >= part.length - separatorLength) {
+        return null;
+      }
+      const key = part.slice(0, splitIndex).trim();
+      const valuePattern = part.slice(splitIndex + separatorLength).trim();
+      if (!key || !valuePattern) {
+        return null;
+      }
+      conditions.push({ key, valuePattern, operator: resolvedOperator });
+    }
+    if (conditions.length === 0) {
+      return null;
+    }
+    groups.push(conditions);
+  }
+  if (groups.length === 0 || !suffix) {
+    return null;
+  }
+  return {
+    prefixPattern,
+    groups,
+    suffix
+  };
+}
+function endsWithNoCase(text, suffix) {
+  return text.toLowerCase().endsWith(suffix.toLowerCase());
+}
+function equalsNoCase(left, right) {
+  return left.toLowerCase() === right.toLowerCase();
+}
+function valuePatternMatches(value, pattern) {
+  return globMatchNoCase(value, pattern) || containsNoCase(value, pattern);
+}
+function parseNumericValue(value) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function predicateConditionMatches(candidateValue, condition) {
+  if (condition.operator === "eq") {
+    return valuePatternMatches(candidateValue, condition.valuePattern);
+  }
+  if (condition.operator === "ne") {
+    return !valuePatternMatches(candidateValue, condition.valuePattern);
+  }
+  const left = parseNumericValue(candidateValue);
+  const right = parseNumericValue(condition.valuePattern);
+  if (left === null || right === null) {
+    return false;
+  }
+  if (condition.operator === "gt") return left > right;
+  if (condition.operator === "ge") return left >= right;
+  if (condition.operator === "lt") return left < right;
+  return left <= right;
+}
+function jsonPredicateRuleMatches(semantic, rule) {
+  const parsed = parseJsonPredicateRule(rule);
+  if (!parsed) {
+    return false;
+  }
+  for (const entry of semantic.entries) {
+    if (!endsWithNoCase(entry.path, parsed.suffix)) {
+      continue;
+    }
+    const objectPath = entry.path.slice(0, entry.path.length - parsed.suffix.length);
+    if (!jsonPathRuleMatches(objectPath, parsed.prefixPattern)) {
+      continue;
+    }
+    if (parsed.groups.some((conditions) => conditions.every((condition) => {
+      const siblingPath = objectPath ? `${objectPath}.${condition.key}` : condition.key;
+      const candidateMatched = semantic.entries.some(
+        (candidate) => equalsNoCase(candidate.path, siblingPath) && predicateConditionMatches(candidate.value, condition)
+      );
+      return candidateMatched;
+    }))) {
+      return true;
+    }
+  }
+  return false;
+}
 function inspectTextualBody(bodyText, contentType) {
-  const semantic = { keys: [], paths: [], values: [] };
+  const semantic = { keys: [], paths: [], values: [], entries: [] };
   if (contentType.toLowerCase().startsWith("application/json")) {
     try {
       collectJsonSemantics(JSON.parse(bodyText), "", semantic);
@@ -360,7 +649,7 @@ function evaluateProxyPolicy(targetUrl, headers, bodyText, contentType, headerRu
       }
     }
     for (const pathRule of jsonPathRules) {
-      if (semantic.paths.some((value) => containsNoCase(value, pathRule))) {
+      if (semantic.paths.some((value) => jsonPathRuleMatches(value, pathRule)) || jsonPredicateRuleMatches(semantic, pathRule)) {
         return { blocked: true, reason: `json-path:${pathRule}` };
       }
     }
@@ -552,7 +841,8 @@ async function proxyViaHttp1(targetUrl, req, requestBody) {
           host: targetUrl.host,
           "content-length": String(requestBody.length)
         },
-        rejectUnauthorized: false
+        rejectUnauthorized: true,
+        servername: targetUrl.hostname
       },
       async (upstreamRes) => {
         try {
@@ -578,7 +868,10 @@ async function proxyViaHttp1(targetUrl, req, requestBody) {
 async function proxyViaHttp2(targetUrl, req, requestBody) {
   const origin = `${targetUrl.protocol}//${targetUrl.host}`;
   return new Promise((resolve, reject) => {
-    const session = http2.connect(origin, { rejectUnauthorized: false });
+    const session = http2.connect(origin, {
+      rejectUnauthorized: true,
+      servername: targetUrl.hostname
+    });
     const headers = {
       ":method": req.method || "GET",
       ":path": `${targetUrl.pathname}${targetUrl.search}`,
@@ -982,7 +1275,7 @@ function handleUpgrade(req, clientSocket, head, forcedScheme) {
   const upstream = targetUrl.protocol === "wss:" || forcedScheme === "https" ? tls.connect(
     targetUrl.port ? Number(targetUrl.port) : 443,
     targetUrl.hostname,
-    { rejectUnauthorized: false },
+    { rejectUnauthorized: true, servername: targetUrl.hostname },
     () => {
       console.log(`[TransparentProxy] upstream websocket connect secure ${targetUrl.host}`);
       upstream.write(buildUpgradeRequest(targetUrl, req));
@@ -1121,8 +1414,8 @@ function createHttpsMitmServer() {
           callback(error);
         }
       },
-      pfx: (0, import_node_fs.readFileSync)(getLeafPfxPath("localhost")),
-      passphrase: CERT_PASSWORD,
+      pfx: (0, import_node_fs2.readFileSync)(getLeafPfxPath("localhost")),
+      passphrase: getCertificatePassword(),
       ALPNProtocols: ["http/1.1"]
     },
     (secureSocket) => {

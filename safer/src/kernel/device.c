@@ -12,11 +12,16 @@
 #include "network/wfp_callout.h"
 #include "policy/policy_engine.h"
 #include "core/protect.h"
+#include <wdmsec.h>
 
 PDEVICE_OBJECT gDeviceObject = NULL;
 
 static UNICODE_STRING gDeviceName = RTL_CONSTANT_STRING(PS_DEVICE_NAME);
 static BOOLEAN gDeviceSymLinkCreated = FALSE;
+static const GUID gPersonalSaferDeviceClass =
+    { 0x8ea63c1e, 0x6337, 0x49d9, { 0xa3, 0x94, 0x4f, 0x8d, 0xc5, 0xe8, 0x1f, 0x31 } };
+static UNICODE_STRING gDeviceSddl = RTL_CONSTANT_STRING(
+    L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;AU)");
 
 static
 VOID
@@ -63,13 +68,15 @@ DeviceCreate(
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    status = IoCreateDevice(
+    status = IoCreateDeviceSecure(
         DriverObject,
         0,
         &gDeviceName,
         FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,
         FALSE,
+        &gDeviceSddl,
+        &gPersonalSaferDeviceClass,
         &gDeviceObject);
     if (!NT_SUCCESS(status)) {
         DLP_LOG(DLP_DEBUG_ERROR, "IoCreateDevice failed: 0x%x", status);
@@ -239,6 +246,24 @@ DeviceDispatchDeviceControl(
 
         case IOCTL_PS_WAIT_EVENTS:
             status = HandleWaitEventsIrp(Irp);
+            break;
+
+        case IOCTL_PS_SET_PROTECT_LIST:
+            status = HandleSetProtectListIrp(Irp);
+            break;
+
+        case IOCTL_PS_GET_PROTECT_CHALLENGE:
+            status = HandleGetProtectChallengeIrp(Irp);
+            break;
+
+        case IOCTL_PS_UNLOCK_PROTECTION:
+            status = HandleUnlockProtectionIrp(Irp);
+            break;
+
+        case IOCTL_PS_RELOCK_PROTECTION:
+            ProtectRelock();
+            status = STATUS_SUCCESS;
+            Irp->IoStatus.Information = 0;
             break;
 
         case IOCTL_PS_QUERY_PROTECT_STATE:

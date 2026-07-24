@@ -21,6 +21,7 @@ type WsEndpoint = {
 }
 
 const MITM_CERT_PASSWORD = 'PersonalSafer-MITM-2026!'
+const EXPLICIT_PROXY_HOST = '127.0.0.1'
 
 function parseArgValue(prefix: string): string | null {
   const item = process.argv.find((arg) => arg.startsWith(prefix))
@@ -139,7 +140,10 @@ async function readHttpHeader(socket: net.Socket): Promise<{ header: string; lef
   })
 }
 
-async function readWebSocketOutcome(socket: net.Socket, initial = Buffer.alloc(0)): Promise<{ type: string; text?: string; code?: number; reason?: string }> {
+async function readWebSocketOutcome(
+  socket: net.Socket,
+  initial: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+): Promise<{ type: string; text?: string; code?: number; reason?: string }> {
   let pending = initial
 
   while (true) {
@@ -256,8 +260,8 @@ async function startLocalEcho(wsPort: number, wssPort: number): Promise<() => Pr
     attachEcho(socket)
   }
 
-  wsServer.on('upgrade', (req, socket, head) => upgradeHandler(socket, head, String(req.headers['sec-websocket-key'] || '')))
-  parserServer.on('upgrade', (req, socket, head) => upgradeHandler(socket, head, String(req.headers['sec-websocket-key'] || '')))
+  wsServer.on('upgrade', (req, socket, head) => upgradeHandler(socket as net.Socket, head, String(req.headers['sec-websocket-key'] || '')))
+  parserServer.on('upgrade', (req, socket, head) => upgradeHandler(socket as net.Socket, head, String(req.headers['sec-websocket-key'] || '')))
   wssServer.on('secureConnection', (socket) => parserServer.emit('connection', socket))
 
   await Promise.all([

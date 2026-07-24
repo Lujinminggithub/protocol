@@ -41,6 +41,9 @@ PolicyEngineInitialize(VOID);
 VOID
 PolicyEngineCleanup(VOID);
 
+BOOLEAN
+PolicyEngineIsAuditEnabled(VOID);
+
 NTSTATUS
 PolicyEngineSetPolicy(
     _In_ PPOLICY_COMMAND Command

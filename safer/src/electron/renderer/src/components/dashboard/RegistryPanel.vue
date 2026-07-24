@@ -15,6 +15,7 @@ interface RegistryEvent {
 
 const events = ref<RegistryEvent[]>([])
 const loading = ref(false)
+const sourceError = ref('')
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 let eventId = 1
 
@@ -23,29 +24,35 @@ const changeTypeLabels: Record<string, string> = {
   value_deleted: '值已删除',
   key_created: '键已创建',
   key_deleted: '键已删除',
-  name_changed: '名称已更改'
+  name_changed: '名称已更改',
+  key_or_value_changed: '键或值已变更'
 }
 
 async function refresh() {
   loading.value = true
   try {
-    // 通过 N-API 获取最近的注册表变更事件
-    // TODO: 当 native addon 就绪后替换
-    const mockEvent: RegistryEvent = {
+    const result = await window.saferAPI.monitor.getRegistryEvents(200)
+    sourceError.value = result.available ? '' : (result.error || '注册表数据源不可用')
+    const incoming = result.events.map((event: any): RegistryEvent => ({
       id: eventId++,
-      keyPath: 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer',
-      changeType: 'value_set',
-      timestamp: new Date().toLocaleTimeString('zh-CN'),
-      details: '模拟注册表变更事件'
+      keyPath: String(event.keyPath || ''),
+      changeType: String(event.changeType || 'key_or_value_changed'),
+      timestamp: new Date(Number(event.timestampMs) || Date.now()).toLocaleTimeString('zh-CN'),
+      details: '系统注册表通知'
+    }))
+    if (incoming.length > 0) {
+      events.value.unshift(...incoming.reverse())
+      events.value.splice(100)
     }
-    events.value.unshift(mockEvent)
-    if (events.value.length > 100) events.value.pop()
+  } catch (error: any) {
+    sourceError.value = error?.message || '注册表数据源不可用'
   } finally {
     loading.value = false
   }
 }
 
 onMounted(() => {
+  refresh()
   refreshTimer = setInterval(refresh, 5000)
 })
 
@@ -66,6 +73,9 @@ onUnmounted(() => {
     </div>
 
     <div class="event-list">
+      <div v-if="sourceError" class="empty-state source-error">
+        {{ sourceError }}
+      </div>
       <div v-if="events.length === 0" class="empty-state">
         暂无注册表变更事件
       </div>

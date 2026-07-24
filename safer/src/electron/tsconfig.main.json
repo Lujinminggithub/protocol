@@ -8,7 +8,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "outDir": "../dist-electron/main",
-    "rootDir": "main",
+    "rootDir": ".",
     "baseUrl": "."
   },
   "include": ["main/**/*.ts", "preload/**/*.ts"]

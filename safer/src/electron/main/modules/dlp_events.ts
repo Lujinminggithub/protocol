@@ -482,7 +482,7 @@ export function listQueuedEventsByState(state: 'abandoned' | 'sent' | 'failed' |
     .slice(0, Math.max(0, limit))
 }
 
-export type { PersistedSinkDeliveryStatus }
+export type { PersistedDlpEvent, PersistedSinkDeliveryStatus }
 
 export function requeueAbandonedEvents(limit: number = 100): number {
   const targets = events.filter((item) => item.state === 'abandoned').slice(0, Math.max(0, limit))

@@ -582,8 +582,6 @@ ProtectControl(_In_ const PS_PROTECT_CONTROL* Control)
     ULONG i;
     UCHAR difference = 0;
     KIRQL oldIrql;
-    LARGE_INTEGER now;
-    LARGE_INTEGER dueTime;
 
     PAGED_CODE();
     if (Control == NULL || Control->Version != PS_PROTECT_VERSION) return STATUS_INVALID_PARAMETER;
@@ -592,22 +590,6 @@ ProtectControl(_In_ const PS_PROTECT_CONTROL* Control)
     }
     if (difference != 0) return STATUS_ACCESS_DENIED;
 
-    if (Control->Action == PS_PROTECT_CONTROL_RELOCK) {
-        ProtectRelock();
-        return STATUS_SUCCESS;
-    }
-    if (Control->Action == PS_PROTECT_CONTROL_UNLOCK) {
-        if (InterlockedCompareExchange(&gProtect.BootstrapComplete, 0, 0) == FALSE) {
-            return STATUS_DEVICE_NOT_READY;
-        }
-        KeQuerySystemTime(&now);
-        InterlockedExchange64(&gProtect.UnlockExpire,
-            now.QuadPart + (LONG64)PS_PROTECT_MAX_TTL_SECONDS * 10000000LL);
-        InterlockedExchange(&gProtect.Mode, PS_PROTECT_MODE_UNLOCKED);
-        dueTime.QuadPart = -(LONG64)PS_PROTECT_MAX_TTL_SECONDS * 10000000LL;
-        KeSetTimer(&gProtect.RelockTimer, dueTime, &gProtect.RelockDpc);
-        return STATUS_SUCCESS;
-    }
     if (Control->Action != PS_PROTECT_CONTROL_INITIALIZE || Control->ProcessId == 0 ||
         Control->InstallDirectory[0] != L'\\' || Control->ProcessImage[0] != L'\\' ||
         Control->DriverPath[0] != L'\\' ||

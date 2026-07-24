@@ -99,16 +99,21 @@ export function initializeQuarantineCatalog(): void {
   }
 
   if (existsSync(getJournalPath())) {
-    try {
-      const lines = readFileSync(getJournalPath(), 'utf8').split(/\r?\n/).filter(Boolean)
-      for (const line of lines) {
+    const lines = readFileSync(getJournalPath(), 'utf8').split(/\r?\n/).filter(Boolean)
+    const validLines: string[] = []
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index]
+      try {
         const record = JSON.parse(line)
         if (record?.op === 'upsert' && record.entry) applyEntry(record.entry)
+        validLines.push(line)
+      } catch {
+        writeFileSync(`${getJournalPath()}.corrupt-${Date.now()}`, `${lines.slice(index).join('\n')}\n`, 'utf8')
+        writeFileSync(getJournalPath(), validLines.length > 0 ? `${validLines.join('\n')}\n` : '', 'utf8')
+        break
       }
-      journalRecords = lines.length
-    } catch {
-      journalRecords = 0
     }
+    journalRecords = validLines.length
   }
 
   initialized = true

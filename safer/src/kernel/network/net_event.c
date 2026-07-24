@@ -5,6 +5,7 @@
 #include "net_event.h"
 #include "../common/shared_events.h"
 #include "../core/protect.h"
+#include "../policy/policy_engine.h"
 
 static NET_EVENT_BUFFER gNetEventBuffer;
 static NPAGED_LOOKASIDE_LIST gNetEventLookaside;
@@ -85,6 +86,7 @@ NetEventEnqueue(
     if (Event == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+    if (!PolicyEngineIsAuditEnabled()) return STATUS_SUCCESS;
     if (ProtectShouldBypassDlp(Event->ProcessId)) return STATUS_SUCCESS;
 
     KeAcquireSpinLock(&gNetEventBuffer.BufferLock, &oldIrql);

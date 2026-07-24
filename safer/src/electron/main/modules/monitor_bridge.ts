@@ -3,9 +3,10 @@
  *
  * 调用原生 monitor 插件获取系统监控数据，
  * 并将数据转换为 Vue store 期望的格式。
- * 如果原生插件不可用，回退到 mock 数据。
+ * Mock data is opt-in for development and is never used implicitly.
  */
 
+import { app } from 'electron'
 import { getAddon, isAddonLoaded } from './native_loader'
 
 // 从 mock_data 导入模拟数据生成器
@@ -15,6 +16,15 @@ import {
   getNetworkMockData,
   getDiskMockData,
 } from './mock_data'
+
+function allowDevelopmentMock(): boolean {
+  return !app.isPackaged && process.env.PS_ENABLE_MOCK_DATA === '1'
+}
+
+function unavailable<T>(source: string, mockFactory: () => T): T {
+  if (allowDevelopmentMock()) return mockFactory()
+  throw new Error(`${source} 数据源不可用`)
+}
 
 // ========== CPU 监控 ==========
 
@@ -43,7 +53,7 @@ export function getCpuData(): { total: number; perCore: number[] } {
   }
 
   // 回退到 mock 数据
-  return getCpuMockData()
+  return unavailable('CPU', getCpuMockData)
 }
 
 // ========== 内存监控 ==========
@@ -86,7 +96,7 @@ export function getMemoryData(): {
   }
 
   // 回退到 mock 数据
-  return getMemoryMockData()
+  return unavailable('内存', getMemoryMockData)
 }
 
 // ========== 网络监控 ==========
@@ -172,7 +182,7 @@ export function getNetworkData(): {
   }
 
   // 回退到 mock 数据
-  return getNetworkMockData()
+  return unavailable('网络', getNetworkMockData)
 }
 
 // ========== 磁盘监控 ==========
@@ -221,7 +231,7 @@ export function getDiskData(): {
   }
 
   // 回退到 mock 数据
-  return getDiskMockData()
+  return unavailable('磁盘', getDiskMockData)
 }
 
 // ========== 辅助函数 ==========

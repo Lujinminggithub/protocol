@@ -70,6 +70,7 @@ export const useMonitorStore = defineStore('monitor', () => {
 
   const loading = ref(false)
   const lastUpdate = ref<Date | null>(null)
+  const sourceError = ref<string | null>(null)
 
   async function refreshAll() {
     loading.value = true
@@ -85,6 +86,7 @@ export const useMonitorStore = defineStore('monitor', () => {
       networkData.value = network
       diskData.value = disk
       lastUpdate.value = new Date()
+      sourceError.value = null
 
       // 更新历史数据
       const now = Date.now()
@@ -98,6 +100,8 @@ export const useMonitorStore = defineStore('monitor', () => {
       if (networkTxHistory.value.length > 60) networkTxHistory.value.shift()
       if (diskReadHistory.value.length > 60) diskReadHistory.value.shift()
       if (diskWriteHistory.value.length > 60) diskWriteHistory.value.shift()
+    } catch (error: any) {
+      sourceError.value = error?.message || '系统监控数据源不可用'
     } finally {
       loading.value = false
     }
@@ -119,7 +123,7 @@ export const useMonitorStore = defineStore('monitor', () => {
     cpuData, memoryData, networkData, diskData,
     cpuHistory, memoryHistory, networkRxHistory, networkTxHistory,
     diskReadHistory, diskWriteHistory,
-    loading, lastUpdate,
+    loading, lastUpdate, sourceError,
     refreshAll, formatBytes, formatSpeed
   }
 })

@@ -85,6 +85,9 @@ function formatBytes(bytes: number): string {
 
 <template>
   <div class="dashboard">
+    <div v-if="store.sourceError" class="source-error" role="status">
+      {{ store.sourceError }}
+    </div>
     <!-- 顶部统计卡片 -->
     <div class="stats-row">
       <div class="stat-card cpu-card">
@@ -351,6 +354,15 @@ function formatBytes(bytes: number): string {
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+
+.source-error {
+  margin-bottom: 10px;
+  padding: 9px 12px;
+  border: 1px solid #9b3d3d;
+  background: #2b171b;
+  color: #ffb4b4;
+  font-size: 13px;
 }
 
 .stats-row {

@@ -101,11 +101,33 @@ function applyDefaultQuarantine(addon: any): void {
   })
 }
 
+let registryWatcherStarted = false
+
 export function registerHandlers(): void {
   ipcMain.handle('monitor:get-cpu', () => getCpuData())
   ipcMain.handle('monitor:get-memory', () => getMemoryData())
   ipcMain.handle('monitor:get-network', () => getNetworkData())
   ipcMain.handle('monitor:get-disk', () => getDiskData())
+  ipcMain.handle('monitor:get-registry-events', (_event, limit?: number) => {
+    try {
+      const addon = getAddon()
+      if (!addon || !isAddonLoaded() || typeof addon.monitor?.readEvents !== 'function') {
+        return { available: false, error: '注册表数据源不可用', events: [] }
+      }
+      if (!registryWatcherStarted) {
+        addon.monitor.watchKey('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer')
+        registryWatcherStarted = true
+      }
+      return {
+        available: true,
+        error: null,
+        events: addon.monitor.readEvents(Math.min(Math.max(Number(limit) || 200, 1), 1000)),
+      }
+    } catch (error: any) {
+      registryWatcherStarted = false
+      return { available: false, error: error?.message || '注册表数据源不可用', events: [] }
+    }
+  })
 
   ipcMain.on('monitor:start', (_event, moduleName: string) => {
     console.log(`[Monitor] start: ${moduleName}`)
@@ -291,8 +313,8 @@ export function registerHandlers(): void {
         return {
           success: true,
           policy: appliedPolicy,
-          warning: policyResult.differences.length > 0
-            ? `内核已应用策略，但以下字段被规范化：${policyResult.differences.join('、')}`
+          warning: (policyResult.differences || []).length > 0
+            ? `内核已应用策略，但以下字段被规范化：${(policyResult.differences || []).join('、')}`
             : null,
         }
       }

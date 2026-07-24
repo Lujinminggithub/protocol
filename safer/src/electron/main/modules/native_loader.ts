@@ -17,7 +17,8 @@ export interface NativeAddon {
     getNetworkInfo: () => any
     getDiskInfo: () => any
     watchKey: (key: string) => any
-    unwatchKey: (key: string) => any
+    unwatchKey: () => any
+    readEvents: (limit?: number) => any[]
   }
   dlp: {
     kernel_comm: {

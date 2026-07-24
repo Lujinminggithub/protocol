@@ -10,6 +10,7 @@ const api = {
     getMemory: () => ipcRenderer.invoke('monitor:get-memory'),
     getNetwork: () => ipcRenderer.invoke('monitor:get-network'),
     getDisk: () => ipcRenderer.invoke('monitor:get-disk'),
+    getRegistryEvents: (limit?: number) => ipcRenderer.invoke('monitor:get-registry-events', limit),
     onStart: (moduleName: string) => ipcRenderer.send('monitor:start', moduleName),
     onStop: (moduleName: string) => ipcRenderer.send('monitor:stop', moduleName),
     onEvent: (callback: (data: any) => void) => {
