@@ -5,6 +5,7 @@ const tls = require('node:tls')
 const path = require('node:path')
 const { existsSync } = require('node:fs')
 const { app } = require('electron')
+const os = require('node:os')
 
 const addonPath = path.resolve(__dirname, '..', 'src', 'native', 'build', 'Release', 'personal_safer.node')
 const driverPath = path.resolve(__dirname, '..', 'build', 'kernel', 'x64', 'Release', 'PersonalSafer.sys')
@@ -279,7 +280,7 @@ function attachEchoBehavior(socket) {
 }
 
 async function startLocalEchoServers() {
-  const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || 'C:\\Users\\USER', 'AppData', 'Roaming')
+  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
   const pfxPath = path.join(appData, 'Electron', 'mitm', 'localhost.pfx')
   if (!existsSync(pfxPath)) {
     throw new Error(`localhost.pfx not found: ${pfxPath}`)

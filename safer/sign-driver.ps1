@@ -2,6 +2,8 @@
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'scripts\build-tools.ps1')
+
 $subject = 'CN=PersonalSafer Test'
 $sysPath = Join-Path $PSScriptRoot 'build\kernel\x64\Release\PersonalSafer.sys'
 $cerOut = Join-Path $PSScriptRoot 'PersonalSafer-Test.cer'
@@ -12,14 +14,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
 $storeScope = if ($isAdmin) { 'LocalMachine' } else { 'CurrentUser' }
 $storePath = "Cert:\$storeScope\My"
 
-$signtool = Get-ChildItem @(
-  'D:\Windows Kits\10\bin\*\x64\signtool.exe',
-  'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe'
-) -ErrorAction SilentlyContinue |
-  Sort-Object FullName -Descending |
-  Select-Object -First 1 -ExpandProperty FullName
-
-if (-not $signtool) { throw 'signtool.exe not found. Install the Windows SDK/WDK.' }
+$signtool = Resolve-WindowsSdkTool -Name 'signtool.exe'
 if (-not (Test-Path $sysPath)) { throw "Driver not found: $sysPath" }
 
 Write-Host "[1/4] Certificate store: $storeScope\My"

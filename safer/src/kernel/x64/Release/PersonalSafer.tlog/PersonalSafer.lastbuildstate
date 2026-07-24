@@ -1,2 +1,2 @@
-PlatformToolSet=WindowsKernelModeDriver10.0:VCToolArchitecture=Native32Bit:VCToolsVersion=14.42.34433:TargetPlatformVersion=10.0.28000.0:
+PlatformToolSet=WindowsKernelModeDriver10.0:VCToolArchitecture=Native32Bit:VCToolsVersion=14.50.35717:VCServicingVersionCompilers=14.50.35726:TargetPlatformVersion=10.0.28000.0:
 Release|x64|E:\project\protocol\safer\src\kernel\|

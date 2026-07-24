@@ -21,7 +21,7 @@ app.whenReady().then(() => {
       fs.mkdirSync(path.dirname(shadowPath), { recursive: true })
       fs.writeFileSync(shadowPath, 'catalog-validation', 'utf8')
       catalog.recordQuarantineCatalogEntry({
-        originalPath: 'C:\\Sensitive\\quarterly-report.txt',
+        originalPath: path.join(path.dirname(shadowPath), 'quarterly-report.txt'),
         quarantinePath: shadowPath,
         processName: 'catalog-test.exe',
         pid: 4242,

@@ -6,7 +6,7 @@ Class       = "ActivityMonitor"
 ClassGuid   = {B86DFF51-A31E-4BAC-B3CF-E8CFE75C9FC2}
 Provider    = %ManufacturerName%
 CatalogFile =
-DriverVer = 07/24/2026,12.0.26.364
+DriverVer = 07/24/2026,14.15.42.918
 PnpLockdown = 1
 
 [DestinationDirs]

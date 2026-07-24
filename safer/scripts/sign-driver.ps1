@@ -9,11 +9,8 @@ param(
 
 Write-Host "=== Signing PersonalSafer Kernel Driver ===" -ForegroundColor Cyan
 
-$signtool = & where.exe signtool
-if (-not $signtool) {
-    Write-Host "ERROR: signtool not found. Install Windows SDK." -ForegroundColor Red
-    exit 1
-}
+. (Join-Path $PSScriptRoot 'build-tools.ps1')
+$signtool = Resolve-WindowsSdkTool -Name 'signtool.exe'
 
 $sysPath = Join-Path $PSScriptRoot "..\build\kernel\x64\Release\PersonalSafer.sys"
 if (-not (Test-Path $sysPath)) {

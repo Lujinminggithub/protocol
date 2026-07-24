@@ -1,3 +1,5 @@
 @echo off
-set MSBUILD="D:\Program Files\Microsoft Visual Studio\18\Professional\MSBuild\Current\Bin\MSBuild.exe"
-%MSBUILD% "E:\project\safer\src\kernel\PersonalSafer.vcxproj" /t:Build /p:Configuration=Release /p:Platform=x64 /p:TrackFileAccess=false /p:SkipPackageVerification=true /v:minimal
+setlocal
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-kernel.ps1" -Configuration Release -Platform x64
+set "EXIT_CODE=%ERRORLEVEL%"
+endlocal & exit /b %EXIT_CODE%

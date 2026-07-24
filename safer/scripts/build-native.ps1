@@ -7,6 +7,8 @@ param(
 
 Write-Host "=== Building PersonalSafer N-API Module ===" -ForegroundColor Cyan
 
+. (Join-Path $PSScriptRoot 'build-tools.ps1')
+
 $nativeDir = Join-Path $PSScriptRoot "..\src\native"
 
 # 检查 Node.js
@@ -33,16 +35,7 @@ npx.cmd node-gyp rebuild --directory="$nativeDir"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Incremental native build failed; retrying without file tracking..." -ForegroundColor Yellow
-    $msbuildCandidates = @(
-        (& where.exe msbuild 2>$null | Select-Object -First 1),
-        "D:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
-        "D:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe",
-        "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
-        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
-    )
-    $msbuildPath = $msbuildCandidates |
-        Where-Object { $_ -and (Test-Path $_) } |
-        Select-Object -First 1
+    $msbuildPath = Resolve-MSBuildPath
     $solutionPath = Join-Path $nativeDir "build\binding.sln"
 
     if ($msbuildPath -and (Test-Path $solutionPath)) {

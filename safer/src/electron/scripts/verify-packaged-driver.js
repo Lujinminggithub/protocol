@@ -7,7 +7,10 @@ function sha256(file) {
 }
 
 const stagingDirectory = path.resolve(__dirname, '..', 'driver')
-const packagedDirectory = path.resolve(__dirname, '..', '..', '..', 'dist', 'win-unpacked', 'resources', 'driver')
+const packageOutputDirectory = process.env.PS_PACKAGE_OUTPUT_DIR
+  ? path.resolve(process.env.PS_PACKAGE_OUTPUT_DIR)
+  : path.resolve(__dirname, '..', '..', '..', 'dist')
+const packagedDirectory = path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'driver')
 const expectedName = 'PersonalSafer.sys'
 const stagingNames = fs.readdirSync(stagingDirectory)
 if (!stagingNames.includes(expectedName)) {

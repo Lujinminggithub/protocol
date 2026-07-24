@@ -9,52 +9,23 @@ param(
 
 Write-Host "=== Building PersonalSafer Kernel Driver ===" -ForegroundColor Cyan
 
-$candidateSdkDirs = @()
-if ($WindowsSdkDirOverride) { $candidateSdkDirs += $WindowsSdkDirOverride }
-if ($env:WindowsSdkDir) { $candidateSdkDirs += $env:WindowsSdkDir }
-$candidateSdkDirs += "D:\Windows Kits\10"
-$candidateSdkDirs += "C:\Program Files (x86)\Windows Kits\10"
+. (Join-Path $PSScriptRoot 'build-tools.ps1')
 
-$wdkPath = $candidateSdkDirs |
-    Where-Object { $_ -and (Test-Path $_) } |
-    Select-Object -First 1
-
-if (-not $wdkPath) {
-    Write-Host "ERROR: WDK not found. Please install Windows Driver Kit." -ForegroundColor Red
-    exit 1
-}
-
-$resolvedWdkPath = (Resolve-Path $wdkPath).Path
+$resolvedWdkPath = Resolve-WindowsSdkRoot -Override $WindowsSdkDirOverride
 $env:WindowsSdkDir = if ($resolvedWdkPath.EndsWith('\')) { $resolvedWdkPath } else { "$resolvedWdkPath\" }
 
 Write-Host "WDK Path: $env:WindowsSdkDir" -ForegroundColor Green
 
-$msbuildCandidates = @()
-$msbuildFromWhere = (& where.exe msbuild 2>$null | Select-Object -First 1)
-if ($msbuildFromWhere) { $msbuildCandidates += $msbuildFromWhere }
-$msbuildCandidates += @(
-    "D:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
-    "D:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe",
-    "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
-    "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
-)
-
-$msbuildPath = $msbuildCandidates |
-    Where-Object { $_ -and (Test-Path $_) } |
-    Select-Object -First 1
-
-if (-not $msbuildPath) {
-    Write-Host "ERROR: MSBuild not found. Please install Visual Studio Build Tools." -ForegroundColor Red
-    exit 1
-}
+$msbuildPath = Resolve-MSBuildPath
 
 Write-Host "MSBuild: $msbuildPath" -ForegroundColor Green
 
 $projectPath = Join-Path $PSScriptRoot "..\src\kernel\PersonalSafer.vcxproj"
 $outputPath = Join-Path $PSScriptRoot "..\build\kernel\$Platform\$Configuration"
 $outputPathWithSlash = if ($outputPath.EndsWith('\')) { $outputPath } else { "$outputPath\" }
-$driverKitTasks18 = Join-Path $env:WindowsSdkDir "build\10.0.28000.0\bin\Microsoft.DriverKit.Build.Tasks.18.0.dll"
-$vsVersion = if (Test-Path $driverKitTasks18) { "18.0" } else { "17.0" }
+$driverKitTasks18 = Get-ChildItem -Path (Join-Path $env:WindowsSdkDir 'build\*\bin\Microsoft.DriverKit.Build.Tasks.18.0.dll') -File -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+$vsVersion = if ($driverKitTasks18) { "18.0" } else { "17.0" }
 
 & $msbuildPath $projectPath `
     /p:Configuration=$Configuration `
