@@ -53,6 +53,12 @@ int main(void){
     { uint8_t payload=0;int n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_CLOSE,7,0,0,1,1,
           route,strlen(route),&payload,1);nb_udp_wire_view_t view;
       CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0&&view.type==NB_UDP_TYPE_CLOSE); }
+    { uint8_t payload[1000]={0};nb_udp_wire_view_t view;
+      int n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_C2S,7,14,0,2,1001,
+          route,strlen(route),payload,sizeof(payload));
+      CHECK(n>0);wire[19]=3;CHECK(nb_udp_wire_decode(wire,(size_t)n,&view)!=0);
+      CHECK(nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_C2S,7,14,0,3,1001,
+          route,strlen(route),payload,sizeof(payload))<0); }
 
     uint8_t socks[3000];int sn=nb_socks_udp_encode(socks,sizeof(socks),"rtc.example",443,source,100);
     CHECK(sn>0);char host[256];int port=0;const uint8_t* payload=NULL;size_t payload_len=0;

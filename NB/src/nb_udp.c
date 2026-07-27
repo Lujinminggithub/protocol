@@ -27,7 +27,8 @@ int nb_udp_wire_encode(uint8_t* out, size_t cap, uint8_t type,
     uint16_t fragment_count, uint16_t total_length, const char* route,
     uint16_t route_length, const uint8_t* payload, uint16_t payload_length){
     if(out==NULL||session_id==0||!nb_udp_wire_type_valid(type)||
-        fragment_count==0||fragment_count>66||fragment_index>=fragment_count||
+        fragment_count==0||fragment_count>66||fragment_count!=nb_udp_fragment_count(total_length)||
+        fragment_index>=fragment_count||
         total_length==0||route==NULL||route_length==0||route_length>=NB_UDP_ROUTE_MAX||
         payload==NULL||payload_length==0||payload_length>NB_UDP_FRAGMENT_PAYLOAD||
         cap<NB_UDP_WIRE_HEADER+(size_t)route_length+payload_length) return -1;
@@ -51,7 +52,9 @@ int nb_udp_wire_decode(const uint8_t* data, size_t length, nb_udp_wire_view_t* o
     out->fragment_count=get16(data+18);out->total_length=get16(data+20);
     out->route_length=get16(data+22);
     if(!nb_udp_wire_type_valid(out->type)||out->session_id==0||
-        out->fragment_count==0||out->fragment_count>66||out->fragment_index>=out->fragment_count||
+        out->fragment_count==0||out->fragment_count>66||
+        out->fragment_count!=nb_udp_fragment_count(out->total_length)||
+        out->fragment_index>=out->fragment_count||
         out->total_length==0||out->route_length==0||out->route_length>=NB_UDP_ROUTE_MAX||
         length<=(size_t)NB_UDP_WIRE_HEADER+out->route_length) return -1;
     size_t payload_length=length-NB_UDP_WIRE_HEADER-out->route_length;
