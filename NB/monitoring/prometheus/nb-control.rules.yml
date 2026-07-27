@@ -1,0 +1,24 @@
+groups:
+  - name: nb-control
+    rules:
+      - alert: NBControlPlaneDown
+        expr: up{job="nb-control"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NB control plane is unavailable"
+      - alert: NBWebDeliveryBacklog
+        expr: nb_control_outbox_pending > 100 or nb_control_outbox_failed > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NB web event delivery is backlogged"
+      - alert: NBWebDeliveryStalled
+        expr: time() - nb_control_web_last_delivery_unixtime > 900 and nb_control_outbox_pending > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NB web event delivery has stalled"

@@ -164,6 +164,17 @@ def run(c, cmd, tmo=120):
     return o.read().decode("utf-8", "replace") + e.read().decode("utf-8", "replace")
 
 
+def checked_run(c, cmd, tmo=120):
+    _i, o, e = c.exec_command(cmd, timeout=tmo)
+    stdout = o.read().decode("utf-8", "replace")
+    stderr = e.read().decode("utf-8", "replace")
+    status = o.channel.recv_exit_status()
+    if status != 0:
+        detail = (stdout + stderr).strip()
+        raise RuntimeError(f"remote command failed rc={status}: {detail[-4096:]}")
+    return stdout + stderr
+
+
 def launch(c, cmd, warmup=2.0):
     """启动后台服务, 不等 channel EOF(后台进程持有 stdout fd 会致 read 永久阻塞)。"""
     ch = c.get_transport().open_session()
@@ -348,9 +359,51 @@ def _backup_role_unit(c, role, release_id):
     raise RuntimeError(f"{role} 无法备份当前 systemd unit")
 
 
-def _rollback_release(c, role, previous, release_id, had_unit):
+def _mutable_role_paths(role):
+    paths = [
+        f"{DEPLOY_CERTS}/ca.pem",
+        f"{DEPLOY_CERTS}/{role}.pem",
+        f"{DEPLOY_CERTS}/{role}.key",
+    ]
+    if role == "entry":
+        paths += [f"{WORK}/socks.users", f"{WORK}/tenant.conf", _exit_routes_remote()]
+    return paths
+
+
+def _backup_role_state(c, role, release_id):
+    root = f"{WORK}/releases/{release_id}/previous-state"
+    run(c, f"mkdir -p {shlex.quote(root)}")
+    result = {}
+    for index, path in enumerate(_mutable_role_paths(role)):
+        backup = f"{root}/{index}"
+        output = run(c, f"if test -e {shlex.quote(path)}; then cp -p {shlex.quote(path)} {shlex.quote(backup)} && "
+                        "echo PRESENT; else echo ABSENT; fi")
+        if "PRESENT" in output:
+            result[path] = True
+        elif "ABSENT" in output:
+            result[path] = False
+        else:
+            raise RuntimeError(f"{role} mutable state backup failed: {path}")
+    return result
+
+
+def _restore_role_state(c, role, release_id, state):
+    root = f"{WORK}/releases/{release_id}/previous-state"
+    expected = _mutable_role_paths(role)
+    if set(state) != set(expected):
+        raise RuntimeError(f"{role} mutable state backup manifest mismatch")
+    for index, path in enumerate(expected):
+        if state[path]:
+            run(c, f"mkdir -p $(dirname {shlex.quote(path)}) && cp -p {shlex.quote(f'{root}/{index}')} {shlex.quote(path)}")
+        else:
+            run(c, f"rm -f {shlex.quote(path)}")
+
+
+def _rollback_release(c, role, previous, release_id, had_unit, mutable_state=None):
     unit = f"/etc/systemd/system/nb-{role}.service"
     backup = f"{WORK}/releases/{release_id}/previous-nb-{role}.service"
+    if mutable_state is not None:
+        _restore_role_state(c, role, release_id, mutable_state)
     if had_unit:
         restored = run(c, f"cp -p {shlex.quote(backup)} {shlex.quote(unit)} && systemctl daemon-reload && echo UNIT_RESTORED")
         if "UNIT_RESTORED" not in restored:
@@ -623,6 +676,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 Environment=NB_FEC_V15=on
+Environment=NB_WORKER_LANE_PORTS=on
 Environment=NB_CC={cc}
 Environment=NB_BBR_OPTIONS={bbr_options}
 {cwin_env}{mtu_env}{udp_gso_env}{release_env}{profile_env}{udp_advertise_env}{reorder_env}ExecStart={exec_start}

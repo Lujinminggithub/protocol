@@ -15,7 +15,8 @@ def main() -> None:
     names = [
         "_require_local_build", "_require_security_material", "connect", "run",
         "_acquire_deploy_lock", "_release_deploy_lock", "_stage_release",
-        "_backup_role_unit", "_append_deploy_audit", "_push_security",
+        "_backup_role_unit", "_backup_role_state", "_restore_role_state",
+        "_append_deploy_audit", "_push_security",
         "_push_tiktok_rules", "_ensure_remote_whitelist", "_push_exit_routes",
         "_node_command", "_activate_release", "_install_and_restart_role",
         "_verify_release_health", "_rollback_release", "_smoke_socks", "_prune_releases",
@@ -36,6 +37,8 @@ def main() -> None:
         deploy._release_deploy_lock = lambda c: events.append(("unlock", c.role))
         deploy._stage_release = lambda c, role, m, data: f"releases/old-{role}/nb_node"
         deploy._backup_role_unit = lambda *args: True
+        deploy._backup_role_state = lambda c, role, release: {"role": role}
+        deploy._restore_role_state = lambda c, role, release, state: events.append(("restore", role))
         deploy._append_deploy_audit = lambda *args, **kwargs: None
         deploy._append_exact_rollback_audit = lambda *args, **kwargs: None
         deploy._push_security = deploy._push_tiktok_rules = lambda *args, **kwargs: None
@@ -47,7 +50,7 @@ def main() -> None:
             if role == "middle": raise RuntimeError("injected middle failure")
         deploy._install_and_restart_role = install
         deploy._verify_release_health = lambda c, role, m: "ok"
-        deploy._rollback_release = lambda c, role, previous, release, had_unit: events.append(("rollback", role)) or "ok"
+        deploy._rollback_release = lambda c, role, previous, release, had_unit, state: events.append(("rollback", role)) or "ok"
         deploy._smoke_socks = lambda port: None
         deploy._prune_releases = lambda *args: "{}"
         try:
@@ -59,6 +62,7 @@ def main() -> None:
         assert [item for item in events if item[0] == "rollback"] == [
             ("rollback", "middle"), ("rollback", "exit")
         ]
+        assert [item for item in events if item[0] == "restore"] == [("restore", "entry")]
         assert {role for event, role in events if event == "unlock"} == {"entry", "middle", "exit"}
 
         events.clear();target="aaaaaaaaaaaaaaaa-bbbbbbbbbbbb"

@@ -59,6 +59,50 @@ static proxy_stream_t* ps_find_by_id(uint32_t id){
     return NULL;
 }
 
+static proxy_stream_t* ps_find_logical(uint64_t hi,uint64_t lo,const proxy_stream_t* exclude){
+    if(hi==0&&lo==0)return NULL;
+    for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
+        if(p!=exclude&&p->in_use&&p->logical_endpoint&&p->logical_flow_hi==hi&&p->logical_flow_lo==lo)return p;}
+    return NULL;
+}
+
+static int logical_endpoint_init(proxy_stream_t* p,uint64_t hi,uint64_t lo){
+    if(p==NULL||p->udp_mode||(hi==0&&lo==0))return -1;
+    p->logical_mode=1;p->logical_endpoint=1;p->logical_flow_hi=hi;p->logical_flow_lo=lo;
+    nb_lstream_tx_init(&p->logical_tx,hi,lo);nb_lstream_decoder_init(&p->logical_decoder);return 0;
+}
+
+static int logical_entry_init(proxy_stream_t* p){
+    if(p==NULL)return -1;
+    if(p->logical_endpoint)return 0;
+    uint64_t ids[2]={0,0};
+    for(int attempt=0;attempt<4&&ids[0]==0&&ids[1]==0;attempt++)picoquic_crypto_random(G.quic,ids,sizeof(ids));
+    return logical_endpoint_init(p,ids[0],ids[1]);
+}
+
+static void ps_release_rebind_shell(proxy_stream_t* shell){
+    if(shell==NULL||!shell->in_use)return;
+    nb_session_index_remove_value(&g_session_index,shell);
+    nb_ring_dispose(&shell->down_tx);nb_ring_dispose(&shell->up_tx);nb_ring_dispose(&shell->q2t);
+    nb_udp_reassembly_dispose(&shell->udp_reassembly);if(g_ps_inuse>0)g_ps_inuse--;memset(shell,0,sizeof(*shell));
+}
+
+static proxy_stream_t* logical_rebind_upstream(proxy_stream_t* shell,proxy_stream_t* existing){
+    if(shell==NULL||existing==NULL||shell==existing)return existing;
+    picoquic_cnx_t* cnx=shell->up_cnx;uint64_t sid=shell->up_stream_id;
+    picoquic_cnx_t* old_cnx=existing->up_cnx;uint64_t old_sid=existing->up_stream_id;
+    nb_session_index_remove_value(&g_session_index,existing);
+    nb_send_clear(&existing->up_tx,&existing->up_tx_clock);
+    nb_send_clear(&existing->q2t,&existing->q2t_clock);existing->logical_rx_next=existing->logical_rx_delivered;
+    if(!existing->logical_rx_fin_acked_sent){existing->logical_rx_fin_seen=0;existing->logical_rx_fin_offset=0;existing->q2t_fin=0;}
+    nb_lstream_decoder_init(&existing->logical_decoder);existing->up_cnx=cnx;existing->up_stream_id=sid;
+    existing->logical_reconnect_pending=0;existing->logical_disconnected_at=0;
+    existing->logical_reconnect_last_attempt=0;
+    picoquic_set_app_stream_ctx(cnx,sid,existing);
+    if(old_cnx&&old_cnx!=cnx){picoquic_set_app_stream_ctx(old_cnx,old_sid,NULL);picoquic_discard_stream(old_cnx,old_sid,0);}
+    ps_release_rebind_shell(shell);ps_index_refresh(existing);return existing;
+}
+
 static proxy_stream_t* ps_find_udp_up(picoquic_cnx_t* cnx,uint32_t session_id){
     proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_UDP_UP,(uintptr_t)cnx,session_id,0);
     if(indexed&&indexed->in_use&&indexed->udp_mode&&indexed->udp_session_id==session_id&&indexed->up_cnx==cnx)return indexed;
@@ -118,6 +162,10 @@ static void ps_clear_stream_ctx_once(picoquic_cnx_t* cnx, uint64_t sid,
 static void ps_free(proxy_stream_t* p){
     if(!p->in_use) return;               /* 幂等: 防拆流/回调重入导致 double free */
     if(p->close_reason[0] == 0) ps_set_close_reason(p, "released");
+    if(p->logical_endpoint)log4c_info("%s logical flow close id=%u flow=%016llx%016llx reason=%s tx_base=%llu tx_next=%llu replay=%zu rx_delivered=%llu rx_next=%llu",
+        role_name(G.role),p->id,(unsigned long long)p->logical_flow_hi,(unsigned long long)p->logical_flow_lo,p->close_reason,
+        (unsigned long long)p->logical_tx.base_offset,(unsigned long long)p->logical_tx.next_offset,p->logical_tx.replay_length,
+        (unsigned long long)p->logical_rx_delivered,(unsigned long long)p->logical_rx_next);
     if(p->udp_mode&&!p->udp_association&&!p->udp_close_received){if(G.role!=ROLE_EXIT)(void)udp_lifecycle_schedule(p->down_cnx,NB_UDP_TYPE_CLOSE,p->udp_session_id,p->route);if(G.role!=ROLE_ENTRY)(void)udp_lifecycle_schedule(p->up_cnx,NB_UDP_TYPE_CLOSE,p->udp_session_id,p->route);}
     if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);if(p->tenant_acquired)nb_tenant_release(&g_tenants,p->tenant_index,p->tenant_udp);}
     /* Business-session lifetime is not a route-health signal. Active probes own health updates. */
@@ -175,6 +223,7 @@ static void ps_free(proxy_stream_t* p){
     if(p->udp_fd>=0){ if(G.epoll_fd>=0)epoll_ctl(G.epoll_fd,EPOLL_CTL_DEL,p->udp_fd,NULL); close(p->udp_fd); }
     nb_ring_dispose(&p->down_tx);
     nb_ring_dispose(&p->up_tx);
+    nb_lstream_tx_dispose(&p->logical_tx);
     free(p->fec_dg_tx); p->fec_dg_tx=NULL;
     free(p->fec_stage_tx); p->fec_stage_tx=NULL;
     free(p->udp_down_tx);p->udp_down_tx=NULL;
@@ -674,6 +723,107 @@ static int queue_up(proxy_stream_t* p, const uint8_t* d, size_t n, int fin){
         picoquic_mark_active_stream(p->up_cnx, p->up_stream_id, 1, p);
     }
     return 0;
+}
+
+static int logical_queue_frame(proxy_stream_t* p,int to_down,uint8_t type,uint64_t offset,
+    const uint8_t* payload,uint32_t payload_length){
+    uint8_t wire[NB_LSTREAM_HEADER+NB_LSTREAM_DATA_MAX];
+    int length=nb_lstream_frame_encode(wire,sizeof(wire),type,p->logical_flow_hi,p->logical_flow_lo,
+        offset,payload,payload_length);
+    if(length<0)return -1;
+    return to_down?queue_down(p,wire,(size_t)length,0):queue_up(p,wire,(size_t)length,0);
+}
+
+static int logical_replay(proxy_stream_t* p,int to_down){
+    nb_lstream_tx_t* tx=&p->logical_tx;size_t position=0;
+    while(position<tx->replay_length){size_t part=tx->replay_length-position;
+        if(part>NB_LSTREAM_DATA_MAX)part=NB_LSTREAM_DATA_MAX;
+        if(logical_queue_frame(p,to_down,NB_LSTREAM_DATA,tx->base_offset+position,
+            tx->replay+position,(uint32_t)part)!=0)return -1;
+        position+=part;}
+    if(tx->fin_queued&&!tx->fin_acked&&logical_queue_frame(p,to_down,NB_LSTREAM_FIN,tx->fin_offset,NULL,0)!=0)return -1;
+    return 0;
+}
+
+static int logical_send_data(proxy_stream_t* p,int to_down,const uint8_t* data,size_t length,int fin){
+    size_t position=0;
+    while(position<length){size_t part=length-position;if(part>NB_LSTREAM_DATA_MAX)part=NB_LSTREAM_DATA_MAX;
+        uint64_t offset=0;if(nb_lstream_tx_append(&p->logical_tx,data+position,part,&offset)!=0)return -1;
+        if(logical_queue_frame(p,to_down,NB_LSTREAM_DATA,offset,data+position,(uint32_t)part)!=0)return -1;
+        position+=part;}
+    if(fin){if(nb_lstream_tx_fin(&p->logical_tx)!=0||logical_queue_frame(p,to_down,NB_LSTREAM_FIN,
+        p->logical_tx.fin_offset,NULL,0)!=0)return -1;}
+    return 0;
+}
+
+static int logical_send_ack(proxy_stream_t* p,int force){
+    uint64_t now=picoquic_current_time();
+    if(!force&&p->logical_rx_delivered-p->logical_last_ack_offset<16384&&
+        p->logical_last_ack_at&&now-p->logical_last_ack_at<20000)return 0;
+    if(p->logical_rx_delivered==p->logical_last_ack_offset&&!force)return 0;
+    int to_down=G.role==ROLE_ENTRY;
+    if(logical_queue_frame(p,to_down,NB_LSTREAM_ACK,p->logical_rx_delivered,NULL,0)!=0)return -1;
+    p->logical_last_ack_offset=p->logical_rx_delivered;p->logical_last_ack_at=now;return 0;
+}
+
+static int logical_receive_frame(void* context,const nb_lstream_frame_t* frame){
+    proxy_stream_t* p=context;if(p==NULL||!p->in_use||!p->logical_endpoint||
+        frame->flow_hi!=p->logical_flow_hi||frame->flow_lo!=p->logical_flow_lo)return -1;
+    int to_down=G.role==ROLE_ENTRY;
+    if(frame->type==NB_LSTREAM_OPEN)return frame->offset==0?0:-1;
+    if(frame->type==NB_LSTREAM_ACK)return nb_lstream_tx_ack(&p->logical_tx,frame->offset);
+    if(frame->type==NB_LSTREAM_FIN_ACK){if(!p->logical_tx.fin_queued||frame->offset!=p->logical_tx.fin_offset)return -1;
+        p->logical_tx.fin_acked=1;return nb_lstream_tx_ack(&p->logical_tx,frame->offset);}
+    if(frame->type==NB_LSTREAM_DATA){
+        uint64_t end=frame->offset+frame->payload_length;if(end<frame->offset)return -1;
+        if(end<=p->logical_rx_next){(void)logical_send_ack(p,1);return 0;}
+        if(frame->offset!=p->logical_rx_next)return -1;
+        if(q2t_append(p,frame->payload,frame->payload_length)!=0)return -1;
+        p->logical_rx_next=end;
+        if(p->logical_rx_fin_seen&&p->logical_rx_next==p->logical_rx_fin_offset)p->q2t_fin=1;
+        return 0;
+    }
+    if(frame->type==NB_LSTREAM_FIN){if(frame->offset<p->logical_rx_next)return -1;
+        p->logical_rx_fin_seen=1;p->logical_rx_fin_offset=frame->offset;
+        if(frame->offset==p->logical_rx_next)p->q2t_fin=1;
+        if(G.role==ROLE_ENTRY)p->down_fin_seen=1;else p->up_fin_seen=1;return 0;}
+    if(frame->type==NB_LSTREAM_RESUME||frame->type==NB_LSTREAM_RESUME_ACK){
+        if(nb_lstream_tx_ack(&p->logical_tx,frame->offset)!=0)return -1;
+        if(frame->type==NB_LSTREAM_RESUME&&logical_queue_frame(p,to_down,NB_LSTREAM_RESUME_ACK,
+            p->logical_rx_delivered,NULL,0)!=0)return -1;
+        return logical_replay(p,to_down);
+    }
+    if(frame->type==NB_LSTREAM_RST){p->need_teardown=1;return 0;}
+    return -1;
+}
+
+static int logical_receive(proxy_stream_t* p,const uint8_t* data,size_t length){
+    return nb_lstream_decoder_feed(&p->logical_decoder,data,length,logical_receive_frame,p);
+}
+
+static void logical_note_delivered(proxy_stream_t* p,size_t length){
+    if(p==NULL||!p->logical_endpoint||length==0)return;
+    p->logical_rx_delivered+=length;
+    if(logical_send_ack(p,p->logical_rx_fin_seen&&p->logical_rx_delivered==p->logical_rx_fin_offset)!=0)p->need_teardown=1;
+}
+
+static void logical_note_fin_delivered(proxy_stream_t* p){
+    if(p==NULL||!p->logical_endpoint||!p->logical_rx_fin_seen||p->logical_rx_fin_acked_sent||
+        p->logical_rx_delivered!=p->logical_rx_fin_offset)return;
+    int to_down=G.role==ROLE_ENTRY;
+    if(logical_queue_frame(p,to_down,NB_LSTREAM_FIN_ACK,p->logical_rx_fin_offset,NULL,0)!=0)p->need_teardown=1;
+    else p->logical_rx_fin_acked_sent=1;
+}
+
+static void logical_detach(proxy_stream_t* p,picoquic_cnx_t* cnx){
+    if(p==NULL||!p->logical_endpoint)return;
+    nb_session_index_remove_value(&g_session_index,p);
+    if(G.role==ROLE_ENTRY&&p->down_cnx==cnx){p->down_cnx=NULL;p->down_opened=0;p->down_prefix_len=p->down_prefix_off=0;
+        nb_send_clear(&p->down_tx,&p->down_tx_clock);p->logical_reconnect_pending=1;}
+    else if(G.role==ROLE_EXIT&&p->up_cnx==cnx){p->up_cnx=NULL;nb_send_clear(&p->up_tx,&p->up_tx_clock);p->logical_reconnect_pending=1;}
+    nb_send_clear(&p->q2t,&p->q2t_clock);p->logical_rx_next=p->logical_rx_delivered;
+    if(!p->logical_rx_fin_acked_sent){p->logical_rx_fin_seen=0;p->logical_rx_fin_offset=0;p->q2t_fin=0;}
+    nb_lstream_decoder_init(&p->logical_decoder);p->logical_disconnected_at=picoquic_current_time();ps_index_refresh(p);
 }
 
 /* 非阻塞 connect 目标 TCP(exit): 用已(异步)解析好的地址, 不在事件循环内做阻塞 DNS */

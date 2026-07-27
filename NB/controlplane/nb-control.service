@@ -1,0 +1,27 @@
+[Unit]
+Description=Newbility operations control plane
+After=network-online.target nb-entry.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/NB/nb-control.env
+ExecStart=/usr/local/bin/nb-control
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=nb-control
+StateDirectoryMode=0700
+ReadWritePaths=/etc/NB
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

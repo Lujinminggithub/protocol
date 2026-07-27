@@ -298,6 +298,14 @@ static void pool_close_candidate(cnx_pool_t* pool,int idx){
     }
 }
 
+static int pool_migrate_logical(picoquic_cnx_t* old){
+    if(G.role!=ROLE_ENTRY||old==NULL)return 0;
+    int migrated=0;
+    for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
+        if(p->in_use&&p->logical_endpoint&&p->down_cnx==old){logical_detach(p,old);migrated++;}}
+    return migrated;
+}
+
 static int pool_promote_replacement(cnx_pool_t* pool,int pool_id,int idx){
     picoquic_cnx_t* replacement=pool->replacement_cnx[idx];
     if(!pool_cnx_ready(replacement)||pool->draining_cnx[idx]!=NULL)return 0;
@@ -305,7 +313,8 @@ static int pool_promote_replacement(cnx_pool_t* pool,int pool_id,int idx){
     pool->cnx[idx]=replacement;pool->replacement_cnx[idx]=NULL;pool->replacement_closing[idx]=0;
     pool->next_sid[idx]=0;nb_pool_slot_reset_quality(pool,idx);memset(&pool->health[idx],0,sizeof(pool->health[idx]));
     g_metrics_state.pool_mbb_promotions++;
-    log4c_warn("pool[%d:%d] make-before-break promoted old_streams=%d",pool_id,idx,pool_slot_streams(old));
+    int old_streams=pool_slot_streams(old);int migrated=pool_migrate_logical(old);
+    log4c_warn("pool[%d:%d] make-before-break promoted old_streams=%d logical_migrated=%d",pool_id,idx,old_streams,migrated);
     return 1;
 }
 
@@ -351,6 +360,8 @@ static void pool_health_tick(uint64_t now){
 
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol){
     if(p->down_pool_id<0||p->down_pool_id>=G.pool_count){log4c_error("id=%u has no downstream pool",p->id);return -1;}
+    if(G.role==ROLE_ENTRY&&!p->udp_mode&&p->probe_mode==0&&!p->logical_endpoint&&logical_entry_init(p)!=0){
+        log4c_error("id=%u logical flow allocation failed",p->id);return -1;}
     cnx_pool_t* pool=&G.pools[p->down_pool_id];
     int prio = pol ? pol->prio : p->prio;
     double best_loss=-1.0, best_jitter_ms=-1.0;
@@ -363,7 +374,7 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     int v15_prio_ok = pol ? (pol->fec_hint == NB_FLOW_FEC_FORCE_ON || pol->fec_hint == NB_FLOW_FEC_AUTO) : prio_is_fec_candidate(prio);
     int fec_v15_would_enable = (G.role==ROLE_MIDDLE && g_fec_v15_observe && v15_prio_ok &&
         (line_bad || g_fec_v15_force));
-    int fec_v15 = (g_fec_v15_active && fec_v15_would_enable);
+    int fec_v15 = (g_fec_v15_active && fec_v15_would_enable && !p->logical_mode);
     if(pol) apply_flow_policy(p, pol);
     if((G.role==ROLE_MIDDLE || G.role==ROLE_ENTRY) && latency_hint){
         log4c_info("%s id=%u fec gate route=%s class=%s lane=%s fec_hint=%s rule=%s prio=%d line_bad=%d coldstart=%d best=%d best_loss=%.2f best_jitter=%.1fms v15_active=%d v15_would=%d",
@@ -420,9 +431,18 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     }
     p->down_opened=1;
     {
-        char hdr[340]; int hl=snprintf(hdr,sizeof(hdr),"%d;%s\n",prio,route);
+        char hdr[390],flow[33];int hl=0;
+        if(p->logical_mode&&nb_lstream_flow_render(flow,p->logical_flow_hi,p->logical_flow_lo)==0)
+            hl=snprintf(hdr,sizeof(hdr),"%d;L=%s;%s\n",prio,flow,route);
+        else hl=snprintf(hdr,sizeof(hdr),"%d;%s\n",prio,route);
         if(hl<=0||(size_t)hl>=sizeof(hdr)||queue_down_prefix(p,(const uint8_t*)hdr,(size_t)hl)!=0){
             log4c_error("id=%u queue route to downstream fail", p->id); return -1; }
+    }
+    if(G.role==ROLE_ENTRY&&p->logical_endpoint){
+        int resume=p->logical_reconnect_pending;
+        if(logical_queue_frame(p,1,resume?NB_LSTREAM_RESUME:NB_LSTREAM_OPEN,
+            resume?p->logical_rx_delivered:0,NULL,0)!=0)return -1;
+        p->logical_reconnect_pending=0;p->logical_disconnected_at=0;p->logical_reconnect_last_attempt=0;
     }
     if(ps_is_rtc_webcast(p)) log4c_info("%s tcp trace id=%u stage=stream-open age=%.1fms request_to_open=%.1fms sid=%llu route=%s",
         role_name(G.role),p->id,trace_delta_ms(p->downstream_open_at,p->created_at),
@@ -430,10 +450,32 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     return 0;
 }
 
+static void logical_reconnect_tick(uint64_t now){
+    if(G.role!=ROLE_ENTRY)return;
+    for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
+        if(!p->in_use||!p->logical_endpoint||!p->logical_reconnect_pending||p->down_cnx!=NULL)continue;
+        if(p->logical_reconnect_last_attempt&&now-p->logical_reconnect_last_attempt<250000ULL)continue;
+        p->logical_reconnect_last_attempt=now;
+        if(p->logical_disconnected_at&&now>p->logical_disconnected_at&&
+            now-p->logical_disconnected_at>60000000ULL){
+            ps_teardown_reason(p,"logical-resume-timeout");continue;}
+        nb_flow_policy_t pol;nb_flow_policy_default(&pol);pol.prio=p->prio;pol.flow_class=p->flow_class;
+        pol.lane_hint=p->lane_hint;pol.fec_hint=p->fec_hint;snprintf(pol.rule_name,sizeof(pol.rule_name),"%s",p->flow_rule);
+        if(downstream_open_stream(p,p->route,&pol)==0)
+            log4c_warn("entry logical flow resumed id=%u flow=%016llx%016llx sid=%llu",
+                p->id,(unsigned long long)p->logical_flow_hi,(unsigned long long)p->logical_flow_lo,
+                (unsigned long long)p->down_stream_id);
+        else log4c_warn("entry logical flow resume deferred id=%u flow=%016llx%016llx",
+            p->id,(unsigned long long)p->logical_flow_hi,(unsigned long long)p->logical_flow_lo);
+    }
+}
+
 static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
     ps_touch(p);
     ps_note_payload(p, 1, n);
-    if(G.role==ROLE_EXIT){
+    if(G.role==ROLE_ENTRY&&p->logical_endpoint){
+        if(logical_send_data(p,1,d,n,fin)!=0)p->need_teardown=1;
+    } else if(G.role==ROLE_EXIT){
         if(q2t_append(p,d,n)!=0){ p->need_teardown=1; return; }
         if(fin) p->q2t_fin=1;
     } else {
@@ -450,7 +492,9 @@ static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
 static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
     ps_touch(p);
     ps_note_payload(p, 0, n);
-    if(G.role==ROLE_ENTRY){
+    if(G.role==ROLE_EXIT&&p->logical_endpoint){
+        if(logical_send_data(p,0,d,n,fin)!=0)p->need_teardown=1;
+    } else if(G.role==ROLE_ENTRY){
         if(q2t_append(p,d,n)!=0){ p->need_teardown=1; return; }
         if(fin) p->q2t_fin=1;
     } else { /* middle / exit: 写回上游 QUIC stream */
@@ -469,6 +513,7 @@ static proxy_stream_t* udp_middle_open(picoquic_cnx_t* cnx,const nb_udp_wire_vie
     const char* route,char* rest,size_t rest_cap){
     char next_host[256];int next_port=0;
     if(udp_route_consume_h(route,next_host,sizeof(next_host),&next_port,rest,rest_cap)!=0)return NULL;
+    next_port=worker_lane_port(next_port);if(next_port<1)return NULL;
     struct sockaddr_storage addr;int is_name=0;
     if(picoquic_get_server_address(next_host,next_port,&addr,&is_name)!=0)return NULL;
     proxy_stream_t* p=ps_alloc();if(p==NULL)return NULL;p->udp_mode=1;p->udp_session_id=view->session_id;

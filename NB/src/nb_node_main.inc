@@ -161,7 +161,12 @@ int main(int argc,char**argv){
             }
             g_socks_auth_enabled=1;log4c_info("SOCKS authentication loaded users=%zu",g_socks_users.count);
         }
-        if(tenants_path){char error[256];if(nb_tenants_load(&g_tenants,tenants_path,error,sizeof(error))!=0){log4c_error("tenant config rejected: %s",error);log4c_shutdown();return 1;}g_tenants_enabled=1;log4c_info("tenant quotas loaded tenants=%zu",g_tenants.count);}
+        if(tenants_path){char error[256],state_path[512];const char* configured_state=getenv("NB_TENANT_STATE");
+            if(nb_tenants_load(&g_tenants,tenants_path,error,sizeof(error))!=0){log4c_error("tenant config rejected: %s",error);log4c_shutdown();return 1;}
+            if(configured_state&&*configured_state)snprintf(state_path,sizeof(state_path),"%s",configured_state);
+            else if(snprintf(state_path,sizeof(state_path),"%s.state",tenants_path)<0||strlen(state_path)>=sizeof(state_path)-1){log4c_error("tenant state path is too long");log4c_shutdown();return 1;}
+            if(nb_tenants_enable_shared(&g_tenants,state_path,error,sizeof(error))!=0){log4c_error("shared tenant state rejected: %s",error);log4c_shutdown();return 1;}
+            g_tenants_enabled=1;log4c_info("tenant quotas loaded tenants=%zu shared_state=%s",g_tenants.count,state_path);}
         if(exit_routes_path){
             char error[256];
             if(nb_routes_load(&G.exit_routes,exit_routes_path,error,sizeof(error))!=0){
@@ -174,6 +179,7 @@ int main(int argc,char**argv){
     if(G.role==ROLE_ENTRY){
         int is_name=0;
         if(!listen_port||!next_host||!next_port||(!G.socks_enabled && !route)){ usage(argv[0]); log4c_shutdown(); return 1; }
+        next_port=worker_lane_port(next_port);if(next_port<1){log4c_error("invalid worker lane next-hop port");log4c_shutdown();return 1;}
         if(picoquic_get_server_address(next_host,next_port,&G.next_addr,&is_name)!=0){
             log4c_error("resolve hop1 %s:%d fail",next_host,next_port); log4c_shutdown(); return 1; }
         G.next_configured=1;
@@ -184,6 +190,7 @@ int main(int argc,char**argv){
         }
     } else {
         if(!quic_port){ usage(argv[0]); log4c_shutdown(); return 1; }
+        quic_port=worker_lane_port(quic_port);if(quic_port<1){log4c_error("invalid worker lane listen port");log4c_shutdown();return 1;}
     }
     if(outbound_ip){
         if(G.role!=ROLE_EXIT){log4c_error("-o outbound source address is only valid for exit");log4c_shutdown();return 1;}
@@ -526,8 +533,12 @@ int main(int argc,char**argv){
               ps_update_runtime_policy(&G.streams[i],metrics_now);
               sched_refresh_stream(&G.streams[i],metrics_now);
               ps_log_media_metrics(&G.streams[i],metrics_now);
+              if(G.streams[i].logical_endpoint&&G.streams[i].logical_rx_delivered>
+                  G.streams[i].logical_last_ack_offset&&logical_send_ack(&G.streams[i],0)!=0)
+                  ps_teardown_reason(&G.streams[i],"logical-ack-queue");
           }
           if(G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE)pool_health_tick(metrics_now);
+          if(G.role==ROLE_ENTRY)logical_reconnect_tick(metrics_now);
         }
         /* 白名单热重载(限流 ~5s 检查一次文件 mtime) */
         if(nb_whitelist_configured()){ static uint64_t wl_last=0; uint64_t tn=picoquic_current_time();
@@ -660,6 +671,7 @@ int main(int argc,char**argv){
               loop_iterations=0;loop_over_5ms=0;loop_over_20ms=0;
           } }
     }
+    if(g_tenants_enabled)nb_tenants_close(&g_tenants);
     log4c_shutdown();
     return 0;
 }

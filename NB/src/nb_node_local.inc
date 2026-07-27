@@ -239,7 +239,8 @@ static void flush_q2t(proxy_stream_t* p){
                     trace_delta_ms(p->first_q2t_flush_at,p->created_at),
                     trace_delta_ms(p->first_q2t_flush_at,p->first_q2t_queue_at),n,p->q2t.len,p->route);
             }
-            nb_send_consume(&p->q2t,&p->q2t_clock,(size_t)n); ps_touch(p);
+            nb_send_consume(&p->q2t,&p->q2t_clock,(size_t)n);
+            logical_note_delivered(p,(size_t)n);ps_touch(p);
         }
         else if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK){
             /* 本地 TCP 已死(EPIPE/ECONNRESET/...): 待写数据无处可去, 丢弃并标记 EOF -> 触发回收,
@@ -252,7 +253,7 @@ static void flush_q2t(proxy_stream_t* p){
         else break; /* EAGAIN: 等下轮可写 */
     }
     if(p->q2t.len==0 && p->q2t_fin){
-        shutdown(p->tcp_fd,SHUT_WR);p->q2t_fin=0;
+        shutdown(p->tcp_fd,SHUT_WR);p->q2t_fin=0;logical_note_fin_delivered(p);
         if(G.role==ROLE_ENTRY&&p->probe_mode==3){ps_teardown_reason(p,"probe-complete");return;}
     }
 }
@@ -262,6 +263,7 @@ static int tcp_read_allowed(proxy_stream_t* p){
     nb_live_queue_clock_t* main_clock=(G.role==ROLE_ENTRY)?&p->down_tx_clock:&p->up_tx_clock;
     size_t stage_q=p->fec_stage_tx_len;
     size_t dg_q=p->fec_dg_tx_len;
+    size_t replay_q=p->logical_endpoint?p->logical_tx.replay_length:0;
     uint64_t now=picoquic_current_time();
     if(p->tenant_throttled_until>now)return 0;
     p->tenant_throttled_until=0;
@@ -270,14 +272,14 @@ static int tcp_read_allowed(proxy_stream_t* p){
     int age_limited=p->flow_class==NB_FLOW_CLASS_MEDIA;
     if(p->tcp_read_paused){
         if(main_q<=limits.low_bytes&&(!age_limited||queue_age<limits.deadline_us)&&
-            stage_q<=limits.low_bytes&&dg_q<=NB_FEC_DG_LOW){
+            stage_q<=limits.low_bytes&&dg_q<=NB_FEC_DG_LOW&&replay_q<=limits.low_bytes){
             p->tcp_read_paused=0;
             log4c_info("%s tcp read resumed id=%u class=%s main=%zu age=%.1fms low=%zu route=%s",
                 role_name(G.role),p->id,nb_flow_class_name(p->flow_class),main_q,
                 queue_age/1000.0,limits.low_bytes,p->route);
         }
     }else if(main_q>=limits.high_bytes||(age_limited&&queue_age>=limits.deadline_us)||
-        stage_q>=limits.high_bytes||dg_q>=NB_FEC_DG_HIGH){
+        stage_q>=limits.high_bytes||dg_q>=NB_FEC_DG_HIGH||replay_q>=NB_LSTREAM_REPLAY_MAX){
         p->tcp_read_paused=1;
         log4c_info("%s tcp read paused id=%u class=%s main=%zu age=%.1fms stage=%zu dg=%zu high=%zu route=%s",
             role_name(G.role),p->id,nb_flow_class_name(p->flow_class),main_q,queue_age/1000.0,
@@ -370,8 +372,8 @@ static void udp_local_drain(proxy_stream_t* p){
                 log4c_warn("entry UDP relay drop id=%u target=%s:%d reason=%s",p->id,host,port,reject_reason?reject_reason:"unknown");
                 continue;
             }
-            if(g_tenants_enabled&&nb_tenant_allowance(&g_tenants,child->tenant_index,payload_len,picoquic_current_time())<payload_len){p->udp_assoc_policy_drop++;continue;}
-            if(g_tenants_enabled)nb_tenant_consume(&g_tenants,child->tenant_index,payload_len);
+            if(g_tenants_enabled){size_t taken=nb_tenant_take(&g_tenants,child->tenant_index,payload_len,picoquic_current_time());
+                if(taken<payload_len){nb_tenant_refund(&g_tenants,child->tenant_index,taken);p->udp_assoc_policy_drop++;continue;}}
             if(child->udp_first_local_c2s_at==0){
                 child->udp_first_local_c2s_at=picoquic_current_time();
                 log4c_info("entry udp trace id=%u usid=%u stage=phone-first-rx association_age=%.1fms flow_age=%.1fms bytes=%zu target=%s:%d",
@@ -404,18 +406,25 @@ static void udp_local_drain(proxy_stream_t* p){
 static void pump_tcp(proxy_stream_t* p){
     uint8_t buf[16384]; ssize_t n;
     for(;;){
-        size_t limit=g_tenants_enabled?nb_tenant_allowance(&g_tenants,p->tenant_index,sizeof(buf),picoquic_current_time()):sizeof(buf);if(limit==0){p->tenant_throttled_until=picoquic_current_time()+10000ULL;break;}
+        size_t desired=sizeof(buf);
+        if(p->logical_endpoint){
+            if(p->logical_tx.replay_length>=NB_LSTREAM_REPLAY_MAX){(void)tcp_read_allowed(p);break;}
+            size_t replay_left=NB_LSTREAM_REPLAY_MAX-p->logical_tx.replay_length;
+            if(desired>replay_left)desired=replay_left;
+        }
+        size_t limit=g_tenants_enabled?nb_tenant_take(&g_tenants,p->tenant_index,desired,picoquic_current_time()):desired;if(limit==0){p->tenant_throttled_until=picoquic_current_time()+10000ULL;break;}
         n=recv(p->tcp_fd,buf,limit,0);
         if(n>0){
-            if(g_tenants_enabled)nb_tenant_consume(&g_tenants,p->tenant_index,(size_t)n);
+            if(g_tenants_enabled&&(size_t)n<limit)nb_tenant_refund(&g_tenants,p->tenant_index,limit-(size_t)n);
             if(G.role==ROLE_ENTRY) fwd_down(p,buf,(size_t)n,0); else fwd_up(p,buf,(size_t)n,0);
             if(p->need_teardown||!tcp_read_allowed(p))break;
         }
-        else if(n==0){ p->tcp_eof=1;ps_set_close_reason(p,G.role==ROLE_ENTRY?"client-eof":"target-eof");
+        else if(n==0){if(g_tenants_enabled)nb_tenant_refund(&g_tenants,p->tenant_index,limit);p->tcp_eof=1;ps_set_close_reason(p,G.role==ROLE_ENTRY?"client-eof":"target-eof");
             if(G.role==ROLE_ENTRY) fwd_down(p,NULL,0,1); else fwd_up(p,NULL,0,1);
             break; }
-        else if(errno==EAGAIN||errno==EWOULDBLOCK)break;
+        else if(errno==EAGAIN||errno==EWOULDBLOCK){if(g_tenants_enabled)nb_tenant_refund(&g_tenants,p->tenant_index,limit);break;}
         else{
+            if(g_tenants_enabled)nb_tenant_refund(&g_tenants,p->tenant_index,limit);
             log4c_debug("id=%u tcp recv err=%s",p->id,strerror(errno));p->tcp_eof=1;
             ps_set_close_reason(p,"tcp-recv-error");
             if(G.role==ROLE_ENTRY)fwd_down(p,NULL,0,1);else fwd_up(p,NULL,0,1);break;
@@ -438,9 +447,12 @@ static void maybe_free(proxy_stream_t* p){
         ?p->down_prefix_len-p->down_prefix_off:0;
     int reliable_pending=prefix_left>0||p->down_tx.len>0||p->up_tx.len>0||p->q2t.len>0||
         p->down_tx_fin||p->up_tx_fin||p->fec_stage_tx_len>0||p->fec_stage_tx_fin||p->fec_dg_tx_len>0||
-        (p->fec_sidecar_mode&&p->fec_engine!=NULL&&!nb_fec_tx_complete(p->fec_engine));
+        (p->fec_sidecar_mode&&p->fec_engine!=NULL&&!nb_fec_tx_complete(p->fec_engine))||
+        (p->logical_endpoint&&(p->logical_tx.replay_length>0||
+            (p->logical_tx.fin_queued&&!p->logical_tx.fin_acked)));
     if(left_done && right_done && !reliable_pending){ ps_teardown_reason(p,"bidirectional-fin"); return; }
-    if(G.role==ROLE_ENTRY && p->tcp_eof && p->q2t.len==0 && p->probe_mode==0){
+    if(G.role==ROLE_ENTRY && p->tcp_eof && p->q2t.len==0 && p->probe_mode==0&&
+        !p->logical_endpoint){
         ps_teardown_reason(p,"entry-client-eof"); return;
     }
 }

@@ -29,7 +29,7 @@
   "build_host": "entry",
   "release_retention": 5,
   "workers": {
-    "entry": 1,
+    "entry": 2,
     "middle": 2,
     "exit": 2
   },

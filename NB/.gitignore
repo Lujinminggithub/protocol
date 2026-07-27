@@ -1,5 +1,6 @@
 /build/security/
 /build/nb_node
+/build/nb-control
 /build/*.pem
 /build/*.key
 /build/*.users

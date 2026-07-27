@@ -42,6 +42,10 @@ def main() -> None:
         "client/xraydemo/nbproto/metadata_test.go",
         "client/xraydemo/nbproto/xray_adapter.go",
         "client/xraydemo/nbproto/xray_adapter_test.go",
+        "client/xraydemo/nbproto/udp_frag.go",
+        "client/xraydemo/nbproto/udp_frag_test.go",
+        "client/xraydemo/nbproto/udp_transport.go",
+        "client/xraydemo/nbproto/udp_transport_test.go",
         "client/xraydemo/cmd/nbproto-demo/main.go",
     )
     for name in required:

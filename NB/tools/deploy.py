@@ -30,7 +30,7 @@ BUILD_CMD = (
     "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >>/tmp/nbcmake.log 2>&1 && "
     "ionice -c3 nice -n 10 cmake --build build -j2 >>/tmp/nbcmake.log 2>&1 && "
     "test -r tools/nb_supervisor.py -a -r scripts/runtri.sh && "
-    f"NB_MIDDLE_WORKERS={_effective_workers('middle')} NB_EXIT_WORKERS={_effective_workers('exit')} "
+    f"NB_WORKER_LANE_PORTS=on NB_ENTRY_WORKERS={_effective_workers('entry')} NB_MIDDLE_WORKERS={_effective_workers('middle')} NB_EXIT_WORKERS={_effective_workers('exit')} "
     "NB_KEEP_TMP=1 NB_BIN=" + COMPILE_WORK + "/build/nb_node bash scripts/runtri.sh >>/tmp/nbcmake.log 2>&1; "
     "rc=$?; echo NB_BUILD_GATE_RC=$rc; tail -40 /tmp/nbcmake.log; exit $rc"
 )
@@ -44,6 +44,8 @@ BUILD_FILES = {
     "src/nb_policy.h": SRC / "nb_policy.h",
     "src/nb_live.c": SRC / "nb_live.c",
     "src/nb_live.h": SRC / "nb_live.h",
+    "src/nb_lstream.c": SRC / "nb_lstream.c",
+    "src/nb_lstream.h": SRC / "nb_lstream.h",
     "src/nb_metrics.c": SRC / "nb_metrics.c",
     "src/nb_metrics.h": SRC / "nb_metrics.h",
     "src/nb_session_index.c": SRC / "nb_session_index.c",
@@ -86,6 +88,8 @@ BUILD_FILES = {
     "src/nb_routes.h": SRC / "nb_routes.h",
     "src/nb_tenant.c": SRC / "nb_tenant.c",
     "src/nb_tenant.h": SRC / "nb_tenant.h",
+    "src/nb_tenant_shared.c": SRC / "nb_tenant_shared.c",
+    "src/nb_tenant_shared.h": SRC / "nb_tenant_shared.h",
     "src/nb_udp.c": SRC / "nb_udp.c",
     "src/nb_udp.h": SRC / "nb_udp.h",
     "src/nb_v2_metadata.c": SRC / "nb_v2_metadata.c",
@@ -102,6 +106,7 @@ BUILD_FILES = {
     "tools/test_control.c": ROOT / "tools" / "test_control.c",
     "tools/test_routes.c": ROOT / "tools" / "test_routes.c",
     "tools/test_udp.c": ROOT / "tools" / "test_udp.c",
+    "tools/test_lstream.c": ROOT / "tools" / "test_lstream.c",
     "tools/test_v2_metadata.c": ROOT / "tools" / "test_v2_metadata.c",
     "tools/test_udp_io.c": ROOT / "tools" / "test_udp_io.c",
     "tools/test_udp_lifecycle.c": ROOT / "tools" / "test_udp_lifecycle.c",
@@ -303,6 +308,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
     clients = {}
     previous = {}
     unit_backups = {}
+    state_backups = {}
     activated = []
     locked = []
     deployment_id = _deployment_id(manifest)
@@ -314,6 +320,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             run(clients[role], f"mkdir -p {WORK}/logs")
             previous[role] = _stage_release(clients[role], role, manifest, bindata)
             unit_backups[role] = _backup_role_unit(clients[role], role, deployment_id)
+            state_backups[role] = _backup_role_state(clients[role], role, deployment_id)
             _append_deploy_audit(clients[role], role, "staged", manifest, previous[role])
             print(f"{role}: deployment={deployment_id} 预上传及哈希校验完成")
 
@@ -359,12 +366,18 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
         for role in reversed(activated):
             try:
                 state = _rollback_release(
-                    clients[role], role, previous[role], deployment_id, unit_backups[role]
+                    clients[role], role, previous[role], deployment_id, unit_backups[role],
+                    state_backups[role],
                 )
                 _append_deploy_audit(clients[role], role, "rolled_back", manifest, previous[role], state)
                 print(f"{role}: 已回滚到 {previous[role]} ({state})")
             except Exception as rollback_error:
                 print(f"{role}: 自动回滚失败: {rollback_error}", file=sys.stderr)
+        for role in reversed([item for item in locked if item not in activated]):
+            try:
+                _restore_role_state(clients[role], role, deployment_id, state_backups[role])
+            except Exception as rollback_error:
+                print(f"{role}: mutable state restore failed: {rollback_error}", file=sys.stderr)
         raise
     finally:
         for role in locked:

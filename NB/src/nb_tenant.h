@@ -22,14 +22,23 @@ typedef struct {
     uint64_t token_updated_us;
 } nb_tenant_t;
 
-typedef struct { nb_tenant_t items[NB_TENANT_MAX]; size_t count; } nb_tenants_t;
+typedef struct {
+    nb_tenant_t items[NB_TENANT_MAX];
+    size_t count;
+    int shared_fd;
+    void* shared_state;
+} nb_tenants_t;
 
 int nb_tenants_load(nb_tenants_t* out,const char* path,char* error,size_t error_cap);
+int nb_tenants_enable_shared(nb_tenants_t* tenants,const char* path,char* error,size_t error_cap);
+void nb_tenants_close(nb_tenants_t* tenants);
 int nb_tenant_find(const nb_tenants_t* tenants,const char* name);
 int nb_tenant_acquire(nb_tenants_t* tenants,int index,int udp,uint64_t now_us);
 void nb_tenant_release(nb_tenants_t* tenants,int index,int udp);
 size_t nb_tenant_allowance(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us);
 void nb_tenant_consume(nb_tenants_t* tenants,int index,size_t bytes);
+size_t nb_tenant_take(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us);
+void nb_tenant_refund(nb_tenants_t* tenants,int index,size_t bytes);
 void nb_tenant_account(nb_tenants_t* tenants,int index,uint64_t up,uint64_t down);
 int nb_tenants_render_json(const nb_tenants_t* tenants,char* out,size_t cap);
 

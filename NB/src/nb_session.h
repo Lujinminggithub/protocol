@@ -9,6 +9,7 @@
 #include "nb_auth.h"
 #include "nb_fec.h"
 #include "nb_live.h"
+#include "nb_lstream.h"
 #include "nb_policy.h"
 #include "nb_ring.h"
 #include "nb_udp.h"
@@ -55,6 +56,23 @@ typedef struct proxy_stream {
     int upstream_fc_blocked;
     int probe_mode;              /* exit 内部探针: 1=sink/count, 2=echo */
     uint64_t probe_bytes;
+    /* 端到端逻辑流。Middle 仅透传 NBLS 帧；Entry/Exit 保存 replay 与消费 offset。 */
+    int logical_mode;
+    int logical_endpoint;
+    int logical_reconnect_pending;
+    uint64_t logical_disconnected_at;
+    uint64_t logical_reconnect_last_attempt;
+    uint64_t logical_flow_hi;
+    uint64_t logical_flow_lo;
+    nb_lstream_tx_t logical_tx;
+    nb_lstream_decoder_t logical_decoder;
+    uint64_t logical_rx_next;
+    uint64_t logical_rx_delivered;
+    uint64_t logical_rx_fin_offset;
+    int logical_rx_fin_seen;
+    int logical_rx_fin_acked_sent;
+    uint64_t logical_last_ack_offset;
+    uint64_t logical_last_ack_at;
     /* fin 追踪(去程 left->right, 回程 right->left) */
     int up_fin_seen;             /* 收到 left QUIC fin(仅 middle/exit) */
     int down_fin_seen;           /* 收到 right QUIC fin(仅 entry/middle) */

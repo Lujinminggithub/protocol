@@ -108,7 +108,8 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
 }
 
 /* middle/exit: 收上一跳 stream 数据(去程)。首解析 route 首部, 再转发。 */
-static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin){
+static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int fin){
+    proxy_stream_t* p=stream?*stream:NULL;if(p==NULL)return -1;
     size_t off=0;
     if(p->fec_ctrl_only){
         if(len > 0) fec_ctrl_feed_bytes(p, bytes, len, 0);
@@ -168,6 +169,18 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin){
         if(prio<=0||prio>255){log4c_error("id=%u invalid priority",p->id);ps_teardown(p);return -1;}
         p->prio=prio;
         picoquic_set_stream_priority(p->up_cnx,p->up_stream_id,(uint8_t)prio);
+        if(!strncmp(rt,"L=",2)){
+            char* logical_end=strchr(rt+2,';');uint64_t flow_hi=0,flow_lo=0;
+            if(logical_end==NULL||logical_end-(rt+2)!=32){ps_teardown_reason(p,"logical-route-header");return -1;}
+            char flow[33];memcpy(flow,rt+2,32);flow[32]=0;
+            if(nb_lstream_flow_parse(flow,&flow_hi,&flow_lo)!=0){ps_teardown_reason(p,"logical-flow-id");return -1;}
+            p->logical_mode=1;p->logical_flow_hi=flow_hi;p->logical_flow_lo=flow_lo;rt=logical_end+1;
+            if(G.role==ROLE_EXIT){proxy_stream_t* existing=ps_find_logical(flow_hi,flow_lo,p);
+                if(existing!=NULL){p=logical_rebind_upstream(p,existing);*stream=p;
+                    if(off<len&&logical_receive(p,bytes+off,len-off)!=0){ps_teardown_reason(p,"logical-resume-frame");return -1;}
+                    return 0;}
+                if(logical_endpoint_init(p,flow_hi,flow_lo)!=0){ps_teardown_reason(p,"logical-init");return -1;}}
+        }
         /* 首部(去 prio 前缀后)第一段(到第一个 ',') = 本节点动作; 其余 = 转发给下一跳 */
         char first[300], rest[300]; rest[0]=0;
         char* comma=strchr(rt,',');
@@ -211,6 +224,7 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin){
             if(c){size_t host_len=(size_t)(c-(first+2));
                 if(host_len>0&&host_len<sizeof(nhost)&&parse_port_strict(c+1,&nport)==0){memcpy(nhost,first+2,host_len);nhost[host_len]=0;}}
             if(c==NULL||nhost[0]==0||nport<=0||nport>65535||rest[0]==0){log4c_error("id=%u malformed hop route",p->id);ps_teardown(p);return -1;}
+            nport=worker_lane_port(nport);if(nport<1){ps_teardown_reason(p,"worker-lane-port");return -1;}
             struct sockaddr_storage naddr; int is_name=0;
             nb_flow_policy_t pol;
             char thost[256]; int tport=0;
@@ -233,11 +247,14 @@ static int on_up_data(proxy_stream_t* p, uint8_t* bytes, size_t len, int fin){
         }
     }
     if(off<len){
-        if(p->probe_mode){
+        if(G.role==ROLE_EXIT&&p->logical_endpoint){
+            if(logical_receive(p,bytes+off,len-off)!=0){ps_teardown_reason(p,"logical-frame");return -1;}
+        }else if(p->probe_mode){
             p->probe_bytes+=len-off;ps_note_payload(p,1,len-off);
             if(p->probe_mode==2&&queue_up(p,bytes+off,len-off,0)!=0)return -1;
         }else fwd_down(p,bytes+off,len-off,0);
     }
+    if(fin&&p->logical_mode)return 0;
     if(fin){ p->up_fin_seen=1;if(p->probe_mode)p->tcp_eof=1;
         if(p->probe_mode==1){
             char ack[96];int n=snprintf(ack,sizeof(ack),"NBPROBE OK bytes=%llu\n",
@@ -268,8 +285,13 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                 if(length>0) fec_ctrl_feed_bytes(p,bytes,length,1);
                 break;
             }
-            if(length>0) fwd_up(p,bytes,length,0);
-            if(fin){ p->down_fin_seen=1; if(G.role==ROLE_ENTRY) p->q2t_fin=1; else fwd_up(p,NULL,0,1); }
+            if(G.role==ROLE_ENTRY&&p->logical_endpoint){
+                if(length>0&&logical_receive(p,bytes,length)!=0){ps_teardown_reason(p,"logical-frame");break;}
+                if(fin)logical_detach(p,cnx);
+            }else{
+                if(length>0) fwd_up(p,bytes,length,0);
+                if(fin){ p->down_fin_seen=1; if(G.role==ROLE_ENTRY) p->q2t_fin=1; else fwd_up(p,NULL,0,1); }
+            }
             break;
         }
         if(G.role==ROLE_MIDDLE&&pool_contains_cnx(cnx)){
@@ -295,7 +317,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                     p->id,(unsigned long long)stream_id,fc_ret);
             }
         }
-        on_up_data(p,bytes,length,fin);
+        on_up_data(&p,bytes,length,fin);
         break; }
     case picoquic_callback_prepare_to_send: {
         p=(proxy_stream_t*)v_stream_ctx;
@@ -517,8 +539,10 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_stream_reset:
     case picoquic_callback_stop_sending:
         /* 对端 reset/stop 单条 stream -> 主动 teardown, discard 另一侧 stream 连锁通知(middle 据此回收) */
-        if((p=ps_find_by_down(cnx,stream_id))!=NULL){ ps_teardown_reason(p,ev==picoquic_callback_stream_reset?"quic-stream-reset":"quic-stop-sending"); }
-        else if((p=ps_find_by_up(cnx,stream_id))!=NULL){ ps_teardown_reason(p,ev==picoquic_callback_stream_reset?"quic-stream-reset":"quic-stop-sending"); }
+        if((p=ps_find_by_down(cnx,stream_id))!=NULL){
+            ps_teardown_reason(p,ev==picoquic_callback_stream_reset?"quic-stream-reset":"quic-stop-sending"); }
+        else if((p=ps_find_by_up(cnx,stream_id))!=NULL){
+            ps_teardown_reason(p,ev==picoquic_callback_stream_reset?"quic-stream-reset":"quic-stop-sending"); }
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
@@ -526,7 +550,12 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
         const char* close_reason=ev==picoquic_callback_close?"quic-connection-close":
             (ev==picoquic_callback_application_close?"quic-application-close":"quic-stateless-reset");
         int i; for(i=0;i<MAX_CONN;i++) if(G.streams[i].in_use && (G.streams[i].up_cnx==cnx||G.streams[i].down_cnx==cnx||G.streams[i].fec_ctrl_cnx==cnx)){
-            ps_set_close_reason(&G.streams[i],close_reason);ps_free(&G.streams[i]);
+            proxy_stream_t* affected=&G.streams[i];
+            if(affected->logical_endpoint&&((G.role==ROLE_ENTRY&&affected->down_cnx==cnx)||
+                (G.role==ROLE_EXIT&&affected->up_cnx==cnx))){
+                log4c_warn("%s logical flow detached id=%u reason=%s",role_name(G.role),affected->id,close_reason);
+                logical_detach(affected,cnx);
+            }else{ps_set_close_reason(affected,close_reason);ps_free(affected);}
         }
         for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(i=0;i<POOL_SIZE;i++){
             cnx_pool_t* pool=&G.pools[pool_id];

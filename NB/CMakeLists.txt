@@ -5,7 +5,8 @@
 #   - 缺失 -> configure 阶段调 build_libs.sh 从 vendored 源码现编并落缓存
 # platform 标识与 build_libs.sh 一致: <os>-<arch> 小写, 如 linux-x86_64。
 cmake_minimum_required(VERSION 3.16)
-project(newbility C)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" NB_PROJECT_VERSION LIMIT_COUNT 1)
+project(newbility VERSION "${NB_PROJECT_VERSION}" LANGUAGES C)
 
 include(CTest)
 find_package(OpenSSL REQUIRED)
@@ -65,6 +66,11 @@ if(BUILD_TESTING)
   target_include_directories(nb_udp_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_udp_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp COMMAND nb_udp_test)
+
+  add_executable(nb_lstream_test tools/test_lstream.c src/nb_lstream.c)
+  target_include_directories(nb_lstream_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_lstream_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_lstream COMMAND nb_lstream_test)
 
   add_executable(nb_v2_metadata_test tools/test_v2_metadata.c src/nb_v2_metadata.c)
   target_include_directories(nb_v2_metadata_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -133,7 +139,7 @@ if(BUILD_TESTING)
   target_link_libraries(nb_dns_test Threads::Threads)
   add_test(NAME nb_dns COMMAND nb_dns_test)
 
-  add_executable(nb_tenant_test tools/test_tenant.c src/nb_tenant.c)
+  add_executable(nb_tenant_test tools/test_tenant.c src/nb_tenant.c src/nb_tenant_shared.c)
   target_include_directories(nb_tenant_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_tenant_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_tenant COMMAND nb_tenant_test)
@@ -145,7 +151,7 @@ if(BUILD_TESTING)
 
   foreach(_nb_test_target
       nb_fec_test nb_fec_policy_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test
-      nb_auth_async_test nb_routes_test nb_udp_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_metrics_test
+      nb_auth_async_test nb_routes_test nb_udp_test nb_lstream_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_metrics_test
       nb_session_index_test nb_bridge_test nb_send_test nb_path_test
       nb_pool_health_test nb_dns_test nb_tenant_test nb_whitelist_test)
     target_compile_options(${_nb_test_target} PRIVATE -UNDEBUG -Werror)
@@ -169,7 +175,7 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_udp.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_policy.c src/nb_live.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_udp.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
 target_compile_options(nb_node PRIVATE -O2 -Wall -Wextra -Werror)
 target_include_directories(nb_node PRIVATE

@@ -42,6 +42,7 @@
 #include "nb_routes.h"
 #include "nb_policy.h"
 #include "nb_live.h"
+#include "nb_lstream.h"
 #include "nb_metrics.h"
 #include "nb_session_index.h"
 #include "nb_session.h"
@@ -101,6 +102,13 @@ typedef enum {
 
 static nb_global_t G;
 static uint64_t g_run_id;
+static int worker_lane_port(int base){
+    const char* enabled=getenv("NB_WORKER_LANE_PORTS");
+    if(!enabled||(!strcmp(enabled,"0")||!strcasecmp(enabled,"off")))return base;
+    const char* text=getenv("NB_WORKER_ID");char* end=NULL;long worker=text?strtol(text,&end,10):0;
+    if((text&&(!end||*end))||worker<0||worker>31||base<1||base+worker>65535)return -1;
+    return base+(int)worker;
+}
 static nb_auth_users_t g_socks_users;
 static int g_socks_auth_enabled=0;
 static nb_tenants_t g_tenants;static int g_tenants_enabled=0;
@@ -303,8 +311,8 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
     long schema_long=schema_text?strtol(schema_text,&schema_end,10):0;
     int profile_schema=(schema_text&&schema_end&&*schema_end==0&&schema_long>=0&&schema_long<=999999)?(int)schema_long:0;
     if(!strcmp(command,"health")||!strcmp(command,"GET /health")){
-        return snprintf(out,cap,"{\"status\":\"ok\",\"role\":\"%s\",\"worker\":\"%s\",\"release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d}\n",
-            role_name(G.role),worker,release,profile,profile_schema);
+        return snprintf(out,cap,"{\"status\":\"ok\",\"role\":\"%s\",\"worker\":\"%s\",\"boot_id\":\"%016llx\",\"release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d}\n",
+            role_name(G.role),worker,(unsigned long long)g_run_id,release,profile,profile_schema);
     }
     if(!strcmp(command,"metrics")||!strcmp(command,"GET /metrics")){
         uint64_t now=picoquic_current_time();nb_metrics_snapshot_t snapshot;

@@ -1,14 +1,16 @@
 #!/bin/bash
 # 单机安全三角色回归，端口按进程号隔离。
 set -euo pipefail
+export NB_WORKER_LANE_PORTS=${NB_WORKER_LANE_PORTS:-on}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NB=${NB_BIN:-$ROOT/build/nb_node}
 TMP=${TMPDIR:-/tmp}/nb-runtri-$$
 MW=${NB_MIDDLE_WORKERS:-1}
 EW=${NB_EXIT_WORKERS:-1}
-BASE=$((20000 + ($$ % 10000) * 4)); HTTP_PORT=$BASE; EXIT_PORT=$((BASE+1)); MIDDLE_PORT=$((BASE+2)); ENTRY_PORT=$((BASE+3))
-export HTTP_PORT EXIT_PORT MIDDLE_PORT ENTRY_PORT
+IW=${NB_ENTRY_WORKERS:-1}
+BASE=$((20000 + ($$ % 400) * 100)); HTTP_PORT=$BASE; ECHO_PORT=$((BASE+1)); EXIT_PORT=$((BASE+10)); MIDDLE_PORT=$((BASE+45)); ENTRY_PORT=$((BASE+80))
+export HTTP_PORT EXIT_PORT MIDDLE_PORT ENTRY_PORT ECHO_PORT
 mkdir -p "$TMP/www" "$TMP/pki"
 trap 'rc=$?; trap - EXIT; pkill -P $$ 2>/dev/null || true; rm -f /run/nb-middle-{0..31}.ctl /run/nb-exit-{0..31}.ctl; if [ $rc -eq 0 ] || [ "${NB_KEEP_TMP:-0}" != 1 ]; then rm -rf "$TMP"; else echo "FAILED LOGS: $TMP" >&2; fi; exit "$rc"' EXIT
 
@@ -43,6 +45,7 @@ done
 cat >"$TMP/whitelist.conf" <<EOF
 ip 127.0.0.0/8
 port $HTTP_PORT
+port $ECHO_PORT
 EOF
 cat >"$TMP/exit_routes.conf" <<EOF
 route local H:127.0.0.1:$EXIT_PORT 1
@@ -68,6 +71,19 @@ data,peer=s.recvfrom(65535);s.sendto(data,peer)
 for _ in range(3):time.sleep(2);s.sendto(b"late-"+data,peer)
 s.close()
 PY
+python3 - "$ECHO_PORT" >"$TMP/echo-target.log" 2>&1 <<'PY' &
+import socket,sys,threading
+listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+listener.bind(("127.0.0.1",int(sys.argv[1])));listener.listen(32)
+def serve(conn):
+    with conn:
+        while True:
+            data=conn.recv(65536)
+            if not data:break
+            conn.sendall(data)
+while True:
+    conn,_=listener.accept();threading.Thread(target=serve,args=(conn,),daemon=True).start()
+PY
 if [ "$EW" -gt 1 ]; then
   NB_CONTROL_DIR="$TMP" python3 "$ROOT/tools/nb_supervisor.py" --workers "$EW" -- "$NB" -r exit -p "$EXIT_PORT" -c "$TMP/pki/exit.pem" -k "$TMP/pki/exit.key" -a "$TMP/pki/ca.pem" -W "$TMP/whitelist.conf" >"$TMP/exit.log" 2>&1 &
   EXIT_SUP=$!
@@ -81,12 +97,19 @@ else
   "$NB" -r middle -p "$MIDDLE_PORT" -c "$TMP/pki/middle.pem" -k "$TMP/pki/middle.key" -a "$TMP/pki/ca.pem" -C "$TMP/middle.ctl" >"$TMP/middle.log" 2>&1 &
 fi
 sleep 1
-NB_UDP_CONTROL_GRACE_MS=500 "$NB" -r entry -l "$ENTRY_PORT" -n 127.0.0.1 -N "$MIDDLE_PORT" -S -U "$TMP/socks.users" -Q "$TMP/tenant.conf" -W "$TMP/whitelist.conf" \
-  -E "$TMP/exit_routes.conf" -c "$TMP/pki/entry.pem" -k "$TMP/pki/entry.key" -a "$TMP/pki/ca.pem" -C "$TMP/entry.ctl" \
-  >"$TMP/entry.log" 2>&1 &
+ENTRY_CMD=("$NB" -r entry -l "$ENTRY_PORT" -n 127.0.0.1 -N "$MIDDLE_PORT" -S -U "$TMP/socks.users" -Q "$TMP/tenant.conf" -W "$TMP/whitelist.conf" \
+  -E "$TMP/exit_routes.conf" -c "$TMP/pki/entry.pem" -k "$TMP/pki/entry.key" -a "$TMP/pki/ca.pem")
+if [ "$IW" -gt 1 ]; then
+  NB_UDP_CONTROL_GRACE_MS=500 NB_CONTROL_DIR="$TMP" python3 "$ROOT/tools/nb_supervisor.py" --workers "$IW" -- "${ENTRY_CMD[@]}" >"$TMP/entry.log" 2>&1 &
+  ENTRY_SUP=$!
+else
+  NB_UDP_CONTROL_GRACE_MS=500 "${ENTRY_CMD[@]}" -C "$TMP/entry.ctl" >"$TMP/entry.log" 2>&1 &
+fi
 sleep 2
 
-CONTROLS=("$TMP/entry.ctl")
+CONTROLS=()
+if [ "$IW" -eq 1 ]; then CONTROLS+=("$TMP/entry.ctl"); else for i in $(seq 0 $((IW-1))); do CONTROLS+=("$TMP/nb-entry-$i.ctl"); done; fi
+ENTRY_CONTROL=${CONTROLS[0]}
 if [ "$MW" -eq 1 ]; then CONTROLS+=("$TMP/middle.ctl"); else for i in $(seq 0 $((MW-1))); do CONTROLS+=("$TMP/nb-middle-$i.ctl"); done; fi
 if [ "$EW" -eq 1 ]; then CONTROLS+=("$TMP/exit.ctl"); else for i in $(seq 0 $((EW-1))); do CONTROLS+=("$TMP/nb-exit-$i.ctl"); done; fi
 for path in "${CONTROLS[@]}"; do
@@ -123,7 +146,7 @@ for _ in 1 2 3; do
     echo "ERROR: unavailable target unexpectedly succeeded" >&2;exit 1
   fi
 done
-python3 - "$TMP/entry.ctl" <<'PY'
+python3 - "$ENTRY_CONTROL" <<'PY'
 import json,socket,sys
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);s.sendall(b"routes\n")
 data=b""
@@ -215,19 +238,55 @@ seq 1 16 | xargs -P8 -I{} curl -fsS -o /dev/null --noproxy "" --proxy-user nbtes
   --socks5-hostname 127.0.0.1:$ENTRY_PORT http://127.0.0.1:$HTTP_PORT/test.txt --max-time 10
 echo "RESULT PASS: 16 路并发"
 if [ "$MW" -gt 1 ]; then
-  victim=$(pgrep -P "$MIDDLE_SUP" | head -1); test -n "$victim"; kill -9 "$victim"
-  for _ in $(seq 1 50); do [ "$(pgrep -P "$MIDDLE_SUP" | wc -l)" -eq "$MW" ] && break; sleep .1; done
+  sleep 2
+  export MIDDLE_SUP
+  python3 - "$TMP/lstream.started" <<'PY' &
+import os,socket,struct,sys,threading,time
+def exact(sock,size):
+    out=bytearray()
+    while len(out)<size:
+        part=sock.recv(size-len(out))
+        if not part:raise RuntimeError(f"short response {len(out)}/{size}")
+        out.extend(part)
+    return bytes(out)
+s=socket.create_connection(("127.0.0.1",int(os.environ["ENTRY_PORT"])),timeout=10);s.settimeout(60)
+s.sendall(b"\x05\x01\x02");assert exact(s,2)==b"\x05\x02"
+u=b"nbtest";p=b"nb-test-password";s.sendall(b"\x01"+bytes([len(u)])+u+bytes([len(p)])+p);assert exact(s,2)==b"\x01\x00"
+s.sendall(b"\x05\x01\x00\x01"+socket.inet_aton("127.0.0.1")+struct.pack("!H",int(os.environ["ECHO_PORT"])))
+head=exact(s,4);assert head[:2]==b"\x05\x00",head
+exact(s,6 if head[3]==1 else 18)
+payload=bytes((i*73+19)&255 for i in range(2*1024*1024));received=bytearray();failure=[]
+def reader():
+    try:
+        while len(received)<len(payload):received.extend(s.recv(min(65536,len(payload)-len(received))))
+    except BaseException as exc:failure.append(exc)
+reader_thread=threading.Thread(target=reader,daemon=True);reader_thread.start();open(sys.argv[1],"w").close()
+for offset in range(0,len(payload),4096):
+    s.sendall(payload[offset:offset+4096]);time.sleep(.001)
+s.shutdown(socket.SHUT_WR)
+reader_thread.join(60)
+if failure:raise failure[0]
+assert not reader_thread.is_alive(),f"logical resume receive timeout {len(received)}/{len(payload)}"
+assert bytes(received)==payload,f"logical resume payload mismatch {len(received)}/{len(payload)}"
+s.close()
+print("RESULT PASS: same logical TCP stream survived middle connection loss")
+PY
+  LSTREAM_CLIENT=$!
+  for _ in $(seq 1 100); do [ -f "$TMP/lstream.started" ] && break;sleep .05;done
+  test -f "$TMP/lstream.started";sleep .1
+  victims=$(pgrep -P "$MIDDLE_SUP");test -n "$victims";kill -9 $victims
+  wait "$LSTREAM_CLIENT"
+  grep -q 'logical flow resumed' "$TMP/nb-entry.log"
+  for _ in $(seq 1 100); do [ "$(pgrep -P "$MIDDLE_SUP" | wc -l)" -eq "$MW" ] && break; sleep .1; done
   test "$(pgrep -P "$MIDDLE_SUP" | wc -l)" -eq "$MW"
-  recovered=0
-  for _ in $(seq 1 30); do
-    if curl -fsS -o /dev/null --noproxy "" --proxy-user nbtest:nb-test-password --socks5-hostname 127.0.0.1:$ENTRY_PORT \
-      http://127.0.0.1:$HTTP_PORT/test.txt --max-time 3; then recovered=1;break;fi
-    sleep 1
-  done
-  test "$recovered" -eq 1
   echo "RESULT PASS: middle worker 故障后主动 payload 恢复"
 fi
-curl -fsS --noproxy "" --proxy-user nbtest:nb-test-password --socks5-hostname 127.0.0.1:$ENTRY_PORT \
-  http://127.0.0.1:$HTTP_PORT/big.txt -o "$TMP/got" --max-time 20
-test "$(sha256sum "$TMP/www/big.txt" | cut -d' ' -f1)" = "$(sha256sum "$TMP/got" | cut -d' ' -f1)"
+expected_hash=$(sha256sum "$TMP/www/big.txt" | cut -d' ' -f1);payload_ok=0
+for _ in $(seq 1 30); do
+  if curl -fsS --noproxy "" --proxy-user nbtest:nb-test-password --socks5-hostname 127.0.0.1:$ENTRY_PORT \
+    http://127.0.0.1:$HTTP_PORT/big.txt -o "$TMP/got" --max-time 20 &&
+    [ "$expected_hash" = "$(sha256sum "$TMP/got" | cut -d' ' -f1)" ]; then payload_ok=1;break;fi
+  sleep 1
+done
+test "$payload_ok" -eq 1
 echo "RESULT PASS：三跳 payload 完整"

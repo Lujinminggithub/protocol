@@ -3,9 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 int main(void){
-    char path[96],error[128],json[1024];
+    char path[96],state_path[112],error[128],json[1024];
 #ifdef _WIN32
     snprintf(path,sizeof(path),"nb-tenant-%ld.tmp",(long)getpid());
 #else
@@ -19,5 +22,18 @@ int main(void){
     size_t allowed=nb_tenant_allowance(&tenants,alice,2000,1000000);ok=ok&&allowed==1000;nb_tenant_consume(&tenants,alice,1000);
     allowed=nb_tenant_allowance(&tenants,alice,1000,1500000);ok=ok&&allowed==500;
     nb_tenant_account(&tenants,alice,400,100);ok=ok&&nb_tenants_render_json(&tenants,json,sizeof(json))>0&&strstr(json,"\"bytes_up\":400");
+#ifndef _WIN32
+    snprintf(state_path,sizeof(state_path),"%s.state",path);unlink(state_path);
+    nb_tenants_t shared;ok=ok&&nb_tenants_load(&shared,path,error,sizeof(error))==0&&
+        nb_tenants_enable_shared(&shared,state_path,error,sizeof(error))==0;
+    int shared_alice=nb_tenant_find(&shared,"alice");ok=ok&&nb_tenant_acquire(&shared,shared_alice,0,2000000)==0;
+    pid_t child=fork();if(child==0){nb_tenants_t peer;if(nb_tenants_load(&peer,path,error,sizeof(error))!=0||
+        nb_tenants_enable_shared(&peer,state_path,error,sizeof(error))!=0)_exit(2);
+        int rc=nb_tenant_acquire(&peer,0,0,2000000)==0?3:0;nb_tenants_close(&peer);_exit(rc);}
+    int status=0;ok=ok&&child>0&&waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0;
+    nb_tenant_release(&shared,shared_alice,0);ok=ok&&nb_tenant_take(&shared,shared_alice,1000,2000000)==1000;
+    nb_tenant_refund(&shared,shared_alice,250);ok=ok&&nb_tenant_allowance(&shared,shared_alice,251,2000000)==250;
+    nb_tenants_close(&shared);unlink(state_path);
+#endif
     unlink(path);printf("RESULT %s\n",ok?"PASS":"FAIL");return ok?0:1;
 }

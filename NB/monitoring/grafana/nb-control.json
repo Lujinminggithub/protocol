@@ -1,0 +1,67 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active users",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(nb_control_active_users{line=~\"$line\"})", "refId": "A"}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Pending web events",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "sum(nb_control_outbox_pending{line=~\"$line\"})", "refId": "A"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Failed web events",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "sum(nb_control_outbox_failed{line=~\"$line\"})", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Control planes up",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "sum(up{job=\"nb-control\",line=~\"$line\"})", "refId": "A"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Usage events by line",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{"expr": "sum by (line) (nb_control_usage_events_total{line=~\"$line\"})", "refId": "A"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Web delivery errors",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{"expr": "sum by (line) (rate(nb_control_web_delivery_errors_total{line=~\"$line\"}[5m]))", "refId": "A"}]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["newbility", "control-plane"],
+  "templating": {
+    "list": [
+      {
+        "name": "line",
+        "type": "query",
+        "query": "label_values(nb_control_active_users, line)",
+        "includeAll": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "NB control plane",
+  "uid": "nb-control",
+  "version": 1
+}
