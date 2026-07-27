@@ -294,7 +294,7 @@ static int epoll_tcp_update(proxy_stream_t* p,int add){
     if(G.socks_enabled&&p->socks_stage<3){
         if(!p->socks_auth_pending)events|=EPOLLIN;
     }else if(p->tcp_connecting||tcp_read_allowed(p))events|=EPOLLIN;
-    if(p->q2t.len>0||p->tcp_connecting)events|=EPOLLOUT;
+    if(nb_send_local_write_pending(p->q2t.len,p->tcp_connecting,p->q2t_fin))events|=EPOLLOUT;
     size_t index=(size_t)(p-G.streams);if(index>=MAX_CONN)return -1;
     struct epoll_event ev;memset(&ev,0,sizeof(ev));ev.events=events;
     ev.data.u64=NB_EPOLL_TAG_STREAM|((uint64_t)p->id<<16)|(uint64_t)index;

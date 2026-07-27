@@ -25,3 +25,7 @@ void nb_send_clear(nb_ring_t* ring,nb_live_queue_clock_t* clock){
     if(ring==NULL||clock==NULL)return;
     nb_ring_clear(ring);nb_live_queue_consumed(clock,0,0);
 }
+
+int nb_send_local_write_pending(size_t queued,int connecting,int fin_pending){
+    return queued>0||connecting||fin_pending;
+}

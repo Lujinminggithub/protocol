@@ -10,6 +10,10 @@ int main(void){
     assert(nb_live_queue_age_us(&clock,ring.len,11000)==10000);
     assert(nb_send_copyout(&ring,&clock,(uint8_t*)out,3)==3&&!memcmp(out,"abc",3));
     assert(nb_live_queue_age_us(&clock,ring.len,11000)==3000);
+    assert(!nb_send_local_write_pending(0,0,0));
+    assert(nb_send_local_write_pending(1,0,0));
+    assert(nb_send_local_write_pending(0,1,0));
+    assert(nb_send_local_write_pending(0,0,1));
     nb_send_clear(&ring,&clock);assert(ring.len==0&&clock.count==0);nb_ring_dispose(&ring);
     puts("RESULT PASS");return 0;
 }

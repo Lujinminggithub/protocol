@@ -37,6 +37,7 @@ BUILD_CMD = (
 
 # CMake 构建集: 自有源码 + CMakeLists + build_libs.sh + 目标平台预编译 .a(自包含, 零依赖 /root/poc)
 BUILD_FILES = {
+    "VERSION": ROOT / "VERSION",
     "scripts/runtri.sh": ROOT / "scripts" / "runtri.sh",
     "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
     "src/nb_node.c": SRC / "nb_node.c",

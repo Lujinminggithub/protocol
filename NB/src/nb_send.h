@@ -12,5 +12,6 @@ int nb_send_append(nb_ring_t* ring,nb_live_queue_clock_t* clock,const uint8_t* d
 size_t nb_send_copyout(nb_ring_t* ring,nb_live_queue_clock_t* clock,uint8_t* destination,size_t length);
 void nb_send_consume(nb_ring_t* ring,nb_live_queue_clock_t* clock,size_t length);
 void nb_send_clear(nb_ring_t* ring,nb_live_queue_clock_t* clock);
+int nb_send_local_write_pending(size_t queued,int connecting,int fin_pending);
 
 #endif
