@@ -86,16 +86,18 @@ int main(int argc,char**argv){
       log4c_info("FEC v1.5 mode: observe=%d active=%d", g_fec_v15_observe, g_fec_v15_active); }
     { const char* ff=getenv("NB_FEC_V15_FORCE"); /* V1.5 测试强开: 无需 line_bad 即开启 sidecar */
       if(ff && (!strcmp(ff,"on")||!strcmp(ff,"1"))){ g_fec_v15_force=1; log4c_info("FEC v1.5 sidecar force mode: ENABLED (NB_FEC_V15_FORCE=%s)",ff); } }
+    { const char* fr=getenv("NB_FEC_V15_FORCE_ROBUST");
+      if(fr && (!strcmp(fr,"on")||!strcmp(fr,"1"))){ g_fec_v15_force_robust=1; log4c_info("FEC robust profile override: ENABLED"); } }
     { const char* ds=getenv("NB_FEC_V15_DROP_SRC_MOD");
       if(ds && atoi(ds)>0){ g_fec_v15_drop_src_mod=(uint32_t)atoi(ds); log4c_info("FEC v1.5 test drop source mod=%u", g_fec_v15_drop_src_mod); } }
     { const char* dr=getenv("NB_FEC_V15_DROP_REPAIR_MOD");
       if(dr && atoi(dr)>0){ g_fec_v15_drop_repair_mod=(uint32_t)atoi(dr); log4c_info("FEC v1.5 test drop repair mod=%u", g_fec_v15_drop_repair_mod); } }
     {
-      uint64_t bitrate=20000000ULL, rtt_us=250000ULL; unsigned mult=2;
-      const char* eb=getenv("NB_FEC_BDP_BITRATE_BPS"); if(eb&&strtoull(eb,NULL,10)>0) bitrate=strtoull(eb,NULL,10);
-      const char* er=getenv("NB_FEC_BDP_RTT_US"); if(er&&strtoull(er,NULL,10)>0) rtt_us=strtoull(er,NULL,10);
-      const char* em=getenv("NB_FEC_BDP_MULTIPLIER"); if(em&&atoi(em)>0) mult=(unsigned)atoi(em);
-      if(nb_fec_config_for_bdp(&g_fec_cfg,NB_FEC_V15_K,NB_FEC_V15_R,bitrate,rtt_us,mult)!=NB_FEC_OK){
+      const char* eb=getenv("NB_FEC_BDP_BITRATE_BPS"); if(eb&&strtoull(eb,NULL,10)>0) g_fec_bdp_bitrate_bps=strtoull(eb,NULL,10);
+      const char* er=getenv("NB_FEC_BDP_RTT_US"); if(er&&strtoull(er,NULL,10)>0) g_fec_bdp_rtt_us=strtoull(er,NULL,10);
+      const char* em=getenv("NB_FEC_BDP_MULTIPLIER"); if(em&&atoi(em)>0) g_fec_bdp_multiplier=(unsigned)atoi(em);
+      if(nb_fec_config_for_bdp(&g_fec_cfg,NB_FEC_DEFAULT_K,NB_FEC_DEFAULT_R,
+          g_fec_bdp_bitrate_bps,g_fec_bdp_rtt_us,g_fec_bdp_multiplier)!=NB_FEC_OK){
           log4c_error("FEC config invalid"); log4c_shutdown(); return 1;
       }
       log4c_info("FEC engine cfg k=%u r=%u history=%u blocks rx_window=%u blocks hold=%lluus nack=%lluus retry=%lluus/%u",
@@ -195,6 +197,8 @@ int main(int argc,char**argv){
         G.role==ROLE_ENTRY?NULL:relay_quic_callback, G.role==ROLE_ENTRY?NULL:&G, NULL,NULL,NULL,
         picoquic_current_time(), NULL,NULL,NULL,0);
     if(G.quic==NULL){ log4c_error("quic create fail"); log4c_shutdown(); return 1; }
+    picoquic_set_default_pmtud_policy(G.quic,picoquic_pmtud_required);
+    log4c_info("path MTU discovery: required");
     if(G.role!=ROLE_ENTRY){
         picoquic_set_cookie_mode(G.quic,2);
         if(!insecure_test)picoquic_set_client_authentication(G.quic,1);
@@ -496,6 +500,7 @@ int main(int argc,char**argv){
             if(p->fec_engine==NULL){p->need_teardown=1;continue;}
             int rc=nb_fec_tick(p->fec_engine,fnow);
             if(rc!=NB_FEC_OK){ log4c_warn("id=%u fec engine tick fail rc=%d",p->id,rc); p->need_teardown=1; }
+            else (void)fec_pump_staged(p);
           } }
         /* 过载保护: q2t 超限标记的流, 主循环兜底 teardown(不在回调栈内拆, 避免重入/use-after-free) */
         for(i=0;i<MAX_CONN;i++){ proxy_stream_t*p=&G.streams[i]; if(p->in_use && p->need_teardown) ps_teardown_reason(p,"internal-error"); }
@@ -568,10 +573,18 @@ int main(int argc,char**argv){
                     pool->last_preempt_total[k] = cnx->nb_preemptive_repeat;
                     pool->recent_rtt_var[k] = q.rtt_variant;
                     pool->recent_ts[k] = tn;
-                    log4c_info("linkq pool[%d:%d] run=%llx worker=%s cid=%llx mtu=%zu rtt=%.1fms(min%.1f/max%.1f) jit=%.1fms loss=%.2f%% dsent=%llu loss_raw=%llu eff=%llu spur=%llu timer=%llu repeat=%llu retx=%llu/%llu pre=%llu/%llu reorder=%.1fms/%llu tol=%llu/%.1fms ack=%.1fms(min%.1f/max%.1f) cc=%s:%s(%llu)/%llu cwin=%lluKB bif=%lluKB block=%u/%u/%u bw=%lluKbps sent=%lluKB",
+                    int pmtu_event=nb_pmtu_observe(&pool->pmtu[k],path?path->send_mtu:0,
+                        delta_timer,delta_spurious,tn);
+                    if(pmtu_event>0)g_metrics_state.pmtu_promotions++;
+                    else if(pmtu_event<0)g_metrics_state.pmtu_fallbacks++;
+                    if(pmtu_event)log4c_warn("pmtu pool[%d:%d] event=%s observed=%zu confirmed=%zu cooldown_until=%llu",
+                        pool_id,k,pmtu_event>0?"promote":"blackhole-fallback",path?path->send_mtu:0,
+                        nb_pmtu_effective(&pool->pmtu[k]),(unsigned long long)pool->pmtu[k].cooldown_until_us);
+                    log4c_info("linkq pool[%d:%d] run=%llx worker=%s cid=%llx mtu=%zu pmtu=%zu rtt=%.1fms(min%.1f/max%.1f) jit=%.1fms loss=%.2f%% dsent=%llu loss_raw=%llu eff=%llu spur=%llu timer=%llu repeat=%llu retx=%llu/%llu pre=%llu/%llu reorder=%.1fms/%llu tol=%llu/%.1fms ack=%.1fms(min%.1f/max%.1f) cc=%s:%s(%llu)/%llu cwin=%lluKB bif=%lluKB block=%u/%u/%u bw=%lluKbps sent=%lluKB",
                         pool_id,k,(unsigned long long)g_run_id,getenv("NB_WORKER_ID")?getenv("NB_WORKER_ID"):"0",
                         (unsigned long long)picoquic_val64_connection_id(cnx->initial_cnxid),
                         path?path->send_mtu:0,
+                        nb_pmtu_effective(&pool->pmtu[k]),
                         q.rtt/1000.0, q.rtt_min/1000.0, q.rtt_max/1000.0,
                         (double)q.rtt_variant/1000.0, loss,
                         (unsigned long long)delta_sent,

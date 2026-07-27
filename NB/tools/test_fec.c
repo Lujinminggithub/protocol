@@ -75,7 +75,8 @@ static int expect_payload(const char* name,endpoint_t* e,const uint8_t* data,siz
 
 static int test_out_of_order(void){
     nb_fec_config_t cfg; if(nb_fec_config_for_bdp(&cfg,4,2,20000000,200000,2)!=0)return -1;
-    if(cfg.tx_history_blocks<=8||cfg.rx_window_blocks<=8){fprintf(stderr,"FAIL bdp sizing\n");return -1;}
+    if(cfg.tx_history_blocks<=8||cfg.rx_window_blocks<=8||cfg.nack_delay_us!=200000||
+        cfg.nack_retry_us!=400000||cfg.max_nack_retries!=20){fprintf(stderr,"FAIL bdp sizing\n");return -1;}
     endpoint_t a={0},b={0}; nb_fec_session_t* tx=make_session(&a,&cfg),*rx=make_session(&b,&cfg); if(!tx||!rx)return -1;
     size_t len=NB_FEC_SYMBOL_SIZE*19u+137u; uint8_t* data=malloc(len);fill_data(data,len);
     if(nb_fec_tx_feed(tx,data,len,1,1000)!=0||drain_ctl(&a,rx,2000)!=0)return -1;
@@ -109,7 +110,7 @@ static int test_nack_retx_and_exact_fin(void){
     packet_t*p;while((p=queue_pop(&a.dg_head,&a.dg_tail))!=NULL){
         if(p->data[5]==3&&p->data[14]==3){if(nb_fec_on_datagram(rx,p->data,p->len,3000)!=0){packet_free(p);return -1;}}packet_free(p);
     }
-    if(nb_fec_tick(rx,15000)!=0)return -1;
+    if(nb_fec_tick(rx,2000+cfg.nack_delay_us)!=0)return -1;
     /* Drop first NACK, then verify retry. */
     packet_free(queue_pop(&b.ctl_head,&b.ctl_tail));
     if(nb_fec_tick(rx,36000)!=0||drain_ctl(&b,tx,37000)!=0||drain_ctl(&a,rx,38000)!=0||drain_ctl(&b,tx,39000)!=0)return -1;
@@ -125,7 +126,70 @@ static int test_strict_bounds(void){
     if(rc!=NB_FEC_ERR_PROTOCOL){fprintf(stderr,"FAIL strict-bounds rc=%d\n",rc);return -1;}printf("PASS strict-bounds\n");return 0;
 }
 
+static int test_windowed_large_payload(void){
+    nb_fec_config_t cfg;nb_fec_config_for_bdp(&cfg,4,2,5000000,200000,2);
+    cfg.tx_history_blocks=16;cfg.rx_window_blocks=48;
+    endpoint_t a={0},b={0};nb_fec_session_t*tx=make_session(&a,&cfg),*rx=make_session(&b,&cfg);if(!tx||!rx)return -1;
+    size_t len=1024u*1024u+137u,off=0;uint8_t*data=malloc(len);if(!data)return -1;fill_data(data,len);
+    while(off<len){
+        size_t writable=nb_fec_tx_writable(tx);if(writable==0){fprintf(stderr,"FAIL windowed-large stalled at %zu\n",off);return -1;}
+        size_t take=len-off<writable?len-off:writable;int fin=off+take==len;
+        if(nb_fec_tx_feed(tx,data+off,take,fin,1000+off)!=0)return -1;
+        off+=take;
+        if(drain_ctl(&a,rx,2000+off)!=0)return -1;
+        packet_t*p;while((p=queue_pop(&a.dg_head,&a.dg_tail))!=NULL){int rc=nb_fec_on_datagram(rx,p->data,p->len,3000+off);packet_free(p);if(rc!=0)return -1;}
+        if(drain_ctl(&b,tx,4000+off)!=0)return -1;
+    }
+    int rc=expect_payload("windowed-large",&b,data,len);
+    const nb_fec_metrics_t*tm=nb_fec_metrics(tx);
+    if(!tm||tm->window_errors!=0||tm->block_acked==0)rc=-1;
+    free(data);nb_fec_session_destroy(tx);nb_fec_session_destroy(rx);endpoint_free(&a);endpoint_free(&b);return rc;
+}
+
+static int test_nack_head_of_line_only(void){
+    nb_fec_config_t cfg;nb_fec_config_for_bdp(&cfg,4,2,5000000,200000,2);
+    endpoint_t a={0},b={0};nb_fec_session_t*tx=make_session(&a,&cfg),*rx=make_session(&b,&cfg);if(!tx||!rx)return -1;
+    size_t len=NB_FEC_SYMBOL_SIZE*8u;uint8_t*data=malloc(len);if(!data)return -1;fill_data(data,len);
+    if(nb_fec_tx_feed(tx,data,len,1,1000)!=0||drain_ctl(&a,rx,2000)!=0)return -1;
+    packet_t*p;while((p=queue_pop(&a.dg_head,&a.dg_tail))!=NULL)packet_free(p);
+    if(nb_fec_tick(rx,2000+cfg.nack_delay_us)!=0)return -1;
+    int rc=0;packet_t*nack=queue_pop(&b.ctl_head,&b.ctl_tail);
+    if(nack==NULL||list_count(b.ctl_head)!=0||nack->len<13||memcmp(nack->data,"FC:NACK:77:0",12)!=0){
+        fprintf(stderr,"FAIL nack-head-of-line\n");rc=-1;
+    }else printf("PASS nack-head-of-line\n");
+    packet_free(nack);free(data);nb_fec_session_destroy(tx);nb_fec_session_destroy(rx);endpoint_free(&a);endpoint_free(&b);return rc;
+}
+
+static int test_partial_block_deadline(void){
+    nb_fec_config_t cfg;nb_fec_config_for_bdp(&cfg,4,2,5000000,200000,2);
+    endpoint_t e={0};nb_fec_session_t*s=make_session(&e,&cfg);if(!s)return -1;
+    uint8_t data[100];fill_data(data,sizeof(data));uint64_t started=10000;
+    if(cfg.block_hold_us!=NB_FEC_DEFAULT_BLOCK_HOLD_US||nb_fec_tx_feed(s,data,sizeof(data),0,started)!=0)return -1;
+    uint64_t deadline=started+NB_FEC_DEFAULT_BLOCK_HOLD_US;
+    int rc=0;
+    if(nb_fec_next_deadline(s)!=deadline||e.dg_head!=NULL||e.ctl_head!=NULL)rc=-1;
+    if(nb_fec_tick(s,deadline-1)!=0||e.dg_head!=NULL||e.ctl_head!=NULL)rc=-1;
+    if(nb_fec_tick(s,deadline)!=0||list_count(e.dg_head)!=3||list_count(e.ctl_head)!=1)rc=-1;
+    if(rc)fprintf(stderr,"FAIL partial-block-deadline\n");else printf("PASS partial-block-deadline\n");
+    nb_fec_session_destroy(s);endpoint_free(&e);return rc;
+}
+
+static int test_tx_complete_waits_for_finack(void){
+    nb_fec_config_t cfg;nb_fec_config_for_bdp(&cfg,4,2,5000000,200000,2);
+    endpoint_t a={0},b={0};nb_fec_session_t*tx=make_session(&a,&cfg),*rx=make_session(&b,&cfg);if(!tx||!rx)return -1;
+    uint8_t data[100];fill_data(data,sizeof(data));int rc=0;
+    if(nb_fec_tx_feed(tx,data,sizeof(data),1,1000)!=0||nb_fec_tx_complete(tx))rc=-1;
+    if(drain_ctl(&a,rx,2000)!=0)rc=-1;
+    packet_t*p;while((p=queue_pop(&a.dg_head,&a.dg_tail))!=NULL){
+        if(nb_fec_on_datagram(rx,p->data,p->len,3000)!=0)rc=-1;
+        packet_free(p);
+    }
+    if(nb_fec_tx_complete(tx)||drain_ctl(&b,tx,4000)!=0||!nb_fec_tx_complete(tx))rc=-1;
+    if(rc)fprintf(stderr,"FAIL tx-complete-finack\n");else printf("PASS tx-complete-finack\n");
+    nb_fec_session_destroy(tx);nb_fec_session_destroy(rx);endpoint_free(&a);endpoint_free(&b);return rc;
+}
+
 int main(void){
-    int fail=0;fail|=test_out_of_order();fail|=test_rs_recovery();fail|=test_nack_retx_and_exact_fin();fail|=test_strict_bounds();
+    int fail=0;fail|=test_out_of_order();fail|=test_rs_recovery();fail|=test_nack_retx_and_exact_fin();fail|=test_strict_bounds();fail|=test_windowed_large_payload();fail|=test_nack_head_of_line_only();fail|=test_partial_block_deadline();fail|=test_tx_complete_waits_for_finack();
     printf("RESULT %s\n",fail?"FAIL":"PASS");return fail?1:0;
 }

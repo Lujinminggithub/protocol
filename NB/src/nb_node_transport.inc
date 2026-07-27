@@ -438,6 +438,9 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
             if(dst != NULL){
                 memcpy(dst, dg, dg_len);
                 dgramq_consume(p->fec_dg_tx, &p->fec_dg_tx_len);
+                p->fec_dg_inflight++;
+                if(p->fec_dg_inflight>p->fec_dg_inflight_peak)p->fec_dg_inflight_peak=p->fec_dg_inflight;
+                (void)fec_pump_staged(p);
                 handled = 1;
                 break;
             }
@@ -473,12 +476,15 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                 if(ev==picoquic_callback_datagram){
                     uint32_t block_id=nb_get_u32(bytes+10); uint8_t symbol_idx=bytes[14];
                     p->fec_dg_recv++;
-                    if(!fec_should_drop(bytes[5],block_id,symbol_idx)){
+                    if(!fec_should_drop(p,bytes[5],block_id,symbol_idx)){
                         int rc=nb_fec_on_datagram(p->fec_engine,bytes,length,picoquic_current_time());
                         if(rc!=NB_FEC_OK){ log4c_warn("%s fec engine datagram fail sid=%u rc=%d",role_name(G.role),sid,rc); p->need_teardown=1; }
                     }
-                }else if(ev==picoquic_callback_datagram_acked){ p->fec_dg_acked++; }
-                else if(ev==picoquic_callback_datagram_lost){ p->fec_dg_lost++; }
+                }else if(ev==picoquic_callback_datagram_acked){
+                    p->fec_dg_acked++;if(p->fec_dg_inflight)p->fec_dg_inflight--;(void)fec_pump_staged(p);
+                }else if(ev==picoquic_callback_datagram_lost){
+                    p->fec_dg_lost++;if(p->fec_dg_inflight)p->fec_dg_inflight--;(void)fec_pump_staged(p);
+                }
             }
             break;
         }
@@ -494,30 +500,16 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                     if(G.role == ROLE_EXIT && dgt == nb_fec_dgram_hello){
                         p->fec_dg_cnx = cnx;
                         p->fec_ctrl_peer_ready = 1;
-                        if((p->fec_stage_tx_len > 0 || p->fec_stage_tx_fin) && !p->need_teardown){
-                            if(nb_fec_tx_feed(p->fec_engine,p->fec_stage_tx,p->fec_stage_tx_len,
-                                p->fec_stage_tx_fin,picoquic_current_time())!=NB_FEC_OK){
-                                p->need_teardown = 1;
-                            }
-                            p->fec_stage_tx_len = 0;
-                            p->fec_stage_tx_fin = 0;
-                        }
+                        if(!p->need_teardown) (void)fec_pump_staged(p);
                         (void)fec_queue_probe_datagram(p, nb_fec_dgram_ack);
                     } else if(G.role == ROLE_MIDDLE && dgt == nb_fec_dgram_ack){
                         p->fec_ctrl_peer_ready = 1;
-                        if((p->fec_stage_tx_len > 0 || p->fec_stage_tx_fin) && !p->need_teardown){
-                            if(nb_fec_tx_feed(p->fec_engine,p->fec_stage_tx,p->fec_stage_tx_len,
-                                p->fec_stage_tx_fin,picoquic_current_time())!=NB_FEC_OK){
-                                p->need_teardown = 1;
-                            }
-                            p->fec_stage_tx_len = 0;
-                            p->fec_stage_tx_fin = 0;
-                        }
+                        if(!p->need_teardown) (void)fec_pump_staged(p);
                     }
                 } else if(ev == picoquic_callback_datagram_acked){
-                    p->fec_dg_acked++;
+                    p->fec_dg_acked++;if(p->fec_dg_inflight)p->fec_dg_inflight--;(void)fec_pump_staged(p);
                 } else if(ev == picoquic_callback_datagram_lost){
-                    p->fec_dg_lost++;
+                    p->fec_dg_lost++;if(p->fec_dg_inflight)p->fec_dg_inflight--;(void)fec_pump_staged(p);
                 }
             }
         }
@@ -536,9 +528,24 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
         int i; for(i=0;i<MAX_CONN;i++) if(G.streams[i].in_use && (G.streams[i].up_cnx==cnx||G.streams[i].down_cnx==cnx||G.streams[i].fec_ctrl_cnx==cnx)){
             ps_set_close_reason(&G.streams[i],close_reason);ps_free(&G.streams[i]);
         }
-        for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(i=0;i<POOL_SIZE;i++)if(G.pools[pool_id].cnx[i]==cnx){
+        for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(i=0;i<POOL_SIZE;i++){
             cnx_pool_t* pool=&G.pools[pool_id];
-            pool->cnx[i]=NULL;nb_pool_slot_reset_quality(pool,i);pool->health[i].degraded_since_us=0;
+            if(pool->cnx[i]==cnx){
+                picoquic_cnx_t* replacement=pool->replacement_cnx[i];
+                if(replacement&&!pool->replacement_closing[i]){
+                    pool->cnx[i]=replacement;pool->replacement_cnx[i]=NULL;
+                    pool->replacement_closing[i]=0;pool->next_sid[i]=0;
+                    g_metrics_state.pool_mbb_promotions++;
+                    log4c_warn("pool[%d:%d] active connection closed; replacement promoted",pool_id,i);
+                }else pool->cnx[i]=NULL;
+                nb_pool_slot_reset_quality(pool,i);memset(&pool->health[i],0,sizeof(pool->health[i]));
+            }
+            if(pool->replacement_cnx[i]==cnx){
+                pool->replacement_cnx[i]=NULL;pool->replacement_closing[i]=0;
+            }
+            if(pool->draining_cnx[i]==cnx){
+                pool->draining_cnx[i]=NULL;pool->draining_closing[i]=0;
+            }
         }
         udp_lifecycle_forget_cnx(cnx);sched_forget_cnx(cnx);picoquic_set_callback(cnx,NULL,NULL); break; }
     default: break;

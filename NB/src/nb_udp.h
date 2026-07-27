@@ -14,6 +14,7 @@
 #define NB_UDP_FRAGMENT_PAYLOAD 1000
 #define NB_UDP_MAX_PAYLOAD 65507
 #define NB_UDP_REASSEMBLY_SLOTS 8
+#define NB_UDP_REASSEMBLY_TIMEOUT_US 5000000ULL
 /* Some mobile proxy clients close the SOCKS UDP control TCP connection after
  * setup while continuing to use the negotiated UDP relay. Keep the association
  * while either UDP direction is active, then reclaim it on the normal idle

@@ -5,11 +5,16 @@
 #include <sys/socket.h>
 #include <picoquic.h>
 #include "nb_pool_health.h"
+#include "nb_pmtu.h"
 
 #define NB_POOL_SIZE 1
 
 typedef struct cnx_pool {
     picoquic_cnx_t* cnx[NB_POOL_SIZE];
+    picoquic_cnx_t* replacement_cnx[NB_POOL_SIZE];
+    picoquic_cnx_t* draining_cnx[NB_POOL_SIZE];
+    uint8_t replacement_closing[NB_POOL_SIZE];
+    uint8_t draining_closing[NB_POOL_SIZE];
     uint64_t next_sid[NB_POOL_SIZE];
     struct sockaddr_storage addr;
     int configured;
@@ -28,6 +33,7 @@ typedef struct cnx_pool {
     uint64_t recent_rtt_var[NB_POOL_SIZE];
     uint64_t recent_ts[NB_POOL_SIZE];
     nb_pool_health_t health[NB_POOL_SIZE];
+    nb_pmtu_state_t pmtu[NB_POOL_SIZE];
     int fec_latched;
 } cnx_pool_t;
 

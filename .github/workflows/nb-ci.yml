@@ -25,15 +25,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libssl-dev ninja-build
           python -m pip install --disable-pip-version-check paramiko
-      - name: P0 and P1 repository gates
+      - name: P0, P1, and P2 repository gates
         run: |
           python tools/p0_gate.py
           python tools/p1_gate.py
+          python tools/p2_gate.py
+          python tools/test_pmtu_evidence.py
+          python tools/test_fec_canary.py
+          python tools/test_p2_release_gate.py
+          python tools/test_p2_release_disposition.py
+      - name: Xray protocol demo tests
+        working-directory: NB/client/xraydemo
+        run: go test ./...
       - name: Configure and build
         run: cmake -S . -B build-ci-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Unit tests

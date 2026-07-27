@@ -90,11 +90,14 @@ int nb_fec_config_for_bdp(nb_fec_config_t* cfg, uint8_t k, uint8_t r,
     uint64_t blocks = (bdp_bytes * multiplier + block_bytes - 1u) / block_bytes;
     cfg->tx_history_blocks = clamp_u32(blocks + 8u, NB_FEC_MIN_HISTORY, NB_FEC_MAX_HISTORY);
     cfg->rx_window_blocks = clamp_u32(blocks + 32u, NB_FEC_MIN_WINDOW, NB_FEC_MAX_WINDOW);
-    cfg->block_hold_us = 5000u;
-    cfg->nack_delay_us = 10000u;
-    cfg->nack_retry_us = rtt_us > 0 ? rtt_us : 200000u;
-    if(cfg->nack_retry_us < 20000u) cfg->nack_retry_us = 20000u;
-    cfg->max_nack_retries = 5u;
+    cfg->block_hold_us = NB_FEC_DEFAULT_BLOCK_HOLD_US;
+    cfg->nack_delay_us = rtt_us > 0 ? rtt_us : 200000u;
+    if(cfg->nack_delay_us < 50000u) cfg->nack_delay_us = 50000u;
+    if(cfg->nack_delay_us > 500000u) cfg->nack_delay_us = 500000u;
+    cfg->nack_retry_us = rtt_us > 0 ? rtt_us * 2u : 400000u;
+    if(cfg->nack_retry_us < 40000u) cfg->nack_retry_us = 40000u;
+    if(cfg->nack_retry_us > 1000000u) cfg->nack_retry_us = 1000000u;
+    cfg->max_nack_retries = 20u;
     return NB_FEC_OK;
 }
 
@@ -245,6 +248,29 @@ int nb_fec_tx_feed(nb_fec_session_t* s, const uint8_t* data, size_t len, int fin
         return rc;
     }
     return NB_FEC_OK;
+}
+
+size_t nb_fec_tx_writable(const nb_fec_session_t* s){
+    if(s==NULL||s->failed||s->tx_fin_sent) return 0;
+    size_t block_bytes=(size_t)s->cfg.k*s->cfg.symbol_size;
+    size_t free_blocks=0;
+    for(uint32_t i=0;i<s->cfg.tx_history_blocks;i++){
+        uint32_t block=s->tx_block_id+i;
+        if(s->tx_history[block%s->cfg.tx_history_blocks]!=NULL) break;
+        free_blocks++;
+    }
+    size_t capacity=free_blocks*block_bytes;
+    return capacity>s->tx_raw_bytes?capacity-s->tx_raw_bytes:0;
+}
+
+int nb_fec_tx_finish_ready(const nb_fec_session_t* s){
+    if(s==NULL||s->failed||s->tx_fin_sent) return 0;
+    if(s->tx_raw_bytes==0) return 1;
+    return s->tx_history[s->tx_block_id%s->cfg.tx_history_blocks]==NULL;
+}
+
+int nb_fec_tx_complete(const nb_fec_session_t* s){
+    return s!=NULL && (s->failed || (s->tx_fin_sent && s->tx_fin_acked));
 }
 
 static nb_fec_rx_block_t* rx_get(nb_fec_session_t* s, uint32_t block_id, uint64_t now_us, int create){
@@ -421,18 +447,22 @@ int nb_fec_tick(nb_fec_session_t* s, uint64_t now_us){
     if(s->tx_raw_bytes>0&&s->tx_first_us>0&&now_us>=s->tx_first_us&&now_us-s->tx_first_us>=s->cfg.block_hold_us){
         int rc=flush_tx_block(s); if(rc!=NB_FEC_OK) return rc;
     }
-    for(uint32_t i=0;i<s->cfg.rx_window_blocks;i++){
-        nb_fec_rx_block_t* b=s->rx_window[i]; if(b==NULL||b->src_count==0) continue;
+    {
+        nb_fec_rx_block_t* b=s->rx_window[s->rx_next_block%s->cfg.rx_window_blocks];
+        if(b!=NULL&&b->block_id==s->rx_next_block&&b->src_count>0){
         uint32_t missing=0; for(uint8_t j=0;j<b->src_count;j++) if(!b->src_present[j]) missing|=(1u<<j);
-        if(missing==0) continue;
-        uint64_t due=b->nack_count==0?b->first_us+s->cfg.nack_delay_us:b->last_nack_us+s->cfg.nack_retry_us;
-        if(now_us<due) continue;
-        if(b->nack_count>=s->cfg.max_nack_retries){
-            s->metrics.retry_exhausted++; s->failed=1; (void)nb_fec_send_reset(s,3u); return NB_FEC_ERR_RETRY_EXHAUSTED;
+            if(missing!=0){
+                uint64_t due=b->nack_count==0?b->first_us+s->cfg.nack_delay_us:b->last_nack_us+s->cfg.nack_retry_us;
+                if(now_us>=due){
+                    if(b->nack_count>=s->cfg.max_nack_retries){
+                        s->metrics.retry_exhausted++; s->failed=1; (void)nb_fec_send_reset(s,3u); return NB_FEC_ERR_RETRY_EXHAUSTED;
+                    }
+                    int rc=send_controlf(s,"FC:NACK:%u:%u:%u\n",s->session_id,b->block_id,missing); if(rc!=NB_FEC_OK) return rc;
+                    if(b->nack_count==0) s->metrics.nack_sent++; else s->metrics.nack_retried++;
+                    b->nack_count++; b->last_nack_us=now_us;
+                }
+            }
         }
-        int rc=send_controlf(s,"FC:NACK:%u:%u:%u\n",s->session_id,b->block_id,missing); if(rc!=NB_FEC_OK) return rc;
-        if(b->nack_count==0) s->metrics.nack_sent++; else s->metrics.nack_retried++;
-        b->nack_count++; b->last_nack_us=now_us;
     }
     return deliver_ready(s);
 }
@@ -445,12 +475,15 @@ int nb_fec_send_reset(nb_fec_session_t* s, uint32_t code){
 uint64_t nb_fec_next_deadline(const nb_fec_session_t* s){
     if(s==NULL||s->failed) return 0;
     uint64_t next=s->tx_raw_bytes>0&&s->tx_first_us>0?s->tx_first_us+s->cfg.block_hold_us:0;
-    for(uint32_t i=0;i<s->cfg.rx_window_blocks;i++){
-        const nb_fec_rx_block_t* b=s->rx_window[i]; if(b==NULL||b->src_count==0) continue;
+    {
+        const nb_fec_rx_block_t* b=s->rx_window[s->rx_next_block%s->cfg.rx_window_blocks];
+        if(b!=NULL&&b->block_id==s->rx_next_block&&b->src_count>0){
         uint32_t missing=0; for(uint8_t j=0;j<b->src_count;j++) if(!b->src_present[j]) missing|=(1u<<j);
-        if(missing==0) continue;
-        uint64_t due=b->nack_count==0?b->first_us+s->cfg.nack_delay_us:b->last_nack_us+s->cfg.nack_retry_us;
-        if(next==0||due<next) next=due;
+            if(missing!=0){
+                uint64_t due=b->nack_count==0?b->first_us+s->cfg.nack_delay_us:b->last_nack_us+s->cfg.nack_retry_us;
+                if(next==0||due<next) next=due;
+            }
+        }
     }
     return next;
 }

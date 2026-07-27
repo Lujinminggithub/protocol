@@ -1,6 +1,6 @@
 # Newbility（NB）
 
-NB 是基于 picoquic 的可级联 TCP-over-QUIC 三跳传输系统。当前 V1.5 保留可靠 TCP 语义，拓扑为 `entry -> middle -> exit -> target`，并将手机原生客户端留到 V2。
+NB 是基于 picoquic 的可级联三跳传输系统。生产基线 `v1.5` 保留可靠 TCP-over-QUIC 语义，拓扑为 `entry -> middle -> exit -> target`；P2 服务端 A/B/C 已按受限范围关闭：IPv4-only、FEC observe-only、公共 UDP 单报文不超过 1001 字节。手机 App 暂不开发，未来客户端基于 Xray-core，当前只维护协议收发 demo。
 
 ## 当前基线
 
@@ -8,8 +8,9 @@ NB 是基于 picoquic 的可级联 TCP-over-QUIC 三跳传输系统。当前 V1.
 - 只有受控测试显式设置 `NB_FEC_V15_ACTIVE=on` 时，纠错型 FEC 才接管候选媒体流。
 - 发送路径统一使用 `picoquic_callback_prepare_to_send`，不存在 `picoquic_add_to_stream` 遗留。
 - 每个进程使用 `epoll`、环形发送队列、TCP 高低水位背压和 O(1) FEC session 索引。
-- worker 数量由 `tools/lab-hosts.json` 分角色配置；当前基线为 entry 1、middle 1、exit 2。
+- worker 数量由 `tools/lab-hosts.json` 分角色配置；当前基线为 entry 1、middle 2、exit 2。
 - entry 可按权重选择多个出口；middle 按下一跳地址维护最多 8 个独立 QUIC 连接池。
+- P2 受限发布使用有限期 HMAC 豁免绑定证据哈希；三角色故障矩阵不可豁免，active FEC 不属于生产准入面。
 
 ## FEC V1.5
 

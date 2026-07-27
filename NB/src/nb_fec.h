@@ -8,6 +8,7 @@
 #define NB_FEC_MAX_K 8u
 #define NB_FEC_MAX_R 4u
 #define NB_FEC_PROTOCOL_VERSION 2u
+#define NB_FEC_DEFAULT_BLOCK_HOLD_US 1000u
 
 typedef enum {
     NB_FEC_OK = 0,
@@ -72,6 +73,9 @@ void nb_fec_session_destroy(nb_fec_session_t* s);
 
 int nb_fec_tx_feed(nb_fec_session_t* s, const uint8_t* data, size_t len,
     int fin, uint64_t now_us);
+size_t nb_fec_tx_writable(const nb_fec_session_t* s);
+int nb_fec_tx_finish_ready(const nb_fec_session_t* s);
+int nb_fec_tx_complete(const nb_fec_session_t* s);
 int nb_fec_on_datagram(nb_fec_session_t* s, const uint8_t* data, size_t len,
     uint64_t now_us);
 int nb_fec_on_control(nb_fec_session_t* s, const char* line, size_t len,

@@ -22,6 +22,34 @@ int main(void){
     CHECK(complete.payload_length==sizeof(source));CHECK(memcmp(complete.payload,source,sizeof(source))==0);
     CHECK(strcmp(complete.route,route)==0);nb_udp_reassembly_dispose(&rs);
 
+    nb_udp_reassembly_init(&rs);
+    {
+        int n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_C2S,8,12,0,count,
+            sizeof(source),route,strlen(route),source,NB_UDP_FRAGMENT_PAYLOAD);
+        nb_udp_wire_view_t view;CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0);
+        CHECK(nb_udp_reassembly_feed(&rs,&view,100,&complete)==0);
+        CHECK(nb_udp_reassembly_feed(&rs,&view,101,&complete)==0);
+        uint8_t conflicting[1400];memcpy(conflicting,wire,(size_t)n);conflicting[21]--;
+        CHECK(nb_udp_wire_decode(conflicting,(size_t)n,&view)==0);
+        CHECK(nb_udp_reassembly_feed(&rs,&view,102,&complete)==-1);
+
+        n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_C2S,8,13,0,count,
+            sizeof(source),route,strlen(route),source,NB_UDP_FRAGMENT_PAYLOAD);
+        CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0);
+        CHECK(nb_udp_reassembly_feed(&rs,&view,200,&complete)==0);
+        size_t off=NB_UDP_FRAGMENT_PAYLOAD;
+        n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_C2S,8,13,1,count,
+            sizeof(source),route,strlen(route),source+off,NB_UDP_FRAGMENT_PAYLOAD);
+        CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0);
+        CHECK(nb_udp_reassembly_feed(&rs,&view,200+NB_UDP_REASSEMBLY_TIMEOUT_US,&complete)==0);
+        off+=NB_UDP_FRAGMENT_PAYLOAD;
+        n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_C2S,8,13,2,count,
+            sizeof(source),route,strlen(route),source+off,(uint16_t)(sizeof(source)-off));
+        CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0);
+        CHECK(nb_udp_reassembly_feed(&rs,&view,201+NB_UDP_REASSEMBLY_TIMEOUT_US,&complete)==0);
+    }
+    nb_udp_reassembly_dispose(&rs);
+
     { uint8_t payload=0;int n=nb_udp_wire_encode(wire,sizeof(wire),NB_UDP_TYPE_CLOSE,7,0,0,1,1,
           route,strlen(route),&payload,1);nb_udp_wire_view_t view;
       CHECK(n>0&&nb_udp_wire_decode(wire,n,&view)==0&&view.type==NB_UDP_TYPE_CLOSE); }
@@ -30,6 +58,12 @@ int main(void){
     CHECK(sn>0);char host[256];int port=0;const uint8_t* payload=NULL;size_t payload_len=0;
     CHECK(nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)==0);
     CHECK(strcmp(host,"rtc.example")==0&&port==443&&payload_len==100&&memcmp(payload,source,100)==0);
+    sn=nb_socks_udp_encode(socks,sizeof(socks),"192.0.2.10",5353,source,100);
+    CHECK(sn>0&&nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)==0);
+    CHECK(strcmp(host,"192.0.2.10")==0&&port==5353&&payload_len==100);
+    sn=nb_socks_udp_encode(socks,sizeof(socks),"2001:db8::10",5353,source,100);
+    CHECK(sn>0&&nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)==0);
+    CHECK(strcmp(host,"2001:db8::10")==0&&port==5353&&payload_len==100);
     socks[2]=1;CHECK(nb_socks_udp_parse(socks,sn,host,sizeof(host),&port,&payload,&payload_len)!=0);
     CHECK(!nb_udp_control_grace_expired(100,100,100+NB_UDP_CONTROL_GRACE_US-1,
         NB_UDP_CONTROL_GRACE_US));

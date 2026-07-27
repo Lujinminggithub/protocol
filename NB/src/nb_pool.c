@@ -7,6 +7,7 @@ void nb_pool_slot_reset_quality(cnx_pool_t* pool, int idx){
     pool->last_timer_total[idx]=0;pool->last_spurious_total[idx]=0;
     pool->last_retrans_total[idx]=0;pool->last_preempt_total[idx]=0;
     pool->recent_rtt_var[idx]=0;pool->recent_ts[idx]=0;
+    nb_pmtu_init(&pool->pmtu[idx],NB_PMTU_DEFAULT_FLOOR,NB_PMTU_DEFAULT_CEILING);
 }
 
 int nb_pool_health_evaluate(cnx_pool_t* pool, int idx,

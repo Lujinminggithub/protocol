@@ -19,6 +19,10 @@ typedef struct {
     uint64_t udp_tx_errors;
     uint64_t pool_retire_total;
     uint64_t pool_retire_suppressed;
+    uint64_t pool_quarantine_total;
+    uint64_t pool_mbb_promotions;
+    uint64_t pmtu_promotions;
+    uint64_t pmtu_fallbacks;
 } nb_metrics_state_t;
 
 typedef struct {

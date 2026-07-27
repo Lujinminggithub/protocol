@@ -98,7 +98,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"closed\":{\"total\":%llu,\"normal\":%llu,\"timeout\":%llu,\"error\":%llu,\"reset\":%llu},"
         "\"event_loop\":{\"iterations\":%llu,\"over_5ms\":%llu,\"over_20ms\":%llu,\"busy_max_us\":%llu,\"wake_late_max_us\":%llu},"
         "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu},"
-        "\"pool_recovery\":{\"retired\":%llu,\"suppressed\":%llu},"
+        "\"pool_recovery\":{\"retired\":%llu,\"suppressed\":%llu,\"quarantined\":%llu,\"mbb_promotions\":%llu},"
+        "\"pmtu\":{\"promotions\":%llu,\"fallbacks\":%llu},"
         "\"fec\":{\"observe\":%d,\"active\":%d,\"tx_blocks\":%llu,\"rx_blocks\":%llu,\"recovered\":%llu,\"nack\":%llu,\"retx\":%llu}}\n",
         role,worker,release,profile,schema,
         (unsigned long long)s->sessions,(unsigned long long)s->sessions_peak,(unsigned long long)s->pools,(unsigned long long)s->exit_routes,
@@ -120,6 +121,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->lifetime.loop_busy_max_us,(unsigned long long)s->lifetime.loop_wake_late_max_us,
         (unsigned long long)s->lifetime.udp_rx_errors,(unsigned long long)s->lifetime.udp_tx_errors,
         (unsigned long long)s->lifetime.pool_retire_total,(unsigned long long)s->lifetime.pool_retire_suppressed,
+        (unsigned long long)s->lifetime.pool_quarantine_total,(unsigned long long)s->lifetime.pool_mbb_promotions,
+        (unsigned long long)s->lifetime.pmtu_promotions,(unsigned long long)s->lifetime.pmtu_fallbacks,
         f->observe,f->active,(unsigned long long)f->tx_blocks,(unsigned long long)f->rx_blocks,
         (unsigned long long)f->recovered,(unsigned long long)f->nack,(unsigned long long)f->retx);
 }

@@ -7,8 +7,8 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MAX_SOURCE_LINES = 1000
-SOURCE_SUFFIXES = {".c", ".h", ".inc", ".py", ".sh", ".cmake", ".yml", ".yaml"}
-SOURCE_ROOTS = (ROOT / "src", ROOT / "tools", ROOT / "scripts")
+SOURCE_SUFFIXES = {".c", ".h", ".inc", ".go", ".py", ".sh", ".cmake", ".yml", ".yaml"}
+SOURCE_ROOTS = (ROOT / "src", ROOT / "tools", ROOT / "scripts", ROOT / "client")
 
 
 def first_party_sources() -> list[pathlib.Path]:

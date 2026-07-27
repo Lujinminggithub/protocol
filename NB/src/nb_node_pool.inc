@@ -1,23 +1,33 @@
-static int pool_ensure(cnx_pool_t* pool, int idx){
-    if(pool->cnx[idx]!=NULL) return 0;
+static picoquic_cnx_t* pool_create_cnx(cnx_pool_t* pool, int idx){
     picoquic_cnx_t* c=picoquic_create_cnx(G.quic, picoquic_null_connection_id, picoquic_null_connection_id,
         (struct sockaddr*)&pool->addr, picoquic_current_time(), 0, NB_SNI, NB_ALPN, 1);
-    if(c==NULL){ log4c_error("pool[%d] create cnx fail",idx); return -1; }
+    if(c==NULL){ log4c_error("pool[%d] create cnx fail",idx); return NULL; }
     if((G.role==ROLE_ENTRY || G.role==ROLE_MIDDLE) &&
         picoquic_set_loss_reorder_tolerance(c,g_reorder_gap,g_reorder_delay_us)!=0){
         log4c_error("pool[%d] invalid reorder tolerance gap=%llu delay=%lluus",idx,
             (unsigned long long)g_reorder_gap,(unsigned long long)g_reorder_delay_us);
-        picoquic_delete_cnx(c); return -1;
+        picoquic_delete_cnx(c); return NULL;
     }
     picoquic_set_callback(c, relay_quic_callback, NULL);
-    if(picoquic_start_client_cnx(c)!=0){ log4c_error("pool[%d] start cnx fail",idx); return -1; }
+    if(picoquic_start_client_cnx(c)!=0){
+        log4c_error("pool[%d] start cnx fail",idx);picoquic_delete_cnx(c);return NULL;
+    }
     picoquic_enable_keep_alive(c, 15000000); /* 15s 保活 */
-    pool->cnx[idx]=c; pool->next_sid[idx]=0;
-    return 0;
+    return c;
+}
+
+static int pool_ensure(cnx_pool_t* pool, int idx){
+    if(pool->cnx[idx]!=NULL)return 0;
+    picoquic_cnx_t* c=pool_create_cnx(pool,idx);if(c==NULL)return -1;
+    pool->cnx[idx]=c;pool->next_sid[idx]=0;return 0;
 }
 /* 初始化连接池(配下一跳地址 + 建满 POOL_SIZE 条)。返回 0=至少一条就绪 -1=全失败 */
 static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr){
     pool->addr=*addr; pool->rr=0; pool->rr_lat=0;
+    memset(pool->cnx,0,sizeof(pool->cnx));memset(pool->replacement_cnx,0,sizeof(pool->replacement_cnx));
+    memset(pool->draining_cnx,0,sizeof(pool->draining_cnx));
+    memset(pool->replacement_closing,0,sizeof(pool->replacement_closing));
+    memset(pool->draining_closing,0,sizeof(pool->draining_closing));
     memset(pool->recent_loss, 0, sizeof(pool->recent_loss));
     memset(pool->recent_rtt, 0, sizeof(pool->recent_rtt));
     memset(pool->recent_rtt_max, 0, sizeof(pool->recent_rtt_max));
@@ -31,6 +41,8 @@ static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr){
     memset(pool->recent_rtt_var, 0, sizeof(pool->recent_rtt_var));
     memset(pool->recent_ts, 0, sizeof(pool->recent_ts));
     memset(pool->health, 0, sizeof(pool->health));
+    for(int i=0;i<POOL_SIZE;i++)nb_pmtu_init(&pool->pmtu[i],
+        NB_PMTU_DEFAULT_FLOOR,NB_PMTU_DEFAULT_CEILING);
     pool->fec_latched = 0;
     int ok=0; for(int i=0;i<POOL_SIZE;i++) if(pool_ensure(pool,i)==0) ok++;
     pool->configured=1;
@@ -55,7 +67,9 @@ static int pool_contains_cnx(picoquic_cnx_t* cnx){
     if(cnx==NULL)return 0;
     for(int pool_id=0;pool_id<G.pool_count;pool_id++){
         for(int idx=0;idx<POOL_SIZE;idx++){
-            if(G.pools[pool_id].cnx[idx]==cnx)return 1;
+            cnx_pool_t* pool=&G.pools[pool_id];
+            if(pool->cnx[idx]==cnx||pool->replacement_cnx[idx]==cnx||
+                pool->draining_cnx[idx]==cnx)return 1;
         }
     }
     return 0;
@@ -75,6 +89,7 @@ static int pool_pick_all_rr(cnx_pool_t* pool, int avoid_idx){
     for(int k=0;k<POOL_SIZE;k++){
         int idx=pool->rr_lat%POOL_SIZE;pool->rr_lat++;
         if(idx==avoid_idx) continue;
+        if(pool->health[idx].quarantined)continue;
         if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
         if(pool->cnx[idx]!=NULL) return idx;
     }
@@ -118,6 +133,7 @@ static int pool_quality_best(cnx_pool_t* pool, int avoid_idx, int require_sample
     int best = -1;
     for(int idx=0; idx<POOL_SIZE; idx++){
         if(idx==avoid_idx) continue;
+        if(pool->health[idx].quarantined)continue;
         if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
         if(pool->cnx[idx]==NULL) continue;
         if(require_sampled){
@@ -190,6 +206,7 @@ static int pool_pick_fec_best(cnx_pool_t* pool, int avoid_idx){
     int best = -1;
     for(int idx=0; idx<POOL_SIZE; idx++){
         if(idx==avoid_idx) continue;
+        if(pool->health[idx].quarantined)continue;
         if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
         if(pool->cnx[idx]==NULL) continue;
         if(!pool_quality_sampled(pool, idx, now)) continue;
@@ -229,11 +246,16 @@ static int pool_pick(cnx_pool_t* pool, int is_latency){
     } else if(POOL_SIZE>BULK_POOL_START){
         for(int k=BULK_POOL_START;k<POOL_SIZE;k++){
             int idx=BULK_POOL_START+(pool->rr % (POOL_SIZE-BULK_POOL_START)); pool->rr++;
+            if(pool->health[idx].quarantined)continue;
             if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
             if(pool->cnx[idx]!=NULL) return idx;
         }
     }
-    for(int k=0;k<POOL_SIZE;k++){ if(pool->cnx[k]==NULL) pool_ensure(pool,k); if(pool->cnx[k]!=NULL) return k; }
+    for(int k=0;k<POOL_SIZE;k++){
+        if(pool->health[k].quarantined)continue;
+        if(pool->cnx[k]==NULL)pool_ensure(pool,k);
+        if(pool->cnx[k]!=NULL)return k;
+    }
     return -1;
 }
 
@@ -257,27 +279,51 @@ static uint64_t pool_slot_queue_age(picoquic_cnx_t* cnx,uint64_t now,int* eligib
 }
 static int pool_slot_streams(picoquic_cnx_t* cnx){int n=0;for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use&&G.streams[i].down_cnx==cnx)n++;return n;}
 
-static void pool_retire_slot(cnx_pool_t* pool,int pool_id,int idx,uint64_t queue_age,uint64_t pto){
-    picoquic_cnx_t* old=pool->cnx[idx];if(old==NULL)return;
-    pool->cnx[idx]=NULL;nb_pool_slot_reset_quality(pool,idx);int streams=0;
-    for(int i=0;i<MAX_CONN;i++){
-        proxy_stream_t* p=&G.streams[i];
-        if(p->in_use&&(p->down_cnx==old||p->fec_ctrl_cnx==old||p->fec_dg_cnx==old)){
-            streams++;ps_teardown_reason(p,"pool-degraded-retire");
-        }
+static int pool_cnx_ready(picoquic_cnx_t* cnx){
+    if(cnx==NULL)return 0;
+    picoquic_state_enum state=picoquic_get_cnx_state(cnx);
+    return state==picoquic_state_client_ready_start||state==picoquic_state_ready;
+}
+
+static int pool_start_replacement(cnx_pool_t* pool,int pool_id,int idx){
+    if(pool->replacement_cnx[idx]!=NULL)return 0;
+    picoquic_cnx_t* replacement=pool_create_cnx(pool,idx);if(replacement==NULL)return -1;
+    pool->replacement_cnx[idx]=replacement;pool->replacement_closing[idx]=0;
+    log4c_warn("pool[%d:%d] quarantined replacement=started",pool_id,idx);return 0;
+}
+
+static void pool_close_candidate(cnx_pool_t* pool,int idx){
+    if(pool->replacement_cnx[idx]&&!pool->replacement_closing[idx]){
+        pool->replacement_closing[idx]=1;picoquic_close(pool->replacement_cnx[idx],0x4e4243ULL);
     }
-    udp_lifecycle_forget_cnx(old);sched_forget_cnx(old);picoquic_close(old,0x4e4252ULL);
-    g_metrics_state.pool_retire_total++;
-    int replacement=pool_ensure(pool,idx);
-    log4c_warn("pool[%d:%d] degraded retire queue_age=%.1fms pto=%llu streams=%d replacement=%s cooldown=%.1fs",
-        pool_id,idx,queue_age/1000.0,(unsigned long long)pto,streams,replacement==0?"started":"failed",
-        g_pool_health_cfg.cooldown_us/1000000.0);
+}
+
+static int pool_promote_replacement(cnx_pool_t* pool,int pool_id,int idx){
+    picoquic_cnx_t* replacement=pool->replacement_cnx[idx];
+    if(!pool_cnx_ready(replacement)||pool->draining_cnx[idx]!=NULL)return 0;
+    picoquic_cnx_t* old=pool->cnx[idx];pool->draining_cnx[idx]=old;pool->draining_closing[idx]=0;
+    pool->cnx[idx]=replacement;pool->replacement_cnx[idx]=NULL;pool->replacement_closing[idx]=0;
+    pool->next_sid[idx]=0;nb_pool_slot_reset_quality(pool,idx);memset(&pool->health[idx],0,sizeof(pool->health[idx]));
+    g_metrics_state.pool_mbb_promotions++;
+    log4c_warn("pool[%d:%d] make-before-break promoted old_streams=%d",pool_id,idx,pool_slot_streams(old));
+    return 1;
+}
+
+static void pool_drain_tick(cnx_pool_t* pool,int pool_id,int idx){
+    picoquic_cnx_t* draining=pool->draining_cnx[idx];if(draining==NULL)return;
+    int streams=pool_slot_streams(draining);
+    if(streams==0&&!pool->draining_closing[idx]){
+        pool->draining_closing[idx]=1;g_metrics_state.pool_retire_total++;
+        log4c_info("pool[%d:%d] draining connection complete",pool_id,idx);
+        picoquic_close(draining,0x4e4244ULL);
+    }
 }
 
 static void pool_health_tick(uint64_t now){
     static uint64_t last=0;if(last&&now-last<250000ULL)return;last=now;
     for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
-        cnx_pool_t* pool=&G.pools[pool_id];picoquic_cnx_t* cnx=pool->cnx[idx];if(cnx==NULL)continue;
+        cnx_pool_t* pool=&G.pools[pool_id];pool_drain_tick(pool,pool_id,idx);
+        picoquic_cnx_t* cnx=pool->cnx[idx];if(cnx==NULL)continue;
         int eligible=0;uint64_t age=pool_slot_queue_age(cnx,now,&eligible);
         picoquic_path_t* path=cnx->nb_paths?cnx->path[0]:NULL;uint64_t pto=path?path->nb_retransmit:0,suppressed=0;
         int streams=pool_slot_streams(cnx);
@@ -287,9 +333,18 @@ static void pool_health_tick(uint64_t now){
             ?g_pool_health_cfg.queue_age_threshold_us:age;
         int blocked=cnx->cwin_blocked||cnx->stream_blocked;if(G.role==ROLE_MIDDLE)blocked=blocked||cnx->flow_blocked||age>=g_pool_health_cfg.queue_age_threshold_us*2;
         /* 连续 PTO 可处理无活动 stream 的失效槽，但仍须同时通过 ACK 进展、hold 和冷却门槛。 */
+        int was_quarantined=pool->health[idx].quarantined;
         int retire=nb_pool_health_evaluate(pool,idx,&g_pool_health_cfg,now,health_eligible,
             health_age,blocked||connection_candidate,path?path->delivered:0,&suppressed);
-        if(retire)pool_retire_slot(pool,pool_id,idx,age,pto);
+        if(!was_quarantined&&pool->health[idx].quarantined)g_metrics_state.pool_quarantine_total++;
+        int replacement_ready=pool_cnx_ready(pool->replacement_cnx[idx]);
+        nb_pool_recovery_action_t action=nb_pool_health_recovery_action(&pool->health[idx],
+            pool->replacement_cnx[idx]!=NULL,replacement_ready,pool->draining_cnx[idx]!=NULL);
+        if(action==NB_POOL_RECOVERY_START_REPLACEMENT)(void)pool_start_replacement(pool,pool_id,idx);
+        else if(action==NB_POOL_RECOVERY_PROMOTE_REPLACEMENT){if(pool_promote_replacement(pool,pool_id,idx))continue;}
+        else if(action==NB_POOL_RECOVERY_CLOSE_REPLACEMENT)pool_close_candidate(pool,idx);
+        if(retire)log4c_warn("pool[%d:%d] retire deferred queue_age=%.1fms pto=%llu streams=%d replacement_ready=%d",
+            pool_id,idx,age/1000.0,(unsigned long long)pto,streams,replacement_ready);
         g_metrics_state.pool_retire_suppressed+=suppressed;
     }
 }
@@ -339,6 +394,7 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     picoquic_set_stream_priority(c,p->down_stream_id,
         (uint8_t)(latency_hint ? NB_ROUTE_BOOTSTRAP_PRIO : prio));
     if(fec_v15){
+        nb_fec_profile_t profile=nb_fec_profile_select(best_loss,best_jitter_ms,coldstart_on,g_fec_v15_force_robust);
         p->fec_sidecar_mode = 1;
         p->fec_session_id=fec_session_id_new();
         if(p->fec_session_id==0){log4c_error("id=%u unable to allocate fec session id",p->id);return -1;}
@@ -348,15 +404,18 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
         p->fec_dg_cnx = c;
         snprintf(p->fec_route, sizeof(p->fec_route), "%s", route);
         p->down_opened=1;
+        if(nb_fec_config_for_bdp(&p->fec_config,profile.k,profile.r,g_fec_bdp_bitrate_bps,
+            g_fec_bdp_rtt_us,g_fec_bdp_multiplier)!=NB_FEC_OK)return -1;
         if(fec_engine_ensure(p)!=0) return -1;
         {
             char ctrl[420];
-            int cl=snprintf(ctrl,sizeof(ctrl),NB_FEC_CTRL_START ":%u:%d:%s\n",p->fec_session_id,prio,route);
+            int cl=nb_fec_start_render(ctrl,sizeof(ctrl),p->fec_session_id,prio,profile.k,profile.r,route);
             if(cl<=0||(size_t)cl>=sizeof(ctrl)||queue_down_prefix(p,(const uint8_t*)ctrl,(size_t)cl)!=0){
                 log4c_error("id=%u queue fec ctrl start fail", p->id); return -1; }
         }
-        log4c_info("middle id=%u fec v1.5 start sid=%u ctrl_sid=%llu route=%s loss=%.2f jitter=%.1fms",
-            p->id, p->fec_session_id, (unsigned long long)p->down_stream_id, route, best_loss, best_jitter_ms);
+        log4c_info("middle id=%u fec v1.5 start sid=%u ctrl_sid=%llu profile=%s k=%u r=%u route=%s loss=%.2f jitter=%.1fms",
+            p->id, p->fec_session_id, (unsigned long long)p->down_stream_id,
+            nb_fec_profile_name(profile.level),profile.k,profile.r,route,best_loss,best_jitter_ms);
         return 0;
     }
     p->down_opened=1;
@@ -378,13 +437,9 @@ static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
         if(q2t_append(p,d,n)!=0){ p->need_teardown=1; return; }
         if(fin) p->q2t_fin=1;
     } else {
-        if(G.role==ROLE_MIDDLE && p->fec_sidecar_mode && p->fec_ctrl_peer_ready){
-            if(n||fin){
-                if(nb_fec_tx_feed(p->fec_engine,d,n,fin,picoquic_current_time())!=NB_FEC_OK){ p->need_teardown=1; return; }
-            }
-            return;
-        } else if(G.role==ROLE_MIDDLE && p->fec_sidecar_mode){
+        if(G.role==ROLE_MIDDLE && p->fec_sidecar_mode){
             if(fec_stage_bytes(p, d, n, fin) != 0) return;
+            (void)fec_pump_staged(p);
             return;
         }
         if(n||fin){
@@ -399,13 +454,9 @@ static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
         if(q2t_append(p,d,n)!=0){ p->need_teardown=1; return; }
         if(fin) p->q2t_fin=1;
     } else { /* middle / exit: 写回上游 QUIC stream */
-        if(G.role==ROLE_EXIT && p->fec_sidecar_mode && p->fec_ctrl_peer_ready){
-            if(n||fin){
-                if(nb_fec_tx_feed(p->fec_engine,d,n,fin,picoquic_current_time())!=NB_FEC_OK){ p->need_teardown=1; return; }
-            }
-            return;
-        } else if(G.role==ROLE_EXIT && p->fec_sidecar_mode){
+        if(G.role==ROLE_EXIT && p->fec_sidecar_mode){
             if(fec_stage_bytes(p, d, n, fin) != 0) return;
+            (void)fec_pump_staged(p);
             return;
         }
         if(n||fin){

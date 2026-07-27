@@ -4,5 +4,16 @@
 /build/*.key
 /build/*.users
 /build/line-profiles/
+/build/deploy-audit.jsonl
+/build/observability/
+/build/observe-state.json
+/build/release-manifest.json
+/build/soak/
+/build/p2/
+/build/incidents/
+/build-local*/
+/build-sanitize-*/
+/build-p2-*/
 /tools/line-profiles/
+/tools/private/
 __pycache__/

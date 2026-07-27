@@ -33,6 +33,7 @@
 #include <picoquic_internal.h>
 #include <tls_api.h>
 #include "nb_fec.h"
+#include "nb_fec_policy.h"
 #include "nb_ring.h"
 #include "nb_auth.h"
 #include "nb_auth_async.h"
@@ -68,6 +69,7 @@
 #define NB_TCP_TX_LOW  (1024*1024)
 #define NB_FEC_DG_HIGH (192*1024)
 #define NB_FEC_DG_LOW  (96*1024)
+#define NB_FEC_DG_INFLIGHT_MAX 64u
 #define NB_STREAM_FLOW_WINDOW (128*1024ULL)
 #define NB_STREAM_FLOW_CREDIT_QUANTUM (32*1024ULL)
 #define NB_DGRAM_QUEUE_MAX (256*1024) /* FEC sidecar datagram 应用发送队列上限 */
@@ -82,8 +84,8 @@
 #define NB_FEC_CTRL_ACK    "FC:ACK"
 #define NB_FEC_DGRAM_MAGIC 0x4E424644u /* 'NBFD' */
 #define NB_FEC_DGRAM_VER   1
-#define NB_FEC_V15_K 4
-#define NB_FEC_V15_R 2
+#define NB_FEC_DEFAULT_K 8
+#define NB_FEC_DEFAULT_R 1
 
 typedef enum {
     nb_fec_dgram_hello = 1,
@@ -115,11 +117,15 @@ static nb_pool_health_config_t g_pool_health_cfg={750000ULL,5000000ULL,12000000U
 static int g_fec_v15_observe=1;         /* 默认只观测门控，不接管业务数据；NB_FEC_V15=off/0 可关闭观测 */
 static int g_fec_v15_active=0;          /* 仅 NB_FEC_V15_ACTIVE=on/1 显式启用 sidecar 数据面 */
 static int g_fec_v15_force=0;           /* V1.5 测试强开: 忽略 line_bad, 便于代码级测试 */
+static int g_fec_v15_force_robust=0;
 static uint32_t g_fec_v15_drop_src_mod=0;    /* 测试钩子: 每 N 个 source datagram 丢 1 个(收端侧) */
 static uint32_t g_fec_v15_drop_repair_mod=0; /* 测试钩子: 每 N 个 repair datagram 丢 1 个(收端侧) */
 static uint64_t g_fec_v15_drop_src=0;
 static uint64_t g_fec_v15_drop_repair=0;
 static nb_fec_config_t g_fec_cfg;
+static uint64_t g_fec_bdp_bitrate_bps=20000000ULL;
+static uint64_t g_fec_bdp_rtt_us=250000ULL;
+static unsigned g_fec_bdp_multiplier=2;
 static nb_fec_metrics_t g_fec_metrics_done;
 static nb_metrics_state_t g_metrics_state;
 static nb_session_index_t g_session_index;static nb_udp_lifecycle_t g_udp_lifecycle;

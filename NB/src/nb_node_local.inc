@@ -437,7 +437,8 @@ static void maybe_free(proxy_stream_t* p){
     size_t prefix_left=(p->down_prefix_len>=p->down_prefix_off)
         ?p->down_prefix_len-p->down_prefix_off:0;
     int reliable_pending=prefix_left>0||p->down_tx.len>0||p->up_tx.len>0||p->q2t.len>0||
-        p->down_tx_fin||p->up_tx_fin||p->fec_stage_tx_len>0||p->fec_stage_tx_fin||p->fec_dg_tx_len>0;
+        p->down_tx_fin||p->up_tx_fin||p->fec_stage_tx_len>0||p->fec_stage_tx_fin||p->fec_dg_tx_len>0||
+        (p->fec_sidecar_mode&&p->fec_engine!=NULL&&!nb_fec_tx_complete(p->fec_engine));
     if(left_done && right_done && !reliable_pending){ ps_teardown_reason(p,"bidirectional-fin"); return; }
     if(G.role==ROLE_ENTRY && p->tcp_eof && p->q2t.len==0 && p->probe_mode==0){
         ps_teardown_reason(p,"entry-client-eof"); return;

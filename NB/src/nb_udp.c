@@ -75,6 +75,10 @@ static nb_udp_reassembly_slot_t* slot_get(nb_udp_reassembly_t* state,
     nb_udp_reassembly_slot_t* candidate=NULL;
     for(size_t i=0;i<NB_UDP_REASSEMBLY_SLOTS;i++){
         nb_udp_reassembly_slot_t* s=&state->slots[i];
+        if(s->active&&now_us>s->updated_at&&
+            now_us-s->updated_at>=NB_UDP_REASSEMBLY_TIMEOUT_US){
+            free(s->data);memset(s,0,sizeof(*s));
+        }
         if(s->active&&s->sequence==f->sequence)return s;
         if(!s->active){candidate=s;break;}
         if(candidate==NULL||s->updated_at<candidate->updated_at)candidate=s;

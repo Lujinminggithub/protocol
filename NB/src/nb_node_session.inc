@@ -348,6 +348,34 @@ static int fec_stage_bytes(proxy_stream_t* p, const uint8_t* d, size_t n, int fi
     return 0;
 }
 
+static int fec_pump_staged(proxy_stream_t* p){
+    if(p==NULL||p->fec_engine==NULL||!p->fec_ctrl_peer_ready) return 0;
+    uint8_t k=p->fec_config.k?p->fec_config.k:g_fec_cfg.k;
+    uint8_t r=p->fec_config.r?p->fec_config.r:g_fec_cfg.r;
+    size_t queued_block_limit=(size_t)(k+r)*(NB_FEC_SYMBOL_SIZE+30u);
+    if(p->fec_dg_inflight>=NB_FEC_DG_INFLIGHT_MAX||p->fec_dg_tx_len>=queued_block_limit) return 0;
+    if(p->fec_stage_tx_len>0){
+        size_t writable=nb_fec_tx_writable(p->fec_engine);
+        if(writable==0) return 0;
+        size_t take=p->fec_stage_tx_len<writable?p->fec_stage_tx_len:writable;
+        size_t block_bytes=(size_t)k*NB_FEC_SYMBOL_SIZE;
+        if(take>block_bytes) take=block_bytes;
+        int send_fin=p->fec_stage_tx_fin&&take==p->fec_stage_tx_len;
+        int rc=nb_fec_tx_feed(p->fec_engine,p->fec_stage_tx,take,send_fin,picoquic_current_time());
+        if(rc!=NB_FEC_OK){ p->need_teardown=1; return -1; }
+        memmove(p->fec_stage_tx,p->fec_stage_tx+take,p->fec_stage_tx_len-take);
+        p->fec_stage_tx_len-=take;
+        if(send_fin) p->fec_stage_tx_fin=0;
+    }
+    if(p->fec_stage_tx_len==0&&p->fec_stage_tx_fin&&nb_fec_tx_finish_ready(p->fec_engine)){
+        if(nb_fec_tx_feed(p->fec_engine,NULL,0,1,picoquic_current_time())!=NB_FEC_OK){
+            p->need_teardown=1; return -1;
+        }
+        p->fec_stage_tx_fin=0;
+    }
+    return 0;
+}
+
 static int fec_ctrl_send(proxy_stream_t* p, const uint8_t* d, size_t n){
     if((p->fec_ctrl_cnx == p->up_cnx && p->fec_ctrl_stream_id == p->up_stream_id) || G.role == ROLE_EXIT){
         return queue_up(p, d, n, 0);
@@ -388,7 +416,8 @@ static int fec_engine_ensure(proxy_stream_t* p){
         log4c_error("id=%u duplicate fec session sid=%u",p->id,p->fec_session_id);return -1;
     }
     nb_fec_callbacks_t cb={fec_engine_send_datagram,fec_engine_send_control,fec_engine_deliver};
-    p->fec_engine=nb_fec_session_create(p->fec_session_id,&g_fec_cfg,&cb,p);
+    const nb_fec_config_t* cfg=p->fec_config.k?&p->fec_config:&g_fec_cfg;
+    p->fec_engine=nb_fec_session_create(p->fec_session_id,cfg,&cb,p);
     if(p->fec_engine==NULL){
         log4c_error("id=%u fec engine create fail sid=%u",p->id,p->fec_session_id);
         fec_session_index_remove(p->fec_session_id,p);return -1;
@@ -412,10 +441,11 @@ static int fec_queue_probe_datagram(proxy_stream_t* p, uint8_t type){
     return (n > 0) ? fec_queue_datagram(p, buf, (size_t)n) : -1;
 }
 
-static int fec_should_drop(uint8_t type, uint32_t block_id, uint8_t symbol_idx){
+static int fec_should_drop(const proxy_stream_t* p,uint8_t type, uint32_t block_id, uint8_t symbol_idx){
     (void)block_id;
     if(type == nb_fec_dgram_source && g_fec_v15_drop_src_mod > 0){
-        uint64_t seq = (uint64_t)block_id * NB_FEC_V15_K + symbol_idx + 1;
+        uint8_t k=p&&p->fec_config.k?p->fec_config.k:g_fec_cfg.k;
+        uint64_t seq = (uint64_t)block_id * k + symbol_idx + 1;
         if((seq % g_fec_v15_drop_src_mod) == 0){ g_fec_v15_drop_src++; return 1; }
     } else if(type == nb_fec_dgram_repair && g_fec_v15_drop_repair_mod > 0){
         uint64_t seq = (uint64_t)block_id + symbol_idx + 1;
@@ -425,10 +455,12 @@ static int fec_should_drop(uint8_t type, uint32_t block_id, uint8_t symbol_idx){
 }
 
 static void fec_ctrl_handle_line(proxy_stream_t* p, const char* line, int from_down){
-    uint32_t sid=0; int prio=0; char route[300];
+    uint32_t sid=0;char route[300];
     if(strncmp(line, NB_FEC_CTRL_START ":", strlen(NB_FEC_CTRL_START ":")) == 0){
-        route[0]=0;
-        if(sscanf(line, "FC:START:%u:%d:%299[^\n]", &sid, &prio, route) >= 2){
+        nb_fec_start_t start;
+        if(nb_fec_start_parse(line,g_fec_cfg.k,g_fec_cfg.r,&start)==0){
+            sid=start.session_id;int prio=start.priority;
+            snprintf(route,sizeof(route),"%s",start.route);
             p->fec_ctrl_only = 1;
             p->fec_sidecar_mode = 1;
             p->fec_session_id = sid;
@@ -438,8 +470,11 @@ static void fec_ctrl_handle_line(proxy_stream_t* p, const char* line, int from_d
             p->fec_ctrl_cnx = p->up_cnx;
             p->fec_ctrl_stream_id = p->up_stream_id;
             p->fec_ctrl_opened = 1;
+            if(nb_fec_config_for_bdp(&p->fec_config,start.k,start.r,g_fec_bdp_bitrate_bps,
+                g_fec_bdp_rtt_us,g_fec_bdp_multiplier)!=NB_FEC_OK){p->need_teardown=1;return;}
             if(fec_engine_ensure(p)!=0){ p->need_teardown=1; return; }
-            log4c_info("%s fec ctrl START sid=%u prio=%d route=%s", role_name(G.role), sid, prio, p->fec_route);
+            log4c_info("%s fec ctrl START sid=%u prio=%d k=%u r=%u route=%s", role_name(G.role), sid, prio,
+                start.k,start.r,p->fec_route);
             if(G.role == ROLE_MIDDLE && !from_down && route[0]){
                 char first[300], rest[300]; rest[0]=0;
                 char* comma=strchr(route, ',');
@@ -501,14 +536,14 @@ static void fec_ctrl_handle_line(proxy_stream_t* p, const char* line, int from_d
             s->fec_sidecar_mode = 1;
             log4c_info("%s fec ctrl ACK sid=%u", role_name(G.role), sid);
             if(G.role == ROLE_MIDDLE && from_down){
-                if((s->fec_stage_tx_len > 0 || s->fec_stage_tx_fin) && !s->need_teardown){
-                    if(nb_fec_tx_feed(s->fec_engine, s->fec_stage_tx, s->fec_stage_tx_len,
-                        s->fec_stage_tx_fin, picoquic_current_time()) != 0){
-                        s->need_teardown = 1;
-                    }
-                    s->fec_stage_tx_len = 0;
-                    s->fec_stage_tx_fin = 0;
+                int fc_ret=picoquic_open_flow_control(s->fec_ctrl_cnx,s->fec_ctrl_stream_id,4u*1024u*1024u);
+                if(fc_ret!=0){
+                    log4c_warn("middle fec ctrl flow credit failed sid=%u stream=%llu ret=%d",
+                        sid,(unsigned long long)s->fec_ctrl_stream_id,fc_ret);
+                    s->need_teardown=1;
+                    return;
                 }
+                if(!s->need_teardown) (void)fec_pump_staged(s);
                 (void)fec_queue_probe_datagram(s, nb_fec_dgram_hello);
             }
         }
@@ -518,6 +553,7 @@ static void fec_ctrl_handle_line(proxy_stream_t* p, const char* line, int from_d
             log4c_warn("%s fec engine control fail sid=%u rc=%d line=%.32s",role_name(G.role),p->fec_session_id,rc,line);
             p->need_teardown=1;
         }
+        if(rc==NB_FEC_OK) (void)fec_pump_staged(p);
         return;
     } else {
         log4c_warn("%s fec control without engine: %.32s",role_name(G.role),line);

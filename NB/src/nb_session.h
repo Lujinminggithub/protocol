@@ -94,6 +94,9 @@ typedef struct proxy_stream {
     uint64_t fec_dg_recv;
     uint64_t fec_dg_acked;
     uint64_t fec_dg_lost;
+    uint32_t fec_dg_inflight;
+    uint32_t fec_dg_inflight_peak;
+    nb_fec_config_t fec_config;
     nb_fec_session_t* fec_engine;
     /* SOCKS5 入口(仅 entry -S): 握手阶段 0=greeting 1=request 2=直通 */
     int socks_stage;

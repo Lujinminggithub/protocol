@@ -11,6 +11,8 @@ int main(void){
     nb_metrics_note_loop(&state,6000,3000);nb_metrics_note_loop(&state,25000,40000);
     nb_metrics_note_udp_error(&state,0);nb_metrics_note_udp_error(&state,1);
     state.pool_retire_total=2;state.pool_retire_suppressed=3;
+    state.pool_quarantine_total=4;state.pool_mbb_promotions=2;
+    state.pmtu_promotions=4;state.pmtu_fallbacks=1;
     nb_metrics_snapshot_t snapshot;
     nb_metrics_snapshot_init(&snapshot,&state,2,4,1,1);
     nb_metrics_snapshot_add_stream(&snapshot,2,1,0,1,1,0,100,200,10,20,30,1000,2000,3000,4000,5000);
@@ -27,6 +29,7 @@ int main(void){
     assert(len>0&&(size_t)len<sizeof(json));assert(strstr(json,"\"media\":1")!=NULL);
     assert(strstr(json,"\"busy_max_us\":25000")!=NULL);assert(strstr(json,"\"tx_blocks\":2")!=NULL);
     assert(strstr(json,"\"spurious_total\":4")!=NULL&&strstr(json,"\"cc\":\"bbr\"")!=NULL);
-    assert(strstr(json,"\"pool_recovery\":{\"retired\":2,\"suppressed\":3}")!=NULL);
+    assert(strstr(json,"\"pool_recovery\":{\"retired\":2,\"suppressed\":3,\"quarantined\":4,\"mbb_promotions\":2}")!=NULL);
+    assert(strstr(json,"\"pmtu\":{\"promotions\":4,\"fallbacks\":1}")!=NULL);
     puts("RESULT PASS");return 0;
 }

@@ -4,7 +4,7 @@ import pathlib
 import tempfile
 from types import SimpleNamespace
 
-from netem_matrix import (contract_met, load_scenarios, parse_losses, segment_target, summarize_cases,
+from netem_matrix import (SelectiveNetem, contract_met, load_scenarios, parse_losses, segment_target, summarize_cases,
                           summarize_observation, validate_cluster, validate_resources)
 
 
@@ -39,6 +39,8 @@ def main() -> None:
     assert not summary["collection_errors"]
     assert segment_target("middle-exit")["receiver_role"] == "exit"
     assert segment_target("entry-middle")["receiver_role"] == "middle"
+    assert SelectiveNetem("middle", "192.0.2.1", "192.0.2.2").port_direction == "dst"
+    assert SelectiveNetem("middle", "192.0.2.1", "192.0.2.2", port_direction="src").port_direction == "src"
     cases = [
         {"loss_pct": 1, "delay_ms": 0, "jitter_ms": 0, "reorder_pct": 0,
          "passed": True, "load": {"achieved_mbps": 4}, "observation": {"queue_age_p95_us": 10}},

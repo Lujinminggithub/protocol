@@ -71,6 +71,7 @@ class SelectiveNetem:
     source_ip: str
     destination_ip: str
     port: int = QUIC_PORT
+    port_direction: str = "dst"
     filter_pref: int = FILTER_PREF
     connection: object | None = None
     interface: str = ""
@@ -80,6 +81,8 @@ class SelectiveNetem:
     guard_pid: int = 0
 
     def open(self) -> dict:
+        if self.port_direction not in ("src", "dst"):
+            raise RuntimeError(f"invalid netem port direction: {self.port_direction}")
         self.connection = deploy.connect(self.receiver_role)
         local_lookup = (
             f"ip -o -4 addr show | awk -v ip={shlex.quote(self.destination_ip)} "
@@ -109,6 +112,7 @@ class SelectiveNetem:
             "source_ip": self.source_ip,
             "destination_ip": self.destination_ip,
             "udp_port": self.port,
+            "port_direction": self.port_direction,
             "original_qdisc": qdisc.strip(),
         }
 
@@ -126,7 +130,7 @@ class SelectiveNetem:
         checked(
             self.connection,
             f"tc filter add dev {self.interface} ingress protocol ip pref {self.filter_pref} flower "
-            f"ip_proto udp dst_port {self.port} action mirred egress redirect dev {self.ifb}",
+            f"ip_proto udp {self.port_direction}_port {self.port} action mirred egress redirect dev {self.ifb}",
         )
         self.installed = True
         cleanup = (

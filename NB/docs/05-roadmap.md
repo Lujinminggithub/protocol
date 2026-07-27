@@ -40,11 +40,19 @@
 3. **控制平面**：探测各中转质量+加权最短路选路+source-route下发。linkq是质量度量基础。**已发现hk→kz线路差,选路可换更优exit落地点**。
 4. **多线程规模化**：进入 V1.5 主线，而不是拖到手机客户端之后。
 
-### P2 — V2 主线
-1. **自研手机客户端**（替代 Shadowrocket）：见 [07-手机代理客户端方案](07-手机代理客户端方案.md)。
+### P2 — V1.5 后的服务端极限与发布闭环
+> 已于 2026-07-24 从 tag `v1.5` 启动，并于 2026-07-27 按 IPv4-only、FEC observe-only、公共 UDP 单报文不超过 1001 字节的受限范围关闭。详见 [18-P2-A/B/C实施与Xray协议Demo](18-P2-ABC实施与Xray协议Demo.md)。
+
+1. **P2-A UDP/PMTU 完整性**：IPv4、运行期 PMTU、分片边界和黑洞回退已验收；IPv6 因无原生线路延期。
+2. **P2-B FEC 生产化**：自适应策略和定量 canary 已完成；active 未达到准入线，生产固定 observe-only。
+3. **P2-C CI、故障矩阵与 soak**：CI 和三角色故障矩阵通过；未完成的 24 小时 soak 通过有限期、证据绑定的签名豁免接受。
+4. **客户端边界**：本阶段不开发手机 App，只交付协议收发 demo；未来手机端基于 Xray-core。
+
+### P3 — Xray 手机客户端与 V2 双平面
+1. **Xray-core 客户端适配**：实现 NB outbound/transport，替代 Shadowrocket。
 2. **实时媒体平面**：从全量 `TCP-over-QUIC` 演进为“可靠平面 + 实时平面”。
-3. **客户端侧 multipath / FEC**：优先用于 `客户端 -> 入口节点` 段。
-4. **更激进的 FEC 下沉**：从当前 stream 双发试验过渡到 datagram/chunk 级纠错。
+3. **客户端侧 multipath/FEC**：优先用于 `客户端 -> 入口节点` 段。
+4. **FEC 下沉**：从当前 hop-local sidecar 演进到实时 datagram/chunk 级纠错。
 
 ### 限速能力（QoS）— 卖线路必需，分两层互补
 **① 用户套餐限速(按用户,核心)→ NB应用层自研**
@@ -60,7 +68,7 @@
 
 **关键判断**:用户套餐限速必须NB应用层(用认证身份+优先级);节点/IP防护复用xgw XDP且不依赖认证可先用。顺序:认证→用户套餐限速(应用层)→XDP节点防护(复用xgw)。
 
-### P3 — 优化/规模化
+### 后续优化/规模化
 1. **优化4**:exit DNS多地址重试;直播webcast媒体vs rtc信令细分优先级。
 2. **多线程SO_REUSEPORT**(多用户规模化):单用户单核够80Mbps。**可做成多线程**——每线程独立quic context(picoquic非线程安全)+SO_REUSEPORT内核分发,共享配置/白名单/DNS缓存,比多进程优。DNS worker已是线程先例。
 3. **P1-1 epoll+hashmap**:替select(FD_SETSIZE=1024上限)+O(n)查找。高并发(数千fd)才需要,单用户价值低,风险最高,放最后。
