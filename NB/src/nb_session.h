@@ -56,6 +56,7 @@ typedef struct proxy_stream {
     int upstream_fc_blocked;
     int probe_mode;              /* exit 内部探针: 1=sink/count, 2=echo */
     uint64_t probe_bytes;
+    uint64_t probe_progress_at;
     /* 端到端逻辑流。Middle 仅透传 NBLS 帧；Entry/Exit 保存 replay 与消费 offset。 */
     int logical_mode;
     int logical_endpoint;

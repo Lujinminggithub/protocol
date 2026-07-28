@@ -42,6 +42,7 @@
 #include "nb_routes.h"
 #include "nb_policy.h"
 #include "nb_live.h"
+#include "nb_probe.h"
 #include "nb_lstream.h"
 #include "nb_metrics.h"
 #include "nb_session_index.h"

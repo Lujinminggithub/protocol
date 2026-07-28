@@ -120,6 +120,11 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
         if(len>0){
             p->probe_bytes+=len;ps_note_payload(p,1,len);
             if(p->probe_mode==2&&queue_up(p,bytes,len,0)!=0)return -1;
+            if(p->probe_mode==1){
+                char progress[96];int n=nb_probe_progress_format(p->probe_bytes,picoquic_current_time(),
+                    &p->probe_progress_at,progress,sizeof(progress));
+                if(n<0||(n>0&&queue_up(p,(const uint8_t*)progress,(size_t)n,0)!=0))return -1;
+            }
         }
         if(fin){
             p->up_fin_seen=1;p->tcp_eof=1;
@@ -252,6 +257,11 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
         }else if(p->probe_mode){
             p->probe_bytes+=len-off;ps_note_payload(p,1,len-off);
             if(p->probe_mode==2&&queue_up(p,bytes+off,len-off,0)!=0)return -1;
+            if(p->probe_mode==1){
+                char progress[96];int n=nb_probe_progress_format(p->probe_bytes,picoquic_current_time(),
+                    &p->probe_progress_at,progress,sizeof(progress));
+                if(n<0||(n>0&&queue_up(p,(const uint8_t*)progress,(size_t)n,0)!=0))return -1;
+            }
         }else fwd_down(p,bytes+off,len-off,0);
     }
     if(fin&&p->logical_mode)return 0;
