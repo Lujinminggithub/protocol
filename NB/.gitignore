@@ -15,6 +15,8 @@
 /build-local*/
 /build-sanitize-*/
 /build-p2-*/
+/controlplane/build/
+/build/controlplane-backups/
 /tools/line-profiles/
 /tools/private/
 __pycache__/

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "worker_id": "windows-operations-1",
+  "root": "..",
+  "python": "python",
+  "state_dir": "./build/nb-web-worker",
+  "lines": [
+    {
+      "line_id": "gz-83-hk-216-kz-1",
+      "resource_group": "gz-hk-primary",
+      "hosts_file": "../tools/lab-hosts.json",
+      "source_machines_file": "../tools/private/kz-machines.json",
+      "line_profile_file": "../tools/line-profiles/gz-hk-kz.json",
+      "known_hosts_file": "../tools/private/kz-known_hosts",
+      "security_dir": "../tools/private/kz-security",
+      "client_secret_file": "../tools/private/kz-socks-client.json",
+      "package_mbps": 10,
+      "socks_port": 1080,
+      "enabled_operations": [],
+      "disabled_reason": "shares GZ/HK with the active US deployment"
+    }
+  ]
+}
+

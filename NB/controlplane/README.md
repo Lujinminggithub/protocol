@@ -4,6 +4,87 @@
 reconciles the C node's `users.conf` and `tenants.conf`. It also collects worker
 health/metrics and sends durable, idempotent events to an existing web service.
 
+## Windows central operations service
+
+`nb-web` is the central multi-line service. It runs on the Windows operations
+host, embeds its browser UI in the Go binary, and keeps line metadata, latest
+worker snapshots, incidents and typed operations in a separate SQLite database.
+It never stores SSH passwords or node private keys; a line stores only a
+`secret_ref` that points to the external secret owner.
+
+Start it locally:
+
+```powershell
+$env:NB_WEB_ADMIN_TOKEN = "use-a-long-random-admin-token"
+$env:NB_WEB_AGENT_TOKEN = "use-a-different-long-agent-token"
+./start-nb-web.ps1 -Listen "127.0.0.1:9091"
+```
+
+Open `http://127.0.0.1:9091` and enter the admin token. The central API uses
+`Authorization: Bearer`; all operation mutations additionally require an
+`Idempotency-Key`. Supported operation types are `line.open`, `line.validate`,
+`line.upgrade`, `line.rollback`, and `line.disable`. Agents can only claim typed
+operations and return a terminal result, so the web service cannot execute
+arbitrary SSH commands.
+
+Existing Linux `nb-control` instances can report to the central service without
+changing their collector payload:
+
+```ini
+NB_WEB_BASE_URL=http://windows-operations-host:9091
+NB_WEB_TOKEN=<same value as NB_WEB_AGENT_TOKEN>
+```
+
+Register the matching `line_id` in the UI before enabling delivery. The central
+service accepts the existing `/api/nb/v1/node-snapshots` and
+`/api/nb/v1/incidents` outbox paths. New agents can use `/agent/v1/snapshots`,
+`/agent/v1/incidents`, `GET /agent/v1/operations?line_id=...`, and
+`POST /agent/v1/operations/{id}/result` directly.
+
+SQLite WAL is appropriate for one Windows central process and dozens of lines.
+Before running multiple central replicas, move the central store to PostgreSQL;
+the per-line agent outbox remains SQLite.
+
+### Windows operation worker
+
+`nb-web-worker` is a separate Windows process. It polls the central service and
+executes only these typed operations: `line.open`, `line.validate`,
+`line.upgrade`, `line.rollback`, and `line.disable`. The worker never accepts a
+host, credential, file path, or shell command from an operation payload.
+
+Server placement is selected by `line_id` in the worker's ignored private
+registry (`tools/private/nb-web-worker.json`). Each entry maps a line to a fixed
+resource group, machine inventory, line profile, `known_hosts`, security
+directory, and an explicit operation allowlist. The mapping is the authority
+for where a line is deployed; the web line record is display and scheduling
+metadata only. This permits multiple lines while keeping credentials outside
+the central database.
+
+Create the private registry from
+`controlplane/nb-web-worker.registry.example.json`, then start the worker:
+
+```powershell
+$env:NB_WEB_BASE_URL = "http://127.0.0.1:9091"
+$env:NB_WEB_AGENT_TOKEN = "use-the-central-agent-token"
+./start-nb-web-worker.ps1
+```
+
+The worker sends a heartbeat with its per-line capabilities. Until an online
+worker advertises the requested operation, the API rejects operation creation
+and the UI disables the action with a `waiting for executor` explanation. A
+worker writes the operation result to its local state directory before
+acknowledging completion, which prevents a lost HTTP response from rerunning a
+completed deployment.
+
+The current deployment model treats GZ/HK as a shared resource group. Opening
+the KZ and US profiles concurrently would overwrite that shared deployment, so
+the private registry must disable KZ mutations until multi-exit coexistence is
+implemented or dedicated GZ/HK resources are assigned.
+
+Incorrect or superseded draft lines are marked `archived`. Their historical
+operations remain queryable, while the line is excluded from the active line
+list, dashboard totals, and capacity calculations.
+
 Build and install on the Entry host:
 
 ```bash
