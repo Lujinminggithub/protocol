@@ -8,6 +8,7 @@
     {
       "line_id": "gz-83-hk-216-kz-1",
       "resource_group": "gz-hk-primary",
+      "instance_id": "kz",
       "hosts_file": "../tools/lab-hosts.json",
       "source_machines_file": "../tools/private/kz-machines.json",
       "line_profile_file": "../tools/line-profiles/gz-hk-kz.json",
@@ -15,10 +16,18 @@
       "security_dir": "../tools/private/kz-security",
       "client_secret_file": "../tools/private/kz-socks-client.json",
       "package_mbps": 10,
-      "socks_port": 1080,
-      "enabled_operations": [],
-      "disabled_reason": "shares GZ/HK with the active US deployment"
+      "socks_port": 1081,
+      "udp_port_min": 21024,
+      "udp_port_max": 22047,
+      "middle_port": 4444,
+      "exit_port": 4443,
+      "enabled_operations": [
+        "line.validate",
+        "line.upgrade",
+        "line.rollback",
+        "line.disable"
+      ],
+      "disabled_reason": ""
     }
   ]
 }
-

@@ -29,7 +29,7 @@ def _single(source: dict, key: str) -> dict:
     return copy.deepcopy(values[0])
 
 
-def normalize_hosts(source: dict) -> tuple[dict, dict[str, str]]:
+def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str, str]]:
     """兼容 role 对象、machines[] 和 edges/relays/terminals 三种三机清单。"""
     if all(isinstance(source.get(role), dict) for role in ROLES):
         roles = {role: copy.deepcopy(source[role]) for role in ROLES}
@@ -93,12 +93,13 @@ def normalize_hosts(source: dict) -> tuple[dict, dict[str, str]]:
     if not result.get("exits"):
         result["exits"] = [{"name": f"{normalized['exit']['name']}-primary",
                             "host": normalized["exit"]["host"],
-                            "port": 4443, "weight": 1, "capacity": 512,
+                            "port": exit_port, "weight": 1, "capacity": 512,
                             "fixed_exit": normalized["exit"]["name"]}]
     return result, credentials
 
 
-def baseline_profile(hosts: dict, line_id: str) -> dict:
+def baseline_profile(hosts: dict, line_id: str, middle_port: int = 4443,
+                     exit_port: int = 4443) -> dict:
     entry, middle, exit_host = (hosts[role] for role in ROLES)
     transport = hosts["transport"]
     def selected(role: str) -> dict:
@@ -113,9 +114,9 @@ def baseline_profile(hosts: dict, line_id: str) -> dict:
         "transport": {
             "pool_size": 1,
             "workers": copy.deepcopy(hosts["workers"]),
-            "entry_middle": {"address": f"{middle.get('private_ip') or middle['host']}:4443",
+            "entry_middle": {"address": f"{middle.get('private_ip') or middle['host']}:{middle_port}",
                              **selected("entry")},
-            "middle_exit": {"address": f"{exit_host['host']}:4443", **selected("middle")},
+            "middle_exit": {"address": f"{exit_host['host']}:{exit_port}", **selected("middle")},
             "exit": selected("exit"),
             "pacing": {"media_max_burst_mtu": 2, "gso": False},
             "udp": {"control_grace_us": 120000000,
@@ -147,20 +148,30 @@ def main() -> None:
     parser.add_argument("--line-id", required=True)
     parser.add_argument("--package-mbps", type=float, choices=(5, 10, 15), required=True)
     parser.add_argument("--socks-port", type=int, default=1080)
+    parser.add_argument("--middle-port", type=int, default=int(os.environ.get("NB_MIDDLE_PORT", "4443")))
+    parser.add_argument("--exit-port", type=int, default=int(os.environ.get("NB_EXIT_PORT", "4443")))
+    parser.add_argument("--udp-port-min", type=int, default=int(os.environ.get("NB_SOCKS_UDP_PORT_MIN", "20000")))
+    parser.add_argument("--udp-port-max", type=int, default=int(os.environ.get("NB_SOCKS_UDP_PORT_MAX", "21023")))
     parser.add_argument("--client-username", default="nbmobile")
     parser.add_argument("--output-dir", type=pathlib.Path)
     parser.add_argument("--execute", action="store_true", help="实际初始化和部署；默认只生成计划")
     args = parser.parse_args()
     if not 1 <= args.socks_port <= 65535:
         raise SystemExit("--socks-port 非法")
+    if any(port < 1 or port > 65535 for port in (args.socks_port, args.middle_port, args.exit_port)):
+        raise SystemExit("line port is invalid")
     source = json.loads(args.hosts.resolve().read_text(encoding="utf-8"))
-    hosts, credentials = normalize_hosts(source)
+    hosts, credentials = normalize_hosts(source, args.exit_port)
+    if args.udp_port_min < 1024 or args.udp_port_max > 65535 or args.udp_port_min > args.udp_port_max:
+        raise SystemExit("UDP relay range is invalid")
+    hosts["transport"]["entry"]["udp_port_min"] = args.udp_port_min
+    hosts["transport"]["entry"]["udp_port_max"] = args.udp_port_max
     output = (args.output_dir or ROOT / "build" / "line-open" / args.line_id).resolve()
     security = output / "security"
     bootstrap_hosts = output / "bootstrap-hosts.json"
     bootstrap_profile = output / "bootstrap-profile.json"
     write_json(bootstrap_hosts, hosts)
-    write_json(bootstrap_profile, baseline_profile(hosts, args.line_id))
+    write_json(bootstrap_profile, baseline_profile(hosts, args.line_id, args.middle_port, args.exit_port))
     client_password = os.environ.get("NB_CLIENT_PASSWORD") or secrets.token_urlsafe(18)
     client_secret = {"username": args.client_username, "password": client_password,
                      "password_env": "NB_OPEN_CLIENT_PASSWORD"}
@@ -181,6 +192,8 @@ def main() -> None:
     plan = {
         "schema_version": 1, "line_id": args.line_id, "package_mbps": args.package_mbps,
         "qualification_mbps": args.package_mbps * 1.25, "socks_port": args.socks_port,
+        "instance_id": os.environ.get("NB_DEPLOY_INSTANCE", ""),
+        "middle_port": args.middle_port, "exit_port": args.exit_port,
         "stages": ["pin-host-keys", "generate-security", "bootstrap-build-deploy",
                    "active-quic-probe", "stable-build-deploy", "tenant-policy-apply",
                    "client-output"],
@@ -200,8 +213,11 @@ def main() -> None:
     env.update({"NB_HOSTS_FILE": str(bootstrap_hosts),
                 "NB_LINE_PROFILE_FILE": str(bootstrap_profile),
                 "NB_SECURITY_DIR": str(security),
-                "NB_SOCKS_USERNAME": args.client_username,
-                "NB_SOCKS_PASSWORD": client_password,
+                 "NB_SOCKS_USERNAME": args.client_username,
+                 "NB_SOCKS_PASSWORD": client_password,
+                 "NB_SOCKS_PORT": str(args.socks_port),
+                 "NB_MIDDLE_PORT": str(args.middle_port),
+                 "NB_EXIT_PORT": str(args.exit_port),
                 "NB_OPEN_CLIENT_PASSWORD": client_password,
                 "NB_SSH_INSECURE": "1"})
     run([sys.executable, "tools/security_setup.py", "--out", str(security)], env)

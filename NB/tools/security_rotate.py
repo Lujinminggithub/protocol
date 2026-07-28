@@ -62,7 +62,7 @@ def apply_phase(bundle:pathlib.Path,phase:str,execute:bool)->None:
     required={"trust":"prepared","identity":"trusted-overlap","retire":"identity-switched"}[phase]
     if manifest.get("state")!=required:raise ValueError(f"phase={phase} 要求 state={required}，当前为 {manifest.get('state')}")
     if not execute:print(json.dumps({"preflight":"ok","phase":phase,"rotation_id":manifest["rotation_id"]},ensure_ascii=False));return
-    remote_root=f"{deploy.WORK}/certs";backup=f"{remote_root}/rotation-{manifest['rotation_id']}-{phase}"
+    remote_root=deploy.DEPLOY_CERTS;backup=f"{remote_root}/rotation-{manifest['rotation_id']}-{phase}"
     attempted=[]
     try:
         for role in ("exit","middle","entry"):
@@ -77,7 +77,7 @@ def apply_phase(bundle:pathlib.Path,phase:str,execute:bool)->None:
                 elif phase=="retire":
                     deploy.push_bytes(c,(bundle/"new"/"ca.pem").read_bytes(),f"{remote_root}/ca.pem",0o644);deploy.push_bytes(c,(manifest["old_ca_sha256"]+"\n").encode(),f"{remote_root}/revoked-ca.sha256",0o600)
                 else:raise ValueError("phase 必须为 trust/identity/retire")
-                deploy.run(c,f"systemctl kill -s HUP nb-{role}.service");health=deploy._verify_deployment_health(c,role,deployment,warmup=4)
+                deploy.run(c,f"systemctl kill -s HUP {shlex.quote(deploy._service_name(role) + '.service')}");health=deploy._verify_deployment_health(c,role,deployment,warmup=4)
                 audit(bundle,f"{phase}-applied",role,{"health":health})
             finally:
                 if c is not None:c.close()
@@ -85,7 +85,7 @@ def apply_phase(bundle:pathlib.Path,phase:str,execute:bool)->None:
         for role in reversed(attempted):
             c=None
             try:
-                c=deploy.connect(role);deploy.run(c,f"cp -pf {shlex.quote(backup)}/ca.pem {remote_root}/ca.pem; cp -pf {shlex.quote(backup)}/{role}.pem {remote_root}/{role}.pem; cp -pf {shlex.quote(backup)}/{role}.key {remote_root}/{role}.key; systemctl kill -s HUP nb-{role}.service")
+                c=deploy.connect(role);deploy.run(c,f"cp -pf {shlex.quote(backup)}/ca.pem {remote_root}/ca.pem; cp -pf {shlex.quote(backup)}/{role}.pem {remote_root}/{role}.pem; cp -pf {shlex.quote(backup)}/{role}.key {remote_root}/{role}.key; systemctl kill -s HUP {shlex.quote(deploy._service_name(role) + '.service')}")
             except Exception:pass
             finally:
                 if c is not None:c.close()

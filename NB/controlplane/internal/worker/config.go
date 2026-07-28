@@ -32,6 +32,7 @@ type Registry struct {
 type LineSpec struct {
 	LineID             string   `json:"line_id"`
 	ResourceGroup      string   `json:"resource_group"`
+	InstanceID         string   `json:"instance_id"`
 	HostsFile          string   `json:"hosts_file"`
 	SourceMachinesFile string   `json:"source_machines_file"`
 	LineProfileFile    string   `json:"line_profile_file"`
@@ -40,6 +41,10 @@ type LineSpec struct {
 	ClientSecretFile   string   `json:"client_secret_file"`
 	PackageMbps        float64  `json:"package_mbps"`
 	SocksPort          int      `json:"socks_port"`
+	UDPPortMin         int      `json:"udp_port_min"`
+	UDPPortMax         int      `json:"udp_port_max"`
+	MiddlePort         int      `json:"middle_port"`
+	ExitPort           int      `json:"exit_port"`
 	EnabledOperations  []string `json:"enabled_operations"`
 	DisabledReason     string   `json:"disabled_reason"`
 }
@@ -74,6 +79,15 @@ func LoadRegistry(path string) (Registry, error) {
 		line.KnownHostsFile = resolve(line.KnownHostsFile)
 		line.SecurityDir = resolve(line.SecurityDir)
 		line.ClientSecretFile = resolve(line.ClientSecretFile)
+		if line.MiddlePort == 0 {
+			line.MiddlePort = 4443
+		}
+		if line.UDPPortMin == 0 && line.UDPPortMax == 0 {
+			line.UDPPortMin, line.UDPPortMax = 20000, 21023
+		}
+		if line.ExitPort == 0 {
+			line.ExitPort = 4443
+		}
 	}
 	if err = registry.Validate(); err != nil {
 		return Registry{}, err
@@ -92,14 +106,53 @@ func (r Registry) Validate() error {
 		return fmt.Errorf("worker root is unavailable: %s", r.Root)
 	}
 	seen := map[string]bool{}
+	entryPorts := map[string]string{}
+	middlePorts := map[string]string{}
+	udpRanges := map[string][]LineSpec{}
 	for _, line := range r.Lines {
 		if !safeID.MatchString(line.LineID) || !safeID.MatchString(line.ResourceGroup) || seen[line.LineID] {
 			return fmt.Errorf("invalid or duplicate worker line: %s", line.LineID)
 		}
 		seen[line.LineID] = true
+		if line.InstanceID != "" && !safeID.MatchString(line.InstanceID) {
+			return fmt.Errorf("invalid instance_id for %s", line.LineID)
+		}
+		middlePort, exitPort := line.MiddlePort, line.ExitPort
+		udpPortMin, udpPortMax := line.UDPPortMin, line.UDPPortMax
+		if middlePort == 0 {
+			middlePort = 4443
+		}
+		if exitPort == 0 {
+			exitPort = 4443
+		}
+		if udpPortMin == 0 && udpPortMax == 0 {
+			udpPortMin, udpPortMax = 20000, 21023
+		}
 		if line.SocksPort < 1 || line.SocksPort > 65535 || (line.PackageMbps != 5 && line.PackageMbps != 10 && line.PackageMbps != 15) {
 			return fmt.Errorf("invalid package or SOCKS port for %s", line.LineID)
 		}
+		if middlePort < 1 || middlePort > 65535 || exitPort < 1 || exitPort > 65535 {
+			return fmt.Errorf("invalid transport port for %s", line.LineID)
+		}
+		if udpPortMin < 1024 || udpPortMax > 65535 || udpPortMin > udpPortMax {
+			return fmt.Errorf("invalid UDP relay range for %s", line.LineID)
+		}
+		entryKey := fmt.Sprintf("%s:%d", line.ResourceGroup, line.SocksPort)
+		middleKey := fmt.Sprintf("%s:%d", line.ResourceGroup, middlePort)
+		if other := entryPorts[entryKey]; other != "" {
+			return fmt.Errorf("SOCKS port collision between %s and %s", other, line.LineID)
+		}
+		if other := middlePorts[middleKey]; other != "" {
+			return fmt.Errorf("middle port collision between %s and %s", other, line.LineID)
+		}
+		entryPorts[entryKey], middlePorts[middleKey] = line.LineID, line.LineID
+		for _, other := range udpRanges[line.ResourceGroup] {
+			if udpPortMin <= other.UDPPortMax && other.UDPPortMin <= udpPortMax {
+				return fmt.Errorf("UDP relay range collision between %s and %s", other.LineID, line.LineID)
+			}
+		}
+		line.UDPPortMin, line.UDPPortMax = udpPortMin, udpPortMax
+		udpRanges[line.ResourceGroup] = append(udpRanges[line.ResourceGroup], line)
 		operationSeen := map[string]bool{}
 		for _, kind := range line.EnabledOperations {
 			if !allowedKinds[kind] || operationSeen[kind] {

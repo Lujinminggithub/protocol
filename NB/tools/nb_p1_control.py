@@ -49,14 +49,15 @@ def apply(bundle:pathlib.Path,execute:bool,socks_port:int=1080)->None:
     tenant=(bundle/"tenant.conf").read_bytes();routes=(bundle/"exit_routes.conf").read_bytes()
     if hashlib.sha256(tenant).hexdigest()!=doc["tenant_sha256"]or hashlib.sha256(routes).hexdigest()!=doc["routes_sha256"]:raise ValueError("策略文件哈希不匹配")
     if not execute:print(json.dumps({"preflight":"ok","policy_id":doc["policy_id"]},ensure_ascii=False));return
-    c=deploy.connect("entry");root=f"{deploy.WORK}/configs/{doc['policy_id']}";old_t=deploy.fetch_bytes(c,f"{deploy.WORK}/tenant.conf");old_r=deploy.fetch_bytes(c,f"{deploy.WORK}/exit_routes.conf")
+    work=deploy.INSTANCE_WORK;service=deploy._service_name("entry")
+    c=deploy.connect("entry");root=f"{work}/configs/{doc['policy_id']}";old_t=deploy.fetch_bytes(c,f"{work}/tenant.conf");old_r=deploy.fetch_bytes(c,f"{work}/exit_routes.conf")
     try:
         deploy.push_bytes(c,tenant,f"{root}/tenant.conf",0o600);deploy.push_bytes(c,routes,f"{root}/exit_routes.conf",0o600)
-        deploy.run(c,f"ln -sfn {shlex.quote(root+'/tenant.conf')} {shlex.quote(deploy.WORK+'/tenant.conf.next')}; mv -Tf {shlex.quote(deploy.WORK+'/tenant.conf.next')} {shlex.quote(deploy.WORK+'/tenant.conf')}; ln -sfn {shlex.quote(root+'/exit_routes.conf')} {shlex.quote(deploy.WORK+'/exit_routes.conf.next')}; mv -Tf {shlex.quote(deploy.WORK+'/exit_routes.conf.next')} {shlex.quote(deploy.WORK+'/exit_routes.conf')}; systemctl kill -s HUP nb-entry.service")
+        deploy.run(c,f"ln -sfn {shlex.quote(root+'/tenant.conf')} {shlex.quote(work+'/tenant.conf.next')}; mv -Tf {shlex.quote(work+'/tenant.conf.next')} {shlex.quote(work+'/tenant.conf')}; ln -sfn {shlex.quote(root+'/exit_routes.conf')} {shlex.quote(work+'/exit_routes.conf.next')}; mv -Tf {shlex.quote(work+'/exit_routes.conf.next')} {shlex.quote(work+'/exit_routes.conf')}; systemctl kill -s HUP {shlex.quote(service + '.service')}")
         deployment=deploy._remote_current_deployment(c,"entry");deploy._verify_deployment_health(c,"entry",deployment,warmup=4)
         os.environ.setdefault("NB_SOCKS_USERNAME","");line_probe.run_integrity_probe(deploy._role_host("entry")["host"],socks_port)
     except Exception:
-        deploy.push_bytes(c,old_t,f"{deploy.WORK}/tenant.conf",0o600);deploy.push_bytes(c,old_r,f"{deploy.WORK}/exit_routes.conf",0o600);deploy.run(c,"systemctl kill -s HUP nb-entry.service");raise
+        deploy.push_bytes(c,old_t,f"{work}/tenant.conf",0o600);deploy.push_bytes(c,old_r,f"{work}/exit_routes.conf",0o600);deploy.run(c,f"systemctl kill -s HUP {shlex.quote(service + '.service')}");raise
     finally:c.close()
     doc["state"]="active";doc["activated_at_utc"]=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z");sign(doc);(bundle/"manifest.json").write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
 

@@ -43,6 +43,39 @@ func TestRegistryRejectsNonAllowlistedOperation(t *testing.T) {
 	}
 }
 
+func TestRegistryRejectsSharedPortCollision(t *testing.T) {
+	registry := testRegistry(t, nil)
+	second := registry.Lines[0]
+	second.LineID = "line-2"
+	second.InstanceID = "line-2"
+	registry.Lines = append(registry.Lines, second)
+	if err := registry.Validate(); err == nil {
+		t.Fatal("registry accepted colliding shared entry and middle ports")
+	}
+	registry.Lines[1].SocksPort = 1081
+	registry.Lines[1].MiddlePort = 4444
+	registry.Lines[1].UDPPortMin, registry.Lines[1].UDPPortMax = 21024, 22047
+	if err := registry.Validate(); err != nil {
+		t.Fatalf("registry rejected isolated ports: %v", err)
+	}
+}
+
+func TestRunnerInjectsInstanceRouting(t *testing.T) {
+	registry := testRegistry(t, nil)
+	line := registry.Lines[0]
+	line.InstanceID, line.SocksPort, line.MiddlePort, line.ExitPort = "kz", 1081, 4444, 4443
+	line.UDPPortMin, line.UDPPortMax = 21024, 22047
+	values, err := NewRunner(registry).environment(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, expected := range map[string]string{"NB_DEPLOY_INSTANCE": "kz", "NB_SOCKS_PORT": "1081", "NB_SOCKS_UDP_PORT_MIN": "21024", "NB_SOCKS_UDP_PORT_MAX": "22047", "NB_MIDDLE_PORT": "4444", "NB_EXIT_PORT": "4443"} {
+		if values[key] != expected {
+			t.Fatalf("%s=%q, want %q", key, values[key], expected)
+		}
+	}
+}
+
 func TestRunnerRefusesDisabledOperation(t *testing.T) {
 	registry := testRegistry(t, nil)
 	registry.Lines[0].DisabledReason = "shared resource is active"

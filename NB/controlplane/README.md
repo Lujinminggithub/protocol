@@ -76,10 +76,14 @@ worker writes the operation result to its local state directory before
 acknowledging completion, which prevents a lost HTTP response from rerunning a
 completed deployment.
 
-The current deployment model treats GZ/HK as a shared resource group. Opening
-the KZ and US profiles concurrently would overwrite that shared deployment, so
-the private registry must disable KZ mutations until multi-exit coexistence is
-implemented or dedicated GZ/HK resources are assigned.
+Lines sharing GZ/HK use isolated deployment namespaces. The registry allocates
+an `instance_id`, SOCKS port, Entry UDP relay range, Relay listener port, and
+Exit listener port for every line in the resource group. Startup rejects port
+or UDP-range collisions. The legacy/default namespace can keep the existing US
+line on `1080/4443`; the KZ line can run as instance `kz` on SOCKS `1081`, Entry
+UDP `21024-22047`, and Relay `4444`. The worker passes these allocations to the
+atomic deployment tools. Windows remains the orchestration plane and is never
+part of packet forwarding.
 
 Incorrect or superseded draft lines are marked `archived`. Their historical
 operations remain queryable, while the line is excluded from the active line

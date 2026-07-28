@@ -84,11 +84,28 @@ func loadJSON(path string) (map[string]any, error) {
 }
 
 func (r *Runner) environment(line LineSpec) (map[string]string, error) {
+	middlePort, exitPort := line.MiddlePort, line.ExitPort
+	udpPortMin, udpPortMax := line.UDPPortMin, line.UDPPortMax
+	if middlePort == 0 {
+		middlePort = 4443
+	}
+	if exitPort == 0 {
+		exitPort = 4443
+	}
+	if udpPortMin == 0 && udpPortMax == 0 {
+		udpPortMin, udpPortMax = 20000, 21023
+	}
 	values := map[string]string{
-		"NB_HOSTS_FILE":        line.HostsFile,
-		"NB_LINE_PROFILE_FILE": line.LineProfileFile,
-		"NB_SECURITY_DIR":      line.SecurityDir,
-		"NB_KNOWN_HOSTS":       line.KnownHostsFile,
+		"NB_HOSTS_FILE":         line.HostsFile,
+		"NB_LINE_PROFILE_FILE":  line.LineProfileFile,
+		"NB_SECURITY_DIR":       line.SecurityDir,
+		"NB_KNOWN_HOSTS":        line.KnownHostsFile,
+		"NB_DEPLOY_INSTANCE":    line.InstanceID,
+		"NB_SOCKS_PORT":         strconv.Itoa(line.SocksPort),
+		"NB_SOCKS_UDP_PORT_MIN": strconv.Itoa(udpPortMin),
+		"NB_SOCKS_UDP_PORT_MAX": strconv.Itoa(udpPortMax),
+		"NB_MIDDLE_PORT":        strconv.Itoa(middlePort),
+		"NB_EXIT_PORT":          strconv.Itoa(exitPort),
 	}
 	credentials, err := loadJSON(line.SourceMachinesFile)
 	if err != nil && line.SourceMachinesFile != "" {
@@ -128,11 +145,13 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 	case "line.open":
 		return []commandStep{{Name: python, Args: []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
 			"--line-id", line.LineID, "--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64),
-			"--socks-port", socks, "--output-dir", filepath.Join(operationDir, "line-open"), "--execute"}}}, nil
+			"--socks-port", socks, "--middle-port", strconv.Itoa(line.MiddlePort), "--exit-port", strconv.Itoa(line.ExitPort),
+			"--udp-port-min", strconv.Itoa(line.UDPPortMin), "--udp-port-max", strconv.Itoa(line.UDPPortMax),
+			"--output-dir", filepath.Join(operationDir, "line-open"), "--execute"}}}, nil
 	case "line.validate":
 		return []commandStep{{Name: python, Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
-			"--socks-port", socks, "--output", filepath.Join(operationDir, "validation.json")}}}, nil
+			"--socks-port", socks, "--via-entry-ssh", "--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.upgrade":
 		return []commandStep{{Name: python, Args: []string{deploy, "build"}},
 			{Name: python, Args: []string{deploy, "deploy-socks", "--socks-port", socks}}}, nil

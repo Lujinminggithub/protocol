@@ -254,12 +254,14 @@ def act_stop(roles):
 def act_logs(roles):
     for r in roles:
         c = connect(r); h = _role_host(r)
-        out = run(c, f"tail -25 {WORK}/logs/nb-{r}.log 2>/dev/null || echo '(no log)'")
+        out = run(c, f"tail -25 {_log_path(r)} 2>/dev/null || echo '(no log)'")
         print(f"### {r}({h['name']}) log\n{out}")
         c.close()
 
 
 def act_deploy_tri():
+    if DEPLOY_INSTANCE:
+        raise RuntimeError("deploy-tri cannot target a named instance; use deploy-socks")
     """分发二进制/证书 -> 起 exit(kz)->middle(hk)->entry(gz) -> 从 gz 冒烟(多 stream + md5)。"""
     hk = _role_host("middle"); kz = _role_host("exit")
     hk_ip = hk["host"]; kz_ip = kz["host"]
@@ -321,7 +323,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             clients[role] = connect(role)
             _acquire_deploy_lock(clients[role], role, deployment_id)
             locked.append(role)
-            run(clients[role], f"mkdir -p {WORK}/logs")
+            run(clients[role], f"mkdir -p {INSTANCE_WORK}/logs")
             previous[role] = _stage_release(clients[role], role, manifest, bindata)
             unit_backups[role] = _backup_role_unit(clients[role], role, deployment_id)
             state_backups[role] = _backup_role_state(clients[role], role, deployment_id)
@@ -329,7 +331,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             print(f"{role}: deployment={deployment_id} 预上传及哈希校验完成")
 
         commands = {}
-        release_dir = f"{WORK}/releases/{deployment_id}"
+        release_dir = f"{INSTANCE_WORK}/releases/{deployment_id}"
         release_rules = f"{release_dir}/tiktok_flow_rules.conf"
         release_routes = f"{release_dir}/exit_routes.conf"
 
@@ -360,7 +362,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             health = _verify_release_health(client, role, manifest)
             _append_deploy_audit(client, role, "healthy", manifest, previous[role], health)
             print(f"{role}: {health}")
-            print(run(client, f"tail -4 {WORK}/logs/nb-{role}.log 2>/dev/null"))
+            print(run(client, f"tail -4 {_log_path(role)} 2>/dev/null"))
 
         _smoke_socks(socks_port)
         for role in roles:
@@ -410,7 +412,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
 def _activate_existing_deployment(c, role, deployment_id):
     if not nb_release.RELEASE_NAME_RE.fullmatch(deployment_id) or deployment_id.startswith("legacy-"):
         raise ValueError(f"非法 deployment_id: {deployment_id}")
-    directory=f"{WORK}/releases/{deployment_id}";unit=f"nb-{role}.service"
+    service=_service_name(role);directory=f"{INSTANCE_WORK}/releases/{deployment_id}";unit=f"{service}.service"
     check=run(c,f"test -x {shlex.quote(directory + '/nb_node')} && test -f {shlex.quote(directory + '/' + unit)} && echo READY")
     if "READY" not in check:raise RuntimeError(f"{role} 缺少不可变部署 {deployment_id}")
     push_target=f"/etc/systemd/system/{unit}"
@@ -468,7 +470,7 @@ def act_wl_show():
 def act_wl_push(local_path: pathlib.Path):
     c = connect("exit")
     _push_whitelist(c, local_path)
-    print(run(c, f"tail -6 {WORK}/logs/nb-exit.log 2>/dev/null"))
+    print(run(c, f"tail -6 {_log_path('exit')} 2>/dev/null"))
     c.close()
 
 

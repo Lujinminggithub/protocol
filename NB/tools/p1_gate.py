@@ -7,7 +7,7 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 def run(name:str)->None:subprocess.run([sys.executable,str(ROOT/"tools"/name)],check=True,cwd=ROOT)
 def main()->None:
     for name in ("test_deploy_connection.py","test_observe.py","test_supervisor.py","test_p1_control.py","test_security_rotate.py",
-                 "test_line_provision.py","test_line_open.py","test_netem_matrix.py"):
+                 "test_line_provision.py","test_line_open.py","test_netem_matrix.py","test_deploy_namespace.py"):
         run(name)
     required=("src/nb_tenant.c","src/nb_tenant.h","src/nb_tenant_shared.c","src/nb_tenant_shared.h","tools/test_tenant.c","src/nb_whitelist.c","src/nb_whitelist.h","tools/test_whitelist.c","src/nb_udp_io.c","src/nb_udp_io.h","tools/test_udp_io.c","src/nb_udp_lifecycle.c","src/nb_udp_lifecycle.h","tools/test_udp_lifecycle.c","tools/nb_p1_control.py","tools/security_rotate.py")
     for name in required:
@@ -16,7 +16,7 @@ def main()->None:
     node=node_source_text()
     deploy="\n".join((ROOT/path).read_text(encoding="utf-8") for path in ("tools/deploy.py","tools/deploy_core.py"))
     runtri=(ROOT/"scripts/runtri.sh").read_text(encoding="utf-8");lab=json.loads((ROOT/"tools/lab-hosts.json").read_text(encoding="utf-8"))
-    for token in ("client_udp_fd","nb_routes_pick_key","nb_tenant_acquire","worker_lane_port"):
+    for token in ("client_udp_fd","nb_routes_pick_key","nb_tenant_acquire","worker_lane_port","NB_CONTROL_PREFIX","NB_INSTANCE_ID"):
         if token not in node:raise RuntimeError(f"P1 node integration missing: {token}")
     tenant=(ROOT/"src/nb_tenant.c").read_text(encoding="utf-8")
     if "nb_tenant_shared_open" not in tenant or "nb_tenant_shared_allowance" not in tenant:

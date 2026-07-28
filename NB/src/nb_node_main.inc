@@ -1,3 +1,10 @@
+static int nb_runtime_id_ok(const char* value,size_t max_len){
+    size_t i,n;if(value==NULL)return 0;n=strlen(value);if(n==0||n>max_len)return 0;
+    for(i=0;i<n;i++){unsigned char c=(unsigned char)value[i];
+        if(!(isalnum(c)||c=='_'||c=='-'||c=='.'))return 0;}
+    return 1;
+}
+
 int main(int argc,char**argv){
     int i; int listen_port=0, quic_port=0, next_port=0;
     const char* rolestr=NULL; const char* next_host=NULL;
@@ -38,11 +45,18 @@ int main(int argc,char**argv){
     else if(!strcmp(rolestr,"exit")) G.role=ROLE_EXIT;
     else { usage(argv[0]); return 1; }
     { const char* worker=getenv("NB_WORKER_ID");if(!worker)worker="0";const char* dir=getenv("NB_CONTROL_DIR");if(!dir||!dir[0])dir="/run";
+      const char* prefix=getenv("NB_CONTROL_PREFIX");char fallback[48];
+      if(!prefix||!prefix[0]){snprintf(fallback,sizeof(fallback),"nb-%s",role_name(G.role));prefix=fallback;}
+      if(!nb_runtime_id_ok(prefix,64)||!nb_runtime_id_ok(worker,16)){fprintf(stderr,"invalid control socket identity\n");return 1;}
       int n=control_path_arg?snprintf(control_path,sizeof(control_path),"%s",control_path_arg)
-          :snprintf(control_path,sizeof(control_path),"%s/nb-%s-%s.ctl",dir,role_name(G.role),worker);
+          :snprintf(control_path,sizeof(control_path),"%s/%s-%s.ctl",dir,prefix,worker);
       if(n<0||(size_t)n>=sizeof(control_path)){fprintf(stderr,"control socket path too long\n");return 1;} }
 
-    { char pname[32]; snprintf(pname,sizeof(pname),"nb-%s",role_name(G.role)); log4c_init(pname);
+    { char pname[96];const char* instance=getenv("NB_INSTANCE_ID");
+      if(instance&&instance[0]&&!nb_runtime_id_ok(instance,48)){fprintf(stderr,"invalid instance identity\n");return 1;}
+      if(instance&&instance[0])snprintf(pname,sizeof(pname),"nb-%s-%s",instance,role_name(G.role));
+      else snprintf(pname,sizeof(pname),"nb-%s",role_name(G.role));
+      log4c_init(pname);
       /* 生产默认 INFO(高频 per-stream 日志已降为 DEBUG, 不输出), 避免海量流日志拖慢单线程事件循环。
        * 需调试时 NB_LOG_LEVEL=DEBUG。 */
       const char* lv=getenv("NB_LOG_LEVEL"); int lvl=LOG4C_INFO;

@@ -93,7 +93,7 @@ python tools/deploy.py deploy-socks
 
 ## 控制面与测试
 
-每个 worker 提供本机 `0600` Unix socket：`/run/nb-<role>-<worker>.ctl`。
+每个 worker 提供本机 `0600` Unix socket：默认实例为 `/run/nb-<role>-<worker>.ctl`，命名实例为 `/run/nb-<instance>-<role>-<worker>.ctl`。共享 Entry/Relay 上的多条线路必须使用不同的 `NB_DEPLOY_INSTANCE`、SOCKS 端口、Entry UDP relay 端口池和 Relay 监听端口；部署文件位于 `/etc/NB/instances/<instance>`，不会覆盖默认实例。
 
 ```bash
 printf 'health\n' | socat - UNIX-CONNECT:/run/nb-middle-0.ctl

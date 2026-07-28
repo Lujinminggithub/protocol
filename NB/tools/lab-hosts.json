@@ -39,8 +39,8 @@
       "cwin_max_bytes": 524288,
       "mtu_max": 1452,
       "udp_gso": false,
-      "udp_port_min": 20000,
-      "udp_port_max": 21023,
+      "udp_port_min": 21024,
+      "udp_port_max": 22047,
       "reorder_gap": 128,
       "reorder_delay_us": 450000
     },

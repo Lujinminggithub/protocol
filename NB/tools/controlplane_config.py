@@ -21,17 +21,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", type=pathlib.Path, required=True)
     parser.add_argument("--line-id", required=True)
+    parser.add_argument("--instance-id", default="")
     parser.add_argument("--web-base-url", default="")
     parser.add_argument("--web-token", default="")
     parser.add_argument("--web-signing-key", default="")
     args = parser.parse_args()
     token = secrets.token_urlsafe(32)
+    if args.instance_id and (len(args.instance_id) > 48 or not all(c.isalnum() or c in "._-" for c in args.instance_id)):
+        raise SystemExit("invalid --instance-id")
+    work = f"/etc/NB/instances/{args.instance_id}" if args.instance_id else "/etc/NB"
+    socket_prefix = f"nb-{args.instance_id}-entry" if args.instance_id else "nb-entry"
     values = {
         "NB_CONTROL_LISTEN": "127.0.0.1:9080",
         "NB_CONTROL_STATE_DIR": "/var/lib/nb-control",
-        "NB_CONTROL_USERS_FILE": "/etc/NB/socks.users",
-        "NB_CONTROL_TENANTS_FILE": "/etc/NB/tenant.conf",
-        "NB_CONTROL_SOCKET_GLOB": "/run/nb-entry-*.ctl",
+        "NB_CONTROL_USERS_FILE": f"{work}/socks.users",
+        "NB_CONTROL_TENANTS_FILE": f"{work}/tenant.conf",
+        "NB_CONTROL_SOCKET_GLOB": f"/run/{socket_prefix}-*.ctl",
         "NB_LINE_ID": args.line_id,
         "NB_CONTROL_API_TOKEN": token,
         "NB_WEB_BASE_URL": args.web_base_url,

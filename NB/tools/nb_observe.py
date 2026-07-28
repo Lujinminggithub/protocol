@@ -20,7 +20,7 @@ OUTPUT_DIR = deploy.BUILD_DIR / "observability"
 
 def _remote_control_query_commands(connection, role: str, commands: tuple[str, ...]) -> list[dict]:
     script = f"""import glob,json,re,socket
-paths=[p for p in sorted(glob.glob({f'/run/nb-{role}-*.ctl'!r})) if re.fullmatch({f'/run/nb-{role}-[0-9]+\\.ctl'!r},p)]
+paths=[p for p in sorted(glob.glob({deploy._control_socket_glob(role)!r})) if re.fullmatch({f'/run/{deploy._control_socket_prefix(role)}-[0-9]+\\.ctl'!r},p)]
 if not paths:raise RuntimeError('no control sockets for {role}')
 results=[]
 for path in paths:
@@ -41,7 +41,7 @@ print(json.dumps(results))
     by_worker: dict[str, dict] = {}
     for record in records:
         response = record["response"]
-        match = re.search(rf"/nb-{re.escape(role)}-(\d+)\.ctl$", record["path"])
+        match = re.search(rf"/{re.escape(deploy._control_socket_prefix(role))}-(\d+)\.ctl$", record["path"])
         worker = str(response.get("worker", match.group(1) if match else "unknown"))
         by_worker.setdefault(worker, {})[record["command"]] = response
     return [{"role": role, "worker": worker, **values} for worker, values in sorted(by_worker.items())]

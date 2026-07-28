@@ -211,12 +211,32 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
+class EntrySSHSocket:
+    def __init__(self, port: int):
+        self.client = deploy.connect("entry")
+        try:
+            self.channel = self.client.get_transport().open_channel(
+                "direct-tcpip", ("127.0.0.1", port), ("127.0.0.1", 0))
+        except Exception:
+            self.client.close()
+            raise
+
+    def settimeout(self, value): self.channel.settimeout(value)
+    def sendall(self, value): return self.channel.sendall(value)
+    def recv(self, size): return self.channel.recv(size)
+    def shutdown(self, how): return self.channel.shutdown(how)
+    def close(self):
+        try: self.channel.close()
+        finally: self.client.close()
+
+
 def socks_connect(host: str, port: int, target: str, io_timeout: float = 30) -> socket.socket:
     username = os.environ.get("NB_SOCKS_USERNAME", "").encode()
     password = os.environ.get("NB_SOCKS_PASSWORD", "").encode()
     if not username or not password or len(username) > 255 or len(password) > 255:
         raise RuntimeError("主动探针需要 NB_SOCKS_USERNAME 和 NB_SOCKS_PASSWORD")
-    sock = socket.create_connection((host, port), timeout=15)
+    sock = (EntrySSHSocket(port) if os.environ.get("NB_PROBE_VIA_ENTRY_SSH") == "1"
+            else socket.create_connection((host, port), timeout=15))
     sock.settimeout(io_timeout)
     sock.sendall(b"\x05\x01\x02")
     if recv_exact(sock, 2) != b"\x05\x02":
@@ -290,9 +310,9 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
 
 def remote_log_path(connection, role: str) -> str:
     command = (
-        f"bin=$(readlink -f {deploy.WORK}/nb_node 2>/dev/null); "
+        f"bin=$(readlink -f {deploy.INSTANCE_WORK}/nb_node 2>/dev/null); "
         "dir=$(dirname \"$bin\"); "
-        f"if test -f \"$dir/cfg/log4c.json\"; then echo {deploy.WORK}/logs/nb-{role}.log; "
+        f"if test -f \"$dir/cfg/log4c.json\"; then echo {deploy._log_path(role)}; "
         f"else echo \"$dir/logs/nb-{role}.log\"; fi"
     )
     return deploy.run(connection, command).strip()
@@ -349,7 +369,7 @@ def probe_path_mtu(source_role: str, target: str,
 def collect_segment(source_role: str, target: str, samples: int, target_mbps: float) -> dict:
     connection = deploy.connect(source_role)
     ping = deploy.run(connection, f"ping -n -q -c {samples} -i 0.1 -W 2 {target}", tmo=max(30, samples // 2))
-    log_path = f"{deploy.WORK}/logs/nb-{source_role}.log"
+    log_path = deploy._log_path(source_role)
     log = deploy.run(connection,
         f"tac {log_path} 2>/dev/null | sed -n '1,/runtime: core dump enabled/p' | tac | "
         "grep 'linkq pool' | tail -120")
@@ -380,8 +400,12 @@ def main() -> None:
     parser.add_argument("--active", action="store_true", help="通过真实三跳 QUIC 产生受控负载")
     parser.add_argument("--duration", type=int, default=90, help="主动负载持续秒数")
     parser.add_argument("--socks-port", type=int, default=1080)
+    parser.add_argument("--via-entry-ssh", action="store_true",
+                        help="reach the Entry-local SOCKS listener through the pinned SSH connection")
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
+    if args.via_entry_ssh:
+        os.environ["NB_PROBE_VIA_ENTRY_SSH"] = "1"
     if args.headroom_ratio < 1.0 or args.headroom_ratio > 2.0:
         raise SystemExit("--headroom-ratio 必须在 1.0..2.0")
     package_mbps = args.package_mbps

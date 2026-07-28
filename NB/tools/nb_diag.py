@@ -18,8 +18,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-WORK = deploy.WORK
-LOG = lambda role: f"{WORK}/logs/nb-{role}.log"
+WORK = deploy.INSTANCE_WORK
+LOG = deploy._log_path
 SOCKS_PORT = deploy.DEFAULT_SOCKS_PORT
 SOCKS_ARG = f"--socks5-hostname 127.0.0.1:{SOCKS_PORT}"
 
@@ -28,7 +28,7 @@ def _control_snapshot(c, role):
     workers = deploy._effective_workers(role)
     script = (
         "import json,socket;"
-        f"paths={[f'/run/nb-{role}-{worker}.ctl' for worker in range(workers)]!r};"
+        f"paths={[deploy._control_socket_path(role, worker) for worker in range(workers)]!r};"
         "results=[];"
         "[(lambda p,cmd,s:(s.settimeout(2),s.connect(p),s.sendall((cmd+'\\n').encode()),results.append({'path':p,'command':cmd,'response':s.recv(8192).decode(errors='replace')}),s.close()))(p,cmd,socket.socket(socket.AF_UNIX)) for p in paths for cmd in ('health','metrics')];"
         "print(json.dumps(results,ensure_ascii=False))"
@@ -50,7 +50,7 @@ def _incident_role_text(c, role, lines):
         f"systemctl show {unit} -p ActiveState -p SubState -p MainPID -p NRestarts -p ExecMainStatus -p Environment --no-pager 2>&1; "
         "echo '=== PROCESS ==='; pgrep -ax nb_node 2>/dev/null || true; "
         "ps -eo pid,ppid,stat,pcpu,pmem,rss,vsz,lstart,cmd | grep '[n]b_node' || true; "
-        "echo '=== SOCKETS ==='; ss -s; ss -lntup 2>/dev/null | grep -E 'nb_node|:1080|:4443' || true; "
+        f"echo '=== SOCKETS ==='; ss -s; ss -lntup 2>/dev/null | grep -E 'nb_node|:{SOCKS_PORT}|:{deploy.MIDDLE_PORT}|:{deploy.EXIT_PORT}' || true; "
         "echo '=== RESOURCES ==='; free -m; df -h / /etc 2>/dev/null; "
         "echo '=== JOURNAL ==='; "
         f"journalctl -u {unit} --since '-30 min' -n {lines} --no-pager -o short-iso-precise 2>&1; "
