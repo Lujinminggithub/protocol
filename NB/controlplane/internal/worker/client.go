@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,8 @@ type ClientConfig struct {
 	PollEvery        time.Duration
 	HeartbeatEvery   time.Duration
 	OperationTimeout time.Duration
+	MaintenanceEvery time.Duration
+	SnapshotEvery    time.Duration
 }
 
 type operationRunner interface {
@@ -33,11 +36,30 @@ type Client struct {
 	runner   operationRunner
 	cfg      ClientConfig
 	http     *http.Client
+	snapshot sync.Mutex
 }
 
 type persistedResult struct {
 	Status string          `json:"status"`
 	Result json.RawMessage `json:"result"`
+}
+
+type eventEmitter func(context.Context, OperationEvent) error
+type eventContextKey struct{}
+
+type OperationEvent struct {
+	Sequence   int            `json:"sequence"`
+	Stage      string         `json:"stage"`
+	Status     string         `json:"status"`
+	Message    string         `json:"message"`
+	Parameters map[string]any `json:"parameters,omitempty"`
+}
+
+func emitOperationEvent(ctx context.Context, event OperationEvent) error {
+	if emit, ok := ctx.Value(eventContextKey{}).(eventEmitter); ok {
+		return emit(ctx, event)
+	}
+	return nil
 }
 
 func NewClient(registry Registry, runner operationRunner, cfg ClientConfig) (*Client, error) {
@@ -52,6 +74,12 @@ func NewClient(registry Registry, runner operationRunner, cfg ClientConfig) (*Cl
 	}
 	if cfg.OperationTimeout <= 0 {
 		cfg.OperationTimeout = 45 * time.Minute
+	}
+	if cfg.MaintenanceEvery <= 0 {
+		cfg.MaintenanceEvery = 5 * time.Minute
+	}
+	if cfg.SnapshotEvery <= 0 {
+		cfg.SnapshotEvery = 15 * time.Second
 	}
 	return &Client{registry: registry, runner: runner, cfg: cfg,
 		http: &http.Client{Timeout: 20 * time.Second}}, nil
@@ -84,6 +112,12 @@ func (c *Client) request(ctx context.Context, method, path string, body any, out
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var problem struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &problem) == nil && problem.Error != "" {
+			return fmt.Errorf("central returned HTTP %d: %s", response.StatusCode, problem.Error)
+		}
 		return fmt.Errorf("central returned HTTP %d", response.StatusCode)
 	}
 	if output != nil && len(data) > 0 {
@@ -101,6 +135,9 @@ func (c *Client) heartbeat(ctx context.Context) error {
 	lines := make([]lineCapability, 0, len(c.registry.Lines))
 	for _, line := range c.registry.Lines {
 		lines = append(lines, lineCapability{LineID: line.LineID, Operations: line.SortedOperations(), Reason: line.DisabledReason})
+	}
+	if c.registry.Dynamic.Enabled {
+		lines = append(lines, lineCapability{LineID: "*", Operations: append([]string(nil), c.registry.Dynamic.Operations...)})
 	}
 	payload := map[string]any{"worker_id": c.registry.WorkerID, "status": "ready", "version": c.cfg.Version,
 		"lines": lines, "observed_at": time.Now().UTC().Format(time.RFC3339Nano)}
@@ -121,8 +158,60 @@ func (c *Client) complete(ctx context.Context, operation Operation, status strin
 	return c.request(ctx, http.MethodPost, "/agent/v1/operations/"+url.PathEscape(operation.ID)+"/result", payload, nil)
 }
 
-func (c *Client) poll(ctx context.Context) error {
+func (c *Client) event(ctx context.Context, operation Operation, event OperationEvent) error {
+	return c.request(ctx, http.MethodPost, "/agent/v1/operations/"+url.PathEscape(operation.ID)+"/events", event, nil)
+}
+
+func (c *Client) collectSnapshots(ctx context.Context) {
+	if !c.snapshot.TryLock() {
+		return
+	}
+	defer c.snapshot.Unlock()
+	collector, ok := c.runner.(interface {
+		CollectSnapshots(context.Context, LineSpec) ([]Snapshot, error)
+	})
+	if !ok {
+		return
+	}
+	type collected struct {
+		lineID    string
+		snapshots []Snapshot
+		err       error
+	}
+	results := make(chan collected, len(c.registry.Lines))
+	var group sync.WaitGroup
 	for _, line := range c.registry.Lines {
+		line := line
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			snapshots, err := collector.CollectSnapshots(ctx, line)
+			results <- collected{lineID: line.LineID, snapshots: snapshots, err: err}
+		}()
+	}
+	go func() {
+		group.Wait()
+		close(results)
+	}()
+	for result := range results {
+		if result.err != nil {
+			fmt.Fprintf(os.Stderr, "nb-web-worker snapshot collection failed line=%s: %v\n", result.lineID, result.err)
+			continue
+		}
+		for _, snapshot := range result.snapshots {
+			if err := c.request(ctx, http.MethodPost, "/agent/v1/snapshots", snapshot, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "nb-web-worker snapshot delivery failed line=%s node=%s: %v\n", result.lineID, snapshot.NodeID, err)
+			}
+		}
+	}
+}
+
+func (c *Client) poll(ctx context.Context) error {
+	lines := append([]LineSpec(nil), c.registry.Lines...)
+	if c.registry.Dynamic.Enabled {
+		lines = append(lines, LineSpec{LineID: "*"})
+	}
+	for _, line := range lines {
 		operations, err := c.claim(ctx, line.LineID)
 		if err != nil {
 			return err
@@ -137,6 +226,7 @@ func (c *Client) poll(ctx context.Context) error {
 				continue
 			}
 			operationCtx, cancel := context.WithTimeout(ctx, c.cfg.OperationTimeout)
+			operationCtx = context.WithValue(operationCtx, eventContextKey{}, eventEmitter(func(eventCtx context.Context, event OperationEvent) error { return c.event(eventCtx, operation, event) }))
 			result, runErr := c.runner.Run(operationCtx, operation)
 			cancel()
 			status := "succeeded"
@@ -173,10 +263,18 @@ func (c *Client) Run(ctx context.Context) error {
 	if err := c.heartbeat(ctx); err != nil {
 		return err
 	}
+	if err := c.syncInventory(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+	}
+	go c.collectSnapshots(ctx)
 	heartbeat := time.NewTicker(c.cfg.HeartbeatEvery)
 	poll := time.NewTicker(c.cfg.PollEvery)
+	maintenance := time.NewTicker(c.cfg.MaintenanceEvery)
+	snapshots := time.NewTicker(c.cfg.SnapshotEvery)
 	defer heartbeat.Stop()
 	defer poll.Stop()
+	defer maintenance.Stop()
+	defer snapshots.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -185,10 +283,21 @@ func (c *Client) Run(ctx context.Context) error {
 			if err := c.heartbeat(ctx); err != nil {
 				return err
 			}
+			if err := c.syncInventory(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+			}
 		case <-poll.C:
 			if err := c.poll(ctx); err != nil {
 				return err
 			}
+		case <-maintenance.C:
+			if runner, ok := c.runner.(interface{ Maintain(context.Context) error }); ok {
+				if err := runner.Maintain(ctx); err != nil {
+					fmt.Fprintf(os.Stderr, "nb-web-worker maintenance failed: %v\n", err)
+				}
+			}
+		case <-snapshots.C:
+			go c.collectSnapshots(ctx)
 		}
 	}
 }

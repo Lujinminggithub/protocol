@@ -43,6 +43,8 @@ func main() {
 		PollEvery:        duration("NB_WEB_WORKER_POLL_SECONDS", 2*time.Second),
 		HeartbeatEvery:   duration("NB_WEB_WORKER_HEARTBEAT_SECONDS", 10*time.Second),
 		OperationTimeout: duration("NB_WEB_WORKER_OPERATION_TIMEOUT_SECONDS", 45*time.Minute),
+		MaintenanceEvery: duration("NB_WEB_WORKER_MAINTENANCE_SECONDS", 5*time.Minute),
+		SnapshotEvery:    duration("NB_WEB_WORKER_SNAPSHOT_SECONDS", 15*time.Second),
 	})
 	if err != nil {
 		log.Fatal(err)

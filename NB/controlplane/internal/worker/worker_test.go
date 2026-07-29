@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -85,11 +86,94 @@ func TestRunnerRefusesDisabledOperation(t *testing.T) {
 	}
 }
 
+func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, ResourceGroups: []string{"shared-1"},
+		Operations: []string{"line.open"}, SingBox: "sing-box", SocksPortMin: 1082, SocksPortMax: 1199,
+		RelayPortMin: 4445, RelayPortMax: 4599, UDPPortMin: 22048, UDPPortMax: 65535}
+	for _, name := range []string{"ENTRY", "RELAY", "EXIT"} {
+		t.Setenv("NB_TEST_"+name, "private-password-"+name)
+	}
+	t.Setenv("NB_TEST_SRS_URL", "https://example.invalid/whitelist.srs")
+	device := func(id, role, host, secret string) dynamicNode {
+		return dynamicNode{DeviceID: id, Role: role, Device: dynamicDevice{ID: id, Name: id, Host: host,
+			SSHPort: 22, SSHUser: "root", SecretRef: "env:" + secret}}
+	}
+	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "new", BandwidthMbps: 20,
+		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		Whitelist: []string{"domain example.com"}, BuildMode: "auto", JumpPolicy: "auto", SRSRef: "env:NB_TEST_SRS_URL",
+		Nodes: []dynamicNode{device("entry-1", "entry", "192.0.2.1", "NB_TEST_ENTRY"),
+			device("relay-1", "relay", "192.0.2.2", "NB_TEST_RELAY"), device("exit-1", "exit", "192.0.2.3", "NB_TEST_EXIT")}}
+	runner := NewRunner(registry)
+	line, err := runner.dynamicLine(Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(line.StateDir, "runtime-plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("private-password")) || line.WhitelistSourceEnv != "NB_TEST_SRS_URL" {
+		t.Fatal("runtime plan persisted a secret value or lost the SRS source reference")
+	}
+	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
+	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
+		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)
+	}
+}
+
 type fakeRunner struct{ calls atomic.Int64 }
 
 func (runner *fakeRunner) Run(_ context.Context, operation Operation) (Result, error) {
 	runner.calls.Add(1)
 	return Result{Deployment: "dep-2", Profile: operation.LineID + ":1", LogFile: "worker.log", Message: "ok"}, nil
+}
+
+type fakeSnapshotRunner struct{ fakeRunner }
+
+func (runner *fakeSnapshotRunner) CollectSnapshots(_ context.Context, line LineSpec) ([]Snapshot, error) {
+	return []Snapshot{{LineID: line.LineID, NodeID: "entry-1", Role: "entry", WorkerID: "0",
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "ok",
+		Deployment: "dep-1", Profile: line.LineID + ":1"}}, nil
+}
+
+func TestClientCollectsAndDeliversSnapshots(t *testing.T) {
+	registry := testRegistry(t, nil)
+	var delivered atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer agent-secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch request.URL.Path {
+		case "/agent/v1/snapshots":
+			var snapshot Snapshot
+			if json.NewDecoder(request.Body).Decode(&snapshot) != nil || snapshot.LineID != "line-1" || snapshot.Health != "ok" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			delivered.Add(1)
+		case "/agent/v1/executors/heartbeat":
+		case "/agent/v1/operations":
+			_, _ = w.Write([]byte(`{"operations":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(registry, &fakeSnapshotRunner{}, ClientConfig{BaseURL: server.URL,
+		Token: "agent-secret", SnapshotEvery: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.collectSnapshots(context.Background())
+	if delivered.Load() != 1 {
+		t.Fatalf("delivered snapshots=%d", delivered.Load())
+	}
 }
 
 func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
@@ -140,5 +224,30 @@ func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
 	}
 	if _, err = os.Stat(filepath.Join(registry.StateDir, "op-1", "result.json")); err != nil {
 		t.Fatal("operation result was not persisted")
+	}
+}
+
+func TestInventoryDiscoveryOmitsCredentials(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines[0].InstanceID = "test"
+	registry.Lines[0].MiddlePort, registry.Lines[0].ExitPort = 4444, 4443
+	registry.Lines[0].UDPPortMin, registry.Lines[0].UDPPortMax = 21024, 22047
+	machines := `{"edges":[{"name":"entry-1","host":"192.0.2.1","port":22,"user":"root","password":"entry-secret"}],` +
+		`"relays":[{"name":"relay-1","host":"192.0.2.2","port":22,"user":"root","password":"relay-secret"}],` +
+		`"terminals":[{"name":"exit-1","host":"192.0.2.3","port":2273,"user":"root","password":"exit-secret"}]}`
+	if err := os.WriteFile(registry.Lines[0].SourceMachinesFile, []byte(machines), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{registry: registry}
+	lines := client.inventoryLines()
+	encoded, err := json.Marshal(lines)
+	if err != nil || len(lines) != 1 {
+		t.Fatalf("inventory lines=%d err=%v", len(lines), err)
+	}
+	if bytes.Contains(encoded, []byte("entry-secret")) || bytes.Contains(encoded, []byte("relay-secret")) || bytes.Contains(encoded, []byte("exit-secret")) {
+		t.Fatal("inventory payload contains a password")
+	}
+	if !bytes.Contains(encoded, []byte(`"worker-local:line-1:entry"`)) || !bytes.Contains(encoded, []byte(`"ssh_port":2273`)) {
+		t.Fatalf("inventory omitted secret reference or SSH port: %s", encoded)
 	}
 }

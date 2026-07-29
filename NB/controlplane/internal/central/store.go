@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -182,16 +183,117 @@ CREATE TABLE IF NOT EXISTS executors (
  worker_id TEXT PRIMARY KEY, status TEXT NOT NULL, version TEXT NOT NULL,
  capabilities BLOB NOT NULL, observed_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS devices (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+ host TEXT NOT NULL, ssh_port INTEGER NOT NULL, ssh_user TEXT NOT NULL,
+ private_ip TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '',
+ provider TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
+ secret_ref TEXT NOT NULL DEFAULT '', labels BLOB NOT NULL DEFAULT '{}',
+ last_health TEXT NOT NULL DEFAULT 'unknown', last_seen_at TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS line_specs (
+ line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
+ resource_group TEXT NOT NULL, instance_id TEXT NOT NULL,
+ bandwidth_mbps INTEGER NOT NULL, socks_port INTEGER NOT NULL,
+ udp_port_min INTEGER NOT NULL, udp_port_max INTEGER NOT NULL,
+ relay_port INTEGER NOT NULL, exit_port INTEGER NOT NULL,
+ whitelist BLOB NOT NULL, build_mode TEXT NOT NULL, artifact_ref TEXT NOT NULL,
+ source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS line_nodes (
+ line_id TEXT NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+ device_id TEXT NOT NULL REFERENCES devices(id), role TEXT NOT NULL,
+ ordinal INTEGER NOT NULL, next_hop_device_id TEXT NOT NULL DEFAULT '',
+ jump_candidates BLOB NOT NULL DEFAULT '[]', config BLOB NOT NULL DEFAULT '{}',
+ PRIMARY KEY(line_id,role,ordinal)
+);
+CREATE TABLE IF NOT EXISTS operation_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+ sequence INTEGER NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+ message TEXT NOT NULL, parameters BLOB NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+ UNIQUE(operation_id,sequence)
+);
 CREATE TABLE IF NOT EXISTS raw_events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
  payload BLOB NOT NULL, received_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS line_deletion_audit (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, line_id TEXT NOT NULL, line_name TEXT NOT NULL,
+ requested_by TEXT NOT NULL, reason TEXT NOT NULL, snapshot BLOB NOT NULL,
+ deleted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS snapshots_latest ON snapshots(line_id,node_id,worker_id,observed_at DESC);
 CREATE INDEX IF NOT EXISTS incidents_line ON incidents(line_id,status,observed_at DESC);
 CREATE INDEX IF NOT EXISTS operations_ready ON operations(line_id,status,created_at);
 CREATE INDEX IF NOT EXISTS raw_events_path ON raw_events(path,received_at);
+CREATE INDEX IF NOT EXISTS devices_status ON devices(status,region,name);
+CREATE INDEX IF NOT EXISTS line_nodes_device ON line_nodes(device_id,line_id);
+CREATE INDEX IF NOT EXISTS operation_events_order ON operation_events(operation_id,sequence);
+CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_id,deleted_at DESC);
 `)
 	return err
+}
+
+func (s *Store) DeleteLine(ctx context.Context, id, requestedBy, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var line Line
+	err = tx.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
+ active_deployment,profile,secret_ref,created_at,updated_at FROM lines WHERE id=?`, id).Scan(
+		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
+		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	var active, specs, snapshots, incidents, operations int
+	for query, target := range map[string]*int{
+		`SELECT COUNT(*) FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running')`: &active,
+		`SELECT COUNT(*) FROM line_specs WHERE line_id=?`:                                                 &specs,
+		`SELECT COUNT(*) FROM snapshots WHERE line_id=?`:                                                  &snapshots,
+		`SELECT COUNT(*) FROM incidents WHERE line_id=?`:                                                  &incidents,
+		`SELECT COUNT(*) FROM operations WHERE line_id=?`:                                                 &operations,
+	} {
+		if err = tx.QueryRowContext(ctx, query, id).Scan(target); err != nil {
+			return err
+		}
+	}
+	if active > 0 {
+		return errors.New("line has active operations")
+	}
+	if specs > 0 && line.Status != "draft" && line.Status != "disabled" && line.Status != "archived" {
+		return errors.New("configured line must be disabled before deletion")
+	}
+	audit, err := json.Marshal(map[string]any{
+		"line": map[string]any{"id": line.ID, "name": line.Name, "status": line.Status,
+			"entry_region": line.EntryRegion, "exit_region": line.ExitRegion, "provider": line.Provider,
+			"capacity_mbps": line.CapacityMbps, "active_deployment": line.ActiveDeployment, "profile": line.Profile},
+		"counts": map[string]int{"specs": specs, "snapshots": snapshots, "incidents": incidents, "operations": operations},
+	})
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO line_deletion_audit
+ (line_id,line_name,requested_by,reason,snapshot,deleted_at) VALUES(?,?,?,?,?,?)`,
+		line.ID, line.Name, requestedBy, reason, audit, now()); err != nil {
+		return err
+	}
+	for _, query := range []string{
+		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
+		`DELETE FROM operations WHERE line_id=?`, `DELETE FROM snapshots WHERE line_id=?`,
+		`DELETE FROM incidents WHERE line_id=?`, `DELETE FROM line_specs WHERE line_id=?`,
+		`DELETE FROM lines WHERE id=?`,
+	} {
+		if _, err = tx.ExecContext(ctx, query, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
@@ -337,29 +439,78 @@ func (s *Store) Operations(ctx context.Context, lineID string, limit int) ([]Ope
 }
 
 func (s *Store) ClaimOperations(ctx context.Context, lineID string, limit int) ([]Operation, error) {
-	if _, err := s.db.ExecContext(ctx, `UPDATE operations SET status='dispatched',updated_at=? WHERE id IN
- (SELECT id FROM operations WHERE line_id=? AND status='queued' ORDER BY created_at LIMIT ?)`, now(), lineID, limit); err != nil {
-		return nil, err
-	}
-	return s.operationsByStatus(ctx, lineID, "dispatched", limit)
+	return s.claimOperations(ctx, lineID, limit, nil)
 }
 
-func (s *Store) operationsByStatus(ctx context.Context, lineID, status string, limit int) ([]Operation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at
- FROM operations WHERE line_id=? AND status=? ORDER BY created_at LIMIT ?`, lineID, status, limit)
+func (s *Store) ClaimAnyOperations(ctx context.Context, limit int) ([]Operation, error) {
+	return s.ClaimAnyOperationsExcept(ctx, limit, nil)
+}
+
+func (s *Store) ClaimAnyOperationsExcept(ctx context.Context, limit int, excluded []string) ([]Operation, error) {
+	return s.claimOperations(ctx, "", limit, excluded)
+}
+
+func (s *Store) claimOperations(ctx context.Context, lineID string, limit int, excluded []string) ([]Operation, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var result []Operation
+	defer tx.Rollback()
+	query := `SELECT id FROM operations WHERE status='queued'`
+	args := []any{}
+	if lineID != "" {
+		query += ` AND line_id=?`
+		args = append(args, lineID)
+	}
+	if len(excluded) > 0 {
+		query += ` AND line_id NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(excluded)), ",") + `)`
+		for _, id := range excluded {
+			args = append(args, id)
+		}
+	}
+	query += ` ORDER BY created_at LIMIT ?`
+	args = append(args, limit)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
 	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	stamp := now()
+	result := make([]Operation, 0, len(ids))
+	for _, id := range ids {
+		updated, updateErr := tx.ExecContext(ctx, `UPDATE operations SET status='dispatched',updated_at=? WHERE id=? AND status='queued'`, stamp, id)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		count, countErr := updated.RowsAffected()
+		if countErr != nil || count != 1 {
+			return nil, errors.New("operation claim conflict")
+		}
 		var item Operation
-		if err = scanOperation(rows, &item); err != nil {
+		if err = scanOperation(tx.QueryRowContext(ctx, `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at FROM operations WHERE id=?`, id), &item); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
 	}
-	return result, rows.Err()
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string, result json.RawMessage) error {

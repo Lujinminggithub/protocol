@@ -15,7 +15,7 @@ build_host/compile_dir，产物下载到本地后再统一分发，middle/exit �
 用法: python deploy.py <action> [--target host:port]
 """
 from __future__ import annotations
-import argparse, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex, subprocess, logging, random
+import argparse, hashlib, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex, subprocess, logging, random
 import paramiko
 import nb_release
 
@@ -133,41 +133,66 @@ def ssh_retry_delay(attempt: int, base: float = 1.0, cap: float = 12.0,
     return max(0.0, min(cap, value * factor))
 
 
-def connect(role) -> paramiko.SSHClient:
-    """建立 SSH(含 entry 跳板)。失败重试 3 次(全局规范: invoke 不中断)。"""
+def _jump_strategies(role: str) -> list[str | None]:
+    h = _role_host(role)
+    policy = h.get("jump_policy", "pinned" if h.get("jump_via") else "direct")
+    if policy == "direct":
+        return [None]
+    if policy == "pinned":
+        return [h.get("jump_via")] if h.get("jump_via") else [None]
+    if policy != "auto":
+        raise ValueError(f"{role}.jump_policy must be direct, pinned or auto")
+    values = [None, *h.get("jump_candidates", [])]
+    if h.get("jump_via"):
+        values.append(h["jump_via"])
+    result = []
+    for value in values:
+        if value != role and value not in result:
+            result.append(value)
+    return result
+
+
+def _connect(role: str, stack: tuple[str, ...]) -> paramiko.SSHClient:
+    """Try direct and declared SSH jumps, preserving nested jump lifetimes."""
+    if role in stack:
+        raise RuntimeError(f"SSH jump cycle: {' -> '.join((*stack, role))}")
     h = _role_host(role)
     last = None
     for attempt in range(3):
-        c = None
-        jump = None
-        try:
-            sock = None
-            if h.get("jump_via"):
-                jrole = h["jump_via"]
-                jh = _role_host(jrole)
-                jump = paramiko.SSHClient(); _configure_host_keys(jump)
-                jump.connect(hostname=jh["host"], port=jh["port"], username=jh["user"],
-                             password=_host_password(jh), timeout=25, banner_timeout=25, auth_timeout=25,
-                             allow_agent=False, look_for_keys=False)
-                tgt = h.get("jump_target_host") or h["host"]
-                sock = jump.get_transport().open_channel("direct-tcpip", (tgt, h["port"]), ("127.0.0.1", 0))
-            c = paramiko.SSHClient(); _configure_host_keys(c)
-            c.connect(hostname=h["host"], port=h["port"], username=h["user"], password=_host_password(h),
-                      timeout=25, banner_timeout=25, auth_timeout=25, allow_agent=False,
-                      look_for_keys=False, sock=sock)
-            _bind_jump_lifecycle(c, jump)
-            return c
-        except Exception as e:  # noqa
-            last = e
-            if c is not None:
-                try: c.close()
-                except Exception: pass
-            if jump is not None:
-                try: jump.close()
-                except Exception: pass
-            if attempt < 2:
-                time.sleep(ssh_retry_delay(attempt))
+        for jump_role in _jump_strategies(role):
+            c = None
+            jump = None
+            try:
+                sock = None
+                if jump_role:
+                    if jump_role not in LAB:
+                        raise ValueError(f"unknown SSH jump role: {jump_role}")
+                    jump = _connect(jump_role, (*stack, role))
+                    target = h.get("jump_target_host") or h.get("private_ip") or h["host"]
+                    sock = jump.get_transport().open_channel(
+                        "direct-tcpip", (target, h["port"]), ("127.0.0.1", 0))
+                c = paramiko.SSHClient(); _configure_host_keys(c)
+                c.connect(hostname=h["host"], port=h["port"], username=h["user"],
+                          password=_host_password(h), timeout=25, banner_timeout=25,
+                          auth_timeout=25, allow_agent=False, look_for_keys=False, sock=sock)
+                _bind_jump_lifecycle(c, jump)
+                return c
+            except Exception as e:  # noqa
+                last = e
+                if c is not None:
+                    try: c.close()
+                    except Exception: pass
+                if jump is not None:
+                    try: jump.close()
+                    except Exception: pass
+        if attempt < 2:
+            time.sleep(ssh_retry_delay(attempt))
     raise RuntimeError(f"connect {role}({h['name']}) failed after retries: {last}")
+
+
+def connect(role) -> paramiko.SSHClient:
+    """Connect using the line's bounded direct/jump strategy list."""
+    return _connect(role, ())
 
 
 def run(c, cmd, tmo=120):
@@ -214,17 +239,35 @@ def fetch_bytes(c, path):
 
 
 def push_bytes(c, data, path, mode=0o644):
-    run(c, f"mkdir -p $(dirname {path})")
-    tmp = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
-    sf = None
-    try:
-        sf = c.open_sftp()
-        sf.putfo(io.BytesIO(data), tmp)
-        sf.chmod(tmp, mode)
-    finally:
-        if sf is not None:
-            sf.close()
-    run(c, f"mv -f {tmp} {path}")
+    """Resume an interrupted SFTP transfer and atomically publish verified bytes."""
+    digest = hashlib.sha256(data).hexdigest()
+    tmp = f"{path}.part.{digest[:16]}"
+    run(c, f"mkdir -p $(dirname {shlex.quote(path)})")
+    for verify_attempt in range(2):
+        sf = None
+        try:
+            sf = c.open_sftp()
+            try:
+                offset = sf.stat(tmp).st_size
+            except OSError:
+                offset = 0
+            if offset > len(data):
+                sf.remove(tmp); offset = 0
+            if offset < len(data):
+                with sf.file(tmp, "ab") as stream:
+                    for start in range(offset, len(data), 1024 * 1024):
+                        stream.write(data[start:start + 1024 * 1024])
+                    stream.flush()
+            sf.chmod(tmp, mode)
+        finally:
+            if sf is not None:
+                sf.close()
+        remote_digest = run(c, f"sha256sum {shlex.quote(tmp)} | awk '{{print $1}}'").strip()
+        if remote_digest == digest:
+            run(c, f"mv -f {shlex.quote(tmp)} {shlex.quote(path)}")
+            return
+        run(c, f"rm -f {shlex.quote(tmp)}")
+    raise RuntimeError(f"resumable upload checksum mismatch: {path}")
 
 
 def _effective_workers(role):
@@ -591,12 +634,12 @@ def _ensure_remote_whitelist(c, role="exit"):
     return wl_remote
 
 
-def _push_whitelist(c, local_path: pathlib.Path):
+def _push_whitelist(c, local_path: pathlib.Path, role="exit"):
     if not local_path.exists():
         sys.exit(f"白名单文件不存在: {local_path}")
     wl_remote = _whitelist_remote()
     push_bytes(c, local_path.read_bytes(), wl_remote)
-    print(f"whitelist: 已下发 {local_path} -> exit:{wl_remote}")
+    print(f"whitelist: 已下发 {local_path} -> {role}:{wl_remote}")
     return wl_remote
 
 

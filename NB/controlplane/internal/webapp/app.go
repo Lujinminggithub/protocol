@@ -3,6 +3,7 @@ package webapp
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -51,16 +52,28 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/lines", a.admin(a.upsertLine))
 	mux.HandleFunc("GET /api/v1/lines/{id}", a.admin(a.line))
 	mux.HandleFunc("PATCH /api/v1/lines/{id}", a.admin(a.patchLine))
+	mux.HandleFunc("DELETE /api/v1/lines/{id}", a.admin(a.deleteLine))
+	mux.HandleFunc("GET /api/v1/lines/{id}/detail", a.admin(a.lineDetail))
+	mux.HandleFunc("GET /api/v1/lines/{id}/spec", a.admin(a.lineSpec))
+	mux.HandleFunc("PUT /api/v1/lines/{id}/spec", a.admin(a.saveLineSpec))
+	mux.HandleFunc("GET /api/v1/devices", a.admin(a.devices))
+	mux.HandleFunc("POST /api/v1/devices", a.admin(a.upsertDevice))
+	mux.HandleFunc("GET /api/v1/devices/{id}", a.admin(a.device))
+	mux.HandleFunc("DELETE /api/v1/devices/{id}", a.admin(a.deleteDevice))
+	mux.HandleFunc("POST /api/v1/devices/{id}/probe", a.admin(a.probeDevice))
 	mux.HandleFunc("GET /api/v1/incidents", a.admin(a.incidents))
 	mux.HandleFunc("GET /api/v1/operations", a.admin(a.operations))
 	mux.HandleFunc("POST /api/v1/operations", a.admin(a.createOperation))
+	mux.HandleFunc("GET /api/v1/operations/{id}", a.admin(a.operationDetail))
 	mux.HandleFunc("POST /api/v1/operations/{id}/cancel", a.admin(a.cancelOperation))
 	mux.HandleFunc("GET /api/v1/executors", a.admin(a.executors))
 	mux.HandleFunc("POST /agent/v1/snapshots", a.agent(a.snapshot))
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
+	mux.HandleFunc("POST /agent/v1/inventory", a.agent(a.discoverInventory))
 	mux.HandleFunc("GET /agent/v1/operations", a.agent(a.claimOperations))
 	mux.HandleFunc("POST /agent/v1/operations/{id}/result", a.agent(a.completeOperation))
+	mux.HandleFunc("POST /agent/v1/operations/{id}/events", a.agent(a.operationEvent))
 	mux.HandleFunc("POST /api/nb/v1/node-snapshots", a.agent(a.legacySnapshot))
 	mux.HandleFunc("POST /api/nb/v1/incidents", a.agent(a.legacyIncident))
 	mux.HandleFunc("POST /api/nb/v1/provision-results", a.agent(a.rawEvent))
@@ -218,6 +231,29 @@ func (a *App) line(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, line)
 }
 
+func (a *App) deleteLine(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		RequestedBy string `json:"requested_by"`
+		Reason      string `json:"reason"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	if !safeID.MatchString(request.RequestedBy) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 300 {
+		problem(w, 400, "requested_by and deletion reason are required")
+		return
+	}
+	if err := a.store.DeleteLine(r.Context(), r.PathValue("id"), request.RequestedBy, request.Reason); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			problem(w, 404, "line not found")
+		} else {
+			problem(w, 409, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *App) patchLine(w http.ResponseWriter, r *http.Request) {
 	line, err := a.store.Line(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -323,15 +359,34 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "line not found")
 		return
 	}
+	if spec, specErr := a.store.LineSpec(r.Context(), req.LineID); specErr == nil {
+		var values map[string]any
+		if len(req.Request) == 0 || json.Unmarshal(req.Request, &values) != nil {
+			values = map[string]any{}
+		}
+		values["plan"] = spec
+		req.Request, _ = json.Marshal(values)
+	} else if req.Kind == "line.open" {
+		problem(w, 409, "line deployment specification is required before opening")
+		return
+	}
 	executors, err := a.store.Executors(r.Context(), 45*time.Second)
 	if err != nil {
 		problem(w, 500, err.Error())
 		return
 	}
 	available := false
+	exactCapability := false
 	for _, executor := range executors {
 		for _, line := range executor.Lines {
 			if executor.Online && line.LineID == req.LineID {
+				exactCapability = true
+			}
+		}
+	}
+	for _, executor := range executors {
+		for _, line := range executor.Lines {
+			if executor.Online && (line.LineID == req.LineID || (!exactCapability && line.LineID == "*")) {
 				for _, operation := range line.Operations {
 					available = available || operation == req.Kind
 				}
@@ -414,7 +469,7 @@ func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, line := range item.Lines {
-		if !safeID.MatchString(line.LineID) || len(line.Reason) > 300 || len(line.Operations) > 5 {
+		if (line.LineID != "*" && !safeID.MatchString(line.LineID)) || len(line.Reason) > 300 || len(line.Operations) > 5 {
 			problem(w, 400, "invalid executor line")
 			return
 		}
@@ -621,11 +676,36 @@ func (a *App) legacyIncident(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) claimOperations(w http.ResponseWriter, r *http.Request) {
 	lineID := r.URL.Query().Get("line_id")
-	if !safeID.MatchString(lineID) {
+	if lineID != "*" && !safeID.MatchString(lineID) {
 		problem(w, 400, "invalid line_id")
 		return
 	}
-	items, err := a.store.ClaimOperations(r.Context(), lineID, min(limit(r), 20))
+	var items []central.Operation
+	var err error
+	if lineID == "*" {
+		executors, executorErr := a.store.Executors(r.Context(), 45*time.Second)
+		if executorErr != nil {
+			problem(w, 500, executorErr.Error())
+			return
+		}
+		excluded := map[string]bool{}
+		for _, executor := range executors {
+			if executor.Online {
+				for _, capability := range executor.Lines {
+					if capability.LineID != "*" {
+						excluded[capability.LineID] = true
+					}
+				}
+			}
+		}
+		exactLines := make([]string, 0, len(excluded))
+		for id := range excluded {
+			exactLines = append(exactLines, id)
+		}
+		items, err = a.store.ClaimAnyOperationsExcept(r.Context(), min(limit(r), 20), exactLines)
+	} else {
+		items, err = a.store.ClaimOperations(r.Context(), lineID, min(limit(r), 20))
+	}
 	if err != nil {
 		problem(w, 500, err.Error())
 		return

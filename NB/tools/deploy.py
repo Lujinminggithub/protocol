@@ -235,6 +235,35 @@ def act_build(roles):
     c.close()
 
 
+def act_prepare_release():
+    """Rebind a verified local binary to the current topology/profile."""
+    binary = BUILD_DIR / "nb_node"
+    if not binary.is_file() or not RELEASE_MANIFEST.is_file():
+        raise RuntimeError("local binary and release manifest are required")
+    existing = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
+    artifact = existing.get("artifact") or {}
+    digest = nb_release.sha256_file(binary)
+    if (existing.get("schema_version") != nb_release.SCHEMA_VERSION or
+            artifact.get("sha256") != digest or artifact.get("size") != binary.stat().st_size or
+            existing.get("release_id") != digest[:16]):
+        raise RuntimeError("local binary does not match its release manifest")
+    records = existing.get("inputs")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("release manifest has no build inputs")
+    for record in records:
+        source = ROOT / record["path"]
+        if (not source.is_file() or nb_release.sha256_file(source) != record.get("sha256") or
+                source.stat().st_size != record.get("size")):
+            raise RuntimeError("local source differs from the binary build inputs")
+    if existing.get("source_digest") != nb_release._source_digest(records):
+        raise RuntimeError("release source digest is invalid")
+    manifest = nb_release.create_manifest(
+        ROOT, binary, PLATFORM, RELEASE_INPUTS, LAB_FILE,
+        LINE_PROFILE if LINE_PROFILE.is_file() else None, RUNTIME_CONFIGURATION_INPUTS)
+    nb_release.write_manifest(RELEASE_MANIFEST, manifest)
+    print(f">>> prepared existing binary release={manifest['release_id']} deployment={manifest['deployment_id']}")
+
+
 def _distribute(role):
     """把二进制和该角色的安全材料推到节点。"""
     c = connect(role); h = _role_host(role)
@@ -468,16 +497,41 @@ def act_wl_show():
 
 
 def act_wl_push(local_path: pathlib.Path):
-    c = connect("exit")
-    _push_whitelist(c, local_path)
-    print(run(c, f"tail -6 {_log_path('exit')} 2>/dev/null"))
-    c.close()
+    if not local_path.is_file():
+        raise ValueError(f"whitelist file does not exist: {local_path}")
+    clients = {role: connect(role) for role in ("entry", "exit")}
+    remote = _whitelist_remote()
+    previous = {}
+    expected = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    try:
+        for role, client in clients.items():
+            exists = run(client, f"test -f {shlex.quote(remote)} && echo YES || true")
+            previous[role] = fetch_bytes(client, remote) if "YES" in exists else None
+        for role, client in clients.items():
+            _push_whitelist(client, local_path, role=role)
+            actual = run(client, f"sha256sum {shlex.quote(remote)} | awk '{{print $1}}'").strip()
+            if actual != expected:
+                raise RuntimeError(f"{role} whitelist checksum mismatch")
+        print(f">>> entry/exit whitelist active sha256={expected[:16]}")
+    except Exception:
+        for role, client in clients.items():
+            try:
+                if previous.get(role) is None:
+                    run(client, f"rm -f {shlex.quote(remote)}")
+                else:
+                    push_bytes(client, previous[role], remote)
+            except Exception as restore_error:
+                print(f"{role}: whitelist rollback failed: {restore_error}", file=sys.stderr)
+        raise
+    finally:
+        for client in clients.values():
+            client.close()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=[
-        "recon", "build", "deploy-tri", "deploy-socks", "stop", "logs",
+        "recon", "build", "prepare-release", "deploy-tri", "deploy-socks", "stop", "logs",
         "wl-show", "wl-push", "fec-status", "fec-on", "fec-off", "current", "rollback-socks"
     ])
     ap.add_argument("--roles", default="entry,middle,exit")
@@ -488,6 +542,7 @@ def main():
     roles = [r.strip() for r in a.roles.split(",") if r.strip()]
     if a.action == "recon": act_recon(roles)
     elif a.action == "build": act_build(roles)
+    elif a.action == "prepare-release": act_prepare_release()
     elif a.action == "deploy-tri": act_deploy_tri()
     elif a.action == "deploy-socks": act_deploy_socks(a.socks_port)
     elif a.action == "current": act_current_deployment()

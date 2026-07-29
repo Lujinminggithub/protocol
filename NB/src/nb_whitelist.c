@@ -10,11 +10,12 @@
 #include <strings.h>
 #include <sys/stat.h>
 
-#define NB_WHITELIST_MAX 1024
+#define NB_WHITELIST_MAX 8192
 
 typedef struct {uint32_t net,mask;} nb_whitelist_cidr_t;
 typedef struct {
-    char domains[NB_WHITELIST_MAX][128];int domain_count;
+    char domain_suffixes[NB_WHITELIST_MAX][128];int domain_suffix_count;
+    char domain_exact[NB_WHITELIST_MAX][128];int domain_exact_count;
     nb_whitelist_cidr_t cidrs[NB_WHITELIST_MAX];int cidr_count;
     uint16_t ports[NB_WHITELIST_MAX];int port_count;
     int enabled;char path[256];time_t mtime;
@@ -37,10 +38,14 @@ static int load(const char* path,char* error,size_t error_cap){
         if(*p=='#'||*p=='\n'||*p=='\r'||*p==0)continue;
         char keyword[16],value[256],extra[2];
         if(sscanf(p,"%15s %255s %1s",keyword,value,extra)!=2){fclose(file);return fail(error,error_cap,"invalid directive");}
-        if(!strcmp(keyword,"domain")){
+        if(!strcmp(keyword,"domain")||!strcmp(keyword,"domain_suffix")){
             size_t length=strlen(value);
-            if(!length||length>=sizeof(next.domains[0])||next.domain_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid domain");}
-            memcpy(next.domains[next.domain_count++],value,length+1);
+            if(!length||length>=sizeof(next.domain_suffixes[0])||next.domain_suffix_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid domain suffix");}
+            memcpy(next.domain_suffixes[next.domain_suffix_count++],value,length+1);
+        }else if(!strcmp(keyword,"domain_exact")){
+            size_t length=strlen(value);
+            if(!length||length>=sizeof(next.domain_exact[0])||next.domain_exact_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid exact domain");}
+            memcpy(next.domain_exact[next.domain_exact_count++],value,length+1);
         }else if(!strcmp(keyword,"port")){
             char* end=NULL;long port=strtol(value,&end,10);
             if(end==value||*end||port<=0||port>65535||next.port_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid port: %s",value);}
@@ -55,7 +60,7 @@ static int load(const char* path,char* error,size_t error_cap){
         }else{fclose(file);return fail(error,error_cap,"unknown directive: %s",keyword);}
     }
     fclose(file);
-    if(!next.domain_count&&!next.cidr_count)return fail(error,error_cap,"no domain or cidr rules");
+    if(!next.domain_suffix_count&&!next.domain_exact_count&&!next.cidr_count)return fail(error,error_cap,"no domain or cidr rules");
     struct stat status;if(stat(path,&status)==0)next.mtime=status.st_mtime;
     next.enabled=1;state=next;return 0;
 }
@@ -77,12 +82,13 @@ int nb_whitelist_allowed(const char* host,int port){
         for(int i=0;i<state.cidr_count;i++)if((ip&state.cidrs[i].mask)==state.cidrs[i].net)return 1;
         return 0;
     }
-    if(!state.domain_count)return 1;
+    if(!state.domain_suffix_count&&!state.domain_exact_count)return 1;
     size_t host_length=strlen(host);
-    for(int i=0;i<state.domain_count;i++){
-        size_t length=strlen(state.domains[i]);
-        if((host_length==length&&!strcasecmp(host,state.domains[i]))||
-           (host_length>length&&host[host_length-length-1]=='.'&&!strcasecmp(host+host_length-length,state.domains[i])))return 1;
+    for(int i=0;i<state.domain_exact_count;i++)if(!strcasecmp(host,state.domain_exact[i]))return 1;
+    for(int i=0;i<state.domain_suffix_count;i++){
+        size_t length=strlen(state.domain_suffixes[i]);
+        if((host_length==length&&!strcasecmp(host,state.domain_suffixes[i]))||
+           (host_length>length&&host[host_length-length-1]=='.'&&!strcasecmp(host+host_length-length,state.domain_suffixes[i])))return 1;
     }
     return 0;
 }

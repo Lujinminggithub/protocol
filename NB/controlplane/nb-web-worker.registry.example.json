@@ -4,6 +4,20 @@
   "root": "..",
   "python": "python",
   "state_dir": "./build/nb-web-worker",
+  "dynamic": {
+    "enabled": true,
+    "resource_groups": ["gz-hk-primary"],
+    "operations": ["line.open", "line.validate", "line.upgrade", "line.rollback", "line.disable"],
+    "known_hosts_file": "",
+    "secrets_file": "",
+    "sing_box": "sing-box",
+    "socks_port_min": 1082,
+    "socks_port_max": 1199,
+    "relay_port_min": 4445,
+    "relay_port_max": 4599,
+    "udp_port_min": 22048,
+    "udp_port_max": 65535
+  },
   "lines": [
     {
       "line_id": "gz-83-hk-216-kz-1",

@@ -186,3 +186,146 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
 	}
 }
+
+func TestInventoryTopologyAndOperationEvents(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	client := server.Client()
+	for index, role := range []string{"entry", "relay", "exit"} {
+		device := map[string]any{"id": role + "-1", "name": role + " device", "status": "ready",
+			"host": "192.0.2." + string(rune('1'+index)), "ssh_port": 22, "ssh_user": "root",
+			"region": role, "provider": "test", "secret_ref": "env:NB_TEST_" + role, "labels": map[string]any{}}
+		response, body := call(t, client, http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+		if response.StatusCode != 201 {
+			t.Fatalf("create device status=%d body=%s", response.StatusCode, body)
+		}
+	}
+	line := map[string]any{"id": "line-1", "name": "test line", "status": "draft", "entry_region": "entry",
+		"exit_region": "exit", "provider": "test", "capacity_mbps": 20, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body := call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
+	if response.StatusCode != 201 {
+		t.Fatalf("create line status=%d body=%s", response.StatusCode, body)
+	}
+	nodes := []map[string]any{
+		{"device_id": "entry-1", "role": "entry", "ordinal": 0, "next_hop_device_id": "relay-1", "jump_candidates": []string{}, "config": map[string]any{}},
+		{"device_id": "relay-1", "role": "relay", "ordinal": 0, "next_hop_device_id": "exit-1", "jump_candidates": []string{"entry-1"}, "config": map[string]any{}},
+		{"device_id": "exit-1", "role": "exit", "ordinal": 0, "next_hop_device_id": "", "jump_candidates": []string{"relay-1"}, "config": map[string]any{}},
+	}
+	spec := map[string]any{"resource_group": "test-group", "instance_id": "test", "bandwidth_mbps": 20,
+		"socks_port": 1082, "relay_port": 4445, "exit_port": 4443, "udp_port_min": 22048, "udp_port_max": 23071,
+		"whitelist": []string{"domain example.com"}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
+		"srs_ref": "env:NB_TEST_SRS_URL", "jump_policy": "auto", "nodes": nodes}
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
+	if response.StatusCode != 200 {
+		t.Fatalf("save topology status=%d body=%s", response.StatusCode, body)
+	}
+	secondLine := map[string]any{"id": "line-2", "name": "second line", "status": "draft", "entry_region": "entry",
+		"exit_region": "exit", "provider": "test", "capacity_mbps": 20, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", secondLine)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create second line status=%d body=%s", response.StatusCode, body)
+	}
+	conflictingSpec := map[string]any{"resource_group": "other-group", "instance_id": "second", "bandwidth_mbps": 20,
+		"socks_port": 1182, "relay_port": 4545, "exit_port": 4443, "udp_port_min": 24000, "udp_port_max": 25023,
+		"whitelist": []string{}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
+		"srs_ref": "", "jump_policy": "auto", "nodes": nodes}
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-2/spec", "admin", "", conflictingSpec)
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("exit port conflicts")) {
+		t.Fatalf("shared exit port conflict status=%d body=%s", response.StatusCode, body)
+	}
+	heartbeat := map[string]any{"worker_id": "worker-1", "status": "ready", "version": "test", "observed_at": time.Now().UTC(),
+		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open"}}}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/executors/heartbeat", "agent", "", heartbeat)
+	if response.StatusCode != 200 {
+		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)
+	}
+	operation := map[string]any{"line_id": "line-1", "kind": "line.open", "requested_by": "test", "request": map[string]any{}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "inventory-test", operation)
+	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"plan"`)) {
+		t.Fatalf("create operation status=%d body=%s", response.StatusCode, body)
+	}
+	var created central.Operation
+	if err = json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/agent/v1/operations?line_id=line-1&limit=1", "agent", "", nil)
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(created.ID)) {
+		t.Fatalf("exact claim status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/agent/v1/operations?line_id=*&limit=1", "agent", "", nil)
+	if response.StatusCode != 200 || bytes.Contains(body, []byte(created.ID)) {
+		t.Fatalf("wildcard reclaimed dispatched operation status=%d body=%s", response.StatusCode, body)
+	}
+	event := map[string]any{"sequence": 1, "stage": "whitelist-fetch", "status": "running", "message": "started", "parameters": map[string]any{"mode": "auto"}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/operations/"+created.ID+"/events", "agent", "", event)
+	if response.StatusCode != 202 {
+		t.Fatalf("event status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/api/v1/operations/"+created.ID, "admin", "", nil)
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"whitelist-fetch"`)) || bytes.Contains(body, []byte("NB_TEST_SRS_URL=")) {
+		t.Fatalf("operation detail status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestAgentDiscoversMissingTopologyAndIncompleteLineCanBeDeleted(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	client := server.Client()
+	legacy := map[string]any{"id": "legacy-line", "name": "legacy", "status": "active", "entry_region": "gz",
+		"exit_region": "us", "provider": "mixed", "capacity_mbps": 10, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body := call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", legacy)
+	if response.StatusCode != 201 {
+		t.Fatalf("create legacy line status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodDelete, server.URL+"/api/v1/lines/legacy-line", "admin", "",
+		map[string]string{"requested_by": "operator", "reason": "incomplete legacy record"})
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete incomplete line status=%d body=%s", response.StatusCode, body)
+	}
+	devices := []map[string]any{
+		{"id": "entry-1", "name": "entry-1", "status": "ready", "host": "192.0.2.1", "ssh_port": 22, "ssh_user": "root", "private_ip": "", "region": "gz", "provider": "test", "os": "", "arch": "", "secret_ref": "worker-local:line-1:entry", "labels": map[string]any{}},
+		{"id": "relay-1", "name": "relay-1", "status": "ready", "host": "192.0.2.2", "ssh_port": 22, "ssh_user": "root", "private_ip": "", "region": "hk", "provider": "test", "os": "", "arch": "", "secret_ref": "worker-local:line-1:relay", "labels": map[string]any{}},
+		{"id": "exit-1", "name": "exit-1", "status": "ready", "host": "192.0.2.3", "ssh_port": 2273, "ssh_user": "root", "private_ip": "", "region": "us", "provider": "test", "os": "", "arch": "", "secret_ref": "worker-local:line-1:exit", "labels": map[string]any{}},
+	}
+	nodes := []map[string]any{
+		{"device_id": "entry-1", "role": "entry", "ordinal": 0, "next_hop_device_id": "relay-1", "jump_candidates": []string{}, "config": map[string]any{}},
+		{"device_id": "relay-1", "role": "relay", "ordinal": 0, "next_hop_device_id": "exit-1", "jump_candidates": []string{"entry-1"}, "config": map[string]any{}},
+		{"device_id": "exit-1", "role": "exit", "ordinal": 0, "next_hop_device_id": "", "jump_candidates": []string{"relay-1"}, "config": map[string]any{}},
+	}
+	discovery := map[string]any{"worker_id": "worker-1", "observed_at": time.Now().UTC(), "lines": []map[string]any{{
+		"line":    map[string]any{"id": "line-1", "name": "line-1", "status": "maintenance", "entry_region": "gz", "exit_region": "us", "provider": "mixed", "capacity_mbps": 10, "active_deployment": "", "profile": "", "secret_ref": ""},
+		"devices": devices, "spec": map[string]any{"line_id": "line-1", "resource_group": "shared", "instance_id": "us", "bandwidth_mbps": 10, "socks_port": 1080, "udp_port_min": 20000, "udp_port_max": 21023, "relay_port": 4443, "exit_port": 4443, "whitelist": []string{}, "build_mode": "source", "artifact_ref": "build/nb_node", "source_ref": "repo://current", "srs_ref": "", "jump_policy": "auto", "nodes": nodes},
+	}}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/inventory", "agent", "", discovery)
+	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"status":"discovered"`)) {
+		t.Fatalf("inventory discovery status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/api/v1/lines/line-1/detail", "admin", "", nil)
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"device_id":"entry-1"`)) || bytes.Contains(body, []byte("entry-secret")) {
+		t.Fatalf("discovered topology status=%d body=%s", response.StatusCode, body)
+	}
+	manual := devices[0]
+	manual["name"] = "operator managed entry"
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/devices", "admin", "", manual)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("manual device update status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/inventory", "agent", "", discovery)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("repeat discovery status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/api/v1/devices/entry-1", "admin", "", nil)
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"name":"operator managed entry"`)) {
+		t.Fatalf("discovery overwrote operator device status=%d body=%s", response.StatusCode, body)
+	}
+}

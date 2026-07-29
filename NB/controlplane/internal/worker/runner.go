@@ -30,13 +30,15 @@ type Result struct {
 }
 
 type requestValues struct {
-	Deployment string `json:"deployment"`
-	Note       string `json:"note"`
+	Deployment string      `json:"deployment"`
+	Note       string      `json:"note"`
+	Plan       dynamicPlan `json:"plan"`
 }
 
 type commandStep struct {
-	Name string
-	Args []string
+	Name  string
+	Args  []string
+	Stage string
 }
 
 type Runner struct{ registry Registry }
@@ -107,6 +109,9 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		"NB_MIDDLE_PORT":        strconv.Itoa(middlePort),
 		"NB_EXIT_PORT":          strconv.Itoa(exitPort),
 	}
+	for key, value := range line.ExtraEnvironment {
+		values[key] = value
+	}
 	credentials, err := loadJSON(line.SourceMachinesFile)
 	if err != nil && line.SourceMachinesFile != "" {
 		return nil, err
@@ -125,6 +130,9 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		}
 	}
 	if line.ClientSecretFile != "" {
+		if _, statErr := os.Stat(line.ClientSecretFile); errors.Is(statErr, os.ErrNotExist) {
+			return values, nil
+		}
 		secret, loadErr := loadJSON(line.ClientSecretFile)
 		if loadErr != nil {
 			return nil, loadErr
@@ -143,26 +151,38 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 	socks := strconv.Itoa(line.SocksPort)
 	switch operation.Kind {
 	case "line.open":
-		return []commandStep{{Name: python, Args: []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
+		outputDir := filepath.Join(operationDir, "line-open")
+		if line.StateDir != "" {
+			outputDir = line.StateDir
+		}
+		result := []commandStep{}
+		if line.WhitelistSourceEnv != "" {
+			result = append(result, commandStep{Name: python, Stage: "whitelist-fetch", Args: []string{filepath.Join(tools, "whitelist_sync.py"), "--source-env", line.WhitelistSourceEnv, "--mode", "auto", "--sing-box", line.SingBox, "--state-dir", filepath.Join(line.StateDir, "whitelist-sync"), "--output", line.WhitelistFile}})
+		}
+		result = append(result, commandStep{Name: python, Stage: "provision", Args: []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
 			"--line-id", line.LineID, "--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64),
 			"--socks-port", socks, "--middle-port", strconv.Itoa(line.MiddlePort), "--exit-port", strconv.Itoa(line.ExitPort),
 			"--udp-port-min", strconv.Itoa(line.UDPPortMin), "--udp-port-max", strconv.Itoa(line.UDPPortMax),
-			"--output-dir", filepath.Join(operationDir, "line-open"), "--execute"}}}, nil
+			"--output-dir", outputDir, "--build-mode", line.BuildMode, "--execute"}})
+		if line.WhitelistFile != "" {
+			result = append(result, commandStep{Name: python, Stage: "whitelist", Args: []string{deploy, "wl-push", "--whitelist", line.WhitelistFile}})
+		}
+		return result, nil
 	case "line.validate":
-		return []commandStep{{Name: python, Args: []string{filepath.Join(tools, "line_probe.py"),
+		return []commandStep{{Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--socks-port", socks, "--via-entry-ssh", "--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.upgrade":
-		return []commandStep{{Name: python, Args: []string{deploy, "build"}},
-			{Name: python, Args: []string{deploy, "deploy-socks", "--socks-port", socks}}}, nil
+		return []commandStep{{Name: python, Stage: "build", Args: []string{deploy, "build"}},
+			{Name: python, Stage: "deploy", Args: []string{deploy, "deploy-socks", "--socks-port", socks}}}, nil
 	case "line.rollback":
 		if !safeDeployment.MatchString(request.Deployment) {
 			return nil, errors.New("rollback requires a valid deployment")
 		}
-		return []commandStep{{Name: python, Args: []string{deploy, "rollback-socks", "--deployment-id", request.Deployment,
+		return []commandStep{{Name: python, Stage: "rollback", Args: []string{deploy, "rollback-socks", "--deployment-id", request.Deployment,
 			"--socks-port", socks}}}, nil
 	case "line.disable":
-		return []commandStep{{Name: python, Args: []string{deploy, "stop"}}}, nil
+		return []commandStep{{Name: python, Stage: "stop", Args: []string{deploy, "stop"}}}, nil
 	default:
 		return nil, errors.New("operation kind is not allowlisted")
 	}
@@ -212,9 +232,18 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 }
 
 func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
+	var request requestValues
+	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
+		return Result{}, errors.New("invalid operation request")
+	}
+	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
 	line, ok := r.registry.Line(operation.LineID)
 	if !ok {
-		return Result{}, errors.New("line is not registered in this worker")
+		var resolveErr error
+		line, resolveErr = r.dynamicLine(operation, request, operationDir)
+		if resolveErr != nil {
+			return Result{}, resolveErr
+		}
 	}
 	if !line.Allows(operation.Kind) {
 		reason := line.DisabledReason
@@ -223,11 +252,6 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		}
 		return Result{}, errors.New(reason)
 	}
-	var request requestValues
-	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
-		return Result{}, errors.New("invalid operation request")
-	}
-	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
 	if err := os.MkdirAll(operationDir, 0700); err != nil {
 		return Result{}, err
 	}
@@ -247,10 +271,18 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	if err != nil {
 		return Result{LogFile: logPath}, err
 	}
-	for _, step := range steps {
+	for index, step := range steps {
+		stage := step.Stage
+		if stage == "" {
+			stage = "execute"
+		}
+		sequence := index*2 + 1
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "running", Message: "step started", Parameters: map[string]any{"program": filepath.Base(step.Name)}})
 		if err = r.execute(ctx, step, environment, logFile); err != nil {
+			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence + 1, Stage: stage, Status: "failed", Message: err.Error()})
 			return Result{LogFile: logPath}, fmt.Errorf("%s failed: %w", filepath.Base(step.Args[0]), err)
 		}
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence + 1, Stage: stage, Status: "succeeded", Message: "step completed"})
 	}
 	result := Result{LogFile: logPath, Profile: line.LineID, Message: "operation completed"}
 	if operation.Kind == "line.rollback" {

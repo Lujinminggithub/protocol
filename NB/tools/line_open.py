@@ -142,11 +142,25 @@ def run(command: list[str], env: dict, cwd: pathlib.Path = ROOT) -> None:
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+def prepare_release(env: dict, build_mode: str) -> None:
+    if build_mode == "source":
+        run([sys.executable, "tools/deploy.py", "build"], env)
+        return
+    command = [sys.executable, "tools/deploy.py", "prepare-release"]
+    print("+ " + " ".join(command))
+    result = subprocess.run(command, cwd=ROOT, env=env, check=False)
+    if result.returncode == 0:
+        return
+    if build_mode == "binary":
+        raise RuntimeError("verified local binary is unavailable")
+    run([sys.executable, "tools/deploy.py", "build"], env)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("hosts", type=pathlib.Path, help="三台机器清单 JSON")
     parser.add_argument("--line-id", required=True)
-    parser.add_argument("--package-mbps", type=float, choices=(5, 10, 15), required=True)
+    parser.add_argument("--package-mbps", type=float, required=True)
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--middle-port", type=int, default=int(os.environ.get("NB_MIDDLE_PORT", "4443")))
     parser.add_argument("--exit-port", type=int, default=int(os.environ.get("NB_EXIT_PORT", "4443")))
@@ -154,8 +168,11 @@ def main() -> None:
     parser.add_argument("--udp-port-max", type=int, default=int(os.environ.get("NB_SOCKS_UDP_PORT_MAX", "21023")))
     parser.add_argument("--client-username", default="nbmobile")
     parser.add_argument("--output-dir", type=pathlib.Path)
+    parser.add_argument("--build-mode", choices=("auto", "binary", "source"), default="source")
     parser.add_argument("--execute", action="store_true", help="实际初始化和部署；默认只生成计划")
     args = parser.parse_args()
+    if not 1 <= args.package_mbps <= 1000:
+        parser.error("--package-mbps must be between 1 and 1000")
     if not 1 <= args.socks_port <= 65535:
         raise SystemExit("--socks-port 非法")
     if any(port < 1 or port > 65535 for port in (args.socks_port, args.middle_port, args.exit_port)):
@@ -223,7 +240,7 @@ def main() -> None:
     run([sys.executable, "tools/security_setup.py", "--out", str(security)], env)
     run([sys.executable, "tools/pin_host_keys.py", "--out", str(security / "known_hosts")], env)
     env.pop("NB_SSH_INSECURE", None); env["NB_KNOWN_HOSTS"] = str(security / "known_hosts")
-    run([sys.executable, "tools/deploy.py", "build"], env)
+    prepare_release(env, args.build_mode)
     run([sys.executable, "tools/deploy.py", "deploy-socks", "--socks-port", str(args.socks_port)], env)
     provision_dir = output / "provision"
     run([sys.executable, "tools/line_provision.py", str(inventory_path),
@@ -231,7 +248,7 @@ def main() -> None:
     line_dir = provision_dir / args.line_id
     env["NB_HOSTS_FILE"] = str(line_dir / "deployment-hosts.json")
     env["NB_LINE_PROFILE_FILE"] = str(line_dir / "stable-profile.json")
-    run([sys.executable, "tools/deploy.py", "build"], env)
+    prepare_release(env, args.build_mode)
     run([sys.executable, "tools/deploy.py", "deploy-socks", "--socks-port", str(args.socks_port)], env)
     env["NB_CONTROL_SIGNING_KEY"] = secrets.token_hex(32)
     bundle = line_dir / "policy-bundle"

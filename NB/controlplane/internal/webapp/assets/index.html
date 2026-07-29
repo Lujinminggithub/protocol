@@ -3,109 +3,81 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>NB 运营控制台</title>
+  <title>NB 中央运营控制台</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">NB</span><span>运营控制台</span></div>
+      <div class="brand"><span class="brand-mark">NB</span><div><strong>NB 运营控制台</strong><small>NETWORK CONTROL</small></div></div>
       <nav aria-label="主导航">
         <button class="nav-item active" data-view="overview"><span class="nav-icon">⌂</span>总览</button>
+        <button class="nav-item" data-view="devices"><span class="nav-icon">▣</span>设备</button>
         <button class="nav-item" data-view="lines"><span class="nav-icon">⇄</span>线路</button>
-        <button class="nav-item" data-view="operations"><span class="nav-icon">↻</span>操作任务</button>
+        <button class="nav-item" data-view="operations"><span class="nav-icon">≡</span>任务</button>
         <button class="nav-item" data-view="incidents"><span class="nav-icon">!</span>告警</button>
       </nav>
-      <div class="sidebar-foot">
-        <span class="status-dot" id="apiDot"></span>
-        <span id="apiStatus">未连接</span>
-      </div>
+      <div class="sidebar-foot"><span class="status-dot" id="apiDot"></span><span id="apiStatus">未连接</span></div>
     </aside>
 
     <main>
       <header class="topbar">
-        <div>
-          <h1 id="viewTitle">线路总览</h1>
-          <p id="viewSubtitle">统一查看线路容量、健康与运行状态</p>
-        </div>
-        <div class="top-actions">
-          <span class="updated" id="updatedAt">--</span>
-          <button class="icon-button" id="refreshButton" title="刷新" aria-label="刷新">↻</button>
-          <button class="primary" id="newLineButton">新增线路</button>
-        </div>
+        <div><h1 id="viewTitle">运营总览</h1><p id="viewSubtitle">线路容量、节点健康与执行任务</p></div>
+        <div class="top-actions"><span class="updated" id="updatedAt">--</span><button class="icon-button" id="refreshButton" title="刷新" aria-label="刷新">↻</button><button class="primary" id="contextAction">新增线路</button></div>
       </header>
 
       <section class="view active" id="overviewView">
         <div class="metrics" id="metrics"></div>
-        <div class="section-head"><div><h2>线路状态</h2><p>按最新 worker 快照聚合</p></div><div class="legend"><span><i class="good"></i>健康</span><span><i class="warn"></i>异常</span></div></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>线路</th><th>状态</th><th>拓扑</th><th>容量 / 当前</th><th>会话</th><th>延迟队列</th><th>有效丢包</th><th>部署</th></tr></thead>
-            <tbody id="overviewLines"></tbody>
-          </table>
+        <section class="topology-band">
+          <div class="section-head"><div><h2>线路拓扑</h2><p>按实际设备连接关系展示</p></div><select id="topologyLine" aria-label="选择线路"></select></div>
+          <div id="overviewTopology" class="topology-canvas"></div>
+        </section>
+        <div class="split-grid">
+          <section class="band"><div class="section-head"><div><h2>线路运行状态</h2><p>按最新节点快照聚合</p></div></div><div class="table-wrap"><table><thead><tr><th>线路</th><th>健康</th><th>当前 / 配额</th><th>会话</th><th>抖动队列</th><th>有效丢包</th><th>部署</th></tr></thead><tbody id="overviewLines"></tbody></table></div></section>
+          <aside class="activity"><div class="section-head"><div><h2>执行动态</h2><p>最近任务</p></div></div><div id="recentOperations" class="activity-list"></div></aside>
         </div>
+      </section>
+
+      <section class="view" id="devicesView">
+        <div class="toolbar"><input id="deviceSearch" type="search" placeholder="搜索设备、地址、区域或运营商"><select id="deviceStatus"><option value="">全部状态</option><option value="ready">可用</option><option value="maintenance">维护</option><option value="offline">离线</option><option value="retired">退役</option></select><span class="toolbar-note">凭据仅保存引用，不进入中央数据库</span></div>
+        <div class="table-wrap"><table><thead><tr><th>设备</th><th>状态</th><th>SSH 地址</th><th>区域 / 运营商</th><th>系统</th><th>最近健康</th><th>操作</th></tr></thead><tbody id="devicesTable"></tbody></table></div>
       </section>
 
       <section class="view" id="linesView">
         <div class="toolbar"><input id="lineSearch" type="search" placeholder="搜索线路、区域或运营商"><select id="lineStatus"><option value="">全部状态</option><option value="active">运行中</option><option value="draft">草稿</option><option value="validating">验证中</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></div>
-        <div class="table-wrap">
-          <table><thead><tr><th>线路</th><th>状态</th><th>入口</th><th>出口</th><th>运营商</th><th>容量</th><th>Profile</th><th>操作</th></tr></thead><tbody id="linesTable"></tbody></table>
-        </div>
+        <div class="table-wrap"><table><thead><tr><th>线路</th><th>状态</th><th>拓扑</th><th>带宽</th><th>接入端口</th><th>Profile</th><th>操作</th></tr></thead><tbody id="linesTable"></tbody></table></div>
       </section>
 
       <section class="view" id="operationsView">
-        <div class="toolbar"><select id="operationLine"><option value="">全部线路</option></select><button class="secondary" id="reloadOperations">刷新任务</button></div>
-        <div class="table-wrap"><table><thead><tr><th>任务</th><th>线路</th><th>类型</th><th>状态</th><th>发起人</th><th>创建时间</th><th>更新时间</th></tr></thead><tbody id="operationsTable"></tbody></table></div>
+        <div class="toolbar"><select id="operationLine"><option value="">全部线路</option></select><button class="secondary" id="reloadOperations">刷新任务</button><span class="toolbar-note">点击任务查看构建、上传、分发、启动和验证步骤</span></div>
+        <div class="table-wrap"><table><thead><tr><th>任务</th><th>线路</th><th>类型</th><th>状态</th><th>发起人</th><th>开始时间</th><th>更新时间</th></tr></thead><tbody id="operationsTable"></tbody></table></div>
       </section>
 
       <section class="view" id="incidentsView">
-        <div class="section-head"><div><h2>线路告警</h2><p>按发生时间倒序</p></div></div>
+        <div class="section-head"><div><h2>线路与设备告警</h2><p>按发生时间倒序</p></div></div>
         <div class="table-wrap"><table><thead><tr><th>级别</th><th>线路</th><th>类型</th><th>状态</th><th>消息</th><th>时间</th></tr></thead><tbody id="incidentsTable"></tbody></table></div>
       </section>
     </main>
   </div>
 
-  <div class="modal-backdrop" id="authModal">
-    <form class="modal auth-modal" id="authForm" role="dialog" aria-modal="true" aria-labelledby="authTitle">
-      <div class="modal-head"><div><h2 id="authTitle">连接控制台</h2><p>Windows 中央控制面</p></div></div>
-      <label>管理员令牌<input id="tokenInput" type="password" autocomplete="current-password" required></label>
-      <div class="form-error" id="authError"></div>
-      <button class="primary full" type="submit">连接</button>
-    </form>
-  </div>
+  <div class="modal-backdrop" id="authModal"><form class="modal auth-modal" id="authForm"><div class="modal-head"><div><h2>连接运营控制台</h2><p>输入管理员令牌</p></div></div><label>管理员令牌<input id="tokenInput" type="password" autocomplete="current-password" required></label><div class="form-error" id="authError"></div><button class="primary full" type="submit">连接</button></form></div>
 
-  <div class="modal-backdrop hidden" id="lineModal">
-    <form class="modal wide" id="lineForm" role="dialog" aria-modal="true" aria-labelledby="lineModalTitle">
-      <div class="modal-head"><div><h2 id="lineModalTitle">新增线路</h2><p>登记线路后创建验证或开线任务</p></div><button type="button" class="icon-button close-modal" aria-label="关闭">×</button></div>
-      <div class="form-grid">
-        <label>线路 ID<input name="id" placeholder="gz-hk-us" required pattern="[A-Za-z0-9_.-]+"></label>
-        <label>显示名称<input name="name" placeholder="广州 · 香港 · 美国" required></label>
-        <label>入口区域<input name="entry_region" placeholder="广州" required></label>
-        <label>出口区域<input name="exit_region" placeholder="美国" required></label>
-        <label>运营商<input name="provider" placeholder="多运营商"></label>
-        <label>容量 Mbps<input name="capacity_mbps" type="number" min="0" value="10" required></label>
-        <label>Profile<input name="profile" placeholder="gz-hk-us:1"></label>
-        <label>密钥引用<input name="secret_ref" placeholder="vault/nb/lines/gz-hk-us"></label>
-      </div>
-      <label>初始状态<select name="status"><option value="draft">草稿</option><option value="validating">验证中</option><option value="active">运行中</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></label>
-      <div class="form-error" id="lineError"></div>
-      <div class="modal-actions"><button type="button" class="secondary close-modal">取消</button><button type="submit" class="primary">保存线路</button></div>
-    </form>
-  </div>
+  <div class="modal-backdrop hidden" id="deviceModal"><form class="modal wide" id="deviceForm"><div class="modal-head"><div><h2>录入服务器设备</h2><p>登记管理地址、区域和本地凭据引用</p></div><button type="button" class="icon-button close-device">×</button></div><div class="form-grid three">
+    <label>设备 ID<input name="id" placeholder="gz-83" pattern="[A-Za-z0-9_.-]+" required></label><label>显示名称<input name="name" placeholder="广州 Entry 01" required></label><label>状态<select name="status"><option value="ready">可用</option><option value="provisioning">初始化</option><option value="maintenance">维护</option><option value="offline">离线</option></select></label>
+    <label>公网地址<input name="host" placeholder="203.0.113.10" required></label><label>SSH 端口<input name="ssh_port" type="number" min="1" max="65535" value="22" required></label><label>SSH 用户<input name="ssh_user" value="root" required></label>
+    <label>内网地址<input name="private_ip" placeholder="172.16.0.10"></label><label>区域<input name="region" placeholder="CN-GZ"></label><label>运营商<input name="provider" placeholder="UCloud"></label>
+    <label>操作系统<input name="os" placeholder="Ubuntu 24.04"></label><label>架构<input name="arch" placeholder="amd64"></label><label>凭据引用<input name="secret_ref" placeholder="env:NB_DEVICE_GZ83_PASSWORD" required></label>
+  </div><div class="form-error" id="deviceError"></div><div class="modal-actions"><button type="button" class="secondary close-device">取消</button><button class="primary" type="submit">保存设备</button></div></form></div>
 
-  <div class="modal-backdrop hidden" id="operationModal">
-    <form class="modal" id="operationForm" role="dialog" aria-modal="true" aria-labelledby="operationTitle">
-      <div class="modal-head"><div><h2 id="operationTitle">创建任务</h2><p id="operationTarget"></p></div><button type="button" class="icon-button close-operation" aria-label="关闭">×</button></div>
-      <input type="hidden" name="line_id"><input type="hidden" name="kind">
-      <label>发起人<input name="requested_by" value="operator" required pattern="[A-Za-z0-9_.-]+"></label>
-      <label>目标 deployment<input name="deployment" placeholder="可留空"></label>
-      <label>备注<textarea name="note" rows="3" placeholder="变更窗口或审批编号"></textarea></label>
-      <div class="form-error" id="operationError"></div>
-      <div class="modal-actions"><button type="button" class="secondary close-operation">取消</button><button type="submit" class="primary">提交任务</button></div>
-    </form>
-  </div>
+  <div class="modal-backdrop hidden" id="lineModal"><form class="modal xwide" id="lineForm"><div class="modal-head"><div><h2>开线编排</h2><p>选择设备角色并生成不可变部署计划</p></div><button type="button" class="icon-button close-line">×</button></div>
+    <div class="wizard-section"><h3>基本信息</h3><div class="form-grid three"><label>线路 ID<input name="id" placeholder="gz-hk-sg-1" pattern="[A-Za-z0-9_.-]+" required></label><label>显示名称<input name="name" placeholder="广州 / 香港 / 新加坡" required></label><label>资源组<input name="resource_group" value="gz-hk-primary" required></label><label>实例 ID<input name="instance_id" placeholder="sg1" required></label><label>入口区域<input name="entry_region" placeholder="CN-GZ" required></label><label>出口区域<input name="exit_region" placeholder="SG" required></label></div></div>
+    <div class="wizard-section"><h3>设备角色</h3><div class="role-grid"><label><span>Entry</span><select name="entry_device" required></select></label><span class="route-arrow">→</span><label><span>Relay</span><select name="relay_device" required></select></label><span class="route-arrow">→</span><label><span>Exit</span><select name="exit_device" required></select></label></div></div>
+    <div class="wizard-section"><h3>线路参数</h3><div class="form-grid four"><label>限速 Mbps<input name="bandwidth_mbps" type="number" min="1" value="10" required></label><label>入口端口<input name="socks_port" type="number" min="1" value="1082" required></label><label>构建策略<select name="build_mode"><option value="auto">优先二进制，无则源码构建</option><option value="binary">仅使用二进制</option><option value="source">强制源码构建</option></select></label><label>跳板策略<select name="jump_policy"><option value="auto">自动选择稳定跳板</option><option value="direct">仅直连</option><option value="pinned">固定 Entry 跳板</option></select></label></div><p class="field-note">Relay、Exit 端口和 UDP 端口段由控制面按设备占用情况自动分配。</p><label>白名单规则<textarea name="whitelist" rows="4" placeholder="domain tiktok.com&#10;port 443"></textarea></label><div class="form-grid three"><label>SRS 来源引用<input name="srs_ref" placeholder="env:NB_LINE_SRS_URL"></label><label>二进制引用<input name="artifact_ref" placeholder="build/nb_node"></label><label>源码引用<input name="source_ref" value="repo://current"></label></div></div>
+    <div class="form-error" id="lineError"></div><div class="modal-actions"><button type="button" class="secondary close-line">取消</button><button type="submit" class="primary">保存并创建开线任务</button></div>
+  </form></div>
 
-  <div class="toast" id="toast" role="status"></div>
-  <script src="/app.js" defer></script>
-</body>
-</html>
+  <div class="modal-backdrop hidden" id="operationModal"><form class="modal" id="operationForm"><div class="modal-head"><div><h2 id="operationTitle">创建任务</h2><p id="operationTarget"></p></div><button type="button" class="icon-button close-operation">×</button></div><input type="hidden" name="line_id"><input type="hidden" name="kind"><label>发起人<input name="requested_by" value="operator" pattern="[A-Za-z0-9_.-]+" required></label><label>目标 deployment<input name="deployment" placeholder="回滚时填写"></label><label>备注<textarea name="note" rows="3"></textarea></label><div class="form-error" id="operationError"></div><div class="modal-actions"><button type="button" class="secondary close-operation">取消</button><button class="primary" type="submit">提交任务</button></div></form></div>
+
+  <div class="modal-backdrop hidden" id="detailModal"><div class="modal xwide"><div class="modal-head"><div><h2 id="detailTitle">详情</h2><p id="detailSubtitle"></p></div><button type="button" class="icon-button close-detail">×</button></div><div id="detailBody"></div></div></div>
+  <div class="toast" id="toast"></div><script src="/app.js" defer></script>
+</body></html>
