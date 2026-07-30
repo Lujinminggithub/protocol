@@ -262,16 +262,27 @@ func lineDevice(spec LineSpec, role string) string {
 	return ""
 }
 
-func nextFreePort(used map[int]bool, first, last int) (int, error) {
-	for port := first; port <= last; port++ {
-		if !used[port] {
+// Every NB transport instance currently starts two workers. Each worker binds
+// base+workerIndex, so relay and exit reservations must cover both lane ports.
+const transportWorkerLanes = 2
+
+func nextFreePortSpan(used map[int]bool, first, last, width int) (int, error) {
+	for port := first; port+width-1 <= last; port++ {
+		available := true
+		for lane := 0; lane < width; lane++ {
+			if used[port+lane] {
+				available = false
+				break
+			}
+		}
+		if available {
 			return port, nil
 		}
 	}
 	return 0, errors.New("no internal port is available")
 }
 
-func (s *Store) usedRolePorts(ctx context.Context, lineID, deviceID, role, column string) (map[int]bool, error) {
+func (s *Store) usedRolePortSpans(ctx context.Context, lineID, deviceID, role, column string, width int) (map[int]bool, error) {
 	query := fmt.Sprintf(`SELECT s.%s FROM line_specs s
  JOIN line_nodes n ON n.line_id=s.line_id AND n.role=?
  WHERE s.line_id<>? AND n.device_id=?`, column)
@@ -286,33 +297,41 @@ func (s *Store) usedRolePorts(ctx context.Context, lineID, deviceID, role, colum
 		if err = rows.Scan(&port); err != nil {
 			return nil, err
 		}
-		used[port] = true
+		for lane := 0; lane < width; lane++ {
+			used[port+lane] = true
+		}
 	}
 	return used, rows.Err()
 }
 
 // AllocateLineSpec fills control-plane-owned ports without changing an explicitly supplied value.
 func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, error) {
+	if spec.InstanceID == "" {
+		if len(spec.LineID)+2 > 48 {
+			return LineSpec{}, errors.New("line ID is too long for an automatic deployment instance")
+		}
+		spec.InstanceID = spec.LineID + "_1"
+	}
 	relayDevice := lineDevice(spec, "relay")
 	exitDevice := lineDevice(spec, "exit")
 	if relayDevice == "" || exitDevice == "" {
 		return LineSpec{}, errors.New("internal port allocation requires relay and exit devices")
 	}
 	if spec.RelayPort == 0 {
-		used, err := s.usedRolePorts(ctx, spec.LineID, relayDevice, "relay", "relay_port")
+		used, err := s.usedRolePortSpans(ctx, spec.LineID, relayDevice, "relay", "relay_port", transportWorkerLanes)
 		if err != nil {
 			return LineSpec{}, err
 		}
-		if spec.RelayPort, err = nextFreePort(used, 4445, 4599); err != nil {
+		if spec.RelayPort, err = nextFreePortSpan(used, 4445, 4599, transportWorkerLanes); err != nil {
 			return LineSpec{}, err
 		}
 	}
 	if spec.ExitPort == 0 {
-		used, err := s.usedRolePorts(ctx, spec.LineID, exitDevice, "exit", "exit_port")
+		used, err := s.usedRolePortSpans(ctx, spec.LineID, exitDevice, "exit", "exit_port", transportWorkerLanes)
 		if err != nil {
 			return LineSpec{}, err
 		}
-		if spec.ExitPort, err = nextFreePort(used, 4443, 4599); err != nil {
+		if spec.ExitPort, err = nextFreePortSpan(used, 4443, 4599, transportWorkerLanes); err != nil {
 			return LineSpec{}, err
 		}
 	}
@@ -359,14 +378,15 @@ func (s *Store) LineSpecConflict(ctx context.Context, spec LineSpec) (string, er
 	checks := []struct {
 		role, column, label string
 		port                int
-	}{{"entry", "socks_port", "entry", spec.SocksPort}, {"relay", "relay_port", "relay", spec.RelayPort}, {"exit", "exit_port", "exit", spec.ExitPort}}
+		width               int
+	}{{"entry", "socks_port", "entry", spec.SocksPort, 1}, {"relay", "relay_port", "relay", spec.RelayPort, transportWorkerLanes}, {"exit", "exit_port", "exit", spec.ExitPort, transportWorkerLanes}}
 	for _, check := range checks {
 		deviceID := lineDevice(spec, check.role)
 		var conflictingLine string
 		query := fmt.Sprintf(`SELECT s.line_id FROM line_specs s
  JOIN line_nodes n ON n.line_id=s.line_id AND n.role=?
- WHERE s.line_id<>? AND s.%s=? AND n.device_id=? LIMIT 1`, check.column)
-		err := s.db.QueryRowContext(ctx, query, check.role, spec.LineID, check.port, deviceID).Scan(&conflictingLine)
+	 WHERE s.line_id<>? AND ?<=s.%s+? AND s.%s<=? AND n.device_id=? LIMIT 1`, check.column, check.column)
+		err := s.db.QueryRowContext(ctx, query, check.role, spec.LineID, check.port, check.width-1, check.port+check.width-1, deviceID).Scan(&conflictingLine)
 		if err == nil {
 			return fmt.Sprintf("%s port conflicts with %s on device %s", check.label, conflictingLine, deviceID), nil
 		}
@@ -425,11 +445,14 @@ func (s *Store) OperationEvents(ctx context.Context, operationID string) ([]Oper
 }
 
 func (s *Store) LatestSnapshots(ctx context.Context, lineID string) ([]Snapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,
- profile,sessions,throughput_mbps,queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at
- FROM snapshots s WHERE line_id=? AND id=(SELECT id FROM snapshots x WHERE x.line_id=s.line_id
- AND x.node_id=s.node_id AND x.worker_id=s.worker_id ORDER BY observed_at DESC LIMIT 1)
- ORDER BY CASE role WHEN 'entry' THEN 1 WHEN 'middle' THEN 2 WHEN 'relay' THEN 2 ELSE 3 END,node_id`, lineID)
+	rows, err := s.db.QueryContext(ctx, `WITH ranked AS (
+	 SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
+	 queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at,
+	 ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY observed_at DESC,id DESC) AS rn
+	 FROM snapshots WHERE line_id=?
+	) SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
+	 queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at FROM ranked WHERE rn=1
+	 ORDER BY CASE role WHEN 'entry' THEN 1 WHEN 'middle' THEN 2 WHEN 'relay' THEN 2 ELSE 3 END,node_id`, lineID)
 	if err != nil {
 		return nil, err
 	}

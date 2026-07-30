@@ -21,6 +21,8 @@ var allowedKinds = map[string]bool{
 	"line.rollback": true, "line.disable": true,
 }
 
+const transportWorkerLanes = 2
+
 type Registry struct {
 	SchemaVersion int           `json:"schema_version"`
 	WorkerID      string        `json:"worker_id"`
@@ -131,10 +133,33 @@ func LoadRegistry(path string) (Registry, error) {
 			line.BuildMode = "source"
 		}
 	}
+	registry.quarantineLegacyTransportCollisions()
 	if err = registry.Validate(); err != nil {
 		return Registry{}, err
 	}
 	return registry, nil
+}
+
+func spansOverlap(firstA, firstB, width int) bool {
+	return firstA <= firstB+width-1 && firstB <= firstA+width-1
+}
+
+func (r *Registry) quarantineLegacyTransportCollisions() {
+	for left := 0; left < len(r.Lines); left++ {
+		for right := left + 1; right < len(r.Lines); right++ {
+			a, b := &r.Lines[left], &r.Lines[right]
+			if a.ResourceGroup != b.ResourceGroup || !spansOverlap(a.MiddlePort, b.MiddlePort, transportWorkerLanes) {
+				continue
+			}
+			if a.DisabledReason == "" {
+				a.DisabledReason = fmt.Sprintf("middle worker ports overlap historical line %s; atomic port migration is required", b.LineID)
+			}
+			if b.DisabledReason == "" {
+				b.DisabledReason = fmt.Sprintf("middle worker ports overlap historical line %s; atomic port migration is required", a.LineID)
+			}
+			a.EnabledOperations, b.EnabledOperations = nil, nil
+		}
+	}
 }
 
 func (r Registry) Validate() error {
@@ -182,6 +207,7 @@ func (r Registry) Validate() error {
 	seen := map[string]bool{}
 	entryPorts := map[string]string{}
 	middlePorts := map[string]string{}
+	disabledLines := map[string]bool{}
 	udpRanges := map[string][]LineSpec{}
 	for _, line := range r.Lines {
 		if !safeID.MatchString(line.LineID) || !safeID.MatchString(line.ResourceGroup) || seen[line.LineID] {
@@ -208,21 +234,27 @@ func (r Registry) Validate() error {
 		if line.SocksPort < 1 || line.SocksPort > 65535 || line.PackageMbps < 1 || line.PackageMbps > 1000 {
 			return fmt.Errorf("invalid package or SOCKS port for %s", line.LineID)
 		}
-		if middlePort < 1 || middlePort > 65535 || exitPort < 1 || exitPort > 65535 {
+		if middlePort < 1 || middlePort+transportWorkerLanes-1 > 65535 || exitPort < 1 || exitPort+transportWorkerLanes-1 > 65535 {
 			return fmt.Errorf("invalid transport port for %s", line.LineID)
 		}
 		if udpPortMin < 1024 || udpPortMax > 65535 || udpPortMin > udpPortMax {
 			return fmt.Errorf("invalid UDP relay range for %s", line.LineID)
 		}
 		entryKey := fmt.Sprintf("%s:%d", line.ResourceGroup, line.SocksPort)
-		middleKey := fmt.Sprintf("%s:%d", line.ResourceGroup, middlePort)
 		if other := entryPorts[entryKey]; other != "" {
 			return fmt.Errorf("SOCKS port collision between %s and %s", other, line.LineID)
 		}
-		if other := middlePorts[middleKey]; other != "" {
-			return fmt.Errorf("middle port collision between %s and %s", other, line.LineID)
+		for port := middlePort; port < middlePort+transportWorkerLanes; port++ {
+			middleKey := fmt.Sprintf("%s:%d", line.ResourceGroup, port)
+			if other := middlePorts[middleKey]; other != "" && !(disabledLines[other] && line.DisabledReason != "") {
+				return fmt.Errorf("middle worker port collision between %s and %s", other, line.LineID)
+			}
 		}
-		entryPorts[entryKey], middlePorts[middleKey] = line.LineID, line.LineID
+		entryPorts[entryKey] = line.LineID
+		for port := middlePort; port < middlePort+transportWorkerLanes; port++ {
+			middlePorts[fmt.Sprintf("%s:%d", line.ResourceGroup, port)] = line.LineID
+		}
+		disabledLines[line.LineID] = line.DisabledReason != ""
 		for _, other := range udpRanges[line.ResourceGroup] {
 			if udpPortMin <= other.UDPPortMax && other.UDPPortMin <= udpPortMax {
 				return fmt.Errorf("UDP relay range collision between %s and %s", other.LineID, line.LineID)

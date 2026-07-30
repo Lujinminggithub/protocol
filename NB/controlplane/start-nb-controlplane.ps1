@@ -1,9 +1,8 @@
 param(
     [string]$Listen = "127.0.0.1:9091",
-    [string]$StateDirectory = "./build/nb-web",
+    [string]$StateDirectory = "E:\NBData\nb-web",
     [string]$Registry = "../tools/private/nb-web-worker.json",
-    [string]$Version = "1.0.1.5",
-    [string]$BaseURL = ""
+    [string]$Version = "1.0.1.5"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,70 +10,80 @@ if ([string]::IsNullOrWhiteSpace($env:NB_WEB_ADMIN_TOKEN) -or
     [string]::IsNullOrWhiteSpace($env:NB_WEB_AGENT_TOKEN)) {
     throw "NB_WEB_ADMIN_TOKEN and NB_WEB_AGENT_TOKEN must be set"
 }
-if ($Listen -notmatch '^(?<host>.+):(?<port>[0-9]+)$') {
-    throw "Listen must use host:port"
-}
-$listenHost = $Matches.host.Trim('[', ']')
-$listenPort = [int]$Matches.port
-if ($listenPort -lt 1 -or $listenPort -gt 65535) {
-    throw "Listen must end with a valid TCP port"
-}
-$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $listenPort -ErrorAction SilentlyContinue)
-if ($listeners.Count -gt 0) {
-    $owners = ($listeners | Select-Object -ExpandProperty OwningProcess -Unique) -join ', '
-    throw "TCP port $listenPort is already in use by PID $owners. Stop the old control plane before restarting."
-}
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
-New-Item -ItemType Directory -Path "build" -Force | Out-Null
-go build -trimpath -o "build/nb-web.exe" ./cmd/nb-web
-go build -trimpath -ldflags "-X main.version=$Version" -o "build/nb-web-worker.exe" ./cmd/nb-web-worker
-
-if ([string]::IsNullOrWhiteSpace($BaseURL)) {
-    $workerHost = $listenHost
-    if ($workerHost -eq "0.0.0.0" -or $workerHost -eq "::") {
-        $workerHost = "127.0.0.1"
-    }
-    $BaseURL = "http://${workerHost}:$listenPort"
+$registryPath = [System.IO.Path]::GetFullPath((Join-Path $root $Registry))
+$portText = ($Listen -split ':')[-1]
+$listenPort = 0
+if (-not [int]::TryParse($portText, [ref]$listenPort) -or $listenPort -lt 1 -or $listenPort -gt 65535) {
+    throw "Listen must end with a valid TCP port"
 }
-$stdoutLog = Join-Path $root "build/nb-web-combined.stdout.log"
-$stderrLog = Join-Path $root "build/nb-web-combined.stderr.log"
-$env:NB_WEB_LISTEN = $Listen
-$env:NB_WEB_STATE_DIR = $StateDirectory
-$env:NB_WEB_BASE_URL = $BaseURL
-$env:NB_WEB_WORKER_REGISTRY = $Registry
+if (Get-NetTCPConnection -State Listen -LocalPort $listenPort -ErrorAction SilentlyContinue) {
+    throw "TCP port $listenPort is already in use"
+}
+if (-not (Test-Path -LiteralPath $registryPath -PathType Leaf)) {
+    throw "worker registry does not exist: $registryPath"
+}
 
-$web = Start-Process -FilePath "$root/build/nb-web.exe" -WindowStyle Hidden -PassThru `
-    -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+Push-Location $root
 try {
-    $ready = $false
-    for ($attempt = 0; $attempt -lt 40; $attempt++) {
-        if ($web.HasExited) {
-            $tail = Get-Content $stderrLog -Tail 10 -ErrorAction SilentlyContinue
-            throw "nb-web exited during startup: $tail"
-        }
-        try {
-            $response = Invoke-WebRequest -UseBasicParsing -Uri "$BaseURL/healthz" -TimeoutSec 1
-            if ($response.StatusCode -eq 200) {
+    New-Item -ItemType Directory -Path "build" -Force | Out-Null
+    go build -trimpath -o "build/nb-web.exe" ./cmd/nb-web
+    go build -trimpath -ldflags "-X main.version=$Version" -o "build/nb-web-worker.exe" ./cmd/nb-web-worker
+
+    $webEnvironment = @{
+        NB_WEB_LISTEN = $Listen
+        NB_WEB_STATE_DIR = $StateDirectory
+    }
+    $workerEnvironment = @{
+        NB_WEB_BASE_URL = "http://127.0.0.1:$listenPort"
+        NB_WEB_WORKER_REGISTRY = $registryPath
+    }
+    foreach ($entry in $webEnvironment.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+    $web = Start-Process -FilePath "$root/build/nb-web.exe" -NoNewWindow -PassThru
+    try {
+        $ready = $false
+        for ($attempt = 0; $attempt -lt 50; $attempt++) {
+            if ($web.HasExited) {
+                throw "nb-web exited before becoming ready (exit=$($web.ExitCode))"
+            }
+            if (Get-NetTCPConnection -State Listen -LocalPort $listenPort -ErrorAction SilentlyContinue) {
                 $ready = $true
                 break
             }
-        } catch {
-            Start-Sleep -Milliseconds 250
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $ready) {
+            throw "nb-web did not listen on port $listenPort within 10 seconds"
+        }
+        foreach ($entry in $workerEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        $worker = Start-Process -FilePath "$root/build/nb-web-worker.exe" -NoNewWindow -PassThru
+        try {
+            Write-Host "NB control plane running: http://127.0.0.1:$listenPort (web PID=$($web.Id), worker PID=$($worker.Id))"
+            while (-not $web.HasExited -and -not $worker.HasExited) {
+                Start-Sleep -Seconds 1
+            }
+            if ($web.HasExited) {
+                throw "nb-web exited (exit=$($web.ExitCode))"
+            }
+            throw "nb-web-worker exited (exit=$($worker.ExitCode))"
+        }
+        finally {
+            if ($worker -and -not $worker.HasExited) {
+                Stop-Process -Id $worker.Id -ErrorAction SilentlyContinue
+            }
         }
     }
-    if (-not $ready) {
-        throw "nb-web did not become healthy at $BaseURL"
+    finally {
+        if ($web -and -not $web.HasExited) {
+            Stop-Process -Id $web.Id -ErrorAction SilentlyContinue
+        }
     }
-    Write-Host "NB control plane ready at $BaseURL (web PID $($web.Id)); worker is running in this window"
-    & "$root/build/nb-web-worker.exe"
-    if ($LASTEXITCODE -ne 0) {
-        throw "nb-web-worker exited with code $LASTEXITCODE"
-    }
-} finally {
-    if ($null -ne $web -and -not $web.HasExited) {
-        Stop-Process -Id $web.Id -ErrorAction SilentlyContinue
-        $web.WaitForExit()
-    }
+}
+finally {
+    Pop-Location
 }

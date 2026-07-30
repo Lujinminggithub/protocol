@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,11 +13,13 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	qrcode "github.com/skip2/go-qrcode"
 	"nb-controlplane/internal/central"
 )
 
@@ -65,12 +68,14 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/operations", a.admin(a.operations))
 	mux.HandleFunc("POST /api/v1/operations", a.admin(a.createOperation))
 	mux.HandleFunc("GET /api/v1/operations/{id}", a.admin(a.operationDetail))
+	mux.HandleFunc("GET /api/v1/operations/{id}/client-qr", a.admin(a.clientQR))
 	mux.HandleFunc("POST /api/v1/operations/{id}/cancel", a.admin(a.cancelOperation))
 	mux.HandleFunc("GET /api/v1/executors", a.admin(a.executors))
 	mux.HandleFunc("POST /agent/v1/snapshots", a.agent(a.snapshot))
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
 	mux.HandleFunc("POST /agent/v1/inventory", a.agent(a.discoverInventory))
+	mux.HandleFunc("POST /agent/v1/lines/{id}/client-config", a.agent(a.attachClientConfig))
 	mux.HandleFunc("GET /agent/v1/operations", a.agent(a.claimOperations))
 	mux.HandleFunc("POST /agent/v1/operations/{id}/result", a.agent(a.completeOperation))
 	mux.HandleFunc("POST /agent/v1/operations/{id}/events", a.agent(a.operationEvent))
@@ -719,6 +724,78 @@ type resultRequest struct {
 	Result json.RawMessage `json:"result"`
 }
 
+func operationClientURL(operation central.Operation) (string, error) {
+	if operation.Kind != "line.open" || operation.Status != "succeeded" || len(operation.Result) == 0 {
+		return "", errors.New("client configuration is unavailable")
+	}
+	var result struct {
+		ClientURL string `json:"client_url"`
+	}
+	if err := json.Unmarshal(operation.Result, &result); err != nil {
+		return "", errors.New("client configuration is invalid")
+	}
+	parsed, err := url.Parse(result.ClientURL)
+	password, hasPassword := "", false
+	if parsed != nil && parsed.User != nil {
+		password, hasPassword = parsed.User.Password()
+	}
+	if err != nil || parsed == nil || parsed.Scheme != "socks5" || parsed.Host == "" || parsed.User == nil ||
+		parsed.User.Username() == "" || !hasPassword || password == "" || len(result.ClientURL) > 4096 {
+		return "", errors.New("client configuration is invalid")
+	}
+	return result.ClientURL, nil
+}
+
+func (a *App) clientQR(w http.ResponseWriter, r *http.Request) {
+	operation, err := a.store.Operation(r.Context(), r.PathValue("id"))
+	if err != nil {
+		problem(w, 404, "operation not found")
+		return
+	}
+	clientURL, err := operationClientURL(operation)
+	if err != nil {
+		problem(w, 404, err.Error())
+		return
+	}
+	png, err := qrcode.Encode(clientURL, qrcode.Medium, 256)
+	if err != nil {
+		problem(w, 500, "client QR generation failed")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]string{"media_type": "image/png", "data": base64.StdEncoding.EncodeToString(png)})
+}
+
+func (a *App) attachClientConfig(w http.ResponseWriter, r *http.Request) {
+	lineID := r.PathValue("id")
+	if !safeID.MatchString(lineID) {
+		problem(w, 400, "invalid line id")
+		return
+	}
+	var request struct {
+		ClientURL string `json:"client_url"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	encoded, _ := json.Marshal(map[string]string{"client_url": request.ClientURL})
+	candidate := central.Operation{Kind: "line.open", Status: "succeeded", Result: encoded}
+	if _, err := operationClientURL(candidate); err != nil {
+		problem(w, 400, err.Error())
+		return
+	}
+	operationID, err := a.store.AttachClientURL(r.Context(), lineID, request.ClientURL)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			problem(w, 404, "successful line.open operation not found")
+		} else {
+			problem(w, 500, err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]string{"operation_id": operationID, "status": "attached"})
+}
+
 func (a *App) completeOperation(w http.ResponseWriter, r *http.Request) {
 	var req resultRequest
 	if !decode(w, r, &req) {
@@ -730,6 +807,26 @@ func (a *App) completeOperation(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Result) == 0 {
 		req.Result = json.RawMessage(`{}`)
+	}
+	operation, err := a.store.Operation(r.Context(), r.PathValue("id"))
+	if err != nil || operation.LineID != req.LineID {
+		problem(w, 404, "operation not found")
+		return
+	}
+	var resultFields struct {
+		ClientURL string `json:"client_url"`
+	}
+	if json.Unmarshal(req.Result, &resultFields) != nil {
+		problem(w, 400, "invalid operation result")
+		return
+	}
+	if resultFields.ClientURL != "" {
+		candidate := operation
+		candidate.Status, candidate.Result = req.Status, req.Result
+		if _, validateErr := operationClientURL(candidate); validateErr != nil {
+			problem(w, 400, validateErr.Error())
+			return
+		}
 	}
 	if err := a.store.CompleteOperation(r.Context(), r.PathValue("id"), req.LineID, req.Status, req.Result); err != nil {
 		problem(w, 409, err.Error())

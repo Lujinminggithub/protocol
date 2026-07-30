@@ -2,6 +2,7 @@ package webapp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +13,61 @@ import (
 
 	"nb-controlplane/internal/central"
 )
+
+func TestClientConfigurationAndQRCode(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+
+	_, err = database.UpsertLine(t.Context(), central.Line{ID: "line-1", Name: "test", Status: "draft",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, _, err := database.CreateOperation(t.Context(), central.Operation{ID: "op-client", LineID: "line-1",
+		Kind: "line.open", RequestedBy: "test", IdempotencyKey: "client-config-test", Request: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ClaimOperations(t.Context(), "line-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	clientURL := "socks5://user:password@192.0.2.10:1080#line-1"
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/operations/"+operation.ID+"/result", "agent", "",
+		map[string]any{"line_id": "line-1", "status": "succeeded", "result": map[string]any{"deployment": "dep-1", "profile": "line-1:1"}})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("complete status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/lines/line-1/client-config", "agent", "",
+		map[string]string{"client_url": clientURL})
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(operation.ID)) {
+		t.Fatalf("attach status=%d body=%s", response.StatusCode, body)
+	}
+	response, _ = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/operations/"+operation.ID+"/client-qr", "agent", "", nil)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("agent accessed client QR: %d", response.StatusCode)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/operations/"+operation.ID+"/client-qr", "admin", "", nil)
+	var qr struct {
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+	}
+	if response.StatusCode != http.StatusOK || json.Unmarshal(body, &qr) != nil || qr.MediaType != "image/png" {
+		t.Fatalf("QR status=%d body=%s", response.StatusCode, body)
+	}
+	png, err := base64.StdEncoding.DecodeString(qr.Data)
+	if err != nil || !bytes.HasPrefix(png, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatal("QR response is not a PNG")
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/lines/line-1/detail", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"client_operation"`)) || !bytes.Contains(body, []byte(clientURL)) {
+		t.Fatalf("line detail omitted client config status=%d body=%s", response.StatusCode, body)
+	}
+}
 
 func call(t *testing.T, client *http.Client, method, url, token, key string, body any) (*http.Response, []byte) {
 	t.Helper()
@@ -85,6 +141,18 @@ func TestCentralWebWorkflow(t *testing.T) {
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"lines_healthy":1`)) ||
 		!bytes.Contains(body, []byte(`"throughput_mbps":3.8`)) || !bytes.Contains(body, []byte(`"sessions":4`)) {
 		t.Fatalf("dashboard status=%d body=%s", response.StatusCode, body)
+	}
+	newerSnapshot := map[string]any{"line_id": "gz-hk-us", "node_id": "entry-1", "role": "entry", "worker_id": "collector-2",
+		"observed_at": "2026-07-28T02:00:02Z", "health": "down", "deployment": "dep-1", "profile": "gz-hk-us:1",
+		"sessions": 0, "throughput_mbps": 0, "queue_age_p95_us": 0, "effective_loss_pct": 0, "fec_observe": true, "fec_active": false}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/snapshots", "agent-secret", "", newerSnapshot)
+	if response.StatusCode != 200 {
+		t.Fatalf("newer snapshot status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/lines/gz-hk-us/detail", "admin-secret", "", nil)
+	if response.StatusCode != 200 || bytes.Count(body, []byte(`"node_id":"entry-1"`)) != 1 ||
+		!bytes.Contains(body, []byte(`"worker_id":"collector-2"`)) {
+		t.Fatalf("latest node snapshot was not deduplicated status=%d body=%s", response.StatusCode, body)
 	}
 	heartbeat := map[string]any{"worker_id": "windows-1", "status": "ready", "version": "test",
 		"observed_at": time.Now().UTC().Format(time.RFC3339Nano),
@@ -182,6 +250,8 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/app.js", "", "", nil)
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`operationAvailability`)) ||
 		!bytes.Contains(body, []byte(`disabled title=`)) ||
+		!bytes.Contains(body, []byte(`computer-icon`)) || !bytes.Contains(body, []byte(`队列最大等待`)) ||
+		!bytes.Contains(body, []byte(`clientConfigSection`)) || !bytes.Contains(body, []byte(`/client-qr`)) ||
 		bytes.Contains(body, []byte(`event.currentTarget.reset()`)) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
 	}
@@ -231,12 +301,34 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		t.Fatalf("create second line status=%d body=%s", response.StatusCode, body)
 	}
 	conflictingSpec := map[string]any{"resource_group": "other-group", "instance_id": "second", "bandwidth_mbps": 20,
-		"socks_port": 1182, "relay_port": 4545, "exit_port": 4443, "udp_port_min": 24000, "udp_port_max": 25023,
+		"socks_port": 1182, "relay_port": 4545, "exit_port": 4444, "udp_port_min": 24000, "udp_port_max": 25023,
 		"whitelist": []string{}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-2/spec", "admin", "", conflictingSpec)
 	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("exit port conflicts")) {
 		t.Fatalf("shared exit port conflict status=%d body=%s", response.StatusCode, body)
+	}
+	autoLine := map[string]any{"id": "line-auto", "name": "auto allocated line", "status": "draft", "entry_region": "entry",
+		"exit_region": "exit", "provider": "test", "capacity_mbps": 20, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", autoLine)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create auto line status=%d body=%s", response.StatusCode, body)
+	}
+	autoSpec := map[string]any{"resource_group": "other-group", "instance_id": "", "bandwidth_mbps": 20,
+		"socks_port": 1282, "relay_port": 0, "exit_port": 0, "udp_port_min": 0, "udp_port_max": 0,
+		"whitelist": []string{}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
+		"srs_ref": "", "jump_policy": "auto", "nodes": nodes}
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-auto/spec", "admin", "", autoSpec)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("auto allocate shared devices status=%d body=%s", response.StatusCode, body)
+	}
+	var allocated central.LineSpec
+	if err = json.Unmarshal(body, &allocated); err != nil {
+		t.Fatal(err)
+	}
+	if allocated.InstanceID != "line-auto_1" || allocated.RelayPort != 4447 || allocated.ExitPort != 4445 ||
+		allocated.UDPPortMin == 0 || allocated.UDPPortMin <= 23071 {
+		t.Fatalf("internal resources were not independently allocated: %+v", allocated)
 	}
 	heartbeat := map[string]any{"worker_id": "worker-1", "status": "ready", "version": "test", "observed_at": time.Now().UTC(),
 		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open"}}}}

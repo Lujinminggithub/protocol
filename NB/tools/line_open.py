@@ -5,12 +5,15 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import pathlib
 import secrets
 import subprocess
 import sys
+import time
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -131,15 +134,215 @@ def baseline_profile(hosts: dict, line_id: str, middle_port: int = 4443,
 
 def write_json(path: pathlib.Path, value: dict, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if private:
-        try: path.chmod(0o600)
+        try: temporary.chmod(0o600)
         except OSError: pass
+    temporary.replace(path)
 
 
 def run(command: list[str], env: dict, cwd: pathlib.Path = ROOT) -> None:
     print("+ " + " ".join(command))
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def deploy_socks_with_retry(socks_port: int, env: dict, runner=run,
+                            sleeper=time.sleep, delays=(5, 15)) -> None:
+    """Retry the rollback-safe atomic deployment stage after transient SSH loss."""
+    command = [sys.executable, "tools/deploy.py", "deploy-socks",
+               "--socks-port", str(socks_port)]
+    attempts = len(delays) + 1
+    for attempt in range(attempts):
+        try:
+            runner(command, env)
+            return
+        except subprocess.CalledProcessError:
+            if attempt + 1 >= attempts:
+                raise
+            delay = delays[attempt]
+            print(f">>> atomic deployment attempt {attempt + 1}/{attempts} failed; "
+                  f"retry in {delay}s and reuse verified uploads", flush=True)
+            sleeper(delay)
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_capture(command: list[str], env: dict) -> str:
+    print("+ " + " ".join(command))
+    completed = subprocess.run(command, cwd=ROOT, env=env, check=False, text=True,
+                               encoding="utf-8", errors="replace",
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if completed.stdout:
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, command, completed.stdout)
+    return completed.stdout
+
+
+def current_deployments(env: dict) -> dict:
+    output = run_capture([sys.executable, "tools/deploy.py", "current"], env)
+    match = next((line.removeprefix("CURRENT_JSON=") for line in output.splitlines()
+                  if line.startswith("CURRENT_JSON=")), "")
+    if not match:
+        raise RuntimeError("deployment query returned no CURRENT_JSON")
+    value = json.loads(match)
+    return value if isinstance(value, dict) else {}
+
+
+def deployment_matches(env: dict, deployment_id: str) -> bool:
+    if not deployment_id:
+        return False
+    try:
+        current = current_deployments(env)
+    except Exception as error:
+        print(f"checkpoint verification unavailable: {error}")
+        return False
+    return all(current.get(role) == deployment_id for role in ROLES)
+
+
+def release_manifest_for(hosts_path: pathlib.Path, profile_path: pathlib.Path) -> dict | None:
+    path = ROOT / "build" / "release-manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    topology = manifest.get("topology") or {}
+    profile = manifest.get("line_profile") or {}
+    if (topology.get("sha256") != sha256_file(hosts_path) or
+            profile.get("sha256") != sha256_file(profile_path)):
+        return None
+    return manifest
+
+
+def source_tree_digest() -> str:
+    paths = [ROOT / "CMakeLists.txt", ROOT / "VERSION", ROOT / "scripts" / "runtri.sh"]
+    paths.extend(path for path in (ROOT / "src").rglob("*") if path.is_file())
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.as_posix()):
+        relative = path.relative_to(ROOT).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big")); digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def checkpoint_fingerprint(hosts_path: pathlib.Path, profile_path: pathlib.Path,
+                           args: argparse.Namespace) -> str:
+    binary = ROOT / "build" / "nb_node"
+    value = {
+        "checkpoint_protocol": 2,
+        "line_id": args.line_id,
+        "package_mbps": args.package_mbps,
+        "socks_port": args.socks_port,
+        "middle_port": args.middle_port,
+        "exit_port": args.exit_port,
+        "udp_port_min": args.udp_port_min,
+        "udp_port_max": args.udp_port_max,
+        "instance_id": os.environ.get("NB_DEPLOY_INSTANCE", ""),
+        "build_mode": args.build_mode,
+        "hosts_sha256": sha256_file(hosts_path),
+        "profile_sha256": sha256_file(profile_path),
+        "source_tree_sha256": source_tree_digest(),
+        "binary_sha256": sha256_file(binary) if args.build_mode == "binary" and binary.is_file() else "",
+    }
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_checkpoint(path: pathlib.Path, fingerprint: str) -> dict:
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = {}
+        if existing.get("input_fingerprint") == fingerprint:
+            return existing
+        if existing:
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            write_json(path.parent / "checkpoint-history" / f"open-checkpoint-{stamp}.json", existing)
+    return {"schema_version": 1, "input_fingerprint": fingerprint, "stages": {}}
+
+
+def save_checkpoint(path: pathlib.Path, checkpoint: dict, stage: str, value: dict) -> None:
+    checkpoint.setdefault("stages", {})[stage] = value
+    checkpoint["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    write_json(path, checkpoint)
+
+
+def artifacts_match(stage: dict, paths: dict[str, pathlib.Path]) -> bool:
+    hashes = stage.get("sha256") if isinstance(stage, dict) else None
+    return isinstance(hashes, dict) and all(
+        path.is_file() and hashes.get(name) == sha256_file(path) for name, path in paths.items())
+
+
+def load_or_create_client_secret(path: pathlib.Path, username: str) -> dict:
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing.get("username") != username or not existing.get("password"):
+            raise RuntimeError("existing bootstrap client secret is incompatible")
+        return existing
+    password = (os.environ.get("NB_SOCKS_PASSWORD") or
+                os.environ.get("NB_CLIENT_PASSWORD") or secrets.token_urlsafe(18))
+    secret = {"username": username, "password": password,
+              "password_env": "NB_OPEN_CLIENT_PASSWORD"}
+    write_json(path, secret, private=True)
+    return secret
+
+
+def reconcile_socks_user(path: pathlib.Path, username: str, password: str) -> bool:
+    if not path.is_file():
+        return False
+    lines = path.read_text(encoding="ascii").splitlines()
+    output: list[str] = []
+    found = False
+    matched = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            output.append(line)
+            continue
+        parts = stripped.split(":")
+        if len(parts) != 4:
+            raise RuntimeError("existing socks.users contains an invalid record")
+        name, rounds_text, salt_text, digest_text = parts
+        if name != username:
+            output.append(line)
+            continue
+        if found:
+            raise RuntimeError("existing socks.users contains duplicate client users")
+        found = True
+        output.append(line)
+        try:
+            rounds = int(rounds_text)
+            salt = bytes.fromhex(salt_text)
+            expected = bytes.fromhex(digest_text)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError("existing socks.users contains invalid client credentials") from error
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds, 32)
+        if len(salt) >= 16 and len(expected) == 32 and hmac.compare_digest(actual, expected):
+            matched = True
+    if matched:
+        return False
+    salt = secrets.token_bytes(16)
+    rounds = 300_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds, 32)
+    replacement = f"{username}:{rounds}:{salt.hex()}:{digest.hex()}"
+    if found:
+        output = [replacement if item.strip().startswith(username + ":") else item for item in output]
+    else:
+        output.append(replacement)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("\n".join(output) + "\n", encoding="ascii")
+    try:
+        temporary.chmod(0o600)
+    except OSError:
+        pass
+    temporary.replace(path)
+    return True
 
 
 def prepare_release(env: dict, build_mode: str) -> None:
@@ -189,10 +392,9 @@ def main() -> None:
     bootstrap_profile = output / "bootstrap-profile.json"
     write_json(bootstrap_hosts, hosts)
     write_json(bootstrap_profile, baseline_profile(hosts, args.line_id, args.middle_port, args.exit_port))
-    client_password = os.environ.get("NB_CLIENT_PASSWORD") or secrets.token_urlsafe(18)
-    client_secret = {"username": args.client_username, "password": client_password,
-                     "password_env": "NB_OPEN_CLIENT_PASSWORD"}
-    write_json(output / "bootstrap-client-secret.json", client_secret, private=True)
+    client_secret = load_or_create_client_secret(
+        output / "bootstrap-client-secret.json", args.client_username)
+    client_password = client_secret["password"]
     inventory = {
         "schema_version": 1,
         "defaults": {"headroom_ratio": 1.25,
@@ -234,28 +436,104 @@ def main() -> None:
                  "NB_SOCKS_PASSWORD": client_password,
                  "NB_SOCKS_PORT": str(args.socks_port),
                  "NB_MIDDLE_PORT": str(args.middle_port),
-                 "NB_EXIT_PORT": str(args.exit_port),
+                "NB_EXIT_PORT": str(args.exit_port),
                 "NB_OPEN_CLIENT_PASSWORD": client_password,
                 "NB_SSH_INSECURE": "1"})
-    run([sys.executable, "tools/security_setup.py", "--out", str(security)], env)
-    run([sys.executable, "tools/pin_host_keys.py", "--out", str(security / "known_hosts")], env)
+    required_security = {"ca.key", "ca.pem", "socks.users", "tenant.conf"}
+    required_security.update(f"{role}.{suffix}" for role in ROLES for suffix in ("key", "pem"))
+    present_security = {item.name for item in security.iterdir()} if security.exists() else set()
+    if not present_security:
+        run([sys.executable, "tools/security_setup.py", "--out", str(security)], env)
+    elif not required_security.issubset(present_security):
+        missing_security = ", ".join(sorted(required_security - present_security))
+        raise SystemExit(f"安全目录不完整，拒绝自动复用；缺少: {missing_security}")
+    else:
+        print(f"复用已有安全材料: {security}")
+    if reconcile_socks_user(security / "socks.users", args.client_username, client_password):
+        print("reconciled socks.users with the existing bootstrap client secret")
+    known_hosts = security / "known_hosts"
+    if not known_hosts.exists():
+        env.pop("NB_KNOWN_HOSTS", None)
+        run([sys.executable, "tools/pin_host_keys.py", "--out", str(known_hosts)], env)
+    else:
+        print(f"复用已有 known_hosts: {known_hosts}")
     env.pop("NB_SSH_INSECURE", None); env["NB_KNOWN_HOSTS"] = str(security / "known_hosts")
-    prepare_release(env, args.build_mode)
-    run([sys.executable, "tools/deploy.py", "deploy-socks", "--socks-port", str(args.socks_port)], env)
     provision_dir = output / "provision"
-    run([sys.executable, "tools/line_provision.py", str(inventory_path),
-         "--output-dir", str(provision_dir)], env)
     line_dir = provision_dir / args.line_id
-    env["NB_HOSTS_FILE"] = str(line_dir / "deployment-hosts.json")
-    env["NB_LINE_PROFILE_FILE"] = str(line_dir / "stable-profile.json")
-    prepare_release(env, args.build_mode)
-    run([sys.executable, "tools/deploy.py", "deploy-socks", "--socks-port", str(args.socks_port)], env)
-    env["NB_CONTROL_SIGNING_KEY"] = secrets.token_hex(32)
+    qualified_paths = {
+        "hosts": line_dir / "deployment-hosts.json",
+        "profile": line_dir / "stable-profile.json",
+        "client": line_dir / "client.json",
+    }
+    checkpoint_path = output / "open-checkpoint.json"
+    fingerprint = checkpoint_fingerprint(bootstrap_hosts, bootstrap_profile, args)
+    checkpoint = load_checkpoint(checkpoint_path, fingerprint)
+    stages = checkpoint.setdefault("stages", {})
+
+    stable_stage = stages.get("stable_deploy") or {}
+    stable_deployment = str(stable_stage.get("deployment_id") or "")
+    stable_online = deployment_matches(env, stable_deployment) if stable_deployment else False
+    qualification_valid = artifacts_match(stages.get("qualification") or {}, qualified_paths)
+
+    if stable_online and qualification_valid:
+        print(f">>> resume: stable deployment {stable_deployment} already active; "
+              "skip bootstrap, qualification and stable deployment")
+    else:
+        if not qualification_valid:
+            bootstrap_stage = stages.get("bootstrap_deploy") or {}
+            bootstrap_deployment = str(bootstrap_stage.get("deployment_id") or "")
+            bootstrap_online = deployment_matches(env, bootstrap_deployment) if bootstrap_deployment else False
+            if not bootstrap_online:
+                prepare_release(env, args.build_mode)
+                deploy_socks_with_retry(args.socks_port, env)
+                manifest = release_manifest_for(bootstrap_hosts, bootstrap_profile)
+                bootstrap_deployment = str((manifest or {}).get("deployment_id") or "")
+                if not bootstrap_deployment or not deployment_matches(env, bootstrap_deployment):
+                    raise RuntimeError("bootstrap deployment completed but verification failed")
+                save_checkpoint(checkpoint_path, checkpoint, "bootstrap_deploy", {
+                    "status": "complete", "deployment_id": bootstrap_deployment,
+                    "adopted": False})
+            else:
+                print(f">>> resume: bootstrap deployment {bootstrap_deployment} already active")
+
+            run([sys.executable, "tools/line_provision.py", str(inventory_path),
+                 "--output-dir", str(provision_dir)], env)
+            if not all(path.is_file() for path in qualified_paths.values()):
+                raise RuntimeError("qualification completed without stable artifacts")
+            save_checkpoint(checkpoint_path, checkpoint, "qualification", {
+                "status": "complete",
+                "sha256": {name: sha256_file(path) for name, path in qualified_paths.items()},
+            })
+            qualification_valid = True
+        else:
+            print(">>> resume: qualification artifacts verified; skip active probe")
+
+        env["NB_HOSTS_FILE"] = str(qualified_paths["hosts"])
+        env["NB_LINE_PROFILE_FILE"] = str(qualified_paths["profile"])
+        prepare_release(env, args.build_mode)
+        deploy_socks_with_retry(args.socks_port, env)
+        manifest = release_manifest_for(qualified_paths["hosts"], qualified_paths["profile"])
+        stable_deployment = str((manifest or {}).get("deployment_id") or "")
+        if not stable_deployment or not deployment_matches(env, stable_deployment):
+            raise RuntimeError("stable deployment completed but verification failed")
+        stable_online = True
+        save_checkpoint(checkpoint_path, checkpoint, "stable_deploy", {
+            "status": "complete", "deployment_id": stable_deployment})
+
+    env["NB_HOSTS_FILE"] = str(qualified_paths["hosts"])
+    env["NB_LINE_PROFILE_FILE"] = str(qualified_paths["profile"])
     bundle = line_dir / "policy-bundle"
-    run([sys.executable, "tools/nb_p1_control.py", "prepare",
-         str(line_dir / "tenant-route-policy.json"), str(bundle)], env)
-    run([sys.executable, "tools/nb_p1_control.py", "apply", str(bundle),
-         "--execute", "--socks-port", str(args.socks_port)], env)
+    policy_stage = stages.get("policy_apply") or {}
+    if policy_stage.get("deployment_id") == stable_deployment and stable_online:
+        print(">>> resume: tenant policy already applied")
+    else:
+        env["NB_CONTROL_SIGNING_KEY"] = secrets.token_hex(32)
+        run([sys.executable, "tools/nb_p1_control.py", "prepare",
+             str(line_dir / "tenant-route-policy.json"), str(bundle)], env)
+        run([sys.executable, "tools/nb_p1_control.py", "apply", str(bundle),
+             "--execute", "--socks-port", str(args.socks_port)], env)
+        save_checkpoint(checkpoint_path, checkpoint, "policy_apply", {
+            "status": "complete", "deployment_id": stable_deployment})
     print(f"线路开通完成；客户端配置: {line_dir / 'client.json'}")
 
 

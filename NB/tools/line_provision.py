@@ -11,12 +11,15 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 import urllib.parse
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SUPPORTED_PACKAGES = {5.0, 10.0, 15.0}
 STABLE_MIN_QUALIFICATION_RATIO = 0.95
+TRANSIENT_PROBE_ERRORS = ("ConnectionAbortedError", "ConnectionResetError", "TimeoutError",
+                          "WinError 10053", "WinError 10054", "timed out")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -33,6 +36,23 @@ def resolve_path(value: str, inventory_dir: pathlib.Path) -> pathlib.Path:
 
 def sha256(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def transient_probe_failure(output: str) -> bool:
+    return any(marker in output for marker in TRANSIENT_PROBE_ERRORS)
+
+
+def run_streamed(command: list[str], env: dict) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(command, cwd=ROOT, env=env, text=True,
+                               encoding="utf-8", errors="replace",
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               bufsize=1)
+    lines = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        lines.append(line)
+        print(line, end="", flush=True)
+    return subprocess.CompletedProcess(command, process.wait(), stdout="".join(lines))
 
 
 def validate_line(line: dict) -> None:
@@ -210,11 +230,16 @@ def run_probe(line: dict, inventory_dir: pathlib.Path, output: pathlib.Path,
     if not password:
         raise ValueError(f"缺少客户端密码环境变量: {password_env}")
     env["NB_SOCKS_PASSWORD"] = password
-    completed = subprocess.run(command, cwd=ROOT, env=env, text=True,
-                               encoding="utf-8", stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT)
-    if completed.returncode != 0:
-        raise RuntimeError(f"主动探针失败 rc={completed.returncode}:\n{completed.stdout[-4000:]}")
+    completed = None
+    for attempt in range(2):
+        completed = run_streamed(command, env)
+        if completed.returncode == 0:
+            break
+        if attempt == 1 or not transient_probe_failure(completed.stdout):
+            raise RuntimeError(f"主动探针失败 rc={completed.returncode}:\n{completed.stdout[-4000:]}")
+        print("主动探针遇到瞬时连接中断，2 秒后重试一次", file=sys.stderr)
+        time.sleep(2)
+    assert completed is not None
     candidate = json.loads(output.read_text(encoding="utf-8"))
     if candidate.get("baseline_hosts_sha256") != sha256(hosts_path):
         raise ValueError("探针报告与当前 hosts 文件不匹配")

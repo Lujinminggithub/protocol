@@ -2,7 +2,8 @@
 import copy
 
 from line_provision import (assert_qualified, build_artifacts,
-                            qualification_rate, validate_line)
+                            qualification_rate, transient_probe_failure,
+                            validate_line)
 
 
 def recommendation(cc: str) -> dict:
@@ -31,6 +32,9 @@ def candidate(package: float = 10, ratio: float = 1.25) -> dict:
 
 
 def main() -> None:
+    assert transient_probe_failure("ConnectionAbortedError: [WinError 10053]")
+    assert transient_probe_failure("TimeoutError: timed out")
+    assert not transient_probe_failure("容量准入失败: insufficient-throughput")
     assert qualification_rate(5, 1.25) == 6.25
     assert qualification_rate(10, 1.25) == 12.5
     assert qualification_rate(15, 1.25) == 18.75

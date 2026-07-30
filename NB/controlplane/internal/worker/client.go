@@ -158,6 +158,41 @@ func (c *Client) complete(ctx context.Context, operation Operation, status strin
 	return c.request(ctx, http.MethodPost, "/agent/v1/operations/"+url.PathEscape(operation.ID)+"/result", payload, nil)
 }
 
+func (c *Client) syncClientConfigs(ctx context.Context) error {
+	paths := map[string]string{}
+	for _, line := range c.registry.Lines {
+		if line.StateDir != "" {
+			paths[line.LineID] = filepath.Join(line.StateDir, "provision", line.LineID, "client.json")
+		}
+	}
+	dynamic, _ := filepath.Glob(filepath.Join(c.registry.StateDir, "lines", "*", "provision", "*", "client.json"))
+	for _, path := range dynamic {
+		lineID := filepath.Base(filepath.Dir(path))
+		if lineID != "" && !strings.ContainsAny(lineID, `/\\`) {
+			paths[lineID] = path
+		}
+	}
+	failures := make([]string, 0)
+	for lineID, path := range paths {
+		clientURL, err := clientURLFromFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("line %s: invalid local client config", lineID))
+			continue
+		}
+		payload := map[string]string{"client_url": clientURL}
+		if err = c.request(ctx, http.MethodPost, "/agent/v1/lines/"+url.PathEscape(lineID)+"/client-config", payload, nil); err != nil {
+			failures = append(failures, fmt.Sprintf("line %s: central rejected client config", lineID))
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 func (c *Client) event(ctx context.Context, operation Operation, event OperationEvent) error {
 	return c.request(ctx, http.MethodPost, "/agent/v1/operations/"+url.PathEscape(operation.ID)+"/events", event, nil)
 }
@@ -264,6 +299,9 @@ func (c *Client) Run(ctx context.Context) error {
 		return err
 	}
 	if err := c.syncInventory(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+	}
+	if err := c.syncClientConfigs(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
 	}
 	go c.collectSnapshots(ctx)

@@ -115,7 +115,7 @@ func validLineSpecRequest(spec central.LineSpec) error {
 	if !safeID.MatchString(spec.LineID) || !safeID.MatchString(spec.ResourceGroup) || (spec.InstanceID != "" && !safeID.MatchString(spec.InstanceID)) {
 		return errors.New("invalid line deployment identity")
 	}
-	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.SocksPort < 1 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65535 || spec.ExitPort < 0 || spec.ExitPort > 65535 {
+	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.SocksPort < 1 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65534 || spec.ExitPort < 0 || spec.ExitPort > 65534 {
 		return errors.New("invalid line ports or bandwidth")
 	}
 	if (spec.UDPPortMin == 0) != (spec.UDPPortMax == 0) || spec.UDPPortMin < 0 || spec.UDPPortMax > 65535 || (spec.UDPPortMin != 0 && (spec.UDPPortMin < 1024 || spec.UDPPortMin > spec.UDPPortMax)) {
@@ -235,6 +235,14 @@ func (a *App) lineDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := map[string]any{"line": line, "snapshots": snapshots}
+	if operation, operationErr := a.store.LatestSuccessfulOperation(r.Context(), line.ID, "line.open"); operationErr == nil {
+		if _, clientErr := operationClientURL(operation); clientErr == nil {
+			result["client_operation"] = operation
+		}
+	} else if !errors.Is(operationErr, sql.ErrNoRows) {
+		problem(w, 500, operationErr.Error())
+		return
+	}
 	if specErr == nil {
 		result["spec"] = spec
 	} else if !errors.Is(specErr, sql.ErrNoRows) {

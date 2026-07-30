@@ -34,7 +34,8 @@ func (r *Runner) CollectSnapshots(ctx context.Context, line LineSpec) ([]Snapsho
 	}
 	var captured bytes.Buffer
 	step := commandStep{Name: r.registry.Python, Stage: "snapshot", Args: []string{
-		filepath.Join(r.registry.Root, "tools", "worker_snapshot.py"), "--line-id", line.LineID}}
+		filepath.Join(r.registry.Root, "tools", "worker_snapshot.py"), "--line-id", line.LineID,
+		"--state-file", filepath.Join(r.registry.StateDir, "snapshot-counters", line.LineID+".json")}}
 	if err = r.execute(ctx, step, environment, &captured); err != nil {
 		return nil, err
 	}

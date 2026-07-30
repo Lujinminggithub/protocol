@@ -86,6 +86,39 @@ func (r *Runner) resolveSecret(ref string) (localSecret, error) {
 		}
 		return localSecret{PasswordEnv: name}, nil
 	}
+	if strings.HasPrefix(ref, "worker-local:") {
+		parts := strings.Split(ref, ":")
+		if len(parts) != 3 || !safeID.MatchString(parts[1]) {
+			return localSecret{}, errors.New("invalid worker-local secret reference")
+		}
+		role := parts[2]
+		if role == "relay" {
+			role = "middle"
+		}
+		if role != "entry" && role != "middle" && role != "exit" {
+			return localSecret{}, errors.New("invalid worker-local secret role")
+		}
+		line, ok := r.registry.Line(parts[1])
+		if !ok {
+			return localSecret{}, errors.New("worker-local source line is unavailable")
+		}
+		source, err := loadJSON(line.SourceMachinesFile)
+		if err != nil || len(source) == 0 {
+			source, err = loadJSON(line.HostsFile)
+		}
+		if err != nil {
+			return localSecret{}, err
+		}
+		host := roleObject(source, role)
+		if host == nil {
+			return localSecret{}, errors.New("worker-local source role is unavailable")
+		}
+		secret := localSecret{Password: text(host["password"]), PasswordEnv: text(host["password_env"])}
+		if secret.Password == "" && (secret.PasswordEnv == "" || os.Getenv(secret.PasswordEnv) == "") {
+			return localSecret{}, errors.New("resolved worker-local device secret is empty")
+		}
+		return secret, nil
+	}
 	if r.registry.Dynamic.SecretsFile == "" {
 		return localSecret{}, errors.New("dynamic secrets file is not configured")
 	}
@@ -163,7 +196,7 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 	if plan.SourceRef != "" && plan.SourceRef != "repo://current" {
 		return errors.New("dynamic source must use the current repository")
 	}
-	if plan.SocksPort < cfg.SocksPortMin || plan.SocksPort > cfg.SocksPortMax || plan.RelayPort < cfg.RelayPortMin || plan.RelayPort > cfg.RelayPortMax || plan.UDPPortMin < cfg.UDPPortMin || plan.UDPPortMax > cfg.UDPPortMax || plan.UDPPortMin > plan.UDPPortMax || plan.ExitPort < 1 || plan.ExitPort > 65535 {
+	if plan.SocksPort < cfg.SocksPortMin || plan.SocksPort > cfg.SocksPortMax || plan.RelayPort < cfg.RelayPortMin || plan.RelayPort+transportWorkerLanes-1 > cfg.RelayPortMax || plan.UDPPortMin < cfg.UDPPortMin || plan.UDPPortMax > cfg.UDPPortMax || plan.UDPPortMin > plan.UDPPortMax || plan.ExitPort < 1 || plan.ExitPort+transportWorkerLanes-1 > 65535 {
 		return errors.New("dynamic plan exceeds assigned port limits")
 	}
 	roles := map[string]int{}
@@ -252,7 +285,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 		roles[name] = host
 	}
 	exit := roles["exit"].(map[string]any)
-	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "workers": map[string]int{"entry": 2, "middle": 2, "exit": 2}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": plan.BandwidthMbps, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false}}}
+	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "workers": map[string]int{"entry": transportWorkerLanes, "middle": transportWorkerLanes, "exit": transportWorkerLanes}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false}}}
 	if err := writePrivateJSON(sourcePath, source); err != nil {
 		return LineSpec{}, err
 	}
@@ -270,7 +303,14 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 		return LineSpec{}, err
 	}
 	if plan.SRSRef == "" {
-		if err := os.WriteFile(whitelistPath, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		contents := []byte(strings.Join(lines, "\n") + "\n")
+		if len(plan.Whitelist) == 0 {
+			contents, err = os.ReadFile(filepath.Join(r.registry.Root, "tools", "whitelist.local.conf"))
+			if err != nil {
+				return LineSpec{}, fmt.Errorf("default whitelist is unavailable: %w", err)
+			}
+		}
+		if err := os.WriteFile(whitelistPath, contents, 0600); err != nil {
 			return LineSpec{}, err
 		}
 	} else if _, statErr := os.Stat(whitelistPath); errors.Is(statErr, os.ErrNotExist) {

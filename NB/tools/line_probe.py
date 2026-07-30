@@ -14,6 +14,7 @@ import math
 import os
 import pathlib
 import re
+import shlex
 import socket
 import statistics
 import struct
@@ -39,6 +40,137 @@ MTU_PROBE_MIN = 1280
 MTU_PROBE_MAX = 1500
 MTU_SAFETY_MARGIN = 48
 MTU_RECOMMEND_MAX = 1500
+
+ENTRY_LOCAL_PROBE_SCRIPT = r'''
+import json
+import math
+import re
+import socket
+import struct
+import sys
+import time
+
+request = json.load(sys.stdin)
+
+def recv_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError("SOCKS response ended early")
+        data.extend(chunk)
+    return bytes(data)
+
+def fnv1a64(data):
+    value = 14695981039346656037
+    for byte in data:
+        value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+    return value
+
+def connect_socks(target):
+    username = request["username"].encode()
+    password = request["password"].encode()
+    sock = socket.create_connection(("127.0.0.1", request["socks_port"]), timeout=15)
+    sock.settimeout(request["io_timeout"])
+    sock.sendall(b"\x05\x01\x02")
+    if recv_exact(sock, 2) != b"\x05\x02":
+        raise RuntimeError("SOCKS authentication method rejected")
+    sock.sendall(b"\x01" + bytes([len(username)]) + username + bytes([len(password)]) + password)
+    if recv_exact(sock, 2) != b"\x01\x00":
+        raise RuntimeError("SOCKS credentials rejected")
+    encoded = target.encode("ascii")
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(encoded)]) + encoded + struct.pack("!H", 9))
+    response = recv_exact(sock, 4)
+    if response[0] != 5 or response[1] != 0:
+        raise RuntimeError("SOCKS CONNECT rejected: reply=%d" % response[1])
+    atyp = response[3]
+    if atyp == 1:
+        recv_exact(sock, 6)
+    elif atyp == 3:
+        recv_exact(sock, recv_exact(sock, 1)[0] + 2)
+    elif atyp == 4:
+        recv_exact(sock, 18)
+    else:
+        raise RuntimeError("unknown SOCKS address type")
+    return sock
+
+mode = request["mode"]
+if mode == "integrity":
+    size = request["size"]
+    seed = bytes((index * 31 + 17) & 0xff for index in range(4096))
+    expected = (seed * int(math.ceil(float(size) / len(seed))))[:size]
+    expected_hash = fnv1a64(expected)
+    sock = connect_socks("nb-probe-sink.internal")
+    started = time.monotonic()
+    sock.sendall(struct.pack("!4sQ", b"NBP1", len(expected)))
+    sock.sendall(expected)
+    response = bytearray()
+    while b"NBPROBE OK " not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response.extend(chunk)
+    elapsed = time.monotonic() - started
+    sock.close()
+    match = re.search(rb"NBPROBE OK bytes=(\d+) hash=([0-9a-fA-F]{16})", response)
+    received = int(match.group(1)) if match else -1
+    received_hash = int(match.group(2), 16) if match else -1
+    if received != len(expected) or received_hash != expected_hash:
+        raise RuntimeError("integrity mismatch: sent=%d received=%d" % (len(expected), received))
+    result = {"bytes": size, "elapsed_s": elapsed, "integrity": "ok", "origin": "entry-local"}
+elif mode == "load":
+    target_mbps = request["target_mbps"]
+    duration_s = request["duration_s"]
+    target_bytes = int(target_mbps * 1000000.0 / 8.0 * duration_s)
+    chunk = bytes((index * 13 + 29) & 0xff for index in range(16 * 1024))
+    sock = connect_socks("nb-probe-sink.internal")
+    sock.settimeout(min(1.0, request["io_timeout"]))
+    sock.sendall(struct.pack("!4sQ", b"NBP1", target_bytes))
+    started = time.monotonic()
+    deadline = started + duration_s
+    next_progress = started + 5.0
+    sent = 0
+    while sent < target_bytes and time.monotonic() < deadline:
+        now = time.monotonic()
+        allowed = int(target_mbps * 1000000.0 / 8.0 * min(duration_s, now - started + 0.02))
+        if sent >= allowed:
+            time.sleep(min(0.005, max(0.0, deadline - now)))
+            continue
+        count = min(len(chunk), target_bytes - sent, max(1, allowed - sent))
+        try:
+            written = sock.send(chunk[:count])
+        except socket.timeout:
+            written = 0
+        if written:
+            sent += written
+        now = time.monotonic()
+        if now >= next_progress:
+            elapsed = max(0.001, now - started)
+            print("NBPROBE_PROGRESS " + json.dumps({"elapsed_s": elapsed,
+                "sent_bytes": sent, "achieved_mbps": sent * 8.0 / elapsed / 1000000.0}), flush=True)
+            next_progress = now + 5.0
+    send_elapsed = time.monotonic() - started
+    sock.settimeout(request["io_timeout"])
+    response = bytearray()
+    while b"NBPROBE OK " not in response:
+        data = sock.recv(4096)
+        if not data:
+            break
+        response.extend(data)
+    elapsed = time.monotonic() - started
+    sock.close()
+    match = re.search(rb"NBPROBE OK bytes=(\d+)", response)
+    received = int(match.group(1)) if match else -1
+    if received != sent:
+        raise RuntimeError("load count mismatch: sent=%d exit=%d" % (sent, received))
+    result = {"bytes": sent, "elapsed_s": elapsed, "send_elapsed_s": send_elapsed,
+        "planned_duration_s": duration_s, "achieved_mbps": sent * 8.0 / max(elapsed, 0.001) / 1000000.0,
+        "integrity": "count-ok", "origin": "entry-local"}
+else:
+    raise RuntimeError("unknown probe mode")
+
+print("NBPROBE_RESULT " + json.dumps(result), flush=True)
+'''
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -211,6 +343,13 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
+def fnv1a64(data: bytes) -> int:
+    value = 14695981039346656037
+    for byte in data:
+        value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+    return value
+
+
 class EntrySSHSocket:
     def __init__(self, port: int):
         self.client = deploy.connect("entry")
@@ -265,17 +404,22 @@ def run_integrity_probe(entry_host: str, socks_port: int, size: int = 256 * 1024
                         io_timeout: float = 30) -> dict:
     payload = bytes((index * 31 + 17) & 0xff for index in range(4096))
     expected = (payload * math.ceil(size / len(payload)))[:size]
-    sock = socks_connect(entry_host, socks_port, PROBE_ECHO_HOST, io_timeout)
-    started = time.monotonic(); sock.sendall(expected); sock.shutdown(socket.SHUT_WR)
-    received = bytearray()
-    while True:
-        chunk = sock.recv(65536)
+    expected_hash = fnv1a64(expected)
+    sock = socks_connect(entry_host, socks_port, PROBE_SINK_HOST, io_timeout)
+    started = time.monotonic(); sock.sendall(struct.pack("!4sQ", b"NBP1", len(expected))); sock.sendall(expected)
+    response = bytearray()
+    while b"NBPROBE OK " not in response:
+        chunk = sock.recv(4096)
         if not chunk: break
-        received.extend(chunk)
+        response.extend(chunk)
     elapsed = time.monotonic() - started; sock.close()
-    if bytes(received) != expected:
-        raise RuntimeError(f"主动探针完整性失败: sent={len(expected)} recv={len(received)}")
-    return {"bytes": size, "elapsed_s": elapsed, "integrity": "ok"}
+    match = re.search(rb"NBPROBE OK bytes=(\d+) hash=([0-9a-fA-F]{16})", response)
+    received = int(match.group(1)) if match else -1
+    received_hash = int(match.group(2), 16) if match else -1
+    if received != len(expected) or received_hash != expected_hash:
+        raise RuntimeError(f"主动探针完整性失败: sent={len(expected)} recv={received}")
+    return {"bytes": size, "elapsed_s": elapsed, "integrity": "ok",
+            "origin": "controller"}
 
 
 def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duration_s: int,
@@ -283,6 +427,7 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
     sock = socks_connect(entry_host, socks_port, PROBE_SINK_HOST, io_timeout)
     chunk = bytes((index * 13 + 29) & 0xff for index in range(16 * 1024))
     target_bytes = int(target_mbps * 1_000_000 / 8.0 * duration_s)
+    sock.sendall(struct.pack("!4sQ", b"NBP1", target_bytes))
     started = time.monotonic(); sent = 0
     while sent < target_bytes and not (stop_event and stop_event.is_set()):
         now = time.monotonic()
@@ -292,9 +437,8 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
             continue
         count = min(len(chunk), target_bytes - sent, max(1, allowed - sent))
         sock.sendall(chunk[:count]); sent += count
-    sock.shutdown(socket.SHUT_WR)
     response = bytearray()
-    while True:
+    while b"NBPROBE OK " not in response:
         data = sock.recv(4096)
         if not data: break
         response.extend(data)
@@ -305,7 +449,76 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
         raise RuntimeError(f"主动探针计数失败: sent={sent} exit={received} response={response[:100]!r}")
     return {"bytes": sent, "elapsed_s": elapsed,
         "achieved_mbps": sent * 8.0 / elapsed / 1_000_000.0,
-        "integrity": "cancelled" if stop_event and stop_event.is_set() else "count-ok"}
+        "integrity": "cancelled" if stop_event and stop_event.is_set() else "count-ok",
+        "origin": "controller"}
+
+
+def parse_entry_probe_line(raw_line: str) -> dict | None:
+    line = raw_line.strip()
+    if line.startswith("NBPROBE_PROGRESS "):
+        progress = json.loads(line.removeprefix("NBPROBE_PROGRESS "))
+        print("probe progress origin=entry-local "
+              f"elapsed={progress['elapsed_s']:.1f}s "
+              f"throughput={progress['achieved_mbps']:.3f}Mbps", flush=True)
+        return None
+    if line.startswith("NBPROBE_RESULT "):
+        return json.loads(line.removeprefix("NBPROBE_RESULT "))
+    return None
+
+
+def parse_entry_probe_output(lines: list[str]) -> dict:
+    result = None
+    for line in lines:
+        parsed = parse_entry_probe_line(line)
+        if parsed is not None:
+            result = parsed
+    if result is None:
+        raise RuntimeError("entry-local probe returned no result")
+    return result
+
+
+def run_entry_local_probe(mode: str, socks_port: int, *, size: int = 256 * 1024,
+                          target_mbps: float = 0.0, duration_s: int = 0,
+                          io_timeout: float = 30.0) -> dict:
+    """Generate qualification traffic on Entry so controller uplink is excluded."""
+    if mode not in {"integrity", "load"}:
+        raise ValueError("entry-local probe mode must be integrity or load")
+    username = os.environ.get("NB_SOCKS_USERNAME", "")
+    password = os.environ.get("NB_SOCKS_PASSWORD", "")
+    if not username or not password or len(username.encode()) > 255 or len(password.encode()) > 255:
+        raise RuntimeError("entry-local probe requires valid SOCKS credentials")
+    request = {
+        "mode": mode,
+        "socks_port": socks_port,
+        "username": username,
+        "password": password,
+        "size": size,
+        "target_mbps": target_mbps,
+        "duration_s": duration_s,
+        "io_timeout": io_timeout,
+    }
+    connection = deploy.connect("entry")
+    command = "python3 -c " + shlex.quote(ENTRY_LOCAL_PROBE_SCRIPT)
+    stdin, stdout, stderr = connection.exec_command(
+        command, timeout=max(60.0, float(duration_s) + io_timeout + 30.0))
+    try:
+        stdin.write(json.dumps(request).encode("utf-8"))
+        stdin.channel.shutdown_write()
+        result = None
+        for raw_line in stdout:
+            line = raw_line.decode(errors="replace") if isinstance(raw_line, bytes) else raw_line
+            parsed = parse_entry_probe_line(line)
+            if parsed is not None:
+                result = parsed
+        error_text = stderr.read().decode(errors="replace")
+        exit_status = stdout.channel.recv_exit_status()
+    finally:
+        connection.close()
+    if exit_status != 0:
+        raise RuntimeError(f"entry-local probe failed rc={exit_status}: {error_text[-2000:]}")
+    if result is None:
+        raise RuntimeError("entry-local probe returned no result")
+    return result
 
 
 def remote_log_path(connection, role: str) -> str:
@@ -402,6 +615,9 @@ def main() -> None:
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--via-entry-ssh", action="store_true",
                         help="reach the Entry-local SOCKS listener through the pinned SSH connection")
+    parser.add_argument("--probe-origin", choices=("entry-local", "controller"),
+                        default="entry-local",
+                        help="generate qualification traffic on Entry by default")
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     if args.via_entry_ssh:
@@ -427,9 +643,14 @@ def main() -> None:
     active_logs = None
     if args.active:
         offsets = {role: log_offset(role) for role in ("entry", "middle")}
-        integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
-        load = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
-            target_mbps, args.duration)
+        if args.probe_origin == "entry-local":
+            integrity = run_entry_local_probe("integrity", args.socks_port)
+            load = run_entry_local_probe("load", args.socks_port,
+                target_mbps=target_mbps, duration_s=args.duration)
+        else:
+            integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
+            load = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
+                target_mbps, args.duration)
         time.sleep(12)
         active_logs = {role: log_since(role, offsets[role]) for role in offsets}
         active_result = {"integrity": integrity, "load": load}

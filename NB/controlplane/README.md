@@ -91,6 +91,15 @@ worker writes the operation result to its local state directory before
 acknowledging completion, which prevents a lost HTTP response from rerunning a
 completed deployment.
 
+After a successful `line.open`, the worker reads the qualified private
+`client.json` and attaches its `socks5://` URL to the protected operation
+result. The authenticated line and operation detail views show the URL, a copy
+action, and a server-generated QR code. On startup the worker also backfills
+existing qualified line artifacts, so an already completed line does not need
+to be reopened. Client URLs contain credentials: they are never emitted as
+operation events or normal logs, and the QR response uses `Cache-Control:
+no-store`.
+
 On every heartbeat, fixed worker registrations also report non-secret device
 metadata and topology. The central service creates only missing inventory and
 never overwrites operator-managed devices or an existing line specification.
@@ -109,11 +118,14 @@ nodes or lines. Override the interval with `NB_WEB_WORKER_SNAPSHOT_SECONDS`.
 Lines sharing GZ/HK use isolated deployment namespaces. The registry allocates
 an `instance_id`, SOCKS port, Entry UDP relay range, Relay listener port, and
 Exit listener port for every line in the resource group. Startup rejects port
-or UDP-range collisions. The legacy/default namespace can keep the existing US
-line on `1080/4443`; the KZ line can run as instance `kz` on SOCKS `1081`, Entry
-UDP `21024-22047`, and Relay `4444`. The worker passes these allocations to the
-atomic deployment tools. Windows remains the orchestration plane and is never
-part of packet forwarding.
+or UDP-range collisions. Relay and Exit transports run two worker lanes, so a
+base port reserves the inclusive span `[base, base+1]`; adjacent base ports are
+therefore a collision on the same device. The legacy/default namespace can keep
+the existing US line on SOCKS `1080` and Relay base `4443`; a second line on the
+same GZ/HK devices must use Relay base `4445` or later. Exit spans are allocated
+independently per physical Exit device. The worker passes these allocations to
+the atomic deployment tools. Windows remains the orchestration plane and is
+never part of packet forwarding.
 
 Dynamic deployments use resumable, SHA-256 verified SFTP staging and bounded
 direct/jump SSH strategies. A partial artifact remains under a content-addressed

@@ -44,6 +44,7 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
     ages = metrics.get("queue_age_max_us") if isinstance(metrics.get("queue_age_max_us"), dict) else {}
     link = metrics.get("link") if isinstance(metrics.get("link"), dict) else {}
     fec = metrics.get("fec") if isinstance(metrics.get("fec"), dict) else {}
+    byte_counts = metrics.get("bytes") if isinstance(metrics.get("bytes"), dict) else {}
     return {
         "line_id": line_id,
         "node_id": node_id,
@@ -53,14 +54,44 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
         "health": status,
         "deployment": str(health.get("release_id") or ""),
         "profile": profile_id(health),
-        "sessions": int(number(metrics, "sessions_inuse")),
+        "sessions": int(number(metrics, "sessions") or number(metrics, "sessions_inuse")),
         "throughput_mbps": number(metrics, "throughput_mbps"),
         "queue_age_p95_us": max((number(ages, key) for key in ("down", "up", "q2t")), default=0.0),
         "effective_loss_pct": number(link, "effective_loss_max_pct"),
         "fec_observe": number(fec, "observe") != 0,
         "fec_active": number(fec, "active") != 0,
         "payload": {"health": health, "metrics": metrics, "collection_error": error},
+        "_bytes_total": number(byte_counts, "c2s") + number(byte_counts, "s2c"),
     }
+
+
+def apply_throughput(samples: list[dict], state_file: pathlib.Path | None) -> None:
+    previous = {}
+    if state_file and state_file.is_file():
+        try:
+            loaded = json.loads(state_file.read_text(encoding="utf-8"))
+            previous = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            previous = {}
+    current = {}
+    for item in samples:
+        total = float(item.pop("_bytes_total", 0))
+        prior = previous.get(item["node_id"], {})
+        try:
+            before = dt.datetime.fromisoformat(str(prior["observed_at"]).replace("Z", "+00:00"))
+            after = dt.datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
+            elapsed = (after - before).total_seconds()
+            delta = total - float(prior["bytes_total"])
+            if 0 < elapsed <= 300 and delta >= 0:
+                item["throughput_mbps"] = delta * 8 / elapsed / 1_000_000
+        except (KeyError, TypeError, ValueError):
+            pass
+        current[item["node_id"]] = {"observed_at": item["observed_at"], "bytes_total": total}
+    if state_file:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = state_file.with_suffix(state_file.suffix + ".new")
+        temporary.write_text(json.dumps(current, separators=(",", ":")) + "\n", encoding="utf-8")
+        temporary.replace(state_file)
 
 
 def query_role(role: str) -> list[dict]:
@@ -116,10 +147,13 @@ def collect(line_id: str) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--line-id", required=True)
+    parser.add_argument("--state-file", type=pathlib.Path)
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", args.line_id):
         raise SystemExit("invalid line id")
-    print("SNAPSHOTS_JSON=" + json.dumps(collect(args.line_id), separators=(",", ":")))
+    samples = collect(args.line_id)
+    apply_throughput(samples, args.state_file)
+    print("SNAPSHOTS_JSON=" + json.dumps(samples, separators=(",", ":")))
 
 
 if __name__ == "__main__":

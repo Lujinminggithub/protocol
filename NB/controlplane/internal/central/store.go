@@ -126,11 +126,19 @@ type LineView struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	dsn := path + separator + "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	// WAL permits readers to make progress while the worker records snapshots.
+	// A single connection lets one dashboard query stall every API request.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
@@ -226,6 +234,7 @@ CREATE TABLE IF NOT EXISTS line_deletion_audit (
  deleted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS snapshots_latest ON snapshots(line_id,node_id,worker_id,observed_at DESC);
+CREATE INDEX IF NOT EXISTS snapshots_latest_node ON snapshots(line_id,node_id,observed_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS incidents_line ON incidents(line_id,status,observed_at DESC);
 CREATE INDEX IF NOT EXISTS operations_ready ON operations(line_id,status,created_at);
 CREATE INDEX IF NOT EXISTS raw_events_path ON raw_events(path,received_at);
@@ -438,6 +447,45 @@ func (s *Store) Operations(ctx context.Context, lineID string, limit int) ([]Ope
 	return result, rows.Err()
 }
 
+func (s *Store) LatestSuccessfulOperation(ctx context.Context, lineID, kind string) (Operation, error) {
+	var item Operation
+	err := scanOperation(s.db.QueryRowContext(ctx, `SELECT id,line_id,kind,status,requested_by,idempotency_key,
+	 request,result,created_at,updated_at FROM operations WHERE line_id=? AND kind=? AND status='succeeded'
+	 ORDER BY updated_at DESC LIMIT 1`, lineID, kind), &item)
+	return item, err
+}
+
+func (s *Store) AttachClientURL(ctx context.Context, lineID, clientURL string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var operationID string
+	var raw []byte
+	err = tx.QueryRowContext(ctx, `SELECT id,result FROM operations
+	 WHERE line_id=? AND kind='line.open' AND status='succeeded' ORDER BY updated_at DESC LIMIT 1`, lineID).Scan(&operationID, &raw)
+	if err != nil {
+		return "", err
+	}
+	result := map[string]any{}
+	if len(raw) > 0 && json.Unmarshal(raw, &result) != nil {
+		return "", errors.New("operation result is invalid")
+	}
+	result["client_url"] = clientURL
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE operations SET result=? WHERE id=?`, encoded, operationID); err != nil {
+		return "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return operationID, nil
+}
+
 func (s *Store) ClaimOperations(ctx context.Context, lineID string, limit int) ([]Operation, error) {
 	return s.claimOperations(ctx, lineID, limit, nil)
 }
@@ -629,9 +677,12 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 	view := Dashboard{Lines: make([]LineView, 0, len(lines))}
 	for _, line := range lines {
 		item := LineView{Line: line, Health: "unknown"}
-		rows, queryErr := s.db.QueryContext(ctx, `SELECT role,health,deployment,profile,sessions,throughput_mbps,
- queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,observed_at FROM snapshots WHERE line_id=?
- AND id IN (SELECT MAX(id) FROM snapshots WHERE line_id=? GROUP BY node_id,worker_id)`, line.ID, line.ID)
+		rows, queryErr := s.db.QueryContext(ctx, `WITH ranked AS (
+	 SELECT role,health,deployment,profile,sessions,throughput_mbps,queue_age_p95_us,effective_loss_pct,
+	 fec_observe,fec_active,observed_at,ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY observed_at DESC,id DESC) AS rn
+	 FROM snapshots WHERE line_id=?
+	) SELECT role,health,deployment,profile,sessions,throughput_mbps,queue_age_p95_us,effective_loss_pct,
+	 fec_observe,fec_active,observed_at FROM ranked WHERE rn=1`, line.ID)
 		if queryErr != nil {
 			return Dashboard{}, queryErr
 		}

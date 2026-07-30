@@ -44,6 +44,20 @@ def prepare(policy_path:pathlib.Path,output:pathlib.Path)->dict:
     (output/"tenant.conf").write_bytes(tenant_bytes);(output/"exit_routes.conf").write_bytes(route_bytes)
     doc={"schema_version":1,"state":"approved","policy_id":hashlib.sha256(canonical(policy)).hexdigest()[:16],"created_at_utc":dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z"),"fixed_exit":policy["fixed_exit"],"tenant_sha256":hashlib.sha256(tenant_bytes).hexdigest(),"routes_sha256":hashlib.sha256(route_bytes).hexdigest()};sign(doc);(output/"manifest.json").write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");return doc
 
+def verify_integrity_after_reload(socks_port:int)->None:
+    last_error=None
+    for attempt in range(3):
+        try:
+            line_probe.run_entry_local_probe("integrity",socks_port)
+            return
+        except (OSError,RuntimeError,TimeoutError) as error:
+            last_error=error
+            if attempt<2:
+                delay=2*(attempt+1)
+                print(f"策略热加载后的完整性探针暂时不可用，{delay} 秒后重试",flush=True)
+                time.sleep(delay)
+    raise RuntimeError(f"策略热加载后完整性探针连续失败: {last_error}")
+
 def apply(bundle:pathlib.Path,execute:bool,socks_port:int=1080)->None:
     doc=json.loads((bundle/"manifest.json").read_text(encoding="utf-8"));verify(doc)
     tenant=(bundle/"tenant.conf").read_bytes();routes=(bundle/"exit_routes.conf").read_bytes()
@@ -55,7 +69,7 @@ def apply(bundle:pathlib.Path,execute:bool,socks_port:int=1080)->None:
         deploy.push_bytes(c,tenant,f"{root}/tenant.conf",0o600);deploy.push_bytes(c,routes,f"{root}/exit_routes.conf",0o600)
         deploy.run(c,f"ln -sfn {shlex.quote(root+'/tenant.conf')} {shlex.quote(work+'/tenant.conf.next')}; mv -Tf {shlex.quote(work+'/tenant.conf.next')} {shlex.quote(work+'/tenant.conf')}; ln -sfn {shlex.quote(root+'/exit_routes.conf')} {shlex.quote(work+'/exit_routes.conf.next')}; mv -Tf {shlex.quote(work+'/exit_routes.conf.next')} {shlex.quote(work+'/exit_routes.conf')}; systemctl kill -s HUP {shlex.quote(service + '.service')}")
         deployment=deploy._remote_current_deployment(c,"entry");deploy._verify_deployment_health(c,"entry",deployment,warmup=4)
-        os.environ.setdefault("NB_SOCKS_USERNAME","");line_probe.run_integrity_probe(deploy._role_host("entry")["host"],socks_port)
+        os.environ.setdefault("NB_SOCKS_USERNAME","");verify_integrity_after_reload(socks_port)
     except Exception:
         deploy.push_bytes(c,old_t,f"{work}/tenant.conf",0o600);deploy.push_bytes(c,old_r,f"{work}/exit_routes.conf",0o600);deploy.run(c,f"systemctl kill -s HUP {shlex.quote(service + '.service')}");raise
     finally:c.close()

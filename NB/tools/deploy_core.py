@@ -158,6 +158,7 @@ def _connect(role: str, stack: tuple[str, ...]) -> paramiko.SSHClient:
         raise RuntimeError(f"SSH jump cycle: {' -> '.join((*stack, role))}")
     h = _role_host(role)
     last = None
+    failures = []
     for attempt in range(3):
         for jump_role in _jump_strategies(role):
             c = None
@@ -179,6 +180,9 @@ def _connect(role: str, stack: tuple[str, ...]) -> paramiko.SSHClient:
                 return c
             except Exception as e:  # noqa
                 last = e
+                strategy = f"jump:{jump_role}" if jump_role else "direct"
+                failures.append(f"attempt={attempt + 1} strategy={strategy} "
+                                f"error={type(e).__name__}: {str(e)[:240]}")
                 if c is not None:
                     try: c.close()
                     except Exception: pass
@@ -187,7 +191,8 @@ def _connect(role: str, stack: tuple[str, ...]) -> paramiko.SSHClient:
                     except Exception: pass
         if attempt < 2:
             time.sleep(ssh_retry_delay(attempt))
-    raise RuntimeError(f"connect {role}({h['name']}) failed after retries: {last}")
+    detail = "; ".join(failures[-6:]) or f"{type(last).__name__}: {last}"
+    raise RuntimeError(f"connect {role}({h['name']}) failed after retries: {detail}")
 
 
 def connect(role) -> paramiko.SSHClient:

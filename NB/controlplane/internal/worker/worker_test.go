@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,12 @@ import (
 func testRegistry(t *testing.T, operations []string) Registry {
 	t.Helper()
 	directory := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(directory, "tools"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "tools", "whitelist.local.conf"), []byte("domain default.example\nport 443\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"hosts.json", "profile.json", "known_hosts", "machines.json"} {
 		data := []byte(`{}`)
 		if name == "profile.json" {
@@ -56,8 +63,31 @@ func TestRegistryRejectsSharedPortCollision(t *testing.T) {
 	registry.Lines[1].SocksPort = 1081
 	registry.Lines[1].MiddlePort = 4444
 	registry.Lines[1].UDPPortMin, registry.Lines[1].UDPPortMax = 21024, 22047
+	if err := registry.Validate(); err == nil {
+		t.Fatal("registry accepted overlapping adjacent middle worker lanes")
+	}
+	registry.Lines[1].MiddlePort = 4445
 	if err := registry.Validate(); err != nil {
 		t.Fatalf("registry rejected isolated ports: %v", err)
+	}
+}
+
+func TestRegistryQuarantinesHistoricalAdjacentWorkerLanes(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate", "line.upgrade"})
+	registry.Lines[0].MiddlePort = 4443
+	second := registry.Lines[0]
+	second.LineID, second.InstanceID = "line-2", "line-2"
+	second.SocksPort, second.MiddlePort = 1081, 4444
+	second.UDPPortMin, second.UDPPortMax = 21024, 22047
+	registry.Lines = append(registry.Lines, second)
+	registry.quarantineLegacyTransportCollisions()
+	if err := registry.Validate(); err != nil {
+		t.Fatalf("quarantined legacy registry did not start: %v", err)
+	}
+	for _, line := range registry.Lines {
+		if line.DisabledReason == "" || len(line.EnabledOperations) != 0 {
+			t.Fatalf("legacy collision was not quarantined: %+v", line)
+		}
 	}
 }
 
@@ -80,9 +110,84 @@ func TestRunnerInjectsInstanceRouting(t *testing.T) {
 func TestRunnerRefusesDisabledOperation(t *testing.T) {
 	registry := testRegistry(t, nil)
 	registry.Lines[0].DisabledReason = "shared resource is active"
-	_, err := NewRunner(registry).Run(context.Background(), Operation{ID: "op-1", LineID: "line-1", Kind: "line.open"})
+	var events []OperationEvent
+	ctx := context.WithValue(context.Background(), eventContextKey{}, eventEmitter(func(_ context.Context, event OperationEvent) error {
+		events = append(events, event)
+		return nil
+	}))
+	_, err := NewRunner(registry).Run(ctx, Operation{ID: "op-1", LineID: "line-1", Kind: "line.open"})
 	if err == nil || err.Error() != "shared resource is active" {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 2 || events[0].Stage != "prepare" || events[0].Status != "running" || events[1].Status != "failed" {
+		t.Fatalf("preparation failure events=%+v", events)
+	}
+}
+
+func TestCommandFailureSummaryReportsCauseAndRedactsSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.log")
+	content := "Traceback\nRuntimeError: connect entry failed: token=do-not-return password=hidden\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	summary := commandFailureSummary(os.ErrInvalid, path)
+	if !strings.Contains(summary, "connect entry failed") || strings.Contains(summary, "do-not-return") || strings.Contains(summary, "hidden") {
+		t.Fatalf("unsafe or incomplete failure summary: %s", summary)
+	}
+}
+
+func TestCommandFailureSummaryPrefersProvisionRejection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.log")
+	content := "RuntimeError: local source differs from the binary build inputs\n" +
+		"[line-1] 拒绝开通: 主动探针失败 rc=1: connection aborted\n" +
+		"subprocess.CalledProcessError: command returned non-zero exit status 2\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	summary := commandFailureSummary(os.ErrInvalid, path)
+	if summary != "主动探针失败 rc=1: connection aborted" {
+		t.Fatalf("wrong root cause selected: %s", summary)
+	}
+}
+
+func TestClientURLReadsQualifiedPrivateArtifact(t *testing.T) {
+	registry := testRegistry(t, nil)
+	line := registry.Lines[0]
+	line.StateDir = t.TempDir()
+	directory := filepath.Join(line.StateDir, "provision", line.LineID)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	expected := "socks5://user:password@192.0.2.10:1080#line-1"
+	if err := os.WriteFile(filepath.Join(directory, "client.json"), []byte(`{"shadowrocket_url":"`+expected+`"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := clientURL(line, filepath.Join(t.TempDir(), "operation"))
+	if err != nil || actual != expected {
+		t.Fatalf("client URL=%q err=%v", actual, err)
+	}
+	if err = os.WriteFile(filepath.Join(directory, "client.json"), []byte(`{"shadowrocket_url":"https://example.invalid"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = clientURL(line, filepath.Join(t.TempDir(), "operation")); err == nil {
+		t.Fatal("accepted a non-SOCKS client URL")
+	}
+}
+
+func TestProgressWriterStreamsBoundedRedactedLines(t *testing.T) {
+	var destination bytes.Buffer
+	var messages []string
+	writer := newProgressWriter(&destination, 0, 2, func(message string) { messages = append(messages, message) })
+	_, err := writer.Write([]byte("building\npassword=hidden token=private\nthird line\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.Flush()
+	if destination.String() != "building\npassword=hidden token=private\nthird line\n" {
+		t.Fatalf("full local log was changed: %q", destination.String())
+	}
+	if len(messages) != 2 || messages[0] != "building" || strings.Contains(messages[1], "hidden") || strings.Contains(messages[1], "private") {
+		t.Fatalf("unexpected streamed messages: %#v", messages)
 	}
 }
 
@@ -117,9 +222,35 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	if bytes.Contains(data, []byte("private-password")) || line.WhitelistSourceEnv != "NB_TEST_SRS_URL" {
 		t.Fatal("runtime plan persisted a secret value or lost the SRS source reference")
 	}
+	sourceData, err := os.ReadFile(filepath.Join(line.StateDir, "source-machines.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source struct {
+		Exits []struct {
+			Capacity int `json:"capacity"`
+		} `json:"exits"`
+	}
+	if err := json.Unmarshal(sourceData, &source); err != nil {
+		t.Fatal(err)
+	}
+	if len(source.Exits) != 1 || source.Exits[0].Capacity != 0 {
+		t.Fatalf("package bandwidth leaked into route session capacity: %#v", source.Exits)
+	}
 	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
 	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
 		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)
+	}
+	defaultPlan := plan
+	defaultPlan.LineID, defaultPlan.InstanceID = "line-default", "line-default_1"
+	defaultPlan.SRSRef, defaultPlan.Whitelist = "", nil
+	defaultLine, err := runner.dynamicLine(Operation{ID: "op-default", LineID: defaultPlan.LineID, Kind: "line.open"}, requestValues{Plan: defaultPlan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultRules, err := os.ReadFile(defaultLine.WhitelistFile)
+	if err != nil || !bytes.Contains(defaultRules, []byte("domain default.example")) {
+		t.Fatalf("empty plan did not receive default whitelist: %q err=%v", defaultRules, err)
 	}
 }
 
@@ -173,6 +304,41 @@ func TestClientCollectsAndDeliversSnapshots(t *testing.T) {
 	client.collectSnapshots(context.Background())
 	if delivered.Load() != 1 {
 		t.Fatalf("delivered snapshots=%d", delivered.Load())
+	}
+}
+
+func TestClientSyncsExistingClientConfiguration(t *testing.T) {
+	registry := testRegistry(t, nil)
+	lineID := "line-existing"
+	directory := filepath.Join(registry.StateDir, "lines", lineID, "provision", lineID)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	clientURL := "socks5://user:password@192.0.2.10:1080#line-existing"
+	if err := os.WriteFile(filepath.Join(directory, "client.json"), []byte(`{"shadowrocket_url":"`+clientURL+`"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var received atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/agent/v1/lines/line-existing/client-config" || request.Header.Get("Authorization") != "Bearer agent-secret" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var payload map[string]string
+		if json.NewDecoder(request.Body).Decode(&payload) != nil || payload["client_url"] != clientURL {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		received.Store(true)
+		_, _ = w.Write([]byte(`{"status":"attached"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(registry, &fakeRunner{}, ClientConfig{BaseURL: server.URL, Token: "agent-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = client.syncClientConfigs(context.Background()); err != nil || !received.Load() {
+		t.Fatalf("sync received=%v err=%v", received.Load(), err)
 	}
 }
 
@@ -249,5 +415,22 @@ func TestInventoryDiscoveryOmitsCredentials(t *testing.T) {
 	}
 	if !bytes.Contains(encoded, []byte(`"worker-local:line-1:entry"`)) || !bytes.Contains(encoded, []byte(`"ssh_port":2273`)) {
 		t.Fatalf("inventory omitted secret reference or SSH port: %s", encoded)
+	}
+}
+
+func TestWorkerLocalSecretReusesStaticMachineCredentials(t *testing.T) {
+	registry := testRegistry(t, nil)
+	machines := `{"edges":[{"name":"entry-1","host":"192.0.2.1","port":22,"user":"root","password":"entry-secret"}],` +
+		`"relays":[{"name":"relay-1","host":"192.0.2.2","port":22,"user":"root","password":"relay-secret"}],` +
+		`"terminals":[{"name":"exit-1","host":"192.0.2.3","port":2273,"user":"root","password":"exit-secret"}]}`
+	if err := os.WriteFile(registry.Lines[0].SourceMachinesFile, []byte(machines), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(registry)
+	for role, expected := range map[string]string{"entry": "entry-secret", "relay": "relay-secret", "exit": "exit-secret"} {
+		secret, err := runner.resolveSecret("worker-local:line-1:" + role)
+		if err != nil || secret.Password != expected {
+			t.Fatalf("resolve %s password=%q err=%v", role, secret.Password, err)
+		}
 	}
 }

@@ -108,6 +108,35 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
 }
 
 /* middle/exit: 收上一跳 stream 数据(去程)。首解析 route 首部, 再转发。 */
+static int probe_sink_feed(proxy_stream_t* p,const uint8_t* bytes,size_t len){
+    size_t off=0;
+    while(off<len&&p->probe_header_len<NB_PROBE_HEADER_SIZE)
+        p->probe_header[p->probe_header_len++]=bytes[off++];
+    if(p->probe_header_len==NB_PROBE_HEADER_SIZE&&p->probe_expected_bytes==0){
+        if(nb_probe_header_parse(p->probe_header,p->probe_header_len,&p->probe_expected_bytes)!=0){
+            ps_set_close_reason(p,"probe-header");return -1;
+        }
+    }
+    if(off<len){
+        size_t payload=len-off;
+        if(p->probe_expected_bytes==0||p->probe_ack_sent||
+            payload>p->probe_expected_bytes-p->probe_bytes){
+            ps_set_close_reason(p,"probe-length");return -1;
+        }
+        p->probe_hash=nb_probe_hash_update(p->probe_hash,bytes+off,payload);
+        p->probe_bytes+=payload;ps_note_payload(p,1,payload);
+        char progress[96];int n=nb_probe_progress_format(p->probe_bytes,picoquic_current_time(),
+            &p->probe_progress_at,progress,sizeof(progress));
+        if(n<0||(n>0&&queue_up(p,(const uint8_t*)progress,(size_t)n,0)!=0))return -1;
+    }
+    if(p->probe_expected_bytes!=0&&p->probe_bytes==p->probe_expected_bytes&&!p->probe_ack_sent){
+        char ack[128];int n=nb_probe_ack_format(p->probe_bytes,p->probe_hash,ack,sizeof(ack));
+        if(n<0||queue_up(p,(const uint8_t*)ack,(size_t)n,1)!=0)return -1;
+        p->probe_ack_sent=1;
+    }
+    return 0;
+}
+
 static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int fin){
     proxy_stream_t* p=stream?*stream:NULL;if(p==NULL)return -1;
     size_t off=0;
@@ -118,20 +147,17 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
     }
     if(p->hdr_done&&p->probe_mode){
         if(len>0){
-            p->probe_bytes+=len;ps_note_payload(p,1,len);
-            if(p->probe_mode==2&&queue_up(p,bytes,len,0)!=0)return -1;
-            if(p->probe_mode==1){
-                char progress[96];int n=nb_probe_progress_format(p->probe_bytes,picoquic_current_time(),
-                    &p->probe_progress_at,progress,sizeof(progress));
-                if(n<0||(n>0&&queue_up(p,(const uint8_t*)progress,(size_t)n,0)!=0))return -1;
-            }
+            if(p->probe_mode==1){if(probe_sink_feed(p,bytes,len)!=0)return -1;}
+            else if(queue_up(p,bytes,len,0)!=0)return -1;
         }
         if(fin){
             p->up_fin_seen=1;p->tcp_eof=1;
             if(p->probe_mode==1){
-                char ack[96];int n=snprintf(ack,sizeof(ack),"NBPROBE OK bytes=%llu\n",
-                    (unsigned long long)p->probe_bytes);
-                if(n<=0||(size_t)n>=sizeof(ack)||queue_up(p,(const uint8_t*)ack,(size_t)n,1)!=0)return -1;
+                if(!p->probe_ack_sent){
+                    char ack[128];int n=nb_probe_ack_format(p->probe_bytes,p->probe_hash,ack,sizeof(ack));
+                    if(n<0||queue_up(p,(const uint8_t*)ack,(size_t)n,1)!=0)return -1;
+                    p->probe_ack_sent=1;
+                }
             }else if(queue_up(p,NULL,0,1)!=0)return -1;
         }
         return 0;
@@ -209,7 +235,7 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
             if(c==NULL||thost[0]==0||tport<=0||tport>65535){log4c_error("id=%u malformed target route",p->id);ps_teardown(p);return -1;}
             { nb_flow_policy_t target_pol; flow_policy_for_host(thost,tport,&target_pol); apply_flow_policy(p,&target_pol); }
             if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_SINK_HOST)){
-                p->probe_mode=1;p->target_connect_state=2;
+                p->probe_mode=1;p->probe_hash=NB_PROBE_HASH_INITIAL;p->target_connect_state=2;
                 log4c_info("exit internal probe start id=%u mode=sink",p->id);
             }else if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_ECHO_HOST)){
                 p->probe_mode=2;p->target_connect_state=2;
@@ -255,21 +281,18 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
         if(G.role==ROLE_EXIT&&p->logical_endpoint){
             if(logical_receive(p,bytes+off,len-off)!=0){ps_teardown_reason(p,"logical-frame");return -1;}
         }else if(p->probe_mode){
-            p->probe_bytes+=len-off;ps_note_payload(p,1,len-off);
-            if(p->probe_mode==2&&queue_up(p,bytes+off,len-off,0)!=0)return -1;
-            if(p->probe_mode==1){
-                char progress[96];int n=nb_probe_progress_format(p->probe_bytes,picoquic_current_time(),
-                    &p->probe_progress_at,progress,sizeof(progress));
-                if(n<0||(n>0&&queue_up(p,(const uint8_t*)progress,(size_t)n,0)!=0))return -1;
-            }
+            if(p->probe_mode==1){if(probe_sink_feed(p,bytes+off,len-off)!=0)return -1;}
+            else if(queue_up(p,bytes+off,len-off,0)!=0)return -1;
         }else fwd_down(p,bytes+off,len-off,0);
     }
     if(fin&&p->logical_mode)return 0;
     if(fin){ p->up_fin_seen=1;if(p->probe_mode)p->tcp_eof=1;
         if(p->probe_mode==1){
-            char ack[96];int n=snprintf(ack,sizeof(ack),"NBPROBE OK bytes=%llu\n",
-                (unsigned long long)p->probe_bytes);
-            if(n<=0||(size_t)n>=sizeof(ack)||queue_up(p,(const uint8_t*)ack,(size_t)n,1)!=0)return -1;
+            if(!p->probe_ack_sent){
+                char ack[128];int n=nb_probe_ack_format(p->probe_bytes,p->probe_hash,ack,sizeof(ack));
+                if(n<0||queue_up(p,(const uint8_t*)ack,(size_t)n,1)!=0)return -1;
+                p->probe_ack_sent=1;
+            }
         }else if(p->probe_mode==2){
             if(queue_up(p,NULL,0,1)!=0)return -1;
         }else fwd_down(p,NULL,0,1);

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ type Operation struct {
 type Result struct {
 	Deployment string `json:"deployment,omitempty"`
 	Profile    string `json:"profile,omitempty"`
+	ClientURL  string `json:"client_url,omitempty"`
 	LogFile    string `json:"log_file"`
 	Message    string `json:"message"`
 }
@@ -44,6 +47,39 @@ type commandStep struct {
 type Runner struct{ registry Registry }
 
 func NewRunner(registry Registry) *Runner { return &Runner{registry: registry} }
+
+var sensitiveErrorValue = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)`)
+
+func commandFailureSummary(err error, logPath string) string {
+	summary := err.Error()
+	if data, readErr := os.ReadFile(logPath); readErr == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, marker := range []string{"拒绝开通:", "ConnectionAbortedError:", "ConnectionResetError:", "TimeoutError:", "RuntimeError:", "ValueError:", "SystemExit:"} {
+			for index := len(lines) - 1; index >= 0; index-- {
+				if strings.Contains(lines[index], marker) {
+					summary = strings.TrimSpace(lines[index])
+					if marker == "拒绝开通:" {
+						summary = strings.TrimSpace(strings.SplitN(summary, marker, 2)[1])
+					}
+					break
+				}
+			}
+			if summary != err.Error() {
+				break
+			}
+		}
+	}
+	if strings.Contains(summary, "PRIVATE KEY") {
+		summary = "sensitive command failure details were redacted"
+	} else {
+		summary = sensitiveErrorValue.ReplaceAllString(summary, "$1$2[REDACTED]")
+	}
+	runes := []rune(summary)
+	if len(runes) > 240 {
+		summary = string(runes[:240]) + "..."
+	}
+	return summary
+}
 
 func roleObject(source map[string]any, role string) map[string]any {
 	if value, ok := source[role].(map[string]any); ok {
@@ -83,6 +119,32 @@ func loadJSON(path string) (map[string]any, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func clientURLFromFile(path string) (string, error) {
+	config, err := loadJSON(path)
+	if err != nil {
+		return "", err
+	}
+	value := text(config["shadowrocket_url"])
+	parsed, err := url.Parse(value)
+	password, hasPassword := "", false
+	if parsed != nil && parsed.User != nil {
+		password, hasPassword = parsed.User.Password()
+	}
+	if err != nil || parsed == nil || parsed.Scheme != "socks5" || parsed.Host == "" || parsed.User == nil ||
+		parsed.User.Username() == "" || !hasPassword || password == "" || len(value) > 4096 {
+		return "", errors.New("generated client configuration is invalid")
+	}
+	return value, nil
+}
+
+func clientURL(line LineSpec, operationDir string) (string, error) {
+	outputDir := filepath.Join(operationDir, "line-open")
+	if line.StateDir != "" {
+		outputDir = line.StateDir
+	}
+	return clientURLFromFile(filepath.Join(outputDir, "provision", line.LineID, "client.json"))
 }
 
 func (r *Runner) environment(line LineSpec) (map[string]string, error) {
@@ -232,9 +294,14 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 }
 
 func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "preparing operation"})
+	failPreparation := func(err error, result Result) (Result, error) {
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "failed", Message: err.Error()})
+		return result, err
+	}
 	var request requestValues
 	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
-		return Result{}, errors.New("invalid operation request")
+		return failPreparation(errors.New("invalid operation request"), Result{})
 	}
 	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
 	line, ok := r.registry.Line(operation.LineID)
@@ -242,7 +309,7 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		var resolveErr error
 		line, resolveErr = r.dynamicLine(operation, request, operationDir)
 		if resolveErr != nil {
-			return Result{}, resolveErr
+			return failPreparation(resolveErr, Result{})
 		}
 	}
 	if !line.Allows(operation.Kind) {
@@ -250,39 +317,48 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		if reason == "" {
 			reason = "operation is disabled by the worker registry"
 		}
-		return Result{}, errors.New(reason)
+		return failPreparation(errors.New(reason), Result{})
 	}
 	if err := os.MkdirAll(operationDir, 0700); err != nil {
-		return Result{}, err
+		return failPreparation(err, Result{})
 	}
 	logPath := filepath.Join(operationDir, "worker.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		return Result{}, err
+		return failPreparation(err, Result{})
 	}
 	defer logFile.Close()
 	_, _ = fmt.Fprintf(logFile, "started_at=%s operation=%s line=%s kind=%s\n",
 		time.Now().UTC().Format(time.RFC3339Nano), operation.ID, operation.LineID, operation.Kind)
 	environment, err := r.environment(line)
 	if err != nil {
-		return Result{LogFile: logPath}, err
+		return failPreparation(err, Result{LogFile: logPath})
 	}
 	steps, err := r.steps(line, operation, request, operationDir)
 	if err != nil {
-		return Result{LogFile: logPath}, err
+		return failPreparation(err, Result{LogFile: logPath})
 	}
-	for index, step := range steps {
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "succeeded", Message: "operation prepared"})
+	sequence := 3
+	for _, step := range steps {
 		stage := step.Stage
 		if stage == "" {
 			stage = "execute"
 		}
-		sequence := index*2 + 1
 		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "running", Message: "step started", Parameters: map[string]any{"program": filepath.Base(step.Name)}})
-		if err = r.execute(ctx, step, environment, logFile); err != nil {
-			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence + 1, Stage: stage, Status: "failed", Message: err.Error()})
-			return Result{LogFile: logPath}, fmt.Errorf("%s failed: %w", filepath.Base(step.Args[0]), err)
+		sequence++
+		progress := newProgressWriter(logFile, 1500*time.Millisecond, 160, func(message string) {
+			emitProgress(ctx, &sequence, stage, message)
+		})
+		err = r.execute(ctx, step, environment, progress)
+		progress.Flush()
+		if err != nil {
+			summary := commandFailureSummary(err, logPath)
+			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "failed", Message: summary})
+			return Result{LogFile: logPath}, fmt.Errorf("%s failed: %s", filepath.Base(step.Args[0]), summary)
 		}
-		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence + 1, Stage: stage, Status: "succeeded", Message: "step completed"})
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "succeeded", Message: "step completed"})
+		sequence++
 	}
 	result := Result{LogFile: logPath, Profile: line.LineID, Message: "operation completed"}
 	if operation.Kind == "line.rollback" {
@@ -297,6 +373,12 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	if profile, loadErr := loadJSON(line.LineProfileFile); loadErr == nil {
 		if schema, ok := profile["schema_version"].(float64); ok {
 			result.Profile = fmt.Sprintf("%s:%d", line.LineID, int(schema))
+		}
+	}
+	if operation.Kind == "line.open" {
+		result.ClientURL, err = clientURL(line, operationDir)
+		if err != nil {
+			return result, err
 		}
 	}
 	return result, nil
