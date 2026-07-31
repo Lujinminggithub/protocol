@@ -182,6 +182,8 @@ def act_recon(roles):
 
 def act_build(roles):
     """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
+    if BUILD_HOST != "entry":
+        raise RuntimeError("production builds must run on the entry role")
     tests = ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
              "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
              "test_line_provision.py", "test_line_open.py", "test_supervisor.py"]
@@ -189,6 +191,13 @@ def act_build(roles):
         result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"本地 P0 发布门禁失败: {test}")
+    if os.environ.get("NB_FORCE_REMOTE_BUILD") != "1":
+        try:
+            act_prepare_release()
+            print(">>> verified binary build inputs unchanged; remote rebuild skipped")
+            return
+        except RuntimeError as reuse_error:
+            print(f">>> verified binary cannot be reused: {reuse_error}")
     node_source = "\n".join(path.read_text(encoding="utf-8") for path in (
         SRC / "nb_node.c", *sorted(SRC.glob("nb_node_*.inc"))))
     if "picoquic_add_to_stream(" in node_source:
@@ -203,7 +212,8 @@ def act_build(roles):
     build_input_snapshot = nb_release.snapshot_inputs(ROOT, RELEASE_INPUTS)
     run(c, f"rm -rf {COMPILE_WORK}/src {COMPILE_WORK}/third_party {COMPILE_WORK}/CMakeLists.txt {COMPILE_WORK}/build; mkdir -p {COMPILE_WORK}")
     put_tar(c, BUILD_FILES, COMPILE_WORK)
-    out = run(c, BUILD_CMD, tmo=300)
+    build_timeout = max(60, min(3600, int(os.environ.get("NB_REMOTE_BUILD_TIMEOUT_SECONDS", "900"))))
+    out = run(c, BUILD_CMD, tmo=build_timeout)
     print(out.strip()[-600:] if out.strip() else "(no output)")
     if "NB_BUILD_GATE_RC=0" not in out:
         c.close()
@@ -262,6 +272,30 @@ def act_prepare_release():
         LINE_PROFILE if LINE_PROFILE.is_file() else None, RUNTIME_CONFIGURATION_INPUTS)
     nb_release.write_manifest(RELEASE_MANIFEST, manifest)
     print(f">>> prepared existing binary release={manifest['release_id']} deployment={manifest['deployment_id']}")
+
+
+def _stage_entry_release(c, manifest, binary):
+    """Make Entry the authoritative source for the deployment artifact."""
+    release_id = _deployment_id(manifest)
+    release_dir = f"{INSTANCE_WORK}/releases/{release_id}"
+    artifact = f"{release_dir}/nb_node"
+    expected = manifest["artifact"]["sha256"]
+    run(c, f"mkdir -p {shlex.quote(release_dir)}")
+    existing = run(c,
+        f"test -f {shlex.quote(artifact)} && sha256sum {shlex.quote(artifact)} | awk '{{print $1}}' || true").strip()
+    if existing and existing != expected:
+        raise RuntimeError(f"entry immutable release collision: {release_id}")
+    if not existing:
+        compiled = f"{COMPILE_WORK}/build/nb_node"
+        compiled_hash = run(c,
+            f"test -f {shlex.quote(compiled)} && sha256sum {shlex.quote(compiled)} | awk '{{print $1}}' || true").strip()
+        if compiled_hash == expected:
+            run(c, f"cp -p {shlex.quote(compiled)} {shlex.quote(artifact)}; chmod 0755 {shlex.quote(artifact)}")
+            print(f"entry: release={release_id} staged from domestic build workspace")
+        else:
+            push_bytes(c, binary, artifact, mode=0o755)
+            print(f"entry: release={release_id} restored from verified build cache")
+    return _stage_release(c, "entry", manifest)
 
 
 def _distribute(role):
@@ -353,20 +387,47 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             _acquire_deploy_lock(clients[role], role, deployment_id)
             locked.append(role)
             run(clients[role], f"mkdir -p {INSTANCE_WORK}/logs")
-            previous[role] = _stage_release(clients[role], role, manifest, bindata)
+
+        previous["entry"] = _stage_entry_release(clients["entry"], manifest, bindata)
+        _copy_release_between_nodes(clients["entry"], "entry", clients["middle"], "middle", manifest)
+        previous["middle"] = _stage_release(clients["middle"], "middle", manifest)
+        try:
+            _copy_release_between_nodes(clients["entry"], "entry", clients["exit"], "exit", manifest)
+        except Exception as direct_error:
+            print(f"entry -> exit direct transfer failed; retrying through middle: {direct_error}")
+            _copy_release_between_nodes(clients["middle"], "middle", clients["exit"], "exit", manifest)
+        previous["exit"] = _stage_release(clients["exit"], "exit", manifest)
+
+        for role in roles:
             unit_backups[role] = _backup_role_unit(clients[role], role, deployment_id)
             state_backups[role] = _backup_role_state(clients[role], role, deployment_id)
             _append_deploy_audit(clients[role], role, "staged", manifest, previous[role])
-            print(f"{role}: deployment={deployment_id} 预上传及哈希校验完成")
+            print(f"{role}: deployment={deployment_id} distributed and verified")
 
         commands = {}
         release_dir = f"{INSTANCE_WORK}/releases/{deployment_id}"
         release_rules = f"{release_dir}/tiktok_flow_rules.conf"
         release_routes = f"{release_dir}/exit_routes.conf"
 
+        local_whitelist = None
+        explicit_whitelist = os.environ.get("NB_WHITELIST_FILE", "")
+        if explicit_whitelist:
+            candidate = pathlib.Path(explicit_whitelist)
+            if not candidate.is_file():
+                raise RuntimeError("NB_WHITELIST_FILE does not exist")
+            local_whitelist = candidate
+        elif LAB_FILE.name == "deployment-hosts.json":
+            candidate = LAB_FILE.parent.parent.parent / "whitelist.conf"
+            if candidate.is_file():
+                local_whitelist = candidate
+
         ck = clients["exit"]
         _push_security(ck, "exit"); _push_tiktok_rules(ck, release_rules)
+        if local_whitelist is not None:
+            _push_whitelist(ck, local_whitelist, role="exit")
         wl_remote = _ensure_remote_whitelist(ck)
+        verified_exit_ip = _verify_exit_bind_ip(ck)
+        print(f"exit: bind IP verified ({verified_exit_ip})")
         commands["exit"] = _node_command("exit", wl_remote=wl_remote, release_id=deployment_id)
 
         cm = clients["middle"]
@@ -375,6 +436,8 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
 
         cg = clients["entry"]
         _push_security(cg, "entry"); _push_tiktok_rules(cg, release_rules)
+        if local_whitelist is not None:
+            _push_whitelist(cg, local_whitelist, role="entry")
         _push_exit_routes(cg, release_routes);_push_exit_routes(cg, _exit_routes_remote())
         entry_wl = _ensure_remote_whitelist(cg, role="entry")
         commands["entry"] = _node_command(
@@ -408,7 +471,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
                 print(f"{role}: 已回滚到 {previous[role]} ({state})")
             except Exception as rollback_error:
                 print(f"{role}: 自动回滚失败: {rollback_error}", file=sys.stderr)
-        for role in reversed([item for item in locked if item not in activated]):
+        for role in reversed([item for item in locked if item not in activated and item in state_backups]):
             try:
                 _restore_role_state(clients[role], role, deployment_id, state_backups[role])
             except Exception as rollback_error:

@@ -75,6 +75,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
 	mux.HandleFunc("POST /agent/v1/inventory", a.agent(a.discoverInventory))
+	mux.HandleFunc("GET /agent/v1/line-plans", a.agent(a.agentLinePlans))
 	mux.HandleFunc("POST /agent/v1/lines/{id}/client-config", a.agent(a.attachClientConfig))
 	mux.HandleFunc("GET /agent/v1/operations", a.agent(a.claimOperations))
 	mux.HandleFunc("POST /agent/v1/operations/{id}/result", a.agent(a.completeOperation))

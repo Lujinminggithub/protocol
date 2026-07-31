@@ -8,9 +8,9 @@
 - 已核验的 `known_hosts` 文件；
 - 私有 CA、三个角色证书和 SOCKS 用户凭据；
 - entry 与 exit 的 fail-closed 白名单。
-- 广州构建机已安装 `gcc/g++`、`cmake`、`make` 和 OpenSSL 开发包。
+- 广州构建机已安装 `gcc/g++`、`cmake`、`make`、OpenSSL 开发包、`ssh` 和 `ssh-keygen`；Relay 已安装 `ssh` 和 `ssh-keygen`。
 
-当前 `tools/lab-hosts.json` 指定 `build_host=entry`、`compile_dir=/opt/compile`。构建过程只在广州 `/opt/compile` 展开源码和生成中间文件，三端运行目录仍为 `/etc/NB`。`build` 完成后，脚本把二进制下载到本地 `build/nb_node`，并生成 `build/release-manifest.json`。清单绑定二进制 SHA-256、构建输入摘要、拓扑和线路 profile；任一文件在构建后变化，`deploy-socks` 都会 fail-closed，要求重新构建。
+当前 `tools/lab-hosts.json` 必须指定 `build_host=entry`、`compile_dir=/opt/compile`。构建过程只在广州 `/opt/compile` 展开源码和生成中间文件，三端运行目录仍为 `/etc/NB`。`build` 完成后，Entry 保留权威二进制；本地 `build/nb_node` 只是经过校验的恢复缓存，并生成 `build/release-manifest.json`。清单绑定二进制 SHA-256、构建输入摘要、拓扑和线路 profile；任一文件在构建后变化，`deploy-socks` 都会 fail-closed，要求重新构建。
 
 ```powershell
 $env:NB_SSH_PASSWORD_ENTRY = "..."
@@ -39,15 +39,16 @@ Remove-Item Env:NB_REBUILD_PICOQUIC
 
 ## 2. 部署行为
 
-`deploy-socks` 先在全部节点预上传，再按 `exit -> middle -> entry` 顺序激活：
+`deploy-socks` 先从 Entry 分发到全部节点，再按 `exit -> middle -> entry` 顺序激活：
 
-1. 在三节点取得互斥部署锁，再将二进制和清单写入 `/etc/NB/releases/<deployment_id>/`，逐节点校验 SHA-256；`deployment_id` 由代码 release 和配置摘要组成；
-2. 保存当前二进制 symlink 和 systemd unit，所有节点预上传成功后才开始激活；
-3. supervisor、TikTok 规则、出口路由和新 unit 与 release 一起版本化；
-4. 通过原子 symlink 切换 `/etc/NB/nb_node`，按 hosts JSON 的 `workers` 数量重启；
-5. 检查 systemd、实际二进制哈希和每个 worker 的 control socket health；
-6. 三节点通过后执行带用户认证的 SOCKS 端到端冒烟；
-7. 任一步失败，按相反顺序恢复旧 symlink 和旧 unit，并重启已激活角色。
+1. 在三节点取得互斥部署锁，将 Entry 构建制品固化到 `/etc/NB/releases/<deployment_id>/`；
+2. 使用单次临时 Ed25519 密钥断点续传 `Entry -> Relay`，Exit 优先使用 `Entry -> Exit`，失败时自动切换为 `Relay -> Exit`，逐节点校验 SHA-256 后清理临时密钥；
+3. 保存当前二进制 symlink 和 systemd unit，所有节点预上传成功后才开始激活；
+4. supervisor、TikTok 规则、出口路由和新 unit 与 release 一起版本化；
+5. 通过原子 symlink 切换 `/etc/NB/nb_node`，按 hosts JSON 的 `workers` 数量重启；
+6. 检查 systemd、实际二进制哈希和每个 worker 的 control socket health；
+7. 三节点通过后执行带用户认证的 SOCKS 端到端冒烟；
+8. 任一步失败，按相反顺序恢复旧 symlink 和旧 unit，并重启已激活角色。
 
 查看三端当前不可变部署，或精确恢复 canary 之前的完整二进制和参数：
 

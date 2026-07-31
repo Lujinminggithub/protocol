@@ -2,12 +2,12 @@
 """Newbility(NB) 三跳部署工具 —— entry(gz) / middle(hk) / exit(kz)。
 
 角色与机器由 lab-hosts.json 描述; middle 经 entry 跳板连接(direct-tcpip)。
-NB 节点是一份二进制 nb_node, 靠 -r 选角色。构建固定在 hosts JSON 指定的
-build_host/compile_dir，产物下载到本地后再统一分发，middle/exit 无需编译器。
+NB 节点是一份二进制 nb_node, 靠 -r 选角色。生产构建固定在 Entry 的
+compile_dir，Entry 向 Relay 分发，Exit 直传失败时由 Relay 中转；middle/exit 无需编译器。
 
 动作:
   recon        只读侦察: 架构/gcc/picoquic/certs/现有 nb 进程, 不改动。
-  build        上传源码到独立构建机目录，编译并下载 nb_node。
+  build        上传源码到 Entry 构建目录并编译，下载一份校验缓存。
   deploy-tri   分发二进制 + 起 exit->middle->entry + 冒烟(多 stream + md5)。
   stop         停三跳所有 nb_node 进程。
   logs         拉三跳最近日志(便于跨跳追踪 route+stream_id)。
@@ -70,6 +70,7 @@ domain ttwstatic.com
 domain musical.ly
 domain ipinfo.io
 domain ip.sb
+domain_exact odr.itunes.apple.com
 domain www.google.com
 port 443
 port 80
@@ -159,7 +160,8 @@ def _connect(role: str, stack: tuple[str, ...]) -> paramiko.SSHClient:
     h = _role_host(role)
     last = None
     failures = []
-    for attempt in range(3):
+    max_attempts = max(1, min(10, int(os.environ.get("NB_SSH_CONNECT_ATTEMPTS", "5"))))
+    for attempt in range(max_attempts):
         for jump_role in _jump_strategies(role):
             c = None
             jump = None
@@ -189,7 +191,7 @@ def _connect(role: str, stack: tuple[str, ...]) -> paramiko.SSHClient:
                 if jump is not None:
                     try: jump.close()
                     except Exception: pass
-        if attempt < 2:
+        if attempt + 1 < max_attempts:
             time.sleep(ssh_retry_delay(attempt))
     detail = "; ".join(failures[-6:]) or f"{type(last).__name__}: {last}"
     raise RuntimeError(f"connect {role}({h['name']}) failed after retries: {detail}")
@@ -386,7 +388,7 @@ def _line_profile_identity():
     return line_id, schema
 
 
-def _stage_release(c, role, manifest, binary):
+def _stage_release(c, role, manifest, binary=None):
     release_id = _deployment_id(manifest)
     if not nb_release.RELEASE_NAME_RE.fullmatch(release_id) or release_id.startswith("legacy-"):
         raise ValueError(f"非法 deployment_id: {release_id}")
@@ -397,6 +399,8 @@ def _stage_release(c, role, manifest, binary):
     existing = run(c, f"test -f {shlex.quote(artifact)} && sha256sum {shlex.quote(artifact)} | awk '{{print $1}}' || true").strip()
     if existing and existing != expected:
         raise RuntimeError(f"{role} immutable release collision: {release_id}")
+    if not existing and binary is None:
+        raise RuntimeError(f"{role} release artifact was not distributed: {release_id}")
     if not existing:
         push_bytes(c, binary, artifact, mode=0o755)
     push_bytes(c, RELEASE_MANIFEST.read_bytes(), f"{release_dir}/release-manifest.json", mode=0o644)
@@ -419,6 +423,119 @@ def _stage_release(c, role, manifest, binary):
     if marker is None:
         raise RuntimeError(f"{role} 无法保存当前发布指针")
     return marker.split("=", 1)[1]
+
+
+def _transfer_candidates(role):
+    host = _role_host(role)
+    values = [host.get("private_ip"), host.get("jump_target_host"), host.get("host")]
+    result = []
+    for value in values:
+        value = str(value or "").strip()
+        if value and value not in result:
+            result.append(value)
+    if not result:
+        raise ValueError(f"{role} has no transfer address")
+    return result
+
+
+def _copy_release_between_nodes(source_c, source_role, target_c, target_role, manifest):
+    """Copy a release over node-to-node SSH without exposing permanent credentials."""
+    release_id = _deployment_id(manifest)
+    expected = manifest["artifact"]["sha256"]
+    size = int(manifest["artifact"]["size"])
+    source = f"{INSTANCE_WORK}/releases/{release_id}/nb_node"
+    destination = source
+    existing = run(target_c,
+        f"test -f {shlex.quote(destination)} && sha256sum {shlex.quote(destination)} | awk '{{print $1}}' || true").strip()
+    if existing == expected:
+        print(f"{source_role} -> {target_role}: release={release_id} already present and verified")
+        return "already-present"
+    if existing:
+        raise RuntimeError(f"{target_role} immutable release collision: {release_id}")
+
+    target = _role_host(target_role)
+    user = str(target.get("user") or "root").strip()
+    port = int(target.get("port", 22))
+    if not user or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in user):
+        raise ValueError(f"{target_role} has an invalid SSH user")
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{target_role} has an invalid SSH port")
+
+    marker = f"nb-release-{release_id}-{source_role}-to-{target_role}"
+    key_path = f"/tmp/{marker}"
+    known_hosts = f"{key_path}.known_hosts"
+    addresses = _transfer_candidates(target_role)
+    server_key = target_c.get_transport().get_remote_server_key()
+    key_record = f"{server_key.get_name()} {server_key.get_base64()}"
+    host_lines = []
+    for address in addresses:
+        host_token = address if port == 22 else f"[{address}]:{port}"
+        host_lines.append(f"{host_token} {key_record}")
+
+    timeout = max(60, min(3600, int(os.environ.get("NB_REMOTE_TRANSFER_TIMEOUT_SECONDS", "900"))))
+    authorized = None
+    try:
+        dependencies = run(source_c,
+            "for x in ssh ssh-keygen tail sha256sum; do command -v $x >/dev/null 2>&1 || echo MISSING:$x; done")
+        if "MISSING:" in dependencies:
+            missing = ", ".join(line.split(":", 1)[1] for line in dependencies.splitlines() if line.startswith("MISSING:"))
+            raise RuntimeError(f"{source_role} is missing transfer dependencies: {missing}")
+        run(source_c,
+            f"rm -f {shlex.quote(key_path)} {shlex.quote(key_path + '.pub')} {shlex.quote(known_hosts)}; "
+            f"ssh-keygen -q -t ed25519 -N '' -C {shlex.quote(marker)} -f {shlex.quote(key_path)}; chmod 0600 {shlex.quote(key_path)}")
+        public_key = run(source_c, f"cat {shlex.quote(key_path + '.pub')}").strip().split()
+        if len(public_key) < 2:
+            raise RuntimeError("ephemeral transfer key generation failed")
+        authorized = f"{public_key[0]} {public_key[1]} {marker}"
+        run(target_c,
+            "mkdir -p \"$HOME/.ssh\"; chmod 0700 \"$HOME/.ssh\"; "
+            f"printf '\\n%s\\n' {shlex.quote(authorized)} >>\"$HOME/.ssh/authorized_keys\"; "
+            "chmod 0600 \"$HOME/.ssh/authorized_keys\"")
+        push_bytes(source_c, ("\n".join(host_lines) + "\n").encode("ascii"), known_hosts, mode=0o600)
+
+        failures = []
+        for address in addresses:
+            endpoint = f"{user}@{address}"
+            ssh = (f"ssh -i {shlex.quote(key_path)} -o BatchMode=yes -o IdentitiesOnly=yes "
+                   f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(known_hosts)} "
+                   f"-o ConnectTimeout=10 -p {port} {shlex.quote(endpoint)}")
+            part = f"{destination}.part.{expected[:16]}"
+            try:
+                run(source_c, f"{ssh} {shlex.quote('mkdir -p ' + shlex.quote(str(pathlib.PurePosixPath(destination).parent)))}", tmo=30)
+                remote_size = run(source_c,
+                    f"{ssh} {shlex.quote('test -f ' + shlex.quote(part) + ' && stat -c %s ' + shlex.quote(part) + ' || echo 0')}",
+                    tmo=30).strip().splitlines()[-1]
+                offset = int(remote_size)
+                if offset > size:
+                    run(source_c, f"{ssh} {shlex.quote('rm -f ' + shlex.quote(part))}", tmo=30)
+                    offset = 0
+                if offset < size:
+                    append = shlex.quote("cat >> " + shlex.quote(part))
+                    run(source_c,
+                        f"tail -c +{offset + 1} {shlex.quote(source)} | {ssh} {append}", tmo=timeout)
+                publish = (f"test \"$(sha256sum {shlex.quote(part)} | awk '{{print $1}}')\" = {shlex.quote(expected)} && "
+                           f"chmod 0755 {shlex.quote(part)} && mv -f {shlex.quote(part)} {shlex.quote(destination)} && echo VERIFIED")
+                result = run(source_c, f"{ssh} {shlex.quote(publish)}", tmo=60)
+                if "VERIFIED" not in result:
+                    raise RuntimeError("remote checksum verification failed")
+                print(f"{source_role} -> {target_role}: release={release_id} transferred via {address}:{port}")
+                return address
+            except Exception as error:
+                failures.append(f"{address}:{port}: {error}")
+        raise RuntimeError(f"{source_role} -> {target_role} transfer failed: {'; '.join(failures)}")
+    finally:
+        try:
+            run(source_c, f"rm -f {shlex.quote(key_path)} {shlex.quote(key_path + '.pub')} {shlex.quote(known_hosts)}")
+        except Exception:
+            pass
+        if authorized is not None:
+            try:
+                cleanup = ("auth=\"$HOME/.ssh/authorized_keys\"; tmp=\"$auth.nb-clean.$$\"; "
+                           f"awk '$NF != {json.dumps(marker)}' \"$auth\" >\"$tmp\" || true; "
+                           "cat \"$tmp\" >\"$auth\"; rm -f \"$tmp\"")
+                run(target_c, cleanup)
+            except Exception:
+                pass
 
 
 def _activate_release(c, release_id):
@@ -658,6 +775,30 @@ def _fec_override_path(role):
     return f"/etc/systemd/system/{_service_name(role)}.service.d/override.conf"
 
 
+def _exit_bind_ip():
+    value = str(_role_host("exit").get("outip") or "").strip()
+    if not value:
+        return ""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as error:
+        raise ValueError("exit outip must be a valid IPv4 address") from error
+    if address.version != 4:
+        raise ValueError("exit outip must be an IPv4 address")
+    return str(address)
+
+
+def _verify_exit_bind_ip(c):
+    value = _exit_bind_ip()
+    if not value:
+        return "default-route"
+    command = ("ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | "
+               f"grep -Fx -- {shlex.quote(value)} >/dev/null && echo BIND_IP_OK")
+    if "BIND_IP_OK" not in run(c, command, tmo=15):
+        raise RuntimeError(f"configured exit IP is not assigned on the exit device: {value}")
+    return value
+
+
 def _role_fec_enabled(c, role):
     if _service_exists(c, role):
         out = run(c, f"systemctl show -p Environment --value {_service_name(role)} 2>/dev/null")
@@ -686,7 +827,7 @@ def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_i
     if role == "exit":
         if not wl_remote:
             raise ValueError("exit 启动需要 whitelist 路径")
-        outip=_role_host("exit").get("outip")
+        outip=_exit_bind_ip()
         source=f" -o {outip}" if outip else ""
         return f"{base} -p {EXIT_PORT} -W {wl_remote}{source}"
     raise ValueError(f"unknown role: {role}")
@@ -829,15 +970,16 @@ def act_fec_status():
 
 def _smoke_socks(socks_port=DEFAULT_SOCKS_PORT):
     cg = connect("entry")
-    kz_ip = _role_host("exit").get("outip",_role_host("exit")["host"])
+    kz_ip = _exit_bind_ip() or _role_host("exit")["host"]
     user=os.environ.get("NB_SOCKS_USERNAME");password=os.environ.get("NB_SOCKS_PASSWORD")
     if not user or not password:
         cg.close();raise RuntimeError("SOCKS 冒烟需要 NB_SOCKS_USERNAME 和 NB_SOCKS_PASSWORD")
     auth=shlex.quote(f"{user}:{password}")
     actual=""
     attempts=[]
-    for attempt in range(1,6):
-        actual=run(cg,f"curl -fsS --proxy-user {auth} --socks5-hostname 127.0.0.1:{socks_port} http://ipinfo.io/ip --max-time 15",tmo=20).strip()
+    max_attempts=max(1,min(60,int(os.environ.get("NB_DEPLOY_SMOKE_ATTEMPTS","24"))))
+    for attempt in range(1,max_attempts+1):
+        actual=run(cg,f"curl -fsS --proxy-user {auth} --socks5-hostname 127.0.0.1:{socks_port} http://ipinfo.io/ip --max-time 10",tmo=15).strip()
         attempts.append(f"try={attempt} exit={actual or '(empty)'}")
         if actual==kz_ip:break
         time.sleep(3)

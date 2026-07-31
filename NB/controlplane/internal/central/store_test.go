@@ -2,10 +2,56 @@ package central
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestOpenMigratesExitBindIP(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE line_specs (
+ line_id TEXT PRIMARY KEY, resource_group TEXT NOT NULL, instance_id TEXT NOT NULL,
+ bandwidth_mbps INTEGER NOT NULL, socks_port INTEGER NOT NULL,
+ udp_port_min INTEGER NOT NULL, udp_port_max INTEGER NOT NULL,
+ relay_port INTEGER NOT NULL, exit_port INTEGER NOT NULL,
+ whitelist BLOB NOT NULL, build_mode TEXT NOT NULL, artifact_ref TEXT NOT NULL,
+ source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rows, err := store.db.Query(`PRAGMA table_info(line_specs)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		found = found || name == "exit_bind_ip"
+	}
+	_ = rows.Close()
+	if !found {
+		t.Fatal("exit_bind_ip migration was not applied")
+	}
+}
 
 func TestOpenAllowsConcurrentDatabaseWork(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))

@@ -206,6 +206,7 @@ CREATE TABLE IF NOT EXISTS line_specs (
  bandwidth_mbps INTEGER NOT NULL, socks_port INTEGER NOT NULL,
  udp_port_min INTEGER NOT NULL, udp_port_max INTEGER NOT NULL,
  relay_port INTEGER NOT NULL, exit_port INTEGER NOT NULL,
+ exit_bind_ip TEXT NOT NULL DEFAULT '',
  whitelist BLOB NOT NULL, build_mode TEXT NOT NULL, artifact_ref TEXT NOT NULL,
  source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy TEXT NOT NULL,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -243,6 +244,30 @@ CREATE INDEX IF NOT EXISTS line_nodes_device ON line_nodes(device_id,line_id);
 CREATE INDEX IF NOT EXISTS operation_events_order ON operation_events(operation_id,sequence);
 CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_id,deleted_at DESC);
 `)
+	if err != nil {
+		return err
+	}
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(line_specs)`)
+	if err != nil {
+		return err
+	}
+	foundExitBindIP := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		foundExitBindIP = foundExitBindIP || name == "exit_bind_ip"
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if !foundExitBindIP {
+		_, err = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN exit_bind_ip TEXT NOT NULL DEFAULT ''`)
+	}
 	return err
 }
 

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "worker_id": "hk-operations-1",
+  "root": "/opt/nb-controlplane/repo",
+  "python": "/usr/bin/python3",
+  "state_dir": "/opt/nb-controlplane/data/worker",
+  "dynamic": {
+    "enabled": true,
+    "resource_groups": ["gz-hk-primary"],
+    "operations": [
+      "line.open",
+      "line.validate",
+      "line.upgrade",
+      "line.rollback",
+      "line.disable"
+    ],
+    "known_hosts_file": "/opt/nb-controlplane/etc/known_hosts",
+    "secrets_file": "/opt/nb-controlplane/etc/device-secrets.json",
+    "sing_box": "/usr/bin/sing-box",
+    "socks_port_min": 1082,
+    "socks_port_max": 1199,
+    "relay_port_min": 4445,
+    "relay_port_max": 4599,
+    "udp_port_min": 22048,
+    "udp_port_max": 65535
+  },
+  "lines": []
+}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func testRegistry(t *testing.T, operations []string) Registry {
 	if err := os.MkdirAll(filepath.Join(directory, "tools"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, "tools", "whitelist.local.conf"), []byte("domain default.example\nport 443\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(directory, "tools", "whitelist.local.conf"), []byte("domain default.example\ndomain_exact odr.itunes.apple.com\nport 443\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"hosts.json", "profile.json", "known_hosts", "machines.json"} {
@@ -206,7 +207,7 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 			SSHPort: 22, SSHUser: "root", SecretRef: "env:" + secret}}
 	}
 	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "new", BandwidthMbps: 20,
-		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, ExitBindIP: "192.0.2.30", UDPPortMin: 22048, UDPPortMax: 23071,
 		Whitelist: []string{"domain example.com"}, BuildMode: "auto", JumpPolicy: "auto", SRSRef: "env:NB_TEST_SRS_URL",
 		Nodes: []dynamicNode{device("entry-1", "entry", "192.0.2.1", "NB_TEST_ENTRY"),
 			device("relay-1", "relay", "192.0.2.2", "NB_TEST_RELAY"), device("exit-1", "exit", "192.0.2.3", "NB_TEST_EXIT")}}
@@ -227,6 +228,9 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	var source struct {
+		Exit struct {
+			OutIP string `json:"outip"`
+		} `json:"exit"`
 		Exits []struct {
 			Capacity int `json:"capacity"`
 		} `json:"exits"`
@@ -234,12 +238,22 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	if err := json.Unmarshal(sourceData, &source); err != nil {
 		t.Fatal(err)
 	}
-	if len(source.Exits) != 1 || source.Exits[0].Capacity != 0 {
+	if source.Exit.OutIP != plan.ExitBindIP || len(source.Exits) != 1 || source.Exits[0].Capacity != 0 {
 		t.Fatalf("package bandwidth leaked into route session capacity: %#v", source.Exits)
+	}
+	invalidPlan := plan
+	invalidPlan.ExitBindIP = "2001:db8::1"
+	if _, err = runner.dynamicLine(Operation{ID: "op-invalid", LineID: invalidPlan.LineID, Kind: "line.open"}, requestValues{Plan: invalidPlan}, t.TempDir()); err == nil {
+		t.Fatal("dynamic line accepted an IPv6 exit bind address")
 	}
 	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
 	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
 		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)
+	}
+	upgradeSteps, err := runner.steps(line, Operation{ID: "op-upgrade", LineID: plan.LineID, Kind: "line.upgrade"}, requestValues{Plan: plan}, t.TempDir())
+	if err != nil || len(upgradeSteps) != 4 || upgradeSteps[0].Stage != "build" ||
+		upgradeSteps[1].Stage != "whitelist-fetch" || upgradeSteps[2].Stage != "whitelist" || upgradeSteps[3].Stage != "deploy" {
+		t.Fatalf("upgrade does not deploy whitelist before binary: %#v err=%v", upgradeSteps, err)
 	}
 	defaultPlan := plan
 	defaultPlan.LineID, defaultPlan.InstanceID = "line-default", "line-default_1"
@@ -249,15 +263,22 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	defaultRules, err := os.ReadFile(defaultLine.WhitelistFile)
-	if err != nil || !bytes.Contains(defaultRules, []byte("domain default.example")) {
+	if err != nil || !bytes.Contains(defaultRules, []byte("domain default.example")) ||
+		!bytes.Contains(defaultRules, []byte("domain_exact odr.itunes.apple.com")) {
 		t.Fatalf("empty plan did not receive default whitelist: %q err=%v", defaultRules, err)
 	}
 }
 
-type fakeRunner struct{ calls atomic.Int64 }
+type fakeRunner struct {
+	calls atomic.Int64
+	delay time.Duration
+}
 
 func (runner *fakeRunner) Run(_ context.Context, operation Operation) (Result, error) {
 	runner.calls.Add(1)
+	if runner.delay > 0 {
+		time.Sleep(runner.delay)
+	}
 	return Result{Deployment: "dep-2", Profile: operation.LineID + ":1", LogFile: "worker.log", Message: "ok"}, nil
 }
 
@@ -267,6 +288,12 @@ func (runner *fakeSnapshotRunner) CollectSnapshots(_ context.Context, line LineS
 	return []Snapshot{{LineID: line.LineID, NodeID: "entry-1", Role: "entry", WorkerID: "0",
 		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "ok",
 		Deployment: "dep-1", Profile: line.LineID + ":1"}}, nil
+}
+
+type fakeDynamicSnapshotRunner struct{ fakeSnapshotRunner }
+
+func (runner *fakeDynamicSnapshotRunner) resolveSnapshotLine(plan dynamicPlan) (LineSpec, error) {
+	return LineSpec{LineID: plan.LineID}, nil
 }
 
 func TestClientCollectsAndDeliversSnapshots(t *testing.T) {
@@ -304,6 +331,46 @@ func TestClientCollectsAndDeliversSnapshots(t *testing.T) {
 	client.collectSnapshots(context.Background())
 	if delivered.Load() != 1 {
 		t.Fatalf("delivered snapshots=%d", delivered.Load())
+	}
+}
+
+func TestClientCollectsDynamicLineSnapshots(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Dynamic.Enabled = true
+	registry.Dynamic.ResourceGroups = []string{"test-group"}
+	registry.Dynamic.Operations = []string{"line.validate"}
+	var lines sync.Map
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer agent-secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/agent/v1/line-plans":
+			_, _ = w.Write([]byte(`{"plans":[{"line_id":"line-dynamic","resource_group":"test-group"}]}`))
+		case "/agent/v1/snapshots":
+			var snapshot Snapshot
+			if json.NewDecoder(request.Body).Decode(&snapshot) != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			lines.Store(snapshot.LineID, true)
+			_, _ = w.Write([]byte(`{"status":"accepted"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(registry, &fakeDynamicSnapshotRunner{}, ClientConfig{BaseURL: server.URL, Token: "agent-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.collectSnapshots(context.Background())
+	for _, lineID := range []string{"line-1", "line-dynamic"} {
+		if _, ok := lines.Load(lineID); !ok {
+			t.Fatalf("snapshot missing for %s", lineID)
+		}
 	}
 }
 
@@ -374,7 +441,7 @@ func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	runner := &fakeRunner{}
+	runner := &fakeRunner{delay: 70 * time.Millisecond}
 	client, err := NewClient(registry, runner, ClientConfig{BaseURL: server.URL, Token: "agent-secret",
 		Version: "test", PollEvery: 10 * time.Millisecond, HeartbeatEvery: 10 * time.Millisecond, OperationTimeout: time.Second})
 	if err != nil {
@@ -385,7 +452,7 @@ func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
 	if err = client.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if heartbeat.Load() < 1 || completed.Load() != 1 || runner.calls.Load() != 1 {
+	if heartbeat.Load() < 3 || completed.Load() != 1 || runner.calls.Load() != 1 {
 		t.Fatalf("heartbeat=%d completed=%d calls=%d", heartbeat.Load(), completed.Load(), runner.calls.Load())
 	}
 	if _, err = os.Stat(filepath.Join(registry.StateDir, "op-1", "result.json")); err != nil {

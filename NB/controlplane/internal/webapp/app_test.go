@@ -69,6 +69,37 @@ func TestClientConfigurationAndQRCode(t *testing.T) {
 	}
 }
 
+func TestAgentListsOnlyActiveLinePlans(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	for _, item := range []central.Line{
+		{ID: "line-active", Name: "active", Status: "active", EntryRegion: "a", ExitRegion: "b", Provider: "test", CapacityMbps: 10},
+		{ID: "line-draft", Name: "draft", Status: "draft", EntryRegion: "a", ExitRegion: "b", Provider: "test", CapacityMbps: 10},
+	} {
+		if _, err = database.UpsertLine(t.Context(), item); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = database.SaveLineSpec(t.Context(), central.LineSpec{LineID: item.ID, ResourceGroup: "group", InstanceID: item.ID,
+			BandwidthMbps: 10, SocksPort: 1082, UDPPortMin: 22048, UDPPortMax: 23071, RelayPort: 4445, ExitPort: 4443,
+			Whitelist: json.RawMessage(`[]`), BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response, body := call(t, server.Client(), http.MethodGet, server.URL+"/agent/v1/line-plans", "agent", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"line_id":"line-active"`)) || bytes.Contains(body, []byte(`"line_id":"line-draft"`)) {
+		t.Fatalf("plans status=%d body=%s", response.StatusCode, body)
+	}
+	response, _ = call(t, server.Client(), http.MethodGet, server.URL+"/agent/v1/line-plans", "admin", "", nil)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("admin accessed agent plans: %d", response.StatusCode)
+	}
+}
+
 func call(t *testing.T, client *http.Client, method, url, token, key string, body any) (*http.Response, []byte) {
 	t.Helper()
 	var reader io.Reader
@@ -287,13 +318,19 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		{"device_id": "exit-1", "role": "exit", "ordinal": 0, "next_hop_device_id": "", "jump_candidates": []string{"relay-1"}, "config": map[string]any{}},
 	}
 	spec := map[string]any{"resource_group": "test-group", "instance_id": "test", "bandwidth_mbps": 20,
-		"socks_port": 1082, "relay_port": 4445, "exit_port": 4443, "udp_port_min": 22048, "udp_port_max": 23071,
+		"socks_port": 1082, "relay_port": 4445, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "udp_port_min": 22048, "udp_port_max": 23071,
 		"whitelist": []string{"domain example.com"}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "env:NB_TEST_SRS_URL", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
-	if response.StatusCode != 200 {
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) {
 		t.Fatalf("save topology status=%d body=%s", response.StatusCode, body)
 	}
+	spec["exit_bind_ip"] = "2001:db8::1"
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("exit_bind_ip")) {
+		t.Fatalf("IPv6 exit bind address status=%d body=%s", response.StatusCode, body)
+	}
+	spec["exit_bind_ip"] = "192.0.2.3"
 	secondLine := map[string]any{"id": "line-2", "name": "second line", "status": "draft", "entry_region": "entry",
 		"exit_region": "exit", "provider": "test", "capacity_mbps": 20, "active_deployment": "", "profile": "", "secret_ref": ""}
 	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", secondLine)
@@ -396,7 +433,7 @@ func TestAgentDiscoversMissingTopologyAndIncompleteLineCanBeDeleted(t *testing.T
 	}
 	discovery := map[string]any{"worker_id": "worker-1", "observed_at": time.Now().UTC(), "lines": []map[string]any{{
 		"line":    map[string]any{"id": "line-1", "name": "line-1", "status": "maintenance", "entry_region": "gz", "exit_region": "us", "provider": "mixed", "capacity_mbps": 10, "active_deployment": "", "profile": "", "secret_ref": ""},
-		"devices": devices, "spec": map[string]any{"line_id": "line-1", "resource_group": "shared", "instance_id": "us", "bandwidth_mbps": 10, "socks_port": 1080, "udp_port_min": 20000, "udp_port_max": 21023, "relay_port": 4443, "exit_port": 4443, "whitelist": []string{}, "build_mode": "source", "artifact_ref": "build/nb_node", "source_ref": "repo://current", "srs_ref": "", "jump_policy": "auto", "nodes": nodes},
+		"devices": devices, "spec": map[string]any{"line_id": "line-1", "resource_group": "shared", "instance_id": "us", "bandwidth_mbps": 10, "socks_port": 1080, "udp_port_min": 20000, "udp_port_max": 21023, "relay_port": 4443, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "whitelist": []string{}, "build_mode": "source", "artifact_ref": "build/nb_node", "source_ref": "repo://current", "srs_ref": "", "jump_policy": "auto", "nodes": nodes},
 	}}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/inventory", "agent", "", discovery)
 	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"status":"discovered"`)) {

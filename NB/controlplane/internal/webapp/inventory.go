@@ -118,6 +118,12 @@ func validLineSpecRequest(spec central.LineSpec) error {
 	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.SocksPort < 1 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65534 || spec.ExitPort < 0 || spec.ExitPort > 65534 {
 		return errors.New("invalid line ports or bandwidth")
 	}
+	if spec.ExitBindIP != "" {
+		parsed := net.ParseIP(spec.ExitBindIP)
+		if parsed == nil || parsed.To4() == nil {
+			return errors.New("exit_bind_ip must be an IPv4 address")
+		}
+	}
 	if (spec.UDPPortMin == 0) != (spec.UDPPortMax == 0) || spec.UDPPortMin < 0 || spec.UDPPortMax > 65535 || (spec.UDPPortMin != 0 && (spec.UDPPortMin < 1024 || spec.UDPPortMin > spec.UDPPortMax)) {
 		return errors.New("invalid UDP relay range")
 	}
@@ -174,6 +180,7 @@ func (a *App) saveLineSpec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.LineID = r.PathValue("id")
+	spec.ExitBindIP = strings.TrimSpace(spec.ExitBindIP)
 	if _, err := a.store.Line(r.Context(), spec.LineID); err != nil {
 		problem(w, 404, "line not found")
 		return
@@ -220,6 +227,15 @@ func (a *App) lineSpec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, item)
+}
+
+func (a *App) agentLinePlans(w http.ResponseWriter, r *http.Request) {
+	plans, err := a.store.ActiveLineSpecs(r.Context())
+	if err != nil {
+		problem(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"plans": plans})
 }
 
 func (a *App) lineDetail(w http.ResponseWriter, r *http.Request) {

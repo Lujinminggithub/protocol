@@ -15,9 +15,11 @@ def main() -> None:
     names = [
         "_require_local_build", "_require_security_material", "connect", "run",
         "_acquire_deploy_lock", "_release_deploy_lock", "_stage_release",
+        "_stage_entry_release", "_copy_release_between_nodes",
         "_backup_role_unit", "_backup_role_state", "_restore_role_state",
         "_append_deploy_audit", "_push_security",
-        "_push_tiktok_rules", "_ensure_remote_whitelist", "_push_exit_routes",
+        "_push_tiktok_rules", "_push_whitelist", "_ensure_remote_whitelist", "_push_exit_routes",
+        "_verify_exit_bind_ip",
         "_node_command", "_activate_release", "_install_and_restart_role",
         "_verify_release_health", "_rollback_release", "_smoke_socks", "_prune_releases",
         "_remote_current_deployment", "_activate_existing_deployment",
@@ -35,15 +37,24 @@ def main() -> None:
         deploy.run = lambda *args, **kwargs: ""
         deploy._acquire_deploy_lock = lambda c, role, release: events.append(("lock", role))
         deploy._release_deploy_lock = lambda c: events.append(("unlock", c.role))
-        deploy._stage_release = lambda c, role, m, data: f"releases/old-{role}/nb_node"
+        deploy._stage_release = lambda c, role, m, data=None: f"releases/old-{role}/nb_node"
+        deploy._stage_entry_release = lambda c, m, data: "releases/old-entry/nb_node"
+        def copy_release(source, source_role, target, target_role, manifest):
+            events.append(("copy", source_role, target_role))
+            if source_role == "entry" and target_role == "exit":
+                raise RuntimeError("injected direct transfer failure")
+            return "test-address"
+        deploy._copy_release_between_nodes = copy_release
         deploy._backup_role_unit = lambda *args: True
         deploy._backup_role_state = lambda c, role, release: {"role": role}
         deploy._restore_role_state = lambda c, role, release, state: events.append(("restore", role))
         deploy._append_deploy_audit = lambda *args, **kwargs: None
         deploy._append_exact_rollback_audit = lambda *args, **kwargs: None
         deploy._push_security = deploy._push_tiktok_rules = lambda *args, **kwargs: None
+        deploy._push_whitelist = lambda c, path, role: events.append(("whitelist", role)) or "/tmp/wl"
         deploy._ensure_remote_whitelist = lambda *args, **kwargs: "/tmp/wl"
         deploy._push_exit_routes = lambda *args, **kwargs: "/tmp/routes"
+        deploy._verify_exit_bind_ip = lambda c: events.append(("bind-ip", c.role)) or "test-address"
         deploy._node_command = lambda role, **kwargs: role
         deploy._activate_release = lambda c, release: events.append(("activate", c.role))
         def install(c, role, command, **kwargs):
@@ -63,7 +74,17 @@ def main() -> None:
             ("rollback", "middle"), ("rollback", "exit")
         ]
         assert [item for item in events if item[0] == "restore"] == [("restore", "entry")]
-        assert {role for event, role in events if event == "unlock"} == {"entry", "middle", "exit"}
+        assert [item for item in events if item[0] == "copy"] == [
+            ("copy", "entry", "middle"),
+            ("copy", "entry", "exit"),
+            ("copy", "middle", "exit"),
+        ]
+        assert [item for item in events if item[0] == "bind-ip"] == [("bind-ip", "exit")]
+        if deploy.LAB_FILE.name == "deployment-hosts.json":
+            assert [item for item in events if item[0] == "whitelist"] == [
+                ("whitelist", "exit"), ("whitelist", "entry")
+            ]
+        assert {item[1] for item in events if item[0] == "unlock"} == {"entry", "middle", "exit"}
 
         events.clear();target="aaaaaaaaaaaaaaaa-bbbbbbbbbbbb"
         deploy._remote_current_deployment=lambda c,role:"cccccccccccccccc-dddddddddddd"

@@ -38,7 +38,7 @@ typedef struct proxy_stream {
     nb_ring_t down_tx;
     nb_live_queue_clock_t down_tx_clock;
     int down_tx_fin;
-    uint8_t down_prefix[420];
+    uint8_t down_prefix[768];
     size_t down_prefix_len;
     size_t down_prefix_off;
     nb_ring_t up_tx;

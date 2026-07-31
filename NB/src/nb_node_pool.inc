@@ -430,19 +430,22 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
         return 0;
     }
     p->down_opened=1;
-    {
+    if(G.role==ROLE_ENTRY&&p->logical_endpoint){
+        int resume=p->logical_reconnect_pending;
+        uint8_t bootstrap[768];
+        int length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),prio,route,
+            resume?NB_LSTREAM_RESUME:NB_LSTREAM_OPEN,p->logical_flow_hi,p->logical_flow_lo,
+            resume?p->logical_rx_delivered:0);
+        if(length<0||queue_down_prefix(p,bootstrap,(size_t)length)!=0){
+            log4c_error("id=%u queue logical route bootstrap fail",p->id);return -1;}
+        p->logical_reconnect_pending=0;p->logical_disconnected_at=0;p->logical_reconnect_last_attempt=0;
+    }else{
         char hdr[390],flow[33];int hl=0;
         if(p->logical_mode&&nb_lstream_flow_render(flow,p->logical_flow_hi,p->logical_flow_lo)==0)
             hl=snprintf(hdr,sizeof(hdr),"%d;L=%s;%s\n",prio,flow,route);
         else hl=snprintf(hdr,sizeof(hdr),"%d;%s\n",prio,route);
         if(hl<=0||(size_t)hl>=sizeof(hdr)||queue_down_prefix(p,(const uint8_t*)hdr,(size_t)hl)!=0){
             log4c_error("id=%u queue route to downstream fail", p->id); return -1; }
-    }
-    if(G.role==ROLE_ENTRY&&p->logical_endpoint){
-        int resume=p->logical_reconnect_pending;
-        if(logical_queue_frame(p,1,resume?NB_LSTREAM_RESUME:NB_LSTREAM_OPEN,
-            resume?p->logical_rx_delivered:0,NULL,0)!=0)return -1;
-        p->logical_reconnect_pending=0;p->logical_disconnected_at=0;p->logical_reconnect_last_attempt=0;
     }
     if(ps_is_rtc_webcast(p)) log4c_info("%s tcp trace id=%u stage=stream-open age=%.1fms request_to_open=%.1fms sid=%llu route=%s",
         role_name(G.role),p->id,trace_delta_ms(p->downstream_open_at,p->created_at),

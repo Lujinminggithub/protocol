@@ -197,6 +197,40 @@ func (c *Client) event(ctx context.Context, operation Operation, event Operation
 	return c.request(ctx, http.MethodPost, "/agent/v1/operations/"+url.PathEscape(operation.ID)+"/events", event, nil)
 }
 
+func (c *Client) snapshotLines(ctx context.Context) []LineSpec {
+	lines := append([]LineSpec(nil), c.registry.Lines...)
+	resolver, ok := c.runner.(interface {
+		resolveSnapshotLine(dynamicPlan) (LineSpec, error)
+	})
+	if !ok || !c.registry.Dynamic.Enabled {
+		return lines
+	}
+	var response struct {
+		Plans []dynamicPlan `json:"plans"`
+	}
+	if err := c.request(ctx, http.MethodGet, "/agent/v1/line-plans", nil, &response); err != nil {
+		fmt.Fprintf(os.Stderr, "nb-web-worker dynamic snapshot plans unavailable: %v\n", err)
+		return lines
+	}
+	seen := map[string]bool{}
+	for _, line := range lines {
+		seen[line.LineID] = true
+	}
+	for _, plan := range response.Plans {
+		if seen[plan.LineID] || !contains(plan.ResourceGroup, c.registry.Dynamic.ResourceGroups) {
+			continue
+		}
+		line, err := resolver.resolveSnapshotLine(plan)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nb-web-worker dynamic snapshot plan rejected line=%s: %v\n", plan.LineID, err)
+			continue
+		}
+		seen[line.LineID] = true
+		lines = append(lines, line)
+	}
+	return lines
+}
+
 func (c *Client) collectSnapshots(ctx context.Context) {
 	if !c.snapshot.TryLock() {
 		return
@@ -213,9 +247,10 @@ func (c *Client) collectSnapshots(ctx context.Context) {
 		snapshots []Snapshot
 		err       error
 	}
-	results := make(chan collected, len(c.registry.Lines))
+	lines := c.snapshotLines(ctx)
+	results := make(chan collected, len(lines))
 	var group sync.WaitGroup
-	for _, line := range c.registry.Lines {
+	for _, line := range lines {
 		line := line
 		group.Add(1)
 		go func() {
@@ -294,6 +329,28 @@ func (c *Client) poll(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) runHeartbeat(ctx context.Context, failures chan<- error) {
+	ticker := time.NewTicker(c.cfg.HeartbeatEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.heartbeat(ctx); err != nil {
+				select {
+				case failures <- err:
+				default:
+				}
+				return
+			}
+			if err := c.syncInventory(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+			}
+		}
+	}
+}
+
 func (c *Client) Run(ctx context.Context) error {
 	if err := c.heartbeat(ctx); err != nil {
 		return err
@@ -305,11 +362,11 @@ func (c *Client) Run(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
 	}
 	go c.collectSnapshots(ctx)
-	heartbeat := time.NewTicker(c.cfg.HeartbeatEvery)
+	heartbeatFailures := make(chan error, 1)
+	go c.runHeartbeat(ctx, heartbeatFailures)
 	poll := time.NewTicker(c.cfg.PollEvery)
 	maintenance := time.NewTicker(c.cfg.MaintenanceEvery)
 	snapshots := time.NewTicker(c.cfg.SnapshotEvery)
-	defer heartbeat.Stop()
 	defer poll.Stop()
 	defer maintenance.Stop()
 	defer snapshots.Stop()
@@ -317,13 +374,8 @@ func (c *Client) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-heartbeat.C:
-			if err := c.heartbeat(ctx); err != nil {
-				return err
-			}
-			if err := c.syncInventory(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
-			}
+		case err := <-heartbeatFailures:
+			return err
 		case <-poll.C:
 			if err := c.poll(ctx); err != nil {
 				return err

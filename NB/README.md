@@ -43,9 +43,9 @@ FEC 已独立到 `src/nb_fec.c`，数据面采用 QUIC datagram 的 source/repai
 
 ## 构建与部署
 
-当前拓扑固定使用广州 entry 作为构建机。源码上传到广州的 `/opt/compile`，完成全部 CTest、CMake 和 picoquic 静态库构建后，`nb_node` 会下载到本地 `build/`，同时生成 `release-manifest.json`。部署前强校验二进制、源码摘要、拓扑和线路 profile；代码 release 与配置摘要组成不可变 deployment ID，三端使用 `/etc/NB/releases/<deployment_id>/` 保存版本，并通过原子 symlink 激活。构建目录与运行目录相互独立，清理 `/opt/compile` 不影响正在运行的服务。
+当前拓扑强制使用广州 Entry 作为生产构建机。源码上传到广州的 `/opt/compile`，完成全部 CTest、CMake 和 picoquic 静态库构建后，Entry 保留权威制品；本地 `build/` 仅保存经过校验的缓存和 `release-manifest.json`。部署时制品按 `Entry -> Relay` 分发，Exit 优先从 Entry 获取，失败时自动改走 `Relay -> Exit`。部署前强校验二进制、源码摘要、拓扑和线路 profile；代码 release 与配置摘要组成不可变 deployment ID，三端使用 `/etc/NB/releases/<deployment_id>/` 保存版本，并通过原子 symlink 激活。构建目录与运行目录相互独立，清理 `/opt/compile` 不影响正在运行的服务。
 
-构建机需要预装 `gcc/g++`、`cmake`、`make`、OpenSSL 开发包和 pthread 开发环境。构建机、middle、exit 必须使用兼容的 Linux x86_64 ABI。
+构建机需要预装 `gcc/g++`、`cmake`、`make`、OpenSSL 开发包、pthread 开发环境以及 `ssh/ssh-keygen`；Relay 需要 `ssh/ssh-keygen` 以承担 Exit 回退分发。构建机、middle、exit 必须使用兼容的 Linux x86_64 ABI。
 
 拓扑文件中的关键配置如下：
 
@@ -69,12 +69,12 @@ $env:NB_SOCKS_USERNAME = "..."
 $env:NB_SOCKS_PASSWORD = "..."
 python tools/security_setup.py
 
-# 3. 在广州 /opt/compile 构建，下载产物后分发部署
+# 3. 在广州 /opt/compile 构建，由 Entry 向后续节点分发
 python tools/deploy.py build
 python tools/deploy.py deploy-socks
 ```
 
-`deploy-socks` 会先完成三节点预上传和哈希校验，再按 exit、middle、entry 激活。systemd、实际二进制哈希、worker control socket 或端到端 SOCKS 冒烟任一失败时，已激活节点自动恢复上一版二进制和 unit。该流程不会自动部署本地尚未重新构建的源码状态。
+`deploy-socks` 使用单次临时 Ed25519 密钥执行节点间断点续传，并使用控制面已核验的目标主机密钥生成临时 `known_hosts`；传输结束后从源端和目标端清理临时密钥。三节点制品和哈希全部通过后再按 exit、middle、entry 激活。systemd、实际二进制哈希、worker control socket 或端到端 SOCKS 冒烟任一失败时，已激活节点自动恢复上一版二进制和 unit。该流程不会自动部署本地尚未重新构建的源码状态。
 
 首次引导且尚未建立 known_hosts 时，可以显式设置 `NB_SSH_INSECURE=1`，完成指纹核验后应立即取消。
 

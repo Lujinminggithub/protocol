@@ -18,8 +18,9 @@ import urllib.request
 MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 MAX_METADATA = 8192
 MAX_SRS = 64 * 1024 * 1024
-SUPPORTED_FIELDS = {"domain", "domain_suffix", "ip_cidr", "port"}
+SUPPORTED_FIELDS = {"domain", "domain_suffix", "domain_keyword", "ip_cidr", "port"}
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+CONNECTIVITY_TEST_RULES = {"domain_exact odr.itunes.apple.com"}
 
 
 def fetch(url: str, limit: int) -> tuple[bytes, str]:
@@ -63,8 +64,10 @@ def values(rule: dict, field: str) -> list:
     value = rule.get(field, [])
     if value is None:
         return []
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        return [value]
     if not isinstance(value, list):
-        raise ValueError(f"SRS field {field} must be an array")
+        raise ValueError(f"SRS field {field} must be a scalar or array")
     return value
 
 
@@ -78,13 +81,22 @@ def normalize_domain(value: object) -> str:
     return domain
 
 
+def normalize_domain_keyword(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid SRS domain keyword")
+    keyword = value.lower()
+    if not keyword or len(keyword) > 127 or not re.fullmatch(r"[a-z0-9._-]+", keyword):
+        raise ValueError("SRS domain keyword cannot be represented by NB")
+    return keyword
+
+
 def convert(source: dict) -> list[str]:
     if source.get("version") not in (1, 2, 3):
         raise ValueError("unsupported sing-box rule-set version")
     rules = source.get("rules")
     if not isinstance(rules, list) or not rules:
         raise ValueError("SRS contains no rules")
-    output = set()
+    output = set(CONNECTIVITY_TEST_RULES)
     for rule in rules:
         if not isinstance(rule, dict):
             raise ValueError("invalid SRS rule")
@@ -95,6 +107,8 @@ def convert(source: dict) -> list[str]:
             output.add("domain_exact " + normalize_domain(domain))
         for domain in values(rule, "domain_suffix"):
             output.add("domain_suffix " + normalize_domain(domain))
+        for keyword in values(rule, "domain_keyword"):
+            output.add("domain_keyword " + normalize_domain_keyword(keyword))
         for cidr in values(rule, "ip_cidr"):
             network = ipaddress.ip_network(cidr, strict=False)
             if network.version != 4:
@@ -106,7 +120,7 @@ def convert(source: dict) -> list[str]:
             output.add("port " + str(port))
     if not any(item.startswith(("domain_", "ip ")) for item in output):
         raise ValueError("SRS produced no NB address rules")
-    for prefix in ("domain_exact ", "domain_suffix ", "ip ", "port "):
+    for prefix in ("domain_exact ", "domain_suffix ", "domain_keyword ", "ip ", "port "):
         if sum(item.startswith(prefix) for item in output) > 8192:
             raise ValueError("SRS exceeds the NB whitelist capacity")
     return sorted(output)

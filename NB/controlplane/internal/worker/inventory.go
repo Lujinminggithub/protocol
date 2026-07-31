@@ -120,7 +120,7 @@ func (c *Client) inventoryLines() []inventoryLine {
 			Spec: map[string]any{"line_id": line.LineID, "resource_group": line.ResourceGroup,
 				"instance_id": line.InstanceID, "bandwidth_mbps": int(math.Round(line.PackageMbps)),
 				"socks_port": line.SocksPort, "udp_port_min": line.UDPPortMin, "udp_port_max": line.UDPPortMax,
-				"relay_port": line.MiddlePort, "exit_port": line.ExitPort, "whitelist": []string{},
+				"relay_port": line.MiddlePort, "exit_port": line.ExitPort, "exit_bind_ip": line.ExitBindIP, "whitelist": []string{},
 				"build_mode": line.BuildMode, "artifact_ref": "build/nb_node", "source_ref": "repo://current",
 				"srs_ref": "", "jump_policy": "auto", "nodes": nodes},
 		})

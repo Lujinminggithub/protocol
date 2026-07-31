@@ -1,5 +1,6 @@
 #include "nb_lstream.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +21,18 @@ int nb_lstream_frame_encode(uint8_t* out,size_t cap,uint8_t type,uint64_t flow_h
     put64(out+8,flow_hi);put64(out+16,flow_lo);put64(out+24,offset);put32(out+32,payload_length);
     if(payload_length)memcpy(out+NB_LSTREAM_HEADER,payload,payload_length);
     return (int)(NB_LSTREAM_HEADER+payload_length);
+}
+int nb_lstream_bootstrap_encode(uint8_t* out,size_t cap,int priority,const char* route,
+    uint8_t type,uint64_t flow_hi,uint64_t flow_lo,uint64_t offset){
+    if(out==NULL||route==NULL||priority<=0||priority>255||
+        (type!=NB_LSTREAM_OPEN&&type!=NB_LSTREAM_RESUME)||strchr(route,'\n')||strchr(route,'\r'))return -1;
+    char flow[33];if(nb_lstream_flow_render(flow,flow_hi,flow_lo)!=0)return -1;
+    int header=snprintf((char*)out,cap,"%d;L=%s;%s\n",priority,flow,route);
+    if(header<=0||(size_t)header>=cap)return -1;
+    int frame=nb_lstream_frame_encode(out+(size_t)header,cap-(size_t)header,type,
+        flow_hi,flow_lo,offset,NULL,0);
+    if(frame<0)return -1;
+    return header+frame;
 }
 int nb_lstream_frame_decode(const uint8_t* wire,size_t length,nb_lstream_frame_t* out){
     if(wire==NULL||out==NULL||length<NB_LSTREAM_HEADER||get32(wire)!=NB_LSTREAM_MAGIC||wire[4]!=NB_LSTREAM_VERSION||

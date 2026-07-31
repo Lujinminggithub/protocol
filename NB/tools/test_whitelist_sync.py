@@ -13,9 +13,18 @@ def main() -> None:
         }],
     })
     assert "domain_exact exact.example" in rules
+    assert "domain_exact odr.itunes.apple.com" in rules
     assert "domain_suffix example.org" in rules
     assert "ip 10.0.0.0/8" in rules
     assert "port 443" in rules
+    scalar_rules = whitelist_sync.convert({
+        "version": 3,
+        "rules": [{"domain": "scalar.example", "domain_keyword": "bytecdn", "ip_cidr": "192.0.2.8/29", "port": 8443}],
+    })
+    assert "domain_exact scalar.example" in scalar_rules
+    assert "domain_keyword bytecdn" in scalar_rules
+    assert "ip 192.0.2.8/29" in scalar_rules
+    assert "port 8443" in scalar_rules
     try:
         whitelist_sync.convert({"version": 1, "rules": [{"domain_regex": [".*"]}]})
         raise AssertionError("unsupported SRS rule was accepted")

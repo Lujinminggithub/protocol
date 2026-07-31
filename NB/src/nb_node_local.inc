@@ -7,23 +7,23 @@ static int socks_udp_bind_socket(struct sockaddr_in* bound){
         &g_socks_udp_port_next,bound);
 }
 
-static void entry_accept(void){
+static int entry_accept_one(void){
     struct sockaddr_storage peer;
     socklen_t peer_len=sizeof(peer);
     int fd=accept(G.tcp_listen_fd,(struct sockaddr*)&peer,&peer_len);
-    if(fd<0) return;
+    if(fd<0) return 0;
     set_nonblock(fd); int one=1; setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one));
     proxy_stream_t* p=ps_alloc();
-    if(!p){ log4c_warn("stream table full, drop tcp accept"); close(fd); return; }
+    if(!p){ log4c_warn("stream table full, drop tcp accept"); close(fd); return 1; }
     p->tcp_fd=fd;
     sockaddr_to_text((struct sockaddr*)&peer,peer_len,p->peer_addr,sizeof(p->peer_addr));
     p->udp_tcp_peer=peer;p->udp_tcp_peer_len=peer_len;
     p->down_pool_id=0;
-    if(epoll_tcp_update(p,1)!=0){log4c_warn("entry id=%u epoll add fail: %s",p->id,strerror(errno));ps_free(p);return;}
+    if(epoll_tcp_update(p,1)!=0){log4c_warn("entry id=%u epoll add fail: %s",p->id,strerror(errno));ps_free(p);return 1;}
     if(G.socks_enabled){
         p->socks_stage=0; /* 等 SOCKS5 握手拿到 target 后再开 QUIC stream */
         log4c_debug("entry id=%u accept fd=%d (socks, awaiting handshake)",p->id,fd);
-        return;
+        return 1;
     }
     snprintf(p->route,sizeof(p->route),"%s",G.route_str);
     { nb_flow_policy_t pol; char thost[256]="-"; int tport=0;
@@ -34,8 +34,17 @@ static void entry_accept(void){
       log4c_info("entry id=%u classify fixed route=%s host=%s port=%d class=%s lane=%s fec=%s rule=%s prio=%d",
         p->id, G.route_str, parsed ? thost : "-", parsed ? tport : 0,
         nb_flow_class_name(pol.flow_class), nb_flow_lane_name(pol.lane_hint), nb_flow_fec_name(pol.fec_hint), pol.rule_name, prio);
-      if(downstream_open_stream(p,G.route_str,&pol)!=0){ ps_free(p); return; } }
+      if(downstream_open_stream(p,G.route_str,&pol)!=0){ ps_free(p); return 1; } }
     log4c_info("entry id=%u accept fd=%d -> down_sid=%llu route=%s",p->id,fd,(unsigned long long)p->down_stream_id,G.route_str);
+    return 1;
+}
+
+static void entry_accept(void){
+    /* Shadowrocket latency checks arrive as a burst. Drain the level-triggered
+     * listen queue so short probes do not wait behind a full event-loop turn. */
+    for(int accepted=0;accepted<64;accepted++){
+        if(!entry_accept_one())break;
+    }
 }
 
 static int socks_auth_finish(proxy_stream_t* p,const char* username,int credential_valid,

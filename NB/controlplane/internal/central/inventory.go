@@ -48,6 +48,7 @@ type LineSpec struct {
 	UDPPortMax    int             `json:"udp_port_max"`
 	RelayPort     int             `json:"relay_port"`
 	ExitPort      int             `json:"exit_port"`
+	ExitBindIP    string          `json:"exit_bind_ip"`
 	Whitelist     json.RawMessage `json:"whitelist"`
 	BuildMode     string          `json:"build_mode"`
 	ArtifactRef   string          `json:"artifact_ref"`
@@ -177,16 +178,16 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 	stamp := now()
 	_, err = tx.ExecContext(ctx, `INSERT INTO line_specs
  (line_id,resource_group,instance_id,bandwidth_mbps,socks_port,udp_port_min,udp_port_max,
- relay_port,exit_port,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
+ relay_port,exit_port,exit_bind_ip,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
  resource_group=excluded.resource_group,instance_id=excluded.instance_id,
  bandwidth_mbps=excluded.bandwidth_mbps,socks_port=excluded.socks_port,
  udp_port_min=excluded.udp_port_min,udp_port_max=excluded.udp_port_max,
- relay_port=excluded.relay_port,exit_port=excluded.exit_port,whitelist=excluded.whitelist,
+ relay_port=excluded.relay_port,exit_port=excluded.exit_port,exit_bind_ip=excluded.exit_bind_ip,whitelist=excluded.whitelist,
  build_mode=excluded.build_mode,artifact_ref=excluded.artifact_ref,source_ref=excluded.source_ref,
  srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at`,
 		spec.LineID, spec.ResourceGroup, spec.InstanceID, spec.BandwidthMbps, spec.SocksPort,
-		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort,
+		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort, spec.ExitBindIP,
 		normalizedJSON(spec.Whitelist, `[]`), spec.BuildMode, spec.ArtifactRef, spec.SourceRef,
 		spec.SRSRef, spec.JumpPolicy, stamp, stamp)
 	if err != nil {
@@ -214,10 +215,10 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 	var item LineSpec
 	var whitelist []byte
 	err := s.db.QueryRowContext(ctx, `SELECT line_id,resource_group,instance_id,bandwidth_mbps,
- socks_port,udp_port_min,udp_port_max,relay_port,exit_port,whitelist,build_mode,artifact_ref,
+ socks_port,udp_port_min,udp_port_max,relay_port,exit_port,exit_bind_ip,whitelist,build_mode,artifact_ref,
  source_ref,srs_ref,jump_policy,created_at,updated_at FROM line_specs WHERE line_id=?`, lineID).Scan(
 		&item.LineID, &item.ResourceGroup, &item.InstanceID, &item.BandwidthMbps, &item.SocksPort,
-		&item.UDPPortMin, &item.UDPPortMax, &item.RelayPort, &item.ExitPort, &whitelist,
+		&item.UDPPortMin, &item.UDPPortMax, &item.RelayPort, &item.ExitPort, &item.ExitBindIP, &whitelist,
 		&item.BuildMode, &item.ArtifactRef, &item.SourceRef, &item.SRSRef, &item.JumpPolicy,
 		&item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
@@ -251,6 +252,43 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 		}
 	}
 	return item, nil
+}
+
+// ActiveLineSpecs returns only deployed lines. Agents use this to rebuild
+// ephemeral worker state after a controller migration or restart.
+func (s *Store) ActiveLineSpecs(ctx context.Context) ([]LineSpec, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM lines WHERE status IN ('active','maintenance') ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	result := make([]LineSpec, 0, len(ids))
+	for _, id := range ids {
+		spec, loadErr := s.LineSpec(ctx, id)
+		if errors.Is(loadErr, sql.ErrNoRows) {
+			continue
+		}
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		result = append(result, spec)
+	}
+	return result, nil
 }
 
 func lineDevice(spec LineSpec, role string) string {

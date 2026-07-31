@@ -64,6 +64,7 @@ type LineSpec struct {
 	UDPPortMax         int               `json:"udp_port_max"`
 	MiddlePort         int               `json:"middle_port"`
 	ExitPort           int               `json:"exit_port"`
+	ExitBindIP         string            `json:"exit_bind_ip,omitempty"`
 	EnabledOperations  []string          `json:"enabled_operations"`
 	DisabledReason     string            `json:"disabled_reason"`
 	StateDir           string            `json:"-"`

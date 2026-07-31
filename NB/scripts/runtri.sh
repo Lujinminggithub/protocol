@@ -160,6 +160,36 @@ print("RESULT PASS: short business sessions keep route health neutral")
 PY
 
 python3 - <<'PY'
+import concurrent.futures
+import os
+import socket
+import threading
+import time
+
+entry=("127.0.0.1",int(os.environ["ENTRY_PORT"]))
+start=threading.Event()
+def greeting(_):
+    sock=socket.create_connection(entry,timeout=2)
+    sock.settimeout(2)
+    start.wait()
+    began=time.monotonic()
+    sock.sendall(b"\x05\x01\x02")
+    reply=sock.recv(2)
+    elapsed=time.monotonic()-began
+    sock.close()
+    if reply!=b"\x05\x02":raise RuntimeError(f"bad SOCKS greeting reply: {reply!r}")
+    return elapsed
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+    futures=[executor.submit(greeting,index) for index in range(64)]
+    time.sleep(0.1)
+    start.set()
+    elapsed=[future.result(timeout=3) for future in futures]
+assert max(elapsed)<2.0,max(elapsed)
+print(f"RESULT PASS: 64 concurrent SOCKS greetings max={max(elapsed):.3f}s")
+PY
+
+python3 - <<'PY'
 import math,socket,struct
 
 def recv_exact(sock,size):

@@ -235,8 +235,15 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--socks-port", socks, "--via-entry-ssh", "--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.upgrade":
-		return []commandStep{{Name: python, Stage: "build", Args: []string{deploy, "build"}},
-			{Name: python, Stage: "deploy", Args: []string{deploy, "deploy-socks", "--socks-port", socks}}}, nil
+		result := []commandStep{{Name: python, Stage: "build", Args: []string{deploy, "build"}}}
+		if line.WhitelistSourceEnv != "" {
+			result = append(result, commandStep{Name: python, Stage: "whitelist-fetch", Args: []string{filepath.Join(tools, "whitelist_sync.py"), "--source-env", line.WhitelistSourceEnv, "--mode", "auto", "--sing-box", line.SingBox, "--state-dir", filepath.Join(line.StateDir, "whitelist-sync"), "--output", line.WhitelistFile}})
+		}
+		if line.WhitelistFile != "" {
+			result = append(result, commandStep{Name: python, Stage: "whitelist", Args: []string{deploy, "wl-push", "--whitelist", line.WhitelistFile}})
+		}
+		result = append(result, commandStep{Name: python, Stage: "deploy", Args: []string{deploy, "deploy-socks", "--socks-port", socks}})
+		return result, nil
 	case "line.rollback":
 		if !safeDeployment.MatchString(request.Deployment) {
 			return nil, errors.New("rollback requires a valid deployment")

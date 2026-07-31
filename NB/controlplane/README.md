@@ -4,10 +4,10 @@
 reconciles the C node's `users.conf` and `tenants.conf`. It also collects worker
 health/metrics and sends durable, idempotent events to an existing web service.
 
-## Windows central operations service
+## Central operations service
 
-`nb-web` is the central multi-line service. It runs on the Windows operations
-host, embeds its browser UI in the Go binary, and keeps device inventory, line
+`nb-web` is the central multi-line service. It embeds its browser UI in the Go
+binary and keeps device inventory, line
 topology, latest worker snapshots, incidents and typed operations in SQLite.
 It never stores SSH passwords or node private keys; a line stores only a
 `secret_ref` that points to the external secret owner.
@@ -31,6 +31,25 @@ only that child when the worker exits:
 
 The separate start scripts remain available for service installation and
 diagnostics. Do not run them at the same time as the combined launcher.
+
+For the production Linux layout, install the binaries, repository snapshot and
+private configuration below `/opt/nb-controlplane`, then install the units from
+`controlplane/linux`. The Web service listens on `127.0.0.1:9091`; operators use
+an SSH tunnel so bearer tokens are never sent over public plaintext HTTP:
+
+```bash
+install -d -m 0700 /opt/nb-controlplane/{bin,etc,data,repo}
+/opt/nb-controlplane/repo/controlplane/linux/install.sh
+systemctl start nb-web nb-web-worker
+```
+
+```powershell
+ssh -N -L 9091:127.0.0.1:9091 root@hk-operations-host
+```
+
+The Windows SQLite database is copied with SQLite's online-backup API and then
+copied once more after the old processes stop. This preserves operation events,
+snapshots and outbox history without replaying a partially running operation.
 
 Open `http://127.0.0.1:9091` and enter the admin token. The central API uses
 `Authorization: Bearer`; all operation mutations additionally require an
@@ -107,7 +126,8 @@ Incomplete legacy lines can be deleted in the UI; deletion is blocked while an
 operation is active, and configured active lines must be disabled first. A
 separate deletion audit record is retained.
 
-The Windows worker also collects every fixed registry line every 15 seconds over
+The worker collects every fixed registry line and every active dynamic line
+advertised by the central agent API every 15 seconds over
 the same verified SSH/jump topology used for deployment. It reads only the
 line-specific `nb-<instance>-<role>-<worker>.ctl` sockets and posts normalized
 snapshots to the local central agent API. The line identity always comes from
@@ -118,7 +138,10 @@ nodes or lines. Override the interval with `NB_WEB_WORKER_SNAPSHOT_SECONDS`.
 Lines sharing GZ/HK use isolated deployment namespaces. The registry allocates
 an `instance_id`, SOCKS port, Entry UDP relay range, Relay listener port, and
 Exit listener port for every line in the resource group. Startup rejects port
-or UDP-range collisions. Relay and Exit transports run two worker lanes, so a
+or UDP-range collisions. A line may also set `exit_bind_ip` during opening. The value must be IPv4 and the
+worker verifies that it is assigned to the selected Exit before activation;
+the Exit process then binds outbound TCP and UDP sockets to that address. An
+empty value preserves the Exit host's default route. Relay and Exit transports run two worker lanes, so a
 base port reserves the inclusive span `[base, base+1]`; adjacent base ports are
 therefore a collision on the same device. The legacy/default namespace can keep
 the existing US line on SOCKS `1080` and Relay base `4443`; a second line on the
@@ -147,7 +170,15 @@ logical or inverted rules reject the update and preserve the previous version.
 The worker checks every five minutes by default (`NB_WEB_WORKER_MAINTENANCE_SECONDS`)
 and transactionally updates both Entry and Exit. Entry rejects unmatched flows
 before tunnel allocation; Exit keeps the same fail-closed policy as defense in
-depth.
+depth. The exact host `odr.itunes.apple.com` is retained as an operational rule
+so Shadowrocket's default connectivity check measures the NB path instead of
+being rejected by the business whitelist.
+
+Production keeps the signed source only in
+`/opt/nb-controlplane/etc/nb-web-worker.env` as `NB_LINE_SRS_URL`. The same
+setting accepts the metadata endpoint (`MD5|HTTPS URL`) or the direct SRS
+endpoint. Downloads are size-limited, metadata MD5 is verified, direct content
+is hashed locally, and the active file is replaced atomically only on change.
 
 `line.validate` reaches the Entry-local SOCKS listener through the pinned SSH
 connection. This keeps validation available when a cloud security group does

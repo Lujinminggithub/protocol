@@ -16,6 +16,7 @@ typedef struct {uint32_t net,mask;} nb_whitelist_cidr_t;
 typedef struct {
     char domain_suffixes[NB_WHITELIST_MAX][128];int domain_suffix_count;
     char domain_exact[NB_WHITELIST_MAX][128];int domain_exact_count;
+    char domain_keywords[NB_WHITELIST_MAX][128];int domain_keyword_count;
     nb_whitelist_cidr_t cidrs[NB_WHITELIST_MAX];int cidr_count;
     uint16_t ports[NB_WHITELIST_MAX];int port_count;
     int enabled;char path[256];time_t mtime;
@@ -46,6 +47,10 @@ static int load(const char* path,char* error,size_t error_cap){
             size_t length=strlen(value);
             if(!length||length>=sizeof(next.domain_exact[0])||next.domain_exact_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid exact domain");}
             memcpy(next.domain_exact[next.domain_exact_count++],value,length+1);
+        }else if(!strcmp(keyword,"domain_keyword")){
+            size_t length=strlen(value);
+            if(!length||length>=sizeof(next.domain_keywords[0])||next.domain_keyword_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid domain keyword");}
+            memcpy(next.domain_keywords[next.domain_keyword_count++],value,length+1);
         }else if(!strcmp(keyword,"port")){
             char* end=NULL;long port=strtol(value,&end,10);
             if(end==value||*end||port<=0||port>65535||next.port_count>=NB_WHITELIST_MAX){fclose(file);return fail(error,error_cap,"invalid port: %s",value);}
@@ -60,7 +65,7 @@ static int load(const char* path,char* error,size_t error_cap){
         }else{fclose(file);return fail(error,error_cap,"unknown directive: %s",keyword);}
     }
     fclose(file);
-    if(!next.domain_suffix_count&&!next.domain_exact_count&&!next.cidr_count)return fail(error,error_cap,"no domain or cidr rules");
+    if(!next.domain_suffix_count&&!next.domain_exact_count&&!next.domain_keyword_count&&!next.cidr_count)return fail(error,error_cap,"no domain or cidr rules");
     struct stat status;if(stat(path,&status)==0)next.mtime=status.st_mtime;
     next.enabled=1;state=next;return 0;
 }
@@ -82,9 +87,14 @@ int nb_whitelist_allowed(const char* host,int port){
         for(int i=0;i<state.cidr_count;i++)if((ip&state.cidrs[i].mask)==state.cidrs[i].net)return 1;
         return 0;
     }
-    if(!state.domain_suffix_count&&!state.domain_exact_count)return 1;
+    if(!state.domain_suffix_count&&!state.domain_exact_count&&!state.domain_keyword_count)return 1;
     size_t host_length=strlen(host);
     for(int i=0;i<state.domain_exact_count;i++)if(!strcasecmp(host,state.domain_exact[i]))return 1;
+    for(int i=0;i<state.domain_keyword_count;i++){
+        size_t length=strlen(state.domain_keywords[i]);
+        for(size_t offset=0;offset+length<=host_length;offset++)
+            if(!strncasecmp(host+offset,state.domain_keywords[i],length))return 1;
+    }
     for(int i=0;i<state.domain_suffix_count;i++){
         size_t length=strlen(state.domain_suffixes[i]);
         if((host_length==length&&!strcasecmp(host,state.domain_suffixes[i]))||
