@@ -28,6 +28,21 @@ int main(void){
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,40000,0,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,80000,0,3000000,&c2s,&s2c)==NB_LIVE_FLOW_PROMOTE_MEDIA);
 
+    runtime=(nb_live_flow_runtime_t){0};
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,8000,150000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,16000,300000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_DEMOTE_BULK);
+
+    runtime=(nb_live_flow_runtime_t){0};
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,128000,16000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,256000,32000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+
+    runtime=(nb_live_flow_runtime_t){0};
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,40000,400000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,80000,800000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+
     nb_live_sched_t sched={0};
     assert(nb_live_sched_grant(&sched,NB_FLOW_CLASS_CTRL,64*1024,1000000,1)==32*1024);
     assert(nb_live_sched_grant(&sched,NB_FLOW_CLASS_CTRL,4096,1000000,1)==0);

@@ -31,6 +31,7 @@ typedef struct {
     uint64_t sampled_s2c;
     unsigned high_uplink_windows;
     unsigned high_ctrl_windows;
+    unsigned high_downlink_windows;
 } nb_live_flow_runtime_t;
 
 typedef enum {

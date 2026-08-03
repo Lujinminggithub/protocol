@@ -38,6 +38,14 @@ int main(void)
         NB_FLOW_CLASS_BULK, NB_FLOW_LANE_BULK, NB_PRIO_BULK, 1);
     assert_policy("api16-normal-c-useast1a.tiktokv.com", 443,
         NB_FLOW_CLASS_CTRL, NB_FLOW_LANE_LATENCY, NB_PRIO_CTRL, 1);
+    assert_policy("pull-f5-sg01.tiktokcdn.com", 443,
+        NB_FLOW_CLASS_BULK, NB_FLOW_LANE_BULK, NB_PRIO_BULK, 1);
+    assert_policy("ttcdn-useast.tiktokv.com", 443,
+        NB_FLOW_CLASS_BULK, NB_FLOW_LANE_BULK, NB_PRIO_BULK, 1);
+    assert_policy("sf16-video.tiktokcdn.com", 443,
+        NB_FLOW_CLASS_BULK, NB_FLOW_LANE_BULK, NB_PRIO_BULK, 1);
+    assert_policy("v16m-default.tiktokcdn.com", 443,
+        NB_FLOW_CLASS_BULK, NB_FLOW_LANE_BULK, NB_PRIO_BULK, 1);
     assert_policy("example.invalid", 443,
         NB_FLOW_CLASS_BULK, NB_FLOW_LANE_BULK, NB_PRIO_BULK, 0);
 
