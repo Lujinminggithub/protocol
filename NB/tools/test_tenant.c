@@ -19,12 +19,13 @@ int main(void){
 #else
     snprintf(path,sizeof(path),"/tmp/nb-tenant-%ld",(long)getpid());
 #endif
-    FILE* f=fopen(path,"w");if(!f)return 1;fputs("tenant alice 1 2 8 1\ntenant bob 0 0 0 0\n",f);fclose(f);
+    FILE* f=fopen(path,"w");if(!f)return 1;fputs("tenant alice 1 2 8 1 3\ntenant bob 0 0 0 0\n",f);fclose(f);
     nb_tenants_t tenants;int ok=nb_tenants_load(&tenants,path,error,sizeof(error))==0;
     int alice=nb_tenant_find(&tenants,"alice");ok=ok&&alice==0&&nb_tenant_find(&tenants,"missing")==-1;
+    ok=ok&&tenants.items[alice].rate_bytes_per_sec==1000&&tenants.items[alice].burst_bytes==3000;
     ok=ok&&nb_tenant_acquire(&tenants,alice,0,1000000)==0&&nb_tenant_acquire(&tenants,alice,0,1000000)!=0;
     nb_tenant_release(&tenants,alice,0);ok=ok&&nb_tenant_acquire(&tenants,alice,0,1000000)==0;
-    size_t allowed=nb_tenant_allowance(&tenants,alice,2000,1000000);ok=ok&&allowed==1000;nb_tenant_consume(&tenants,alice,1000);
+    size_t allowed=nb_tenant_allowance(&tenants,alice,4000,1000000);ok=ok&&allowed==3000;nb_tenant_consume(&tenants,alice,3000);
     allowed=nb_tenant_allowance(&tenants,alice,1000,1500000);ok=ok&&allowed==500;
     nb_tenant_account(&tenants,alice,400,100);ok=ok&&nb_tenants_render_json(&tenants,json,sizeof(json))>0&&strstr(json,"\"bytes_up\":400");
 #ifndef _WIN32
@@ -36,7 +37,7 @@ int main(void){
         nb_tenants_enable_shared(&peer,state_path,error,sizeof(error))!=0)_exit(2);
         int rc=nb_tenant_acquire(&peer,0,0,2000000)==0?3:0;nb_tenants_close(&peer);_exit(rc);}
     int status=0;ok=ok&&child>0&&waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0;
-    nb_tenant_release(&shared,shared_alice,0);ok=ok&&nb_tenant_take(&shared,shared_alice,1000,2000000)==1000;
+    nb_tenant_release(&shared,shared_alice,0);ok=ok&&nb_tenant_take(&shared,shared_alice,3000,2000000)==3000;
     nb_tenant_refund(&shared,shared_alice,250);ok=ok&&nb_tenant_allowance(&shared,shared_alice,251,2000000)==250;
     nb_tenants_close(&shared);unlink(state_path);
 #endif

@@ -14,7 +14,9 @@ def main():
             try:security_rotate.keygen(generated)
             except ValueError:pass
             else:raise AssertionError("keygen overwrote an existing key")
-            out=pathlib.Path(tmp)/"bundle";doc=security_rotate.prepare(security_rotate.deploy.SECURITY_DIR,out)
+            current=pathlib.Path(tmp)/"current";current.mkdir()
+            (current/"ca.pem").write_text("test-current-ca\n",encoding="ascii")
+            out=pathlib.Path(tmp)/"bundle";doc=security_rotate.prepare(current,out)
             loaded=json.loads((out/"manifest.json").read_text(encoding="utf-8"));security_rotate.verify(loaded)
             assert doc["state"]=="prepared" and (out/"ca-overlap.pem").is_file()
             loaded["state"]="tampered"

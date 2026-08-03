@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import copy
+import pathlib
+import tempfile
 
-from line_provision import (assert_qualified, build_artifacts,
+from line_provision import (assert_qualified, build_artifacts, conservative_candidate,
                             qualification_rate, transient_probe_failure,
                             validate_line)
 
@@ -64,6 +66,7 @@ def main() -> None:
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["entry"]
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["middle"]
     assert artifacts["policy"]["tenants"][0]["rate_kbps"] == 10000
+    assert artifacts["policy"]["tenants"][0]["burst_seconds"] == 10
     assert artifacts["client"]["server"] == "192.0.2.10"
     assert "u%40ser:p%3Aa%2Fss@" in artifacts["client"]["shadowrocket_url"]
 
@@ -94,6 +97,25 @@ def main() -> None:
         raise AssertionError("样本不足必须拒绝")
     except ValueError as error:
         assert "最小有效窗口" in str(error)
+
+    provisional = build_artifacts(
+        line, weak, hosts, baseline, "p:a/ss", 1.25,
+        allow_conservative_fallback=True)
+    assert provisional["qualification"]["status"] == "provisional"
+    assert provisional["profile"]["status"] == "provisional-conservative"
+    assert provisional["profile"]["service_package"]["admission"] == "pending-validation"
+    assert provisional["hosts"]["transport"] == hosts["transport"]
+    assert provisional["client"]["shadowrocket_url"].startswith("socks5://")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        hosts_path, profile_path = root / "hosts.json", root / "profile.json"
+        hosts_path.write_text("{}\n", encoding="utf-8")
+        profile_path.write_text("{}\n", encoding="utf-8")
+        fallback = conservative_candidate(hosts_path, profile_path, 10, 1.25,
+                                          "probe unavailable")
+        assert fallback["admission"]["status"] == "pending-validation"
+        assert fallback["fallback_reason"] == "probe unavailable"
     print("line_provision tests passed")
 
 

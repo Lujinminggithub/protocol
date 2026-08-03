@@ -114,14 +114,17 @@ worker writes the operation result to its local state directory before
 acknowledging completion, which prevents a lost HTTP response from rerunning a
 completed deployment.
 
-After a successful `line.open`, the worker reads the qualified private
-`client.json` and attaches its `socks5://` URL to the protected operation
-result. The authenticated line and operation detail views show the URL, a copy
-action, and a server-generated QR code. On startup the worker also backfills
-existing qualified line artifacts, so an already completed line does not need
-to be reopened. Client URLs contain credentials: they are never emitted as
-operation events or normal logs, and the QR response uses `Cache-Control:
-no-store`.
+After a successful `line.open`, the worker reads the private `client.json` and
+attaches its `socks5://` URL to the protected operation result. Capacity probing
+is advisory for opening: complete evidence produces a `stable-qualified`
+profile, while insufficient samples or a probe timeout retain the conservative
+baseline as `provisional-conservative` and leave capacity `pending-validation`.
+Only the separate `line.validate` and release/canary gates remain strict. The
+authenticated line and operation detail views show the URL, a copy action, and
+a server-generated QR code. On startup the worker also backfills existing line
+artifacts, so an already completed line does not need to be reopened. Client
+URLs contain credentials: they are never emitted as operation events or normal
+logs, and the QR response uses `Cache-Control: no-store`.
 
 On every heartbeat, fixed worker registrations also report non-secret device
 metadata and topology. The central service creates only missing inventory and

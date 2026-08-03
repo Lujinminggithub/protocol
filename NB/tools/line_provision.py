@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""批量探测 NB 线路，并为通过容量准入的线路生成稳定配置和客户端信息。"""
+"""探测 NB 线路，并生成严格稳定配置或显式待复验的保守配置。"""
 from __future__ import annotations
 
 import argparse
@@ -82,6 +82,26 @@ def qualification_rate(package_mbps: float, headroom_ratio: float) -> float:
     return round(package_mbps * headroom_ratio, 3)
 
 
+def conservative_candidate(hosts_path: pathlib.Path, profile_path: pathlib.Path,
+                           package_mbps: float, headroom_ratio: float,
+                           reason: str) -> dict:
+    """Build evidence metadata when probing cannot safely tune transport values."""
+    return {
+        "schema_version": 2,
+        "baseline_hosts_sha256": sha256(hosts_path),
+        "baseline_profile_sha256": sha256(profile_path),
+        "service_package": {
+            "committed_mbps": package_mbps,
+            "qualification_mbps": qualification_rate(package_mbps, headroom_ratio),
+            "headroom_ratio": headroom_ratio,
+        },
+        "admission": {"status": "pending-validation", "achieved_mbps": 0,
+                      "reasons": [reason]},
+        "segments": {},
+        "fallback_reason": reason,
+    }
+
+
 def assert_qualified(candidate: dict, package_mbps: float,
                      headroom_ratio: float) -> None:
     expected = qualification_rate(package_mbps, headroom_ratio)
@@ -142,12 +162,20 @@ def client_document(line: dict, hosts: dict, password: str) -> dict:
 
 
 def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
-                    password: str, headroom_ratio: float) -> dict:
+                    password: str, headroom_ratio: float,
+                    allow_conservative_fallback: bool = False) -> dict:
     package = float(line["package_mbps"])
-    assert_qualified(candidate, package, headroom_ratio)
+    qualification_error = ""
+    try:
+        assert_qualified(candidate, package, headroom_ratio)
+    except ValueError as error:
+        if not allow_conservative_fallback:
+            raise
+        qualification_error = str(candidate.get("fallback_reason") or error)
+    qualified = not qualification_error
     generated_hosts = copy.deepcopy(hosts)
-    entry_transport = selected_transport(candidate, "entry_middle")
-    middle_transport = selected_transport(candidate, "middle_exit")
+    entry_transport = selected_transport(candidate, "entry_middle") if qualified else {}
+    middle_transport = selected_transport(candidate, "middle_exit") if qualified else {}
     generated_hosts.setdefault("transport", {}).setdefault("entry", {}).update(entry_transport)
     generated_hosts.setdefault("transport", {}).setdefault("middle", {}).update(middle_transport)
     generated_hosts["line_service"] = {
@@ -160,7 +188,7 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
     profile = copy.deepcopy(baseline)
     profile["schema_version"] = int(profile.get("schema_version", 0)) + 1
     profile["line_id"] = line["line_id"]
-    profile["status"] = "stable-qualified"
+    profile["status"] = "stable-qualified" if qualified else "provisional-conservative"
     profile["generated_at_utc"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     profile["source_candidate_sha256"] = hashlib.sha256(
         json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -170,9 +198,11 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
         "committed_mbps": package,
         "qualification_mbps": qualification_rate(package, headroom_ratio),
         "headroom_ratio": headroom_ratio,
-        "measured_mbps": float(candidate["admission"].get("achieved_mbps", 0) or 0),
-        "admission": "passed",
+        "measured_mbps": float((candidate.get("admission") or {}).get("achieved_mbps", 0) or 0),
+        "admission": "passed" if qualified else "pending-validation",
     }
+    if qualification_error:
+        profile["qualification_warning"] = qualification_error
 
     username = str(line["client"]["username"])
     rate_kbps = int(round(package * 1000))
@@ -189,11 +219,14 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
         "schema_version": 1,
         "fixed_exit": profile.get("fixed_exit"),
         "tenants": [{"name": username, "max_tcp": 256, "max_udp": 64,
-                     "rate_kbps": rate_kbps, "quota_mb": 0}],
+                     "rate_kbps": rate_kbps, "quota_mb": 0,
+                     "burst_seconds": 10}],
         "routes": routes,
     }
     return {"hosts": generated_hosts, "profile": profile, "policy": policy,
-            "client": client_document(line, hosts, password)}
+            "client": client_document(line, hosts, password),
+            "qualification": {"status": "qualified" if qualified else "provisional",
+                              "warning": qualification_error}}
 
 
 def write_json(path: pathlib.Path, value: dict, private: bool = False) -> None:
@@ -257,6 +290,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=pathlib.Path)
     parser.add_argument("--line", action="append", dest="selected_lines",
                         help="只执行指定 line_id，可重复")
+    parser.add_argument("--allow-conservative-fallback", action="store_true",
+                        help="探针不足时沿用基线参数并标记待复验；仅供开线流程使用")
     args = parser.parse_args()
     inventory_path = args.inventory.resolve()
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -278,18 +313,36 @@ def main() -> None:
                 raise ValueError(f"重复 line_id: {line_id}")
             seen.add(line_id)
             candidate_path = line_dir / "probe-candidate.json"
-            candidate, hosts, baseline = run_probe(
-                line, inventory_path.parent, candidate_path, inventory.get("defaults", {}))
+            try:
+                candidate, hosts, baseline = run_probe(
+                    line, inventory_path.parent, candidate_path, inventory.get("defaults", {}))
+            except Exception as error:
+                if not args.allow_conservative_fallback:
+                    raise
+                hosts_path = resolve_path(line["hosts_file"], inventory_path.parent)
+                profile_path = resolve_path(line["baseline_profile"], inventory_path.parent)
+                if not hosts_path.is_file() or not profile_path.is_file():
+                    raise
+                hosts = json.loads(hosts_path.read_text(encoding="utf-8"))
+                baseline = json.loads(profile_path.read_text(encoding="utf-8"))
+                headroom = float(line.get("headroom_ratio",
+                                         inventory.get("defaults", {}).get("headroom_ratio", 1.25)))
+                candidate = conservative_candidate(
+                    hosts_path, profile_path, float(line["package_mbps"]), headroom, str(error))
+                print(f"[{line_id}] WARNING: 主动探针未完成，使用保守基线并标记待复验: {error}",
+                      file=sys.stderr)
             password = os.environ[str(line["client"]["password_env"])]
             headroom = float(line.get("headroom_ratio",
                                      inventory.get("defaults", {}).get("headroom_ratio", 1.25)))
-            artifacts = build_artifacts(line, candidate, hosts, baseline, password, headroom)
+            artifacts = build_artifacts(line, candidate, hosts, baseline, password, headroom,
+                                        allow_conservative_fallback=args.allow_conservative_fallback)
             write_json(line_dir / "stable-profile.json", artifacts["profile"])
             write_json(line_dir / "deployment-hosts.json", artifacts["hosts"])
             write_json(line_dir / "tenant-route-policy.json", artifacts["policy"])
             write_json(line_dir / "client.json", artifacts["client"], private=True)
+            status = artifacts["qualification"]["status"]
             summaries.append({
-                "line_id": line_id, "status": "qualified",
+                "line_id": line_id, "status": status,
                 "package_mbps": float(line["package_mbps"]),
                 "measured_mbps": artifacts["profile"]["service_package"]["measured_mbps"],
                 "profile": str(line_dir / "stable-profile.json"),
@@ -297,8 +350,12 @@ def main() -> None:
                 "policy": str(line_dir / "tenant-route-policy.json"),
                 "client": str(line_dir / "client.json"),
                 "client_endpoint": f"{artifacts['client']['server']}:{artifacts['client']['port']}",
+                "warning": artifacts["qualification"]["warning"],
             })
-            print(f"[{line_id}] 通过 {line['package_mbps']} Mbps 套餐准入；客户端配置: {line_dir / 'client.json'}")
+            if status == "qualified":
+                print(f"[{line_id}] 通过 {line['package_mbps']} Mbps 套餐准入；客户端配置: {line_dir / 'client.json'}")
+            else:
+                print(f"[{line_id}] 开线使用保守默认配置，容量待复验；客户端配置: {line_dir / 'client.json'}")
         except Exception as error:
             line_dir.mkdir(parents=True, exist_ok=True)
             summaries.append({"line_id": line_id or "invalid", "status": "rejected", "error": str(error)})
@@ -308,7 +365,8 @@ def main() -> None:
                "lines": summaries}
     write_json(output_root / "summary.json", summary)
     print(f"批量结果: {output_root / 'summary.json'}")
-    if not summaries or any(item["status"] != "qualified" for item in summaries):
+    accepted = {"qualified", "provisional"} if args.allow_conservative_fallback else {"qualified"}
+    if not summaries or any(item["status"] not in accepted for item in summaries):
         raise SystemExit(2)
 
 

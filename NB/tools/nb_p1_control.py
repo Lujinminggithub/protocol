@@ -26,8 +26,9 @@ def validate(policy:dict)->tuple[str,str]:
     tlines=[];seen=set()
     for t in tenants:
         name=str(t.get("name",""));values=[int(t.get(k,0)) for k in ("max_tcp","max_udp","rate_kbps","quota_mb")]
-        if not NAME.fullmatch(name)or name in seen or not(0<=values[0]<=100000 and 0<=values[1]<=100000 and 0<=values[2]<=100000000 and 0<=values[3]<=10**9):raise ValueError(f"非法 tenant: {t}")
-        seen.add(name);tlines.append(f"tenant {name} {' '.join(map(str,values))}")
+        burst_seconds=int(t.get("burst_seconds",10))
+        if not NAME.fullmatch(name)or name in seen or not(0<=values[0]<=100000 and 0<=values[1]<=100000 and 0<=values[2]<=100000000 and 0<=values[3]<=10**9 and 1<=burst_seconds<=60):raise ValueError(f"非法 tenant: {t}")
+        seen.add(name);tlines.append(f"tenant {name} {' '.join(map(str,values))} {burst_seconds}")
     rlines=[];seen=set();fixed=str(policy["fixed_exit"])
     for r in routes:
         name=str(r.get("name",""));host=str(r.get("host",""));port=int(r.get("port",4443));weight=int(r.get("weight",1));capacity=int(r.get("capacity",0))

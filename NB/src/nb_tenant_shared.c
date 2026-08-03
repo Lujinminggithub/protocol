@@ -89,12 +89,13 @@ static void totals(shared_state_t* state,int index,uint32_t* tcp,uint32_t* udp){
 
 static void refill(const nb_tenant_t* config,shared_tenant_t* state,uint64_t now_us){
     if(!config->rate_bytes_per_sec)return;
-    if(!state->token_updated_us){state->token_updated_us=now_us;state->tokens=config->rate_bytes_per_sec;return;}
+    if(state->tokens>config->burst_bytes)state->tokens=config->burst_bytes;
+    if(!state->token_updated_us){state->token_updated_us=now_us;state->tokens=config->burst_bytes;return;}
     if(now_us<=state->token_updated_us)return;
     uint64_t elapsed=now_us-state->token_updated_us;
     uint64_t add=elapsed>UINT64_MAX/config->rate_bytes_per_sec?UINT64_MAX:
         elapsed*config->rate_bytes_per_sec/1000000ULL;
-    uint64_t burst=config->rate_bytes_per_sec;
+    uint64_t burst=config->burst_bytes;
     state->tokens=(add>=burst||state->tokens>=burst-add)?burst:state->tokens+add;
     state->token_updated_us=now_us;
 }
@@ -113,7 +114,7 @@ int nb_tenant_shared_open(nb_tenants_t* tenants,const char* path,char* error,siz
        state->config_hash!=hash||state->tenant_count!=tenants->count){
         memset(state,0,sizeof(*state));state->magic=NB_TENANT_SHARED_MAGIC;
         state->version=NB_TENANT_SHARED_VERSION;state->config_hash=hash;state->tenant_count=(uint32_t)tenants->count;
-        for(size_t i=0;i<tenants->count;i++)state->tenants[i].tokens=tenants->items[i].rate_bytes_per_sec;
+        for(size_t i=0;i<tenants->count;i++)state->tenants[i].tokens=tenants->items[i].burst_bytes;
         (void)msync(state,sizeof(*state),MS_SYNC);
     }
     tenants->shared_fd=fd;tenants->shared_state=state;
@@ -159,7 +160,7 @@ size_t nb_tenant_shared_allowance(nb_tenants_t* tenants,int index,size_t request
 void nb_tenant_shared_refund(nb_tenants_t* tenants,int index,size_t bytes){
     if(bytes==0||lock_state(tenants)!=0)return;
     shared_state_t* state=tenants->shared_state;
-    uint64_t burst=tenants->items[index].rate_bytes_per_sec;shared_tenant_t* usage=&state->tenants[index];
+    uint64_t burst=tenants->items[index].burst_bytes;shared_tenant_t* usage=&state->tenants[index];
     if(burst)usage->tokens=bytes>=burst||usage->tokens>=burst-bytes?burst:usage->tokens+bytes;
     unlock_state(tenants);
 }

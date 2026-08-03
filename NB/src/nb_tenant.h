@@ -6,12 +6,15 @@
 
 #define NB_TENANT_MAX 64
 #define NB_TENANT_NAME_MAX 64
+#define NB_TENANT_DEFAULT_BURST_SECONDS 10U
+#define NB_TENANT_MAX_BURST_SECONDS 60U
 
 typedef struct {
     char name[NB_TENANT_NAME_MAX];
     uint32_t max_tcp;
     uint32_t max_udp;
     uint64_t rate_bytes_per_sec;
+    uint64_t burst_bytes;
     uint64_t byte_quota;
     uint32_t active_tcp;
     uint32_t active_udp;

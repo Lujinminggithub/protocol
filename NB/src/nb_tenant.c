@@ -17,11 +17,15 @@ int nb_tenants_load(nb_tenants_t* out,const char* path,char* error,size_t error_
     nb_tenants_t next;memset(&next,0,sizeof(next));next.shared_fd=-1;char line[512];unsigned line_no=0;
     while(fgets(line,sizeof(line),f)){
         line_no++;char* p=line;while(*p==' '||*p=='\t')p++;if(*p==0||*p=='#'||*p=='\r'||*p=='\n')continue;
-        char keyword[16],name[NB_TENANT_NAME_MAX],tcp[32],udp[32],rate[32],quota[32],extra[8];
-        if(sscanf(p,"%15s %63s %31s %31s %31s %31s %7s",keyword,name,tcp,udp,rate,quota,extra)!=6||strcmp(keyword,"tenant")||!valid_name(name)||next.count>=NB_TENANT_MAX){fclose(f);return fail(error,error_cap,"invalid tenant at line %u",line_no);}
-        uint64_t a,b,c,d;if(parse_u64(tcp,100000,&a)||parse_u64(udp,100000,&b)||parse_u64(rate,100000000,&c)||parse_u64(quota,UINT64_MAX/(1024ULL*1024ULL),&d)){fclose(f);return fail(error,error_cap,"invalid tenant limits at line %u",line_no);}
+        char keyword[16],name[NB_TENANT_NAME_MAX],tcp[32],udp[32],rate[32],quota[32],burst[32],extra[8];
+        int fields=sscanf(p,"%15s %63s %31s %31s %31s %31s %31s %7s",keyword,name,tcp,udp,rate,quota,burst,extra);
+        if((fields!=6&&fields!=7)||strcmp(keyword,"tenant")||!valid_name(name)||next.count>=NB_TENANT_MAX){fclose(f);return fail(error,error_cap,"invalid tenant at line %u",line_no);}
+        uint64_t a,b,c,d,e=NB_TENANT_DEFAULT_BURST_SECONDS;
+        if(parse_u64(tcp,100000,&a)||parse_u64(udp,100000,&b)||parse_u64(rate,100000000,&c)||
+            parse_u64(quota,UINT64_MAX/(1024ULL*1024ULL),&d)||(fields==7&&
+            (parse_u64(burst,NB_TENANT_MAX_BURST_SECONDS,&e)||e==0))){fclose(f);return fail(error,error_cap,"invalid tenant limits at line %u",line_no);}
         for(size_t i=0;i<next.count;i++)if(!strcmp(next.items[i].name,name)){fclose(f);return fail(error,error_cap,"duplicate tenant at line %u",line_no);}
-        nb_tenant_t* t=&next.items[next.count++];snprintf(t->name,sizeof(t->name),"%s",name);t->max_tcp=(uint32_t)a;t->max_udp=(uint32_t)b;t->rate_bytes_per_sec=c?c*1000ULL/8ULL:0;t->byte_quota=d*1024ULL*1024ULL;t->tokens=t->rate_bytes_per_sec;
+        nb_tenant_t* t=&next.items[next.count++];snprintf(t->name,sizeof(t->name),"%s",name);t->max_tcp=(uint32_t)a;t->max_udp=(uint32_t)b;t->rate_bytes_per_sec=c?c*1000ULL/8ULL:0;t->burst_bytes=t->rate_bytes_per_sec*e;t->byte_quota=d*1024ULL*1024ULL;t->tokens=t->burst_bytes;
     }
     fclose(f);if(next.count==0)return fail(error,error_cap,"tenant config is empty");*out=next;return 0;
 }
@@ -48,8 +52,9 @@ size_t nb_tenant_allowance(nb_tenants_t* tenants,int index,size_t requested,uint
     nb_tenant_t* t=&tenants->items[index];
     if(t->byte_quota){uint64_t used=t->bytes_up+t->bytes_down;if(used>=t->byte_quota)return 0;uint64_t left=t->byte_quota-used;if(left<requested)requested=(size_t)left;}
     if(!t->rate_bytes_per_sec)return requested;
+    if(t->tokens>t->burst_bytes)t->tokens=t->burst_bytes;
     if(!t->token_updated_us)t->token_updated_us=now_us;
-    if(now_us>t->token_updated_us){uint64_t elapsed=now_us-t->token_updated_us;uint64_t add=elapsed>UINT64_MAX/t->rate_bytes_per_sec?UINT64_MAX:elapsed*t->rate_bytes_per_sec/1000000ULL;uint64_t burst=t->rate_bytes_per_sec;t->tokens=(add>=burst||t->tokens>=burst-add)?burst:t->tokens+add;t->token_updated_us=now_us;}
+    if(now_us>t->token_updated_us){uint64_t elapsed=now_us-t->token_updated_us;uint64_t add=elapsed>UINT64_MAX/t->rate_bytes_per_sec?UINT64_MAX:elapsed*t->rate_bytes_per_sec/1000000ULL;uint64_t burst=t->burst_bytes;t->tokens=(add>=burst||t->tokens>=burst-add)?burst:t->tokens+add;t->token_updated_us=now_us;}
     if(t->tokens<requested)requested=(size_t)t->tokens;
     return requested;
 }
@@ -65,7 +70,7 @@ size_t nb_tenant_take(nb_tenants_t* tenants,int index,size_t requested,uint64_t 
 void nb_tenant_refund(nb_tenants_t* tenants,int index,size_t bytes){
     if(!tenants||index<0||(size_t)index>=tenants->count||bytes==0)return;
     if(tenants->shared_state){nb_tenant_shared_refund(tenants,index,bytes);return;}
-    nb_tenant_t* t=&tenants->items[index];uint64_t burst=t->rate_bytes_per_sec;
+    nb_tenant_t* t=&tenants->items[index];uint64_t burst=t->burst_bytes;
     if(burst)t->tokens=bytes>=burst||t->tokens>=burst-bytes?burst:t->tokens+bytes;
 }
 

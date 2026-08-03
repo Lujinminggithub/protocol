@@ -594,7 +594,8 @@ def main() -> None:
                 print(f">>> resume: bootstrap deployment {bootstrap_deployment} already active")
 
             run([sys.executable, "tools/line_provision.py", str(inventory_path),
-                 "--output-dir", str(provision_dir)], env)
+                 "--output-dir", str(provision_dir),
+                 "--allow-conservative-fallback"], env)
             if not all(path.is_file() for path in qualified_paths.values()):
                 raise RuntimeError("qualification completed without stable artifacts")
             save_checkpoint(checkpoint_path, checkpoint, "qualification", {
