@@ -11,10 +11,70 @@
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
 #endif
+#ifndef SO_RXQ_OVFL
+#define SO_RXQ_OVFL 40
+#endif
 
 static int set_nonblocking(int fd){
     int flags=fcntl(fd,F_GETFL,0);
     return flags<0?-1:fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+}
+
+int nb_udp_enable_rxq_overflow(int fd){
+    if(fd<0){errno=EINVAL;return -1;}
+    int enabled=1;
+    return setsockopt(fd,SOL_SOCKET,SO_RXQ_OVFL,&enabled,sizeof(enabled));
+}
+
+int nb_udp_configure_buffers(int fd,int requested,
+    int* actual_receive,int* actual_send){
+    if(fd<0||requested<=0){errno=EINVAL;return -1;}
+    if(setsockopt(fd,SOL_SOCKET,SO_RCVBUFFORCE,&requested,sizeof(requested))<0&&
+        setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&requested,sizeof(requested))<0)return -1;
+    if(setsockopt(fd,SOL_SOCKET,SO_SNDBUFFORCE,&requested,sizeof(requested))<0&&
+        setsockopt(fd,SOL_SOCKET,SO_SNDBUF,&requested,sizeof(requested))<0)return -1;
+    int receive=0,send=0;socklen_t length=sizeof(receive);
+    if(getsockopt(fd,SOL_SOCKET,SO_RCVBUF,&receive,&length)<0)return -1;
+    length=sizeof(send);
+    if(getsockopt(fd,SOL_SOCKET,SO_SNDBUF,&send,&length)<0)return -1;
+    if(actual_receive)*actual_receive=receive;
+    if(actual_send)*actual_send=send;
+    return 0;
+}
+
+uint64_t nb_udp_rxq_overflow_update(nb_udp_rxq_state_t* state,
+    const struct msghdr* message){
+    if(state==NULL||message==NULL)return 0;
+    for(struct cmsghdr* header=CMSG_FIRSTHDR(message);header!=NULL;
+        header=CMSG_NXTHDR((struct msghdr*)message,header)){
+        if(header->cmsg_level!=SOL_SOCKET||header->cmsg_type!=SO_RXQ_OVFL||
+            header->cmsg_len<CMSG_LEN(sizeof(uint32_t)))continue;
+        uint32_t observed=0;memcpy(&observed,CMSG_DATA(header),sizeof(observed));
+        uint64_t delta=state->seen?(uint32_t)(observed-state->last):observed;
+        state->last=observed;state->seen=1;return delta;
+    }
+    return 0;
+}
+
+ssize_t nb_udp_recv(int fd,void* buffer,size_t length,int flags,
+    struct sockaddr* source,socklen_t* source_length,
+    nb_udp_rxq_state_t* rxq_state,uint64_t* dropped){
+    if(dropped)*dropped=0;
+    if(fd<0||buffer==NULL||length==0||(source!=NULL&&source_length==NULL)){
+        errno=EINVAL;return -1;
+    }
+    struct iovec iov={buffer,length};struct msghdr message;memset(&message,0,sizeof(message));
+    message.msg_iov=&iov;message.msg_iovlen=1;message.msg_name=source;
+    message.msg_namelen=source_length?*source_length:0;
+    union { struct cmsghdr align;uint8_t bytes[CMSG_SPACE(sizeof(uint32_t))]; } control;
+    memset(&control,0,sizeof(control));message.msg_control=control.bytes;
+    message.msg_controllen=sizeof(control.bytes);
+    ssize_t received=recvmsg(fd,&message,flags);
+    if(received>=0){
+        if(source_length)*source_length=message.msg_namelen;
+        if(dropped)*dropped=nb_udp_rxq_overflow_update(rxq_state,&message);
+    }
+    return received;
 }
 
 int nb_udp_bind_relay_socket(uint16_t port_min,uint16_t port_max,
@@ -25,6 +85,7 @@ int nb_udp_bind_relay_socket(uint16_t port_min,uint16_t port_max,
     uint16_t start=(*next_port>=port_min&&*next_port<=port_max)?*next_port:port_min;
     for(uint32_t i=0;i<attempts;i++){
         int fd=socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);if(fd<0)return -1;
+        if(nb_udp_enable_rxq_overflow(fd)!=0){int saved=errno;close(fd);errno=saved;return -1;}
         struct sockaddr_in address;memset(&address,0,sizeof(address));address.sin_family=AF_INET;
         address.sin_addr.s_addr=INADDR_ANY;
         if(port_min){uint32_t offset=((uint32_t)start-port_min+i)%attempts;

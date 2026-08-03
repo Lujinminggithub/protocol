@@ -9,10 +9,39 @@ TMP=${TMPDIR:-/tmp}/nb-runtri-$$
 MW=${NB_MIDDLE_WORKERS:-1}
 EW=${NB_EXIT_WORKERS:-1}
 IW=${NB_ENTRY_WORKERS:-1}
-BASE=$((20000 + ($$ % 400) * 100)); HTTP_PORT=$BASE; ECHO_PORT=$((BASE+1)); EXIT_PORT=$((BASE+10)); MIDDLE_PORT=$((BASE+45)); ENTRY_PORT=$((BASE+80))
+BASE=$(python3 - "$$" <<'PY'
+import socket
+import sys
+
+start = int(sys.argv[1]) % 400
+for attempt in range(400):
+    base = 20000 + ((start + attempt) % 400) * 100
+    sockets = []
+    try:
+        # Reserve the complete block while checking so worker-lane ports cannot
+        # collide with a stale test process from an earlier interrupted run.
+        for port in range(base, base + 100):
+            for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                sock = socket.socket(socket.AF_INET, kind)
+                sock.bind(("127.0.0.1", port))
+                sockets.append(sock)
+    except OSError:
+        for sock in sockets:
+            sock.close()
+        continue
+    for sock in sockets:
+        sock.close()
+    print(base)
+    break
+else:
+    raise SystemExit("no free 100-port runtri block")
+PY
+)
+HTTP_PORT=$BASE; ECHO_PORT=$((BASE+1)); EXIT_PORT=$((BASE+10)); MIDDLE_PORT=$((BASE+45)); ENTRY_PORT=$((BASE+80))
 export HTTP_PORT EXIT_PORT MIDDLE_PORT ENTRY_PORT ECHO_PORT
 mkdir -p "$TMP/www" "$TMP/pki"
-trap 'rc=$?; trap - EXIT; pkill -P $$ 2>/dev/null || true; rm -f /run/nb-middle-{0..31}.ctl /run/nb-exit-{0..31}.ctl; if [ $rc -eq 0 ] || [ "${NB_KEEP_TMP:-0}" != 1 ]; then rm -rf "$TMP"; else echo "FAILED LOGS: $TMP" >&2; fi; exit "$rc"' EXIT
+BACKGROUND_PIDS=()
+trap 'rc=$?; trap - EXIT; if [ ${#BACKGROUND_PIDS[@]} -gt 0 ]; then kill "${BACKGROUND_PIDS[@]}" 2>/dev/null || true; fi; pkill -P $$ 2>/dev/null || true; rm -f /run/nb-middle-{0..31}.ctl /run/nb-exit-{0..31}.ctl; if [ $rc -eq 0 ] || [ "${NB_KEEP_TMP:-0}" != 1 ]; then rm -rf "$TMP"; else echo "FAILED LOGS: $TMP" >&2; fi; exit "$rc"' EXIT
 
 if [ ! -x "$NB" ]; then
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_BUILD_TYPE=Release
@@ -63,7 +92,9 @@ chmod 600 "$TMP/socks.users"
 echo HELLO_NB_TUNNEL_OK >"$TMP/www/test.txt"
 head -c 300000 /dev/urandom | base64 >"$TMP/www/big.txt"
 
-(cd "$TMP/www" && python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >"$TMP/http.log" 2>&1) &
+(cd "$TMP/www" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >"$TMP/http.log" 2>&1) &
+HTTP_PID=$!
+BACKGROUND_PIDS+=("$HTTP_PID")
 python3 - "$HTTP_PORT" >"$TMP/udp-target.log" 2>&1 <<'PY' &
 import socket,sys,time
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",int(sys.argv[1])))
@@ -71,6 +102,8 @@ data,peer=s.recvfrom(65535);s.sendto(data,peer)
 for _ in range(3):time.sleep(2);s.sendto(b"late-"+data,peer)
 s.close()
 PY
+UDP_TARGET_PID=$!
+BACKGROUND_PIDS+=("$UDP_TARGET_PID")
 python3 - "$ECHO_PORT" >"$TMP/echo-target.log" 2>&1 <<'PY' &
 import socket,sys,threading
 listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -84,6 +117,23 @@ def serve(conn):
 while True:
     conn,_=listener.accept();threading.Thread(target=serve,args=(conn,),daemon=True).start()
 PY
+ECHO_TARGET_PID=$!
+BACKGROUND_PIDS+=("$ECHO_TARGET_PID")
+for _ in $(seq 1 50); do
+  if curl -fsS --noproxy "*" "http://127.0.0.1:$HTTP_PORT/test.txt" --max-time 1 | grep -qx HELLO_NB_TUNNEL_OK; then
+    HTTP_READY=1
+    break
+  fi
+  kill -0 "$HTTP_PID" "$UDP_TARGET_PID" "$ECHO_TARGET_PID" 2>/dev/null || break
+  sleep .1
+done
+if [ "${HTTP_READY:-0}" != 1 ]; then
+  echo "runtri local targets failed to start" >&2
+  cat "$TMP/http.log" >&2 || true
+  cat "$TMP/udp-target.log" >&2 || true
+  cat "$TMP/echo-target.log" >&2 || true
+  exit 1
+fi
 if [ "$EW" -gt 1 ]; then
   NB_CONTROL_DIR="$TMP" python3 "$ROOT/tools/nb_supervisor.py" --workers "$EW" -- "$NB" -r exit -p "$EXIT_PORT" -c "$TMP/pki/exit.pem" -k "$TMP/pki/exit.key" -a "$TMP/pki/ca.pem" -W "$TMP/whitelist.conf" >"$TMP/exit.log" 2>&1 &
   EXIT_SUP=$!
@@ -306,7 +356,7 @@ PY
   test -f "$TMP/lstream.started";sleep .1
   victims=$(pgrep -P "$MIDDLE_SUP");test -n "$victims";kill -9 $victims
   wait "$LSTREAM_CLIENT"
-  grep -q 'logical flow resumed' "$TMP/nb-entry.log"
+  grep -q 'logical flow resume confirmed' "$TMP/nb-entry.log"
   for _ in $(seq 1 100); do [ "$(pgrep -P "$MIDDLE_SUP" | wc -l)" -eq "$MW" ] && break; sleep .1; done
   test "$(pgrep -P "$MIDDLE_SUP" | wc -l)" -eq "$MW"
   echo "RESULT PASS: middle worker 故障后主动 payload 恢复"

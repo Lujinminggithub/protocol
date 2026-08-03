@@ -5,7 +5,8 @@ int nb_pool_health_retire_now(nb_pool_health_t* state,const nb_pool_health_confi
     if(state==0||config==0)return 0;
     if(state->last_retired_us&&now_us>=state->last_retired_us&&
         now_us-state->last_retired_us<config->cooldown_us){state->suppressed_count++;return 0;}
-    state->degraded_since_us=0;state->last_retired_us=now_us;state->retire_count++;return 1;
+    state->degraded_since_us=0;state->last_retired_us=now_us;state->retire_count++;
+    state->promotion_ready=1;return 1;
 }
 
 int nb_pool_health_update(nb_pool_health_t* state, const nb_pool_health_config_t* config,
@@ -19,7 +20,8 @@ int nb_pool_health_update(nb_pool_health_t* state, const nb_pool_health_config_t
         now_us-state->last_progress_us>=config->progress_grace_us;
     int degraded=eligible&&transport_blocked&&
         queue_age_us>=config->queue_age_threshold_us;
-    if(!degraded){state->degraded_since_us=0;state->quarantined=0;return 0;}
+    if(!degraded){state->degraded_since_us=0;state->quarantined=0;
+        state->promotion_ready=0;return 0;}
     state->quarantined=1;
     if(state->degraded_since_us==0){state->degraded_since_us=now_us;return 0;}
     if(!progress_stalled)return 0;
@@ -33,6 +35,7 @@ nb_pool_recovery_action_t nb_pool_health_recovery_action(const nb_pool_health_t*
     if(!state->quarantined)return has_replacement
         ?NB_POOL_RECOVERY_CLOSE_REPLACEMENT:NB_POOL_RECOVERY_NONE;
     if(!has_replacement)return NB_POOL_RECOVERY_START_REPLACEMENT;
-    if(replacement_ready&&!has_draining)return NB_POOL_RECOVERY_PROMOTE_REPLACEMENT;
+    if(state->promotion_ready&&replacement_ready&&!has_draining)
+        return NB_POOL_RECOVERY_PROMOTE_REPLACEMENT;
     return NB_POOL_RECOVERY_NONE;
 }

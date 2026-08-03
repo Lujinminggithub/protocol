@@ -36,6 +36,13 @@ typedef struct {
     char rule_name[64];
 } nb_flow_policy_t;
 
+typedef struct nb_policy nb_policy_t;
+
+nb_policy_t* nb_policy_create(const char* rules_path);
+void nb_policy_destroy(nb_policy_t* policy);
+int nb_policy_reload_if_changed(nb_policy_t* policy);
+int nb_policy_context_classify(nb_policy_t* policy,const char* host,int port,nb_flow_policy_t* out);
+
 void nb_policy_init(const char* rules_path);
 void nb_flow_policy_default(nb_flow_policy_t* out);
 int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out);

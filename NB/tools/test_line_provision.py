@@ -9,6 +9,7 @@ from line_provision import (assert_qualified, build_artifacts,
 def recommendation(cc: str) -> dict:
     return {
         "confidence": "load-qualified",
+        "auto_apply_allowed": False,
         "cc": cc,
         "cwin_max_bytes": 786432 if cc == "cubic" else None,
         "reorder_gap": 160,
@@ -60,11 +61,18 @@ def main() -> None:
     artifacts = build_artifacts(line, candidate(), hosts, baseline, "p:a/ss", 1.25)
     assert artifacts["profile"]["status"] == "stable-qualified"
     assert artifacts["profile"]["schema_version"] == 4
-    assert artifacts["hosts"]["transport"]["entry"]["cwin_max_bytes"] == 786432
+    assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["entry"]
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["middle"]
     assert artifacts["policy"]["tenants"][0]["rate_kbps"] == 10000
     assert artifacts["client"]["server"] == "192.0.2.10"
     assert "u%40ser:p%3Aa%2Fss@" in artifacts["client"]["shadowrocket_url"]
+
+    approved = candidate()
+    for segment in approved["segments"].values():
+        segment["candidate"]["auto_apply_allowed"] = True
+    applied = build_artifacts(line, approved, hosts, baseline, "p:a/ss", 1.25)
+    assert applied["hosts"]["transport"]["entry"]["cwin_max_bytes"] == 786432
+    assert "cwin_max_bytes" not in applied["hosts"]["transport"]["middle"]
 
     failed = candidate(); failed["admission"] = {"status": "rejected", "reasons": ["insufficient-throughput"]}
     try:

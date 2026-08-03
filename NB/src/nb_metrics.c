@@ -28,6 +28,12 @@ void nb_metrics_note_udp_error(nb_metrics_state_t* state,int transmit){
     if(transmit)state->udp_tx_errors++;else state->udp_rx_errors++;
 }
 
+void nb_metrics_note_udp_rxq_overflow(nb_metrics_state_t* state,uint64_t dropped){
+    if(state==NULL)return;
+    if(UINT64_MAX-state->udp_rxq_overflow<dropped)state->udp_rxq_overflow=UINT64_MAX;
+    else state->udp_rxq_overflow+=dropped;
+}
+
 void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot,const nb_metrics_state_t* state,
     uint64_t sessions,uint64_t sessions_peak,uint64_t pools,uint64_t exit_routes){
     if(snapshot==NULL)return;
@@ -85,7 +91,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
     if(out==NULL||cap==0||s==NULL||f==NULL)return -1;
     return snprintf(out,cap,
         "{\"role\":\"%s\",\"worker\":\"%s\",\"release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d,"
-        "\"sessions\":%llu,\"sessions_peak\":%llu,\"pools\":%llu,\"exit_routes\":%llu,"
+        "\"sessions\":%llu,\"sessions_peak\":%llu,\"sessions_limit\":%llu,\"pools\":%llu,\"exit_routes\":%llu,"
+        "\"instance_resources\":{\"queue_bytes_used\":%llu,\"queue_bytes_limit\":%llu},"
         "\"flow_sessions\":{\"ctrl\":%llu,\"media\":%llu,\"bulk\":%llu,\"unknown\":%llu,\"udp\":%llu},"
         "\"state\":{\"tcp_connecting\":%llu,\"tcp_read_paused\":%llu,\"upstream_fc_blocked\":%llu,\"target_connect_failed\":%llu},"
         "\"first_byte_wait_max_us\":{\"c2s\":%llu,\"s2c\":%llu},"
@@ -97,12 +104,14 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"cwin_max_bytes\":%llu,\"bytes_in_flight_max\":%llu,\"pacing_rate_max\":%llu,\"blocked_connections\":%llu,\"cc\":\"%s\",\"cc_state\":%llu},"
         "\"closed\":{\"total\":%llu,\"normal\":%llu,\"timeout\":%llu,\"error\":%llu,\"reset\":%llu},"
         "\"event_loop\":{\"iterations\":%llu,\"over_5ms\":%llu,\"over_20ms\":%llu,\"busy_max_us\":%llu,\"wake_late_max_us\":%llu},"
-        "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu},"
+        "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu,\"rxq_overflow\":%llu},"
         "\"pool_recovery\":{\"retired\":%llu,\"suppressed\":%llu,\"quarantined\":%llu,\"mbb_promotions\":%llu},"
         "\"pmtu\":{\"promotions\":%llu,\"fallbacks\":%llu},"
         "\"fec\":{\"observe\":%d,\"active\":%d,\"tx_blocks\":%llu,\"rx_blocks\":%llu,\"recovered\":%llu,\"nack\":%llu,\"retx\":%llu}}\n",
         role,worker,release,profile,schema,
-        (unsigned long long)s->sessions,(unsigned long long)s->sessions_peak,(unsigned long long)s->pools,(unsigned long long)s->exit_routes,
+        (unsigned long long)s->sessions,(unsigned long long)s->sessions_peak,(unsigned long long)s->sessions_limit,
+        (unsigned long long)s->pools,(unsigned long long)s->exit_routes,
+        (unsigned long long)s->queue_bytes_used,(unsigned long long)s->queue_bytes_limit,
         (unsigned long long)s->ctrl_sessions,(unsigned long long)s->media_sessions,(unsigned long long)s->bulk_sessions,(unsigned long long)s->unknown_sessions,(unsigned long long)s->udp_sessions,
         (unsigned long long)s->tcp_connecting,(unsigned long long)s->tcp_read_paused,(unsigned long long)s->upstream_fc_blocked,
         (unsigned long long)s->target_connect_failed,(unsigned long long)s->first_c2s_wait_max_us,(unsigned long long)s->first_s2c_wait_max_us,
@@ -120,6 +129,7 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->lifetime.loop_iterations,(unsigned long long)s->lifetime.loop_over_5ms,(unsigned long long)s->lifetime.loop_over_20ms,
         (unsigned long long)s->lifetime.loop_busy_max_us,(unsigned long long)s->lifetime.loop_wake_late_max_us,
         (unsigned long long)s->lifetime.udp_rx_errors,(unsigned long long)s->lifetime.udp_tx_errors,
+        (unsigned long long)s->lifetime.udp_rxq_overflow,
         (unsigned long long)s->lifetime.pool_retire_total,(unsigned long long)s->lifetime.pool_retire_suppressed,
         (unsigned long long)s->lifetime.pool_quarantine_total,(unsigned long long)s->lifetime.pool_mbb_promotions,
         (unsigned long long)s->lifetime.pmtu_promotions,(unsigned long long)s->lifetime.pmtu_fallbacks,

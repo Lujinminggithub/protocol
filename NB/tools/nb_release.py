@@ -100,7 +100,13 @@ def write_manifest(path: pathlib.Path, manifest: dict) -> None:
     temporary.replace(path)
 
 
-def load_and_validate_manifest(manifest_path: pathlib.Path, root: pathlib.Path, binary: pathlib.Path) -> dict:
+def load_and_validate_manifest(
+    manifest_path: pathlib.Path,
+    root: pathlib.Path,
+    binary: pathlib.Path,
+    topology: pathlib.Path | None = None,
+    line_profile: pathlib.Path | None = None,
+) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"不支持的发布清单版本: {manifest.get('schema_version')}")
@@ -123,11 +129,12 @@ def load_and_validate_manifest(manifest_path: pathlib.Path, root: pathlib.Path, 
             raise ValueError(f"构建输入已变化，请重新构建: {record['path']}")
     if manifest.get("source_digest") != _source_digest(records):
         raise ValueError("构建输入摘要无效")
+    configuration_paths = {"topology": topology, "line_profile": line_profile}
     for key in ("topology", "line_profile"):
         record = manifest.get(key)
         if not record:
             continue
-        current = root / record["path"]
+        current = configuration_paths[key] or (root / record["path"])
         if not current.is_file() or sha256_file(current) != record.get("sha256") or current.stat().st_size != record.get("size"):
             raise ValueError(f"{key} 已变化，请重新生成发布清单")
     runtime_configuration = manifest.get("runtime_configuration")

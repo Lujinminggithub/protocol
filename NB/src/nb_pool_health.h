@@ -11,6 +11,7 @@ typedef struct {
     uint64_t retire_count;
     uint64_t suppressed_count;
     int quarantined;
+    int promotion_ready;
 } nb_pool_health_t;
 
 typedef struct {

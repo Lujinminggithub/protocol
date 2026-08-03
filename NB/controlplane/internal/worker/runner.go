@@ -54,7 +54,7 @@ func commandFailureSummary(err error, logPath string) string {
 	summary := err.Error()
 	if data, readErr := os.ReadFile(logPath); readErr == nil {
 		lines := strings.Split(string(data), "\n")
-		for _, marker := range []string{"拒绝开通:", "ConnectionAbortedError:", "ConnectionResetError:", "TimeoutError:", "RuntimeError:", "ValueError:", "SystemExit:"} {
+		for _, marker := range []string{"拒绝开通:", "发布清单校验失败:", "ConnectionAbortedError:", "ConnectionResetError:", "TimeoutError:", "RuntimeError:", "ValueError:", "SystemExit:"} {
 			for index := len(lines) - 1; index >= 0; index-- {
 				if strings.Contains(lines[index], marker) {
 					summary = strings.TrimSpace(lines[index])

@@ -24,7 +24,9 @@ def main()->None:
     if "nb_routes_finish_session(&G.exit_routes" not in node or "nb_routes_report_result(&G.exit_routes" in node:
         raise RuntimeError("business sessions must not drive route health")
     if "middle worker 强制降为 1" in deploy:raise RuntimeError("middle multi-worker is still disabled")
-    for token in ('"src/nb_tenant.c"','"tools/test_tenant.c"','"tools/nb_supervisor.py"'):
+    for token in ('"src/nb_tenant.c"','"tools/test_tenant.c"','"tools/nb_supervisor.py"',
+                  '"src/nb_node_core.inc"','"src/nb_node_session.inc"','"src/nb_node_pool.inc"',
+                  '"src/nb_node_transport.inc"','"src/nb_node_local.inc"','"src/nb_node_main.inc"'):
         if token not in deploy:raise RuntimeError(f"remote build input missing: {token}")
     if any(token in runtri for token in ("127.0.0.1:8080","127.0.0.1:9000")):raise RuntimeError("runtri still uses shared fixed test ports")
     for token in ("short business sessions keep route health neutral","UDP child close synchronized across entry/middle/exit"):

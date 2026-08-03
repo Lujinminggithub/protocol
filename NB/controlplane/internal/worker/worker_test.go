@@ -15,6 +15,37 @@ import (
 	"time"
 )
 
+func TestWritePrivateJSONSupportsConcurrentWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "line", "source-machines.json")
+	var wait sync.WaitGroup
+	errors := make(chan error, 32)
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func(value int) {
+			defer wait.Done()
+			errors <- writePrivateJSON(path, map[string]int{"value": value})
+		}(index)
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]int
+	if err = json.Unmarshal(data, &value); err != nil || value["value"] < 0 || value["value"] >= 32 {
+		t.Fatalf("invalid final JSON: %s err=%v", data, err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".source-machines.json.new-*")); len(matches) != 0 {
+		t.Fatalf("temporary files leaked: %v", matches)
+	}
+}
+
 func testRegistry(t *testing.T, operations []string) Registry {
 	t.Helper()
 	directory := t.TempDir()
@@ -148,6 +179,19 @@ func TestCommandFailureSummaryPrefersProvisionRejection(t *testing.T) {
 	summary := commandFailureSummary(os.ErrInvalid, path)
 	if summary != "主动探针失败 rc=1: connection aborted" {
 		t.Fatalf("wrong root cause selected: %s", summary)
+	}
+}
+
+func TestCommandFailureSummaryReportsReleaseValidationCause(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.log")
+	content := "发布清单校验失败: topology 已变化，请重新生成发布清单\n" +
+		"subprocess.CalledProcessError: command returned non-zero exit status 1\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	summary := commandFailureSummary(os.ErrInvalid, path)
+	if summary != "发布清单校验失败: topology 已变化，请重新生成发布清单" {
+		t.Fatalf("wrong release validation cause: %s", summary)
 	}
 }
 

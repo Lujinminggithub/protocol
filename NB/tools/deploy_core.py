@@ -18,6 +18,9 @@ from __future__ import annotations
 import argparse, hashlib, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex, subprocess, logging, random
 import paramiko
 import nb_release
+import nb_shard_deploy
+import deploy_shard_runtime
+import deploy_transfer
 
 logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
@@ -425,117 +428,10 @@ def _stage_release(c, role, manifest, binary=None):
     return marker.split("=", 1)[1]
 
 
-def _transfer_candidates(role):
-    host = _role_host(role)
-    values = [host.get("private_ip"), host.get("jump_target_host"), host.get("host")]
-    result = []
-    for value in values:
-        value = str(value or "").strip()
-        if value and value not in result:
-            result.append(value)
-    if not result:
-        raise ValueError(f"{role} has no transfer address")
-    return result
-
-
 def _copy_release_between_nodes(source_c, source_role, target_c, target_role, manifest):
-    """Copy a release over node-to-node SSH without exposing permanent credentials."""
-    release_id = _deployment_id(manifest)
-    expected = manifest["artifact"]["sha256"]
-    size = int(manifest["artifact"]["size"])
-    source = f"{INSTANCE_WORK}/releases/{release_id}/nb_node"
-    destination = source
-    existing = run(target_c,
-        f"test -f {shlex.quote(destination)} && sha256sum {shlex.quote(destination)} | awk '{{print $1}}' || true").strip()
-    if existing == expected:
-        print(f"{source_role} -> {target_role}: release={release_id} already present and verified")
-        return "already-present"
-    if existing:
-        raise RuntimeError(f"{target_role} immutable release collision: {release_id}")
-
-    target = _role_host(target_role)
-    user = str(target.get("user") or "root").strip()
-    port = int(target.get("port", 22))
-    if not user or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in user):
-        raise ValueError(f"{target_role} has an invalid SSH user")
-    if not 1 <= port <= 65535:
-        raise ValueError(f"{target_role} has an invalid SSH port")
-
-    marker = f"nb-release-{release_id}-{source_role}-to-{target_role}"
-    key_path = f"/tmp/{marker}"
-    known_hosts = f"{key_path}.known_hosts"
-    addresses = _transfer_candidates(target_role)
-    server_key = target_c.get_transport().get_remote_server_key()
-    key_record = f"{server_key.get_name()} {server_key.get_base64()}"
-    host_lines = []
-    for address in addresses:
-        host_token = address if port == 22 else f"[{address}]:{port}"
-        host_lines.append(f"{host_token} {key_record}")
-
-    timeout = max(60, min(3600, int(os.environ.get("NB_REMOTE_TRANSFER_TIMEOUT_SECONDS", "900"))))
-    authorized = None
-    try:
-        dependencies = run(source_c,
-            "for x in ssh ssh-keygen tail sha256sum; do command -v $x >/dev/null 2>&1 || echo MISSING:$x; done")
-        if "MISSING:" in dependencies:
-            missing = ", ".join(line.split(":", 1)[1] for line in dependencies.splitlines() if line.startswith("MISSING:"))
-            raise RuntimeError(f"{source_role} is missing transfer dependencies: {missing}")
-        run(source_c,
-            f"rm -f {shlex.quote(key_path)} {shlex.quote(key_path + '.pub')} {shlex.quote(known_hosts)}; "
-            f"ssh-keygen -q -t ed25519 -N '' -C {shlex.quote(marker)} -f {shlex.quote(key_path)}; chmod 0600 {shlex.quote(key_path)}")
-        public_key = run(source_c, f"cat {shlex.quote(key_path + '.pub')}").strip().split()
-        if len(public_key) < 2:
-            raise RuntimeError("ephemeral transfer key generation failed")
-        authorized = f"{public_key[0]} {public_key[1]} {marker}"
-        run(target_c,
-            "mkdir -p \"$HOME/.ssh\"; chmod 0700 \"$HOME/.ssh\"; "
-            f"printf '\\n%s\\n' {shlex.quote(authorized)} >>\"$HOME/.ssh/authorized_keys\"; "
-            "chmod 0600 \"$HOME/.ssh/authorized_keys\"")
-        push_bytes(source_c, ("\n".join(host_lines) + "\n").encode("ascii"), known_hosts, mode=0o600)
-
-        failures = []
-        for address in addresses:
-            endpoint = f"{user}@{address}"
-            ssh = (f"ssh -i {shlex.quote(key_path)} -o BatchMode=yes -o IdentitiesOnly=yes "
-                   f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(known_hosts)} "
-                   f"-o ConnectTimeout=10 -p {port} {shlex.quote(endpoint)}")
-            part = f"{destination}.part.{expected[:16]}"
-            try:
-                run(source_c, f"{ssh} {shlex.quote('mkdir -p ' + shlex.quote(str(pathlib.PurePosixPath(destination).parent)))}", tmo=30)
-                remote_size = run(source_c,
-                    f"{ssh} {shlex.quote('test -f ' + shlex.quote(part) + ' && stat -c %s ' + shlex.quote(part) + ' || echo 0')}",
-                    tmo=30).strip().splitlines()[-1]
-                offset = int(remote_size)
-                if offset > size:
-                    run(source_c, f"{ssh} {shlex.quote('rm -f ' + shlex.quote(part))}", tmo=30)
-                    offset = 0
-                if offset < size:
-                    append = shlex.quote("cat >> " + shlex.quote(part))
-                    run(source_c,
-                        f"tail -c +{offset + 1} {shlex.quote(source)} | {ssh} {append}", tmo=timeout)
-                publish = (f"test \"$(sha256sum {shlex.quote(part)} | awk '{{print $1}}')\" = {shlex.quote(expected)} && "
-                           f"chmod 0755 {shlex.quote(part)} && mv -f {shlex.quote(part)} {shlex.quote(destination)} && echo VERIFIED")
-                result = run(source_c, f"{ssh} {shlex.quote(publish)}", tmo=60)
-                if "VERIFIED" not in result:
-                    raise RuntimeError("remote checksum verification failed")
-                print(f"{source_role} -> {target_role}: release={release_id} transferred via {address}:{port}")
-                return address
-            except Exception as error:
-                failures.append(f"{address}:{port}: {error}")
-        raise RuntimeError(f"{source_role} -> {target_role} transfer failed: {'; '.join(failures)}")
-    finally:
-        try:
-            run(source_c, f"rm -f {shlex.quote(key_path)} {shlex.quote(key_path + '.pub')} {shlex.quote(known_hosts)}")
-        except Exception:
-            pass
-        if authorized is not None:
-            try:
-                cleanup = ("auth=\"$HOME/.ssh/authorized_keys\"; tmp=\"$auth.nb-clean.$$\"; "
-                           f"awk '$NF != {json.dumps(marker)}' \"$auth\" >\"$tmp\" || true; "
-                           "cat \"$tmp\" >\"$auth\"; rm -f \"$tmp\"")
-                run(target_c, cleanup)
-            except Exception:
-                pass
+    return deploy_transfer.copy_release(
+        source_c, source_role, target_c, target_role, manifest,
+        instance_work=INSTANCE_WORK, role_host=_role_host, run=run, push_bytes=push_bytes)
 
 
 def _activate_release(c, release_id):
@@ -568,6 +464,11 @@ def _mutable_role_paths(role):
     ]
     if role == "entry":
         paths += [f"{INSTANCE_WORK}/socks.users", f"{INSTANCE_WORK}/tenant.conf", _exit_routes_remote()]
+    if DEPLOY_INSTANCE:
+        shard_root=nb_shard_deploy.shard_root(WORK)
+        paths += [f"{shard_root}/nb_node",f"/etc/systemd/system/nb-{role}-shard@.service"]
+        paths += [f"{nb_shard_deploy.shard_config_dir(WORK,role,worker)}/{DEPLOY_INSTANCE}.conf"
+                  for worker in range(_effective_workers(role))]
     return paths
 
 
@@ -577,7 +478,7 @@ def _backup_role_state(c, role, release_id):
     result = {}
     for index, path in enumerate(_mutable_role_paths(role)):
         backup = f"{root}/{index}"
-        output = run(c, f"if test -e {shlex.quote(path)}; then cp -p {shlex.quote(path)} {shlex.quote(backup)} && "
+        output = run(c, f"if test -e {shlex.quote(path)} || test -L {shlex.quote(path)}; then cp -Pp {shlex.quote(path)} {shlex.quote(backup)} && "
                         "echo PRESENT; else echo ABSENT; fi")
         if "PRESENT" in output:
             result[path] = True
@@ -595,7 +496,7 @@ def _restore_role_state(c, role, release_id, state):
         raise RuntimeError(f"{role} mutable state backup manifest mismatch")
     for index, path in enumerate(expected):
         if state[path]:
-            run(c, f"mkdir -p $(dirname {shlex.quote(path)}) && cp -p {shlex.quote(f'{root}/{index}')} {shlex.quote(path)}")
+            run(c, f"mkdir -p $(dirname {shlex.quote(path)}) && cp -Pp {shlex.quote(f'{root}/{index}')} {shlex.quote(path)}")
         else:
             run(c, f"rm -f {shlex.quote(path)}")
 
@@ -606,6 +507,23 @@ def _rollback_release(c, role, previous, release_id, had_unit, mutable_state=Non
     backup = f"{INSTANCE_WORK}/releases/{release_id}/previous-{service}.service"
     if mutable_state is not None:
         _restore_role_state(c, role, release_id, mutable_state)
+    if DEPLOY_INSTANCE:
+        workers=_effective_workers(role)
+        run(c,"systemctl daemon-reload")
+        unit_exists=run(c,f"test -f /etc/systemd/system/nb-{role}-shard@.service && echo yes || echo no").strip()=="yes"
+        for worker in range(workers):
+            shard_service=nb_shard_deploy.shard_service(role,worker)
+            if unit_exists:run(c,f"systemctl restart {shlex.quote(shard_service)}; sleep 1")
+            else:run(c,f"systemctl stop {shlex.quote(shard_service)} 2>/dev/null || true")
+        if had_unit:
+            restored = run(c, f"cp -p {shlex.quote(backup)} {shlex.quote(unit)} && systemctl daemon-reload && systemctl start {shlex.quote(service)} && echo UNIT_RESTORED")
+            if "UNIT_RESTORED" not in restored:raise RuntimeError(f"{role} legacy unit rollback failed")
+        elif unit_exists:
+            deploy_shard_runtime.verify_all_controls(c, role, work=WORK, run=run)
+        if previous!="NONE":
+            temporary=f"{INSTANCE_WORK}/.nb_node.rollback"
+            run(c,f"ln -sfn {shlex.quote(previous)} {shlex.quote(temporary)} && mv -Tf {shlex.quote(temporary)} {shlex.quote(INSTANCE_WORK + '/nb_node')}")
+        return f"shard rollback workers={workers} controls=ok"
     if had_unit:
         restored = run(c, f"cp -p {shlex.quote(backup)} {shlex.quote(unit)} && systemctl daemon-reload && echo UNIT_RESTORED")
         if "UNIT_RESTORED" not in restored:
@@ -632,9 +550,17 @@ def _verify_deployment_health(c, role, deployment_id, warmup=8, expected_hash=No
     expected_workers = _effective_workers(role)
     time.sleep(warmup)
     service = _service_name(role)
-    state = run(c, f"systemctl is-active {shlex.quote(service)}; "
-                   f"sha256sum {shlex.quote(INSTANCE_WORK + '/nb_node')} | awk '{{print $1}}'").strip().splitlines()
-    if "active" not in state or (expected_hash is not None and expected_hash not in state):
+    if DEPLOY_INSTANCE:
+        active="; ".join(f"systemctl is-active {shlex.quote(nb_shard_deploy.shard_service(role,worker))}"
+                         for worker in range(expected_workers))
+        binary=nb_shard_deploy.shard_root(WORK)+"/nb_node"
+        state=run(c,f"{active}; sha256sum {shlex.quote(binary)} | awk '{{print $1}}'").strip().splitlines()
+        active_count=sum(item=="active" for item in state)
+    else:
+        state = run(c, f"systemctl is-active {shlex.quote(service)}; "
+                       f"sha256sum {shlex.quote(INSTANCE_WORK + '/nb_node')} | awk '{{print $1}}'").strip().splitlines()
+        active_count=sum(item=="active" for item in state)
+    if active_count<expected_workers or (expected_hash is not None and expected_hash not in state):
         raise RuntimeError(f"nb-{role} systemd/哈希健康门禁失败: {' '.join(state)}")
     script = (
         "import glob,json,socket,sys;"
@@ -658,11 +584,20 @@ def _remote_current_deployment(c, role):
 
 
 def _service_exists(c, role):
+    if DEPLOY_INSTANCE:
+        return all(run(c,f"systemctl cat {shlex.quote(nb_shard_deploy.shard_service(role,worker))} >/dev/null 2>&1 && echo yes || echo no").strip()=="yes"
+                   for worker in range(_effective_workers(role)))
     unit = _service_name(role)
     return run(c, f"systemctl cat {unit} >/dev/null 2>&1 && echo yes || echo no").strip() == "yes"
 
 
 def _systemd_restart(c, role, warmup=2.0):
+    if DEPLOY_INSTANCE:
+        states=[]
+        for worker in range(_effective_workers(role)):
+            unit=nb_shard_deploy.shard_service(role,worker)
+            states.extend(run(c,f"systemctl restart {shlex.quote(unit)}; sleep {warmup}; systemctl is-active {shlex.quote(unit)}; systemctl show -p MainPID --value {shlex.quote(unit)}").strip().splitlines())
+        return " ".join(x.strip() for x in states if x.strip())
     unit = _service_name(role)
     mainpid = run(c, f"systemctl restart {unit}; sleep {warmup}; systemctl is-active {unit}; "
                      f"systemctl show -p MainPID --value {unit}").strip().splitlines()
@@ -670,6 +605,14 @@ def _systemd_restart(c, role, warmup=2.0):
 
 
 def _systemd_stop(c, role):
+    if DEPLOY_INSTANCE:
+        paths=[f"{nb_shard_deploy.shard_config_dir(WORK,role,worker)}/{DEPLOY_INSTANCE}.conf"
+               for worker in range(_effective_workers(role))]
+        run(c,"rm -f "+" ".join(shlex.quote(path) for path in paths))
+        for worker in range(_effective_workers(role)):
+            run(c,f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role,worker))} 2>/dev/null || true")
+        run(c,f"systemctl stop {shlex.quote(_service_name(role))} 2>/dev/null || true; rm -f {_control_socket_glob(role)}")
+        return "line instance removed; shard remains active"
     unit = _service_name(role)
     cleanup = (f"rm -f {_control_socket_glob(role)}; " if DEPLOY_INSTANCE else
                "pkill -9 -x nb_node 2>/dev/null || true; ")
@@ -682,7 +625,10 @@ def _require_local_build():
     if not RELEASE_MANIFEST.is_file():
         sys.exit("本地缺少 build/release-manifest.json，请重新运行 build")
     try:
-        return nb_release.load_and_validate_manifest(RELEASE_MANIFEST, ROOT, BUILD_DIR / "nb_node")
+        return nb_release.load_and_validate_manifest(
+            RELEASE_MANIFEST, ROOT, BUILD_DIR / "nb_node", LAB_FILE,
+            LINE_PROFILE if LINE_PROFILE.is_file() else None,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"发布清单校验失败: {error}")
 
@@ -735,6 +681,8 @@ def _push_exit_routes(c, remote_path=None):
         name=str(item["name"]);host=str(item["host"]);port=int(item.get("port",4443));weight=int(item.get("weight",1))
         if item.get("fixed_exit",_role_host("exit")["name"])!=_role_host("exit")["name"]:
             raise ValueError(f"出口路由越过固定 exit: {item}")
+        if host!=str(_role_host("exit")["host"]) or port!=EXIT_PORT:
+            raise ValueError(f"exit route/listener drift: route={host}:{port} listener={_role_host('exit')['host']}:{EXIT_PORT}")
         if not name.replace("-","").replace("_","").isalnum() or not 1<=port<=65535 or not 1<=weight<=1000:
             raise ValueError(f"非法出口路由配置: {item}")
         capacity=int(item.get("capacity",0))
@@ -743,7 +691,6 @@ def _push_exit_routes(c, remote_path=None):
     destination = remote_path or _exit_routes_remote()
     push_bytes(c,("\n".join(lines)+"\n").encode("ascii"),destination,mode=0o644)
     return destination
-
 
 def _ensure_remote_whitelist(c, role="exit"):
     wl_remote = _whitelist_remote()
@@ -833,7 +780,15 @@ def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_i
     raise ValueError(f"unknown role: {role}")
 
 
-def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None):
+def _install_shard_role(c,role,command,environment,release_id,binary_release_id,warmup):
+    return deploy_shard_runtime.install_role(
+        c, role, command, environment, release_id, binary_release_id, warmup,
+        work=WORK, instance_work=INSTANCE_WORK, deploy_instance=DEPLOY_INSTANCE,
+        lab=LAB, run=run, push_bytes=push_bytes, effective_workers=_effective_workers,
+        legacy_service_name=_service_name)
+
+
+def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None,binary_release_id=None):
     workers = _effective_workers(role)
     supervisor = f"{INSTANCE_WORK}/releases/{release_id}/nb_supervisor.py" if release_id else f"{INSTANCE_WORK}/nb_supervisor.py"
     push_bytes(c,(ROOT/"tools"/"nb_supervisor.py").read_bytes(),supervisor,mode=0o755)
@@ -892,6 +847,21 @@ def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None):
             raise ValueError(f"transport.{role} reorder 参数越界")
         reorder_env=(f"Environment=NB_REORDER_GAP={reorder_gap}\n"
                      f"Environment=NB_REORDER_DELAY_US={reorder_delay_us}\n")
+    if DEPLOY_INSTANCE:
+        environment={"NB_FEC_V15":"on","NB_CC":cc,"NB_BBR_OPTIONS":bbr_options,
+            "NB_UDP_GSO":"on" if udp_gso else "off","NB_RELEASE_ID":release_id or "unversioned",
+            "NB_LINE_PROFILE_ID":line_id,"NB_LINE_PROFILE_SCHEMA":str(line_schema)}
+        if cwin_max_bytes:environment["NB_CWIN_MAX_BYTES"]=str(cwin_max_bytes)
+        if mtu_max:environment["NB_MTU_MAX"]=str(mtu_max)
+        if role=="entry":
+            if udp_advertise_ip:environment["NB_SOCKS_UDP_ADVERTISE_IP"]=udp_advertise_ip
+            if udp_port_min:
+                environment["NB_SOCKS_UDP_PORT_MIN"]=str(udp_port_min)
+                environment["NB_SOCKS_UDP_PORT_MAX"]=str(udp_port_max)
+        if role in ("entry","middle"):
+            environment["NB_REORDER_GAP"]=str(reorder_gap)
+            environment["NB_REORDER_DELAY_US"]=str(reorder_delay_us)
+        return _install_shard_role(c,role,command,environment,release_id,binary_release_id or release_id,warmup)
     unit = f"""[Unit]
 Description=Newbility {role} node
 After=network-online.target
@@ -901,6 +871,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+Environment=MALLOC_ARENA_MAX=2
 Environment=NB_FEC_V15=on
 Environment=NB_WORKER_LANE_PORTS=on
 Environment=NB_CC={cc}

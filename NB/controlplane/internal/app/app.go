@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,6 +51,8 @@ type App struct {
 	delivered      atomic.Uint64
 	deliveryErrors atomic.Uint64
 	lastDelivery   atomic.Int64
+	collectorMu    sync.Mutex
+	udpRXQLast     map[string]float64
 }
 
 func New(s *store.Store, cfg Config) *App {
@@ -57,7 +60,17 @@ func New(s *store.Store, cfg Config) *App {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &App{store: s, cfg: cfg, client: client}
+	return &App{store: s, cfg: cfg, client: client, udpRXQLast: make(map[string]float64)}
+}
+
+func rxqDelta(previous, current float64, seen bool) float64 {
+	if current <= 0 {
+		return 0
+	}
+	if !seen || current < previous {
+		return current
+	}
+	return current - previous
 }
 
 func (a *App) Handler() http.Handler {

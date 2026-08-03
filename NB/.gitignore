@@ -12,6 +12,8 @@
 /build/soak/
 /build/p2/
 /build/incidents/
+/build/Testing/
+/build/local-test/
 /build-local*/
 /build-sanitize-*/
 /build-p2-*/

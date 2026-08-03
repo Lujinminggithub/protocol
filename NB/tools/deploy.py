@@ -41,6 +41,12 @@ BUILD_FILES = {
     "scripts/runtri.sh": ROOT / "scripts" / "runtri.sh",
     "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
     "src/nb_node.c": SRC / "nb_node.c",
+    "src/nb_node_core.inc": SRC / "nb_node_core.inc",
+    "src/nb_node_session.inc": SRC / "nb_node_session.inc",
+    "src/nb_node_pool.inc": SRC / "nb_node_pool.inc",
+    "src/nb_node_transport.inc": SRC / "nb_node_transport.inc",
+    "src/nb_node_local.inc": SRC / "nb_node_local.inc",
+    "src/nb_node_main.inc": SRC / "nb_node_main.inc",
     "src/nb_policy.c": SRC / "nb_policy.c",
     "src/nb_policy.h": SRC / "nb_policy.h",
     "src/nb_live.c": SRC / "nb_live.c",
@@ -55,6 +61,10 @@ BUILD_FILES = {
     "src/nb_session_index.h": SRC / "nb_session_index.h",
     "src/nb_session.h": SRC / "nb_session.h",
     "src/nb_runtime.h": SRC / "nb_runtime.h",
+    "src/nb_instance.h": SRC / "nb_instance.h",
+    "src/nb_instance.c": SRC / "nb_instance.c",
+    "src/nb_shard.h": SRC / "nb_shard.h",
+    "src/nb_shard.c": SRC / "nb_shard.c",
     "src/nb_bridge.c": SRC / "nb_bridge.c",
     "src/nb_bridge.h": SRC / "nb_bridge.h",
     "src/nb_send.c": SRC / "nb_send.c",
@@ -118,6 +128,7 @@ BUILD_FILES = {
     "tools/test_probe.c": ROOT / "tools" / "test_probe.c",
     "tools/test_metrics.c": ROOT / "tools" / "test_metrics.c",
     "tools/test_session_index.c": ROOT / "tools" / "test_session_index.c",
+    "tools/test_session_memory.c": ROOT / "tools" / "test_session_memory.c",
     "tools/test_bridge.c": ROOT / "tools" / "test_bridge.c",
     "tools/test_send.c": ROOT / "tools" / "test_send.c",
     "tools/test_path.c": ROOT / "tools" / "test_path.c",
@@ -125,6 +136,9 @@ BUILD_FILES = {
     "tools/test_pmtu.c": ROOT / "tools" / "test_pmtu.c",
     "tools/test_dns.c": ROOT / "tools" / "test_dns.c",
     "tools/test_tenant.c": ROOT / "tools" / "test_tenant.c",
+    "tools/test_shard_config.c": ROOT / "tools" / "test_shard_config.c",
+    "tools/test_shard_runtime.py": ROOT / "tools" / "test_shard_runtime.py",
+    "tools/security_setup.py": ROOT / "tools" / "security_setup.py",
     "src/log/log4c.c": SRC / "log" / "log4c.c",
     "src/log/log4c.h": SRC / "log" / "log4c.h",
     "CMakeLists.txt": ROOT / "CMakeLists.txt",
@@ -161,6 +175,9 @@ RELEASE_INPUTS["tools/tiktok_flow_rules.conf"] = ROOT / "tools" / "tiktok_flow_r
 RELEASE_INPUTS["tools/log4c.runtime.json"] = LOG4C_RUNTIME_CONFIG
 RELEASE_INPUTS["tools/nb_p1_control.py"] = ROOT / "tools" / "nb_p1_control.py"
 RELEASE_INPUTS["tools/security_rotate.py"] = ROOT / "tools" / "security_rotate.py"
+RELEASE_INPUTS["tools/nb_shard_deploy.py"] = ROOT / "tools" / "nb_shard_deploy.py"
+RELEASE_INPUTS["tools/deploy_shard_runtime.py"] = ROOT / "tools" / "deploy_shard_runtime.py"
+RELEASE_INPUTS["tools/deploy_transfer.py"] = ROOT / "tools" / "deploy_transfer.py"
 RUNTIME_CONFIGURATION_INPUTS = {
     "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
     "tools/tiktok_flow_rules.conf": ROOT / "tools" / "tiktok_flow_rules.conf",
@@ -186,7 +203,8 @@ def act_build(roles):
         raise RuntimeError("production builds must run on the entry role")
     tests = ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
              "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
-             "test_line_provision.py", "test_line_open.py", "test_supervisor.py"]
+             "test_line_provision.py", "test_line_open.py", "test_supervisor.py",
+             "test_shard_deploy.py"]
     for test in tests:
         result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
         if result.returncode != 0:
@@ -450,7 +468,8 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             _activate_release(client, deployment_id)
             activated.append(role)
             _append_deploy_audit(client, role, "activated", manifest, previous[role])
-            _install_and_restart_role(client, role, commands[role], release_id=deployment_id)
+            _install_and_restart_role(client,role,commands[role],release_id=deployment_id,
+                binary_release_id=manifest["release_id"])
             health = _verify_release_health(client, role, manifest)
             _append_deploy_audit(client, role, "healthy", manifest, previous[role], health)
             print(f"{role}: {health}")
@@ -504,6 +523,47 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
 def _activate_existing_deployment(c, role, deployment_id):
     if not nb_release.RELEASE_NAME_RE.fullmatch(deployment_id) or deployment_id.startswith("legacy-"):
         raise ValueError(f"非法 deployment_id: {deployment_id}")
+    if DEPLOY_INSTANCE:
+        workers = _effective_workers(role)
+        directory = f"{INSTANCE_WORK}/releases/{deployment_id}"
+        marker = nb_shard_deploy.saved_binary_release(INSTANCE_WORK, deployment_id, role)
+        saved = [nb_shard_deploy.saved_instance_config(INSTANCE_WORK, deployment_id, role, worker)
+                 for worker in range(workers)]
+        checks = " && ".join(f"test -f {shlex.quote(path)}" for path in [marker, *saved])
+        if "READY" not in run(c, f"test -x {shlex.quote(directory + '/nb_node')} && {checks} && echo READY"):
+            raise RuntimeError(f"{role} named deployment lacks immutable shard rollback state: {deployment_id}")
+        binary_release = run(c, f"cat {shlex.quote(marker)}").strip()
+        if not nb_release.RELEASE_NAME_RE.fullmatch(binary_release):
+            raise RuntimeError(f"{role} saved shard binary release is invalid")
+        current = run(c, f"readlink -f {shlex.quote(nb_shard_deploy.shard_root(WORK) + '/nb_node')}").strip()
+        expected = f"{nb_shard_deploy.shard_root(WORK)}/releases/{binary_release}/nb_node"
+        if current != expected:
+            raise RuntimeError(
+                f"{role} rollback crosses shared shard binary; use a resource-group rollout to protect other lines")
+        active = [f"{nb_shard_deploy.shard_config_dir(WORK, role, worker)}/{DEPLOY_INSTANCE}.conf"
+                  for worker in range(workers)]
+        backups = []
+        try:
+            for source, target in zip(saved, active):
+                backup = target + ".exact-rollback"
+                run(c, f"cp -p {shlex.quote(target)} {shlex.quote(backup)}; "
+                    f"cp -p {shlex.quote(source)} {shlex.quote(target + '.next')}; "
+                    f"mv -f {shlex.quote(target + '.next')} {shlex.quote(target)}")
+                backups.append((target, backup))
+            for worker in range(workers):
+                run(c, f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role, worker))}")
+            _activate_release(c, deployment_id)
+            health = _verify_deployment_health(c, role, deployment_id, warmup=3)
+        except Exception:
+            for target, backup in backups:
+                run(c, f"test ! -f {shlex.quote(backup)} || mv -f {shlex.quote(backup)} {shlex.quote(target)}")
+            for worker in range(workers):
+                run(c, f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role, worker))} 2>/dev/null || true")
+            raise
+        finally:
+            for _target, backup in backups:
+                run(c, f"rm -f {shlex.quote(backup)}")
+        return health
     service=_service_name(role);directory=f"{INSTANCE_WORK}/releases/{deployment_id}";unit=f"{service}.service"
     check=run(c,f"test -x {shlex.quote(directory + '/nb_node')} && test -f {shlex.quote(directory + '/' + unit)} && echo READY")
     if "READY" not in check:raise RuntimeError(f"{role} 缺少不可变部署 {deployment_id}")

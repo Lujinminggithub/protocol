@@ -10,6 +10,7 @@ int main(void){
     nb_metrics_note_close(&state,"bidirectional-fin");nb_metrics_note_close(&state,"quic-stream-reset");
     nb_metrics_note_loop(&state,6000,3000);nb_metrics_note_loop(&state,25000,40000);
     nb_metrics_note_udp_error(&state,0);nb_metrics_note_udp_error(&state,1);
+    nb_metrics_note_udp_rxq_overflow(&state,7);
     state.pool_retire_total=2;state.pool_retire_suppressed=3;
     state.pool_quarantine_total=4;state.pool_mbb_promotions=2;
     state.pmtu_promotions=4;state.pmtu_fallbacks=1;
@@ -28,6 +29,7 @@ int main(void){
     int len=nb_metrics_render_json(json,sizeof(json),"middle","0","abc","line",2,&snapshot,&fec);
     assert(len>0&&(size_t)len<sizeof(json));assert(strstr(json,"\"media\":1")!=NULL);
     assert(strstr(json,"\"busy_max_us\":25000")!=NULL);assert(strstr(json,"\"tx_blocks\":2")!=NULL);
+    assert(strstr(json,"\"udp_errors\":{\"rx\":1,\"tx\":1,\"rxq_overflow\":7}")!=NULL);
     assert(strstr(json,"\"spurious_total\":4")!=NULL&&strstr(json,"\"cc\":\"bbr\"")!=NULL);
     assert(strstr(json,"\"pool_recovery\":{\"retired\":2,\"suppressed\":3,\"quarantined\":4,\"mbb_promotions\":2}")!=NULL);
     assert(strstr(json,"\"pmtu\":{\"promotions\":4,\"fallbacks\":1}")!=NULL);

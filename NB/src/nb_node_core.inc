@@ -21,6 +21,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #ifdef __linux__
 #include <execinfo.h>
 #endif
@@ -48,6 +51,7 @@
 #include "nb_session_index.h"
 #include "nb_session.h"
 #include "nb_runtime.h"
+#include "nb_instance.h"
 #include "nb_bridge.h"
 #include "nb_send.h"
 #include "nb_path.h"
@@ -56,6 +60,7 @@
 #include "nb_udp_io.h"
 #include "nb_udp_lifecycle.h"
 #include "nb_whitelist.h"
+#include "nb_shard.h"
 #include "log/log4c.h"
 
 #define NB_ALPN "nb/1"          /* Newbility(NB) 新传输协议 ALPN */
@@ -75,6 +80,10 @@
 #define NB_STREAM_FLOW_WINDOW (128*1024ULL)
 #define NB_STREAM_FLOW_CREDIT_QUANTUM (32*1024ULL)
 #define NB_DGRAM_QUEUE_MAX (256*1024) /* FEC sidecar datagram 应用发送队列上限 */
+#define NB_EMPTY_QUEUE_RETAIN_MAX (256*1024)
+#define NB_MEMORY_SCAN_INTERVAL_US (5*1000000ULL)
+#define NB_MALLOC_TRIM_INTERVAL_US (30*1000000ULL)
+#define NB_MALLOC_TRIM_MIN_RELEASED (1024*1024ULL)
 #define NB_ROUTE_BOOTSTRAP_PRIO 0       /* latency 流仅在发送 route header 时临时提权 */
 #define IDLE_TIMEOUT_US (120*1000000ULL)  /* 流空闲(无数据)超时兜底回收, 防僵尸流累积拖死复用连接 */
 #define SOCKS_AUTH_CACHE_TTL_US (300*1000000ULL)
@@ -84,6 +93,7 @@
 #define NB_FEC_CTRL_PREFIX "FC:"
 #define NB_FEC_CTRL_START  "FC:START"
 #define NB_FEC_CTRL_ACK    "FC:ACK"
+#define NB_FEC_CTRL_RX_CAP 4096u
 #define NB_FEC_DGRAM_MAGIC 0x4E424644u /* 'NBFD' */
 #define NB_FEC_DGRAM_VER   1
 #define NB_FEC_DEFAULT_K 8
@@ -101,51 +111,53 @@ typedef enum {
  * 新 stream round-robin 分散到各连接, 使总吞吐叠加而非稀释, 且单连接故障/僵死不影响全局。 */
 
 
-static nb_global_t G;
-static uint64_t g_run_id;
+static _Thread_local nb_instance_t* nb_current_instance;
+#define G (nb_current_instance->global)
+#define g_run_id (nb_current_instance->run_id)
+#define g_socks_users (nb_current_instance->socks_users)
+#define g_socks_auth_enabled (nb_current_instance->socks_auth_enabled)
+#define g_tenants (nb_current_instance->tenants)
+#define g_tenants_enabled (nb_current_instance->tenants_enabled)
+#define g_socks_udp_advertise_addr (nb_current_instance->socks_udp_advertise_addr)
+#define g_socks_udp_advertise_configured (nb_current_instance->socks_udp_advertise_configured)
+#define g_socks_udp_port_min (nb_current_instance->socks_udp_port_min)
+#define g_socks_udp_port_max (nb_current_instance->socks_udp_port_max)
+#define g_socks_udp_port_next (nb_current_instance->socks_udp_port_next)
+#define g_ps_inuse (nb_current_instance->streams_inuse)
+#define g_ps_peak (nb_current_instance->streams_peak)
+#define g_udp_gso_enabled (nb_current_instance->udp_gso_enabled)
+#define g_reorder_gap (nb_current_instance->reorder_gap)
+#define g_reorder_delay_us (nb_current_instance->reorder_delay_us)
+#define g_pool_health_cfg (nb_current_instance->pool_health_config)
+#define g_fec_v15_observe (nb_current_instance->fec_v15_observe)
+#define g_fec_v15_active (nb_current_instance->fec_v15_active)
+#define g_fec_v15_force (nb_current_instance->fec_v15_force)
+#define g_fec_v15_force_robust (nb_current_instance->fec_v15_force_robust)
+#define g_fec_v15_drop_src_mod (nb_current_instance->fec_v15_drop_src_mod)
+#define g_fec_v15_drop_repair_mod (nb_current_instance->fec_v15_drop_repair_mod)
+#define g_fec_v15_drop_src (nb_current_instance->fec_v15_drop_src)
+#define g_fec_v15_drop_repair (nb_current_instance->fec_v15_drop_repair)
+#define g_fec_cfg (nb_current_instance->fec_config)
+#define g_fec_bdp_bitrate_bps (nb_current_instance->fec_bdp_bitrate_bps)
+#define g_fec_bdp_rtt_us (nb_current_instance->fec_bdp_rtt_us)
+#define g_fec_bdp_multiplier (nb_current_instance->fec_bdp_multiplier)
+#define g_fec_metrics_done (nb_current_instance->fec_metrics_done)
+#define g_metrics_state (nb_current_instance->metrics_state)
+#define g_udp_rxq_main (nb_current_instance->udp_rxq_main)
+#define g_udp_rxq_client (nb_current_instance->udp_rxq_client)
+#define g_session_index (nb_current_instance->session_index)
+#define g_udp_lifecycle (nb_current_instance->udp_lifecycle)
+#define g_udp_control_grace_us (nb_current_instance->udp_control_grace_us)
+#define g_memory_released_pending (nb_current_instance->memory_released_pending)
+#define g_fec_session_index (nb_current_instance->fec_session_index)
+#define g_sched_cnx (nb_current_instance->sched_cnx)
 static int worker_lane_port(int base){
-    const char* enabled=getenv("NB_WORKER_LANE_PORTS");
+    const char* enabled=nb_instance_env(nb_current_instance,"NB_WORKER_LANE_PORTS");
     if(!enabled||(!strcmp(enabled,"0")||!strcasecmp(enabled,"off")))return base;
-    const char* text=getenv("NB_WORKER_ID");char* end=NULL;long worker=text?strtol(text,&end,10):0;
+    const char* text=nb_instance_env(nb_current_instance,"NB_WORKER_ID");char* end=NULL;long worker=text?strtol(text,&end,10):0;
     if((text&&(!end||*end))||worker<0||worker>31||base<1||base+worker>65535)return -1;
     return base+(int)worker;
 }
-static nb_auth_users_t g_socks_users;
-static int g_socks_auth_enabled=0;
-static nb_tenants_t g_tenants;static int g_tenants_enabled=0;
-static struct in_addr g_socks_udp_advertise_addr;
-static int g_socks_udp_advertise_configured=0;
-static uint16_t g_socks_udp_port_min=0;
-static uint16_t g_socks_udp_port_max=0;
-static uint16_t g_socks_udp_port_next=0;
-static int g_ps_inuse=0, g_ps_peak=0;   /* 过载保护: 在用流数 + 峰值 */
-static int g_udp_gso_enabled=1;
-static uint64_t g_reorder_gap=3;
-static uint64_t g_reorder_delay_us=0;
-static nb_pool_health_config_t g_pool_health_cfg={750000ULL,5000000ULL,12000000ULL,30000000ULL};
-static int g_fec_v15_observe=1;         /* 默认只观测门控，不接管业务数据；NB_FEC_V15=off/0 可关闭观测 */
-static int g_fec_v15_active=0;          /* 仅 NB_FEC_V15_ACTIVE=on/1 显式启用 sidecar 数据面 */
-static int g_fec_v15_force=0;           /* V1.5 测试强开: 忽略 line_bad, 便于代码级测试 */
-static int g_fec_v15_force_robust=0;
-static uint32_t g_fec_v15_drop_src_mod=0;    /* 测试钩子: 每 N 个 source datagram 丢 1 个(收端侧) */
-static uint32_t g_fec_v15_drop_repair_mod=0; /* 测试钩子: 每 N 个 repair datagram 丢 1 个(收端侧) */
-static uint64_t g_fec_v15_drop_src=0;
-static uint64_t g_fec_v15_drop_repair=0;
-static nb_fec_config_t g_fec_cfg;
-static uint64_t g_fec_bdp_bitrate_bps=20000000ULL;
-static uint64_t g_fec_bdp_rtt_us=250000ULL;
-static unsigned g_fec_bdp_multiplier=2;
-static nb_fec_metrics_t g_fec_metrics_done;
-static nb_metrics_state_t g_metrics_state;
-static nb_session_index_t g_session_index;static nb_udp_lifecycle_t g_udp_lifecycle;
-static uint64_t g_udp_control_grace_us=NB_UDP_CONTROL_GRACE_US;
-#define NB_FEC_SESSION_INDEX_CAP 2048u
-typedef struct { uint32_t sid; proxy_stream_t* stream; } nb_fec_session_index_t;
-static nb_fec_session_index_t g_fec_session_index[NB_FEC_SESSION_INDEX_CAP];
-
-#define NB_SCHED_CNX_CAP 64u
-typedef struct { picoquic_cnx_t* cnx; nb_live_sched_t sched; } nb_sched_cnx_t;
-static nb_sched_cnx_t g_sched_cnx[NB_SCHED_CNX_CAP];
 
 static nb_live_sched_t* sched_for_cnx(picoquic_cnx_t* cnx,int create){
     if(cnx==NULL)return NULL;
@@ -261,8 +273,8 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
 #define parse_target_from_route nb_bridge_parse_target
 #define fec_parse_target_route nb_bridge_parse_target_exact
 #define udp_route_consume_h nb_bridge_consume_hop
-#define dns_submit nb_dns_submit
-#define dns_pop_result nb_dns_pop
+#define dns_submit(id,host,port) nb_dns_context_submit(nb_current_instance->dns,(id),(host),(port))
+#define dns_pop_result(result) nb_dns_context_pop(nb_current_instance->dns,(result))
 static int epoll_tcp_update(proxy_stream_t* p, int add);
 
 /* ---- 工具 ---- */
@@ -285,7 +297,7 @@ static int prio_is_latency(int prio){ return nb_prio_is_latency(prio); }
 static int prio_is_fec_candidate(int prio){ return nb_prio_is_fec_candidate(prio); }
 
 static const char* control_env_id(const char* name,const char* fallback){
-    const char* value=getenv(name);if(value==NULL||value[0]==0)return fallback;
+    const char* value=nb_instance_env(nb_current_instance,name);if(value==NULL||value[0]==0)return fallback;
     for(const unsigned char* p=(const unsigned char*)value;*p;p++){
         if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'||*p=='.'||*p=='-'))return fallback;
     }
@@ -293,7 +305,7 @@ static const char* control_env_id(const char* name,const char* fallback){
 }
 
 static uint64_t env_ms_to_us(const char* name,uint64_t fallback_ms,uint64_t minimum_ms,uint64_t maximum_ms){
-    const char* value=getenv(name);if(value==NULL||value[0]==0)return fallback_ms*1000ULL;
+    const char* value=nb_instance_env(nb_current_instance,name);if(value==NULL||value[0]==0)return fallback_ms*1000ULL;
     char* end=NULL;errno=0;unsigned long long parsed=strtoull(value,&end,10);
     if(errno||end==value||*end||parsed<minimum_ms||parsed>maximum_ms){
         log4c_warn("ignore invalid %s=%s range=%llu..%llums",name,value,
@@ -303,22 +315,62 @@ static uint64_t env_ms_to_us(const char* name,uint64_t fallback_ms,uint64_t mini
     return (uint64_t)parsed*1000ULL;
 }
 
+static int configure_udp_socket_buffers(int fd,const char* label){
+    int requested=16*1024*1024,receive=0,send=0;
+    if(nb_udp_configure_buffers(fd,requested,&receive,&send)!=0){
+        log4c_error("%s udp buffer configuration failed: %s",
+            label?label:"quic",strerror(errno));return -1;
+    }
+    log4c_info("%s udp buffers rcvbuf=%d sndbuf=%d requested=%d",
+        label?label:"quic",receive,send,requested);
+    return 0;
+}
+
+static int instance_transport_ready(void){
+    if(G.role!=ROLE_ENTRY)return 1;
+    if(G.pool_count==0)return 0;
+    for(int pool_id=0;pool_id<G.pool_count;pool_id++){
+        cnx_pool_t* pool=&G.pools[pool_id];int ready=0;
+        if(!pool->configured)continue;
+        for(int slot=0;slot<POOL_SIZE;slot++)if(pool->cnx[slot]){
+            picoquic_state_enum state=picoquic_get_cnx_state(pool->cnx[slot]);
+            if(state==picoquic_state_client_ready_start||state==picoquic_state_ready){ready=1;break;}
+        }
+        if(!ready)return 0;
+    }
+    return 1;
+}
+
 static int control_render(const char* command,char* out,size_t cap,void* ctx){
     (void)ctx;
-    const char* worker=getenv("NB_WORKER_ID");if(!worker)worker="0";
+    const char* worker=nb_instance_env(nb_current_instance,"NB_WORKER_ID");if(!worker)worker="0";
     const char* release=control_env_id("NB_RELEASE_ID","unversioned");
+    const char* binary_release=control_env_id("NB_BINARY_RELEASE_ID",release);
     const char* profile=control_env_id("NB_LINE_PROFILE_ID","unversioned");
-    const char* schema_text=getenv("NB_LINE_PROFILE_SCHEMA");char* schema_end=NULL;
+    const char* schema_text=nb_instance_env(nb_current_instance,"NB_LINE_PROFILE_SCHEMA");char* schema_end=NULL;
     long schema_long=schema_text?strtol(schema_text,&schema_end,10):0;
     int profile_schema=(schema_text&&schema_end&&*schema_end==0&&schema_long>=0&&schema_long<=999999)?(int)schema_long:0;
     if(!strcmp(command,"health")||!strcmp(command,"GET /health")){
-        return snprintf(out,cap,"{\"status\":\"ok\",\"role\":\"%s\",\"worker\":\"%s\",\"boot_id\":\"%016llx\",\"release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d}\n",
-            role_name(G.role),worker,(unsigned long long)g_run_id,release,profile,profile_schema);
+        uint64_t logical[NB_LSTREAM_FIN_ACK+1]={0};
+        for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use)for(int type=NB_LSTREAM_OPEN;type<=NB_LSTREAM_FIN_ACK;type++)
+            logical[type]+=G.streams[i].logical_rx_frames[type];
+        const char* status=instance_transport_ready()?"ok":"starting";
+        return snprintf(out,cap,"{\"status\":\"%s\",\"role\":\"%s\",\"worker\":\"%s\",\"boot_id\":\"%016llx\",\"release_id\":\"%s\",\"binary_release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d,\"resources\":{\"sessions\":%d,\"sessions_limit\":%u,\"queue_bytes\":%llu,\"queue_limit_bytes\":%llu},\"logical_rx\":{\"open\":%llu,\"data\":%llu,\"ack\":%llu,\"resume\":%llu,\"resume_ack\":%llu,\"fin\":%llu,\"rst\":%llu,\"fin_ack\":%llu}}\n",
+            status,role_name(G.role),worker,(unsigned long long)g_run_id,release,binary_release,profile,profile_schema,g_ps_inuse,
+            nb_current_instance->session_limit,(unsigned long long)nb_current_instance->queue_bytes,
+            (unsigned long long)nb_current_instance->queue_limit_bytes,
+            (unsigned long long)logical[NB_LSTREAM_OPEN],(unsigned long long)logical[NB_LSTREAM_DATA],
+            (unsigned long long)logical[NB_LSTREAM_ACK],(unsigned long long)logical[NB_LSTREAM_RESUME],
+            (unsigned long long)logical[NB_LSTREAM_RESUME_ACK],(unsigned long long)logical[NB_LSTREAM_FIN],
+            (unsigned long long)logical[NB_LSTREAM_RST],(unsigned long long)logical[NB_LSTREAM_FIN_ACK]);
     }
     if(!strcmp(command,"metrics")||!strcmp(command,"GET /metrics")){
         uint64_t now=picoquic_current_time();nb_metrics_snapshot_t snapshot;
         nb_metrics_snapshot_init(&snapshot,&g_metrics_state,(uint64_t)g_ps_inuse,(uint64_t)g_ps_peak,
             (uint64_t)G.pool_count,(uint64_t)G.exit_routes.count);
+        snapshot.sessions_limit=nb_current_instance->session_limit;
+        snapshot.queue_bytes_used=nb_current_instance->queue_bytes;
+        snapshot.queue_bytes_limit=nb_current_instance->queue_limit_bytes;
         for(int pool=0;pool<G.pool_count;pool++)for(int slot=0;slot<POOL_SIZE;slot++){
             cnx_pool_t* cp=&G.pools[pool];
             if(cp->cnx[slot]&&cp->recent_sent[slot]>0)nb_metrics_snapshot_add_link(&snapshot,
@@ -341,9 +393,9 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
             size_t down=p->udp_mode?p->udp_down_tx_len:p->down_tx.len;
             size_t up=p->udp_mode?p->udp_up_tx_len:p->up_tx.len;
             size_t q2t=p->udp_mode?p->udp_pending_tx_len:p->q2t.len;
-            uint64_t down_age=p->udp_mode?0:nb_live_queue_age_us(&p->down_tx_clock,p->down_tx.len,now);
-            uint64_t up_age=p->udp_mode?0:nb_live_queue_age_us(&p->up_tx_clock,p->up_tx.len,now);
-            uint64_t q2t_age=p->udp_mode?0:nb_live_queue_age_us(&p->q2t_clock,p->q2t.len,now);
+            uint64_t down_age=p->udp_mode?0:nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now);
+            uint64_t up_age=p->udp_mode?0:nb_live_queue_age_us(&p->queue_clocks->up_tx,p->up_tx.len,now);
+            uint64_t q2t_age=p->udp_mode?0:nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now);
             uint64_t c2s_wait=(p->first_c2s_at?p->first_c2s_at:now)-p->created_at;
             uint64_t s2c_wait=(p->first_s2c_at?p->first_s2c_at:now)-p->created_at;
             nb_metrics_snapshot_add_stream(&snapshot,(int)p->flow_class,p->udp_mode,p->tcp_connecting,
@@ -370,7 +422,7 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
 static int whitelist_allowed(const char* host, int port){
     if(port==NB_PROBE_PORT && host!=NULL &&
         (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)))return 1;
-    return nb_whitelist_allowed(host,port);
+    return nb_whitelist_context_allowed(nb_current_instance->whitelist,host,port);
 }
 
 static void flow_policy_for_host(const char* host, int port, nb_flow_policy_t* out){
@@ -382,7 +434,7 @@ static void flow_policy_for_host(const char* host, int port, nb_flow_policy_t* o
         snprintf(out->rule_name,sizeof(out->rule_name),"internal-probe");
         return;
     }
-    (void)nb_tiktok_flow_classify(host, port, out);
+    (void)nb_policy_context_classify(nb_current_instance->policy,host,port,out);
 }
 
 static void apply_flow_policy(proxy_stream_t* p, const nb_flow_policy_t* pol){
@@ -499,9 +551,9 @@ static void ps_log_media_metrics(proxy_stream_t* p,uint64_t now){
     int known_media=ps_is_rtc_webcast(p);
     int high_throughput=c2s_kbps>=256.0||s2c_kbps>=256.0;
     size_t prefix_q=p->down_prefix_len>p->down_prefix_off?p->down_prefix_len-p->down_prefix_off:0;
-    double down_age=nb_live_queue_age_us(&p->down_tx_clock,p->down_tx.len,now)/1000.0;
-    double up_age=nb_live_queue_age_us(&p->up_tx_clock,p->up_tx.len,now)/1000.0;
-    double q2t_age=nb_live_queue_age_us(&p->q2t_clock,p->q2t.len,now)/1000.0;
+    double down_age=nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now)/1000.0;
+    double up_age=nb_live_queue_age_us(&p->queue_clocks->up_tx,p->up_tx.len,now)/1000.0;
+    double q2t_age=nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now)/1000.0;
     if(known_media||high_throughput){
         log4c_info("%s %s flow stat id=%u class=%s rule=%s age=%.1fs window=%.1fs rate_kbps=c2s:%.1f,s2c:%.1f total_kb=c2s:%llu,s2c:%llu queue_now=prefix:%zu,down:%zu,up:%zu,q2t:%zu queue_age_ms=down:%.1f,up:%.1f,q2t:%.1f queue_peak=down:%zu,up:%zu,q2t:%zu tcp_paused=%d route=%s",
             role_name(G.role),known_media?"media":"high-throughput",p->id,nb_flow_class_name(p->flow_class),p->flow_rule,

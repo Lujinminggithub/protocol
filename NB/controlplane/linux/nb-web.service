@@ -1,0 +1,22 @@
+[Unit]
+Description=NB central operations web console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/opt/nb-controlplane/etc/nb-web.env
+ExecStart=/opt/nb-controlplane/bin/nb-web
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nb-controlplane/data/web
+
+[Install]
+WantedBy=multi-user.target

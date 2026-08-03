@@ -1,0 +1,25 @@
+server {
+    listen 9091 ssl;
+    server_name __PUBLIC_IP__;
+
+    ssl_certificate /opt/nb-controlplane/etc/tls/nb-web.crt;
+    ssl_certificate_key /opt/nb-controlplane/etc/tls/nb-web.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+
+    # Render this value from the operator workstation's current public IP.
+    allow 127.0.0.1;
+    allow __OPERATOR_PUBLIC_IP__;
+    deny all;
+
+    client_max_body_size 2m;
+    location / {
+        proxy_pass http://127.0.0.1:19091;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+    }
+}

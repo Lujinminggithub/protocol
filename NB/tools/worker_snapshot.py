@@ -45,6 +45,7 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
     link = metrics.get("link") if isinstance(metrics.get("link"), dict) else {}
     fec = metrics.get("fec") if isinstance(metrics.get("fec"), dict) else {}
     byte_counts = metrics.get("bytes") if isinstance(metrics.get("bytes"), dict) else {}
+    udp_errors = metrics.get("udp_errors") if isinstance(metrics.get("udp_errors"), dict) else {}
     return {
         "line_id": line_id,
         "node_id": node_id,
@@ -62,6 +63,7 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
         "fec_active": number(fec, "active") != 0,
         "payload": {"health": health, "metrics": metrics, "collection_error": error},
         "_bytes_total": number(byte_counts, "c2s") + number(byte_counts, "s2c"),
+        "_rxq_overflow_total": number(udp_errors, "rxq_overflow"),
     }
 
 
@@ -76,6 +78,7 @@ def apply_throughput(samples: list[dict], state_file: pathlib.Path | None) -> No
     current = {}
     for item in samples:
         total = float(item.pop("_bytes_total", 0))
+        rxq_total = float(item.pop("_rxq_overflow_total", 0))
         prior = previous.get(item["node_id"], {})
         try:
             before = dt.datetime.fromisoformat(str(prior["observed_at"]).replace("Z", "+00:00"))
@@ -86,7 +89,14 @@ def apply_throughput(samples: list[dict], state_file: pathlib.Path | None) -> No
                 item["throughput_mbps"] = delta * 8 / elapsed / 1_000_000
         except (KeyError, TypeError, ValueError):
             pass
-        current[item["node_id"]] = {"observed_at": item["observed_at"], "bytes_total": total}
+        previous_rxq = float(prior.get("rxq_overflow_total", 0) or 0)
+        rxq_delta = rxq_total-previous_rxq if rxq_total>=previous_rxq else rxq_total
+        if rxq_delta>0:
+            if item["health"] == "ok":
+                item["health"] = "degraded"
+            item["payload"]["rxq_overflow_delta"] = rxq_delta
+        current[item["node_id"]] = {"observed_at": item["observed_at"], "bytes_total": total,
+                                    "rxq_overflow_total": rxq_total}
     if state_file:
         state_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = state_file.with_suffix(state_file.suffix + ".new")
@@ -97,10 +107,11 @@ def apply_throughput(samples: list[dict], state_file: pathlib.Path | None) -> No
 def query_role(role: str) -> list[dict]:
     pattern = deploy._control_socket_glob(role)
     prefix = deploy._control_socket_prefix(role)
+    socket_pattern = f"/run/{prefix}-[0-9]+\\.ctl"
     script = f"""import glob,json,re,socket
 results=[]
 paths=[path for path in sorted(glob.glob({pattern!r}))
-       if re.fullmatch({f'/run/{prefix}-[0-9]+\\.ctl'!r},path)]
+       if re.fullmatch({socket_pattern!r},path)]
 if not paths:
     raise RuntimeError('no matching control sockets')
 for path in paths:

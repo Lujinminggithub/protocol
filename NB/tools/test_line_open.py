@@ -6,8 +6,10 @@ import tempfile
 
 from line_open import (artifacts_match, baseline_profile, load_checkpoint,
                        deploy_socks_with_retry,
+                       ensure_security_material,
                        load_or_create_client_secret,
-                       normalize_hosts, reconcile_socks_user, save_checkpoint, sha256_file)
+                       normalize_hosts, reconcile_socks_user, resolve_instance_id,
+                       save_checkpoint, sha256_file)
 
 
 def main() -> None:
@@ -17,10 +19,23 @@ def main() -> None:
         {"role": "exit", "host": "192.0.2.3", "port": 2222, "password": "x"},
     ]}
     hosts, credentials = normalize_hosts(source)
+    assert resolve_instance_id("test-line") == "test-line_1"
+    assert resolve_instance_id("test-line", "custom_2") == "custom_2"
+    try:
+        resolve_instance_id("x" * 49)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsafe implicit instance id was accepted")
     assert hosts["middle"]["private_ip"] == "10.0.0.2"
     assert "password" not in hosts["entry"]
     assert credentials["NB_SSH_PASSWORD_ENTRY"] == "e"
     assert hosts["exits"][0]["host"] == "192.0.2.3"
+    stale = dict(source)
+    stale["exits"] = [{"name": "old", "host": "192.0.2.3", "port": 4444,
+                       "fixed_exit": "exit-192-0-2-3"}]
+    synchronized, _ = normalize_hosts(stale, exit_port=4450)
+    assert synchronized["exits"][0]["port"] == 4450
     profile = baseline_profile(hosts, "test-line")
     assert profile["transport"]["entry_middle"]["address"] == "10.0.0.2:4443"
     assert profile["fixed_exit"] == hosts["exit"]["name"]
@@ -38,6 +53,38 @@ def main() -> None:
     assert converted["entry"]["host"] == "1.1.1.1"
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary)
+        security = root / "new-security"
+        def generate_security(command, _env):
+            security_staging = pathlib.Path(command[-1])
+            security_staging.mkdir()
+            for name in ("ca.key", "ca.pem", "socks.users", "tenant.conf",
+                         "entry.key", "entry.pem", "middle.key", "middle.pem",
+                         "exit.key", "exit.pem"):
+                (security_staging / name).write_text(name, encoding="ascii")
+        assert ensure_security_material(security, {}, runner=generate_security) == "generated"
+        assert (security / "ca.key").is_file()
+
+        auxiliary_security = root / "auxiliary-security"
+        auxiliary_security.mkdir()
+        known_hosts = auxiliary_security / "known_hosts"
+        known_hosts.write_text("pinned-host-key\n", encoding="ascii")
+        assert ensure_security_material(auxiliary_security, {}, runner=generate_security) == "generated"
+        assert known_hosts.read_text(encoding="ascii") == "pinned-host-key\n"
+        assert (auxiliary_security / "entry.pem").is_file()
+
+        (security / "ca.key").unlink()
+        def unexpected_generation(_command, _env):
+            raise AssertionError("a valid runtime identity was regenerated")
+        assert ensure_security_material(security, {}, runner=unexpected_generation) == "reused"
+
+        (security / "entry.pem").unlink()
+        try:
+            ensure_security_material(security, {}, runner=unexpected_generation)
+        except SystemExit as error:
+            assert "entry.pem" in str(error)
+        else:
+            raise AssertionError("an incomplete runtime identity was accepted")
+
         secret_path = root / "bootstrap-client-secret.json"
         old_socks, old_client = os.environ.get("NB_SOCKS_PASSWORD"), os.environ.get("NB_CLIENT_PASSWORD")
         try:

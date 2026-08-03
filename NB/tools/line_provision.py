@@ -112,6 +112,8 @@ def assert_qualified(candidate: dict, package_mbps: float,
 
 def selected_transport(candidate: dict, segment_name: str) -> dict:
     recommendation = candidate["segments"][segment_name]["candidate"]
+    if recommendation.get("auto_apply_allowed") is not True:
+        return {}
     keys = ("cc", "cwin_max_bytes", "reorder_gap", "reorder_delay_us", "mtu_max")
     selected = {key: recommendation.get(key) for key in keys
                 if recommendation.get(key) is not None}

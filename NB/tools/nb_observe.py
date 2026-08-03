@@ -19,8 +19,10 @@ OUTPUT_DIR = deploy.BUILD_DIR / "observability"
 
 
 def _remote_control_query_commands(connection, role: str, commands: tuple[str, ...]) -> list[dict]:
+    socket_glob = deploy._control_socket_glob(role)
+    socket_pattern = f"/run/{deploy._control_socket_prefix(role)}-[0-9]+\\.ctl"
     script = f"""import glob,json,re,socket
-paths=[p for p in sorted(glob.glob({deploy._control_socket_glob(role)!r})) if re.fullmatch({f'/run/{deploy._control_socket_prefix(role)}-[0-9]+\\.ctl'!r},p)]
+paths=[p for p in sorted(glob.glob({socket_glob!r})) if re.fullmatch({socket_pattern!r},p)]
 if not paths:raise RuntimeError('no control sockets for {role}')
 results=[]
 for path in paths:
@@ -127,10 +129,13 @@ def evaluate(snapshot: dict, previous_state: dict | None = None) -> tuple[list[d
         if lost_delta >= 20 and spurious_delta/lost_delta >= 0.70:
             add("warning", "spurious-ratio", scope, round(spurious_delta/lost_delta, 3), 0.70, "丢包判断中伪丢包比例过高")
         udp_errors = _delta(metrics, previous, ("udp_errors", "rx")) + _delta(metrics, previous, ("udp_errors", "tx"))
+        rxq_overflow = _delta(metrics, previous, ("udp_errors", "rxq_overflow"))
         close_errors = _delta(metrics, previous, ("closed", "error"))
         loop_over20 = _delta(metrics, previous, ("event_loop", "over_20ms"))
         if udp_errors >= 10: add("critical", "udp-errors", scope, udp_errors, 10, "采样间隔内 UDP 错误过多")
         elif udp_errors > 0: add("warning", "udp-errors", scope, udp_errors, 1, "采样间隔内出现 UDP 错误")
+        if rxq_overflow >= 10: add("critical", "udp-rxq-overflow", scope, rxq_overflow, 10, "UDP kernel receive queue dropped packets")
+        elif rxq_overflow > 0: add("warning", "udp-rxq-overflow", scope, rxq_overflow, 1, "UDP kernel receive queue dropped packets")
         if close_errors >= 5: add("critical", "close-errors", scope, close_errors, 5, "采样间隔内异常关闭过多")
         if loop_over20 >= 5: add("critical", "event-loop-late", scope, loop_over20, 5, "事件循环多次阻塞超过 20ms")
         elif loop_over20 > 0: add("warning", "event-loop-late", scope, loop_over20, 1, "事件循环出现超过 20ms 阻塞")

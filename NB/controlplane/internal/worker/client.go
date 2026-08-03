@@ -311,14 +311,7 @@ func (c *Client) poll(ctx context.Context) error {
 			}
 			persisted = persistedResult{Status: status, Result: encoded}
 			persistedData, _ := json.Marshal(persisted)
-			if err = os.MkdirAll(filepath.Dir(resultPath), 0700); err != nil {
-				return err
-			}
-			temporary := resultPath + ".new"
-			if err = os.WriteFile(temporary, persistedData, 0600); err != nil {
-				return err
-			}
-			if err = os.Rename(temporary, resultPath); err != nil {
+			if err = writePrivateFile(resultPath, persistedData); err != nil {
 				return err
 			}
 			if err = c.complete(ctx, operation, status, json.RawMessage(encoded)); err != nil {

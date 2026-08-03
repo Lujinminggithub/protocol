@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,11 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ROLES = ("entry", "middle", "exit")
 ROLE_ENV = {role: f"NB_SSH_PASSWORD_{role.upper()}" for role in ROLES}
+RUNTIME_SECURITY_FILES = frozenset({"ca.pem", "socks.users", "tenant.conf"} | {
+    f"{role}.{suffix}" for role in ROLES for suffix in ("key", "pem")
+})
+GENERATED_SECURITY_FILES = RUNTIME_SECURITY_FILES | {"ca.key"}
+AUXILIARY_SECURITY_FILES = frozenset({"known_hosts"})
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -98,6 +104,12 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
                             "host": normalized["exit"]["host"],
                             "port": exit_port, "weight": 1, "capacity": 512,
                             "fixed_exit": normalized["exit"]["name"]}]
+    for route in result["exits"]:
+        fixed_exit = route.get("fixed_exit", normalized["exit"]["name"])
+        if fixed_exit != normalized["exit"]["name"] or route.get("host") != normalized["exit"]["host"]:
+            raise ValueError("exits[] must target the line's fixed exit device")
+        route["fixed_exit"] = normalized["exit"]["name"]
+        route["port"] = exit_port
     return result, credentials
 
 
@@ -145,6 +157,87 @@ def write_json(path: pathlib.Path, value: dict, private: bool = False) -> None:
 def run(command: list[str], env: dict, cwd: pathlib.Path = ROOT) -> None:
     print("+ " + " ".join(command))
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def _secure_security_permissions(security: pathlib.Path) -> None:
+    try:
+        security.chmod(0o700)
+    except OSError:
+        pass
+    private_files = {"ca.key", "socks.users", "tenant.conf"}
+    private_files.update(f"{role}.key" for role in ROLES)
+    for name in private_files:
+        path = security / name
+        if path.is_file():
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+    for name in ({"ca.pem", "known_hosts"} |
+                 {f"{role}.pem" for role in ROLES}):
+        path = security / name
+        if path.is_file():
+            try:
+                path.chmod(0o644)
+            except OSError:
+                pass
+
+
+def ensure_security_material(security: pathlib.Path, env: dict, runner=run) -> str:
+    """Create a new bundle atomically, or reuse a complete runtime identity."""
+    present = ({item.name for item in security.iterdir() if item.is_file()}
+               if security.exists() else set())
+    if RUNTIME_SECURITY_FILES.issubset(present):
+        _secure_security_permissions(security)
+        print(f"reuse existing runtime security material: {security}")
+        if "ca.key" not in present:
+            print("CA signing key is not local; runtime deployment remains valid, "
+                  "but future certificate issuance requires the original CA key")
+        return "reused"
+
+    identity_files = present & GENERATED_SECURITY_FILES
+    if identity_files:
+        missing = ", ".join(sorted(RUNTIME_SECURITY_FILES - present))
+        raise SystemExit("security directory is incomplete; refusing to replace an "
+                         f"existing identity; missing runtime files: {missing}")
+
+    unexpected = present - AUXILIARY_SECURITY_FILES
+    if unexpected:
+        raise SystemExit("security directory contains unknown files; refusing to replace it: " +
+                         ", ".join(sorted(unexpected)))
+
+    security.parent.mkdir(parents=True, exist_ok=True)
+    staging = security.with_name(f".{security.name}.generate-{secrets.token_hex(6)}")
+    previous = security.with_name(f".{security.name}.previous-{secrets.token_hex(6)}")
+    try:
+        runner([sys.executable, "tools/security_setup.py", "--out", str(staging)], env)
+        generated = ({item.name for item in staging.iterdir() if item.is_file()}
+                     if staging.exists() else set())
+        missing = GENERATED_SECURITY_FILES - generated
+        if missing:
+            raise RuntimeError("generated security bundle is incomplete: " +
+                               ", ".join(sorted(missing)))
+        for name in AUXILIARY_SECURITY_FILES:
+            source = security / name
+            if source.is_file():
+                shutil.copy2(source, staging / name)
+        _secure_security_permissions(staging)
+        if security.exists():
+            security.replace(previous)
+        try:
+            staging.replace(security)
+        except BaseException:
+            if previous.exists() and not security.exists():
+                previous.replace(security)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
+        return "generated"
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if previous.exists() and security.exists():
+            shutil.rmtree(previous)
 
 
 def deploy_socks_with_retry(socks_port: int, env: dict, runner=run,
@@ -251,6 +344,14 @@ def checkpoint_fingerprint(hosts_path: pathlib.Path, profile_path: pathlib.Path,
     }
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_instance_id(line_id: str, configured: str = "") -> str:
+    instance_id = configured.strip() or f"{line_id}_1"
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+    if not 1 <= len(instance_id) <= 48 or any(ch not in allowed for ch in instance_id):
+        raise ValueError("line instance_id must use 1..48 safe identifier characters")
+    return instance_id
 
 
 def load_checkpoint(path: pathlib.Path, fingerprint: str) -> dict:
@@ -374,6 +475,11 @@ def main() -> None:
     parser.add_argument("--build-mode", choices=("auto", "binary", "source"), default="source")
     parser.add_argument("--execute", action="store_true", help="实际初始化和部署；默认只生成计划")
     args = parser.parse_args()
+    try:
+        os.environ["NB_DEPLOY_INSTANCE"] = resolve_instance_id(
+            args.line_id, os.environ.get("NB_DEPLOY_INSTANCE", ""))
+    except ValueError as error:
+        parser.error(str(error))
     if not 1 <= args.package_mbps <= 1000:
         parser.error("--package-mbps must be between 1 and 1000")
     if not 1 <= args.socks_port <= 65535:
@@ -439,16 +545,7 @@ def main() -> None:
                 "NB_EXIT_PORT": str(args.exit_port),
                 "NB_OPEN_CLIENT_PASSWORD": client_password,
                 "NB_SSH_INSECURE": "1"})
-    required_security = {"ca.key", "ca.pem", "socks.users", "tenant.conf"}
-    required_security.update(f"{role}.{suffix}" for role in ROLES for suffix in ("key", "pem"))
-    present_security = {item.name for item in security.iterdir()} if security.exists() else set()
-    if not present_security:
-        run([sys.executable, "tools/security_setup.py", "--out", str(security)], env)
-    elif not required_security.issubset(present_security):
-        missing_security = ", ".join(sorted(required_security - present_security))
-        raise SystemExit(f"安全目录不完整，拒绝自动复用；缺少: {missing_security}")
-    else:
-        print(f"复用已有安全材料: {security}")
+    ensure_security_material(security, env)
     if reconcile_socks_user(security / "socks.users", args.client_username, client_password):
         print("reconciled socks.users with the existing bootstrap client secret")
     known_hosts = security / "known_hosts"

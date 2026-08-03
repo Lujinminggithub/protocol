@@ -39,6 +39,8 @@ size_t nb_tenant_allowance(nb_tenants_t* tenants,int index,size_t requested,uint
 void nb_tenant_consume(nb_tenants_t* tenants,int index,size_t bytes);
 size_t nb_tenant_take(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us);
 void nb_tenant_refund(nb_tenants_t* tenants,int index,size_t bytes);
+int64_t nb_tenant_wake_delay(uint64_t throttled_until_us,uint64_t now_us,
+    int64_t current_delay_us);
 void nb_tenant_account(nb_tenants_t* tenants,int index,uint64_t up,uint64_t down);
 int nb_tenants_render_json(const nb_tenants_t* tenants,char* out,size_t cap);
 

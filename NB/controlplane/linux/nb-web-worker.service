@@ -1,0 +1,24 @@
+[Unit]
+Description=NB allowlisted operations worker
+After=network-online.target nb-web.service
+Wants=network-online.target
+Requires=nb-web.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/nb-controlplane/repo
+EnvironmentFile=/opt/nb-controlplane/etc/nb-web-worker.env
+ExecStart=/opt/nb-controlplane/bin/nb-web-worker
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nb-controlplane
+
+[Install]
+WantedBy=multi-user.target

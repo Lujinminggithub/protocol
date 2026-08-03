@@ -5,7 +5,9 @@ static int nb_runtime_id_ok(const char* value,size_t max_len){
     return 1;
 }
 
-int main(int argc,char**argv){
+static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
+    if(instance==NULL)return 1;
+    nb_current_instance=instance;
     int i; int listen_port=0, quic_port=0, next_port=0;
     const char* rolestr=NULL; const char* next_host=NULL;
     const char* cert=NULL; const char* key=NULL; const char* cert_root=NULL; const char* route=NULL;
@@ -17,8 +19,6 @@ int main(int argc,char**argv){
     char control_path[108];
     const char* wl_path=NULL;
     const char* tiktok_rules_path=NULL;
-    memset(&G,0,sizeof(G)); G.tcp_listen_fd=-1; G.udp_fd=-1;G.client_udp_fd=-1; G.epoll_fd=-1;G.control_fd=-1;
-
     for(i=1;i<argc;i++){
         if(!strcmp(argv[i],"-r")&&i+1<argc) rolestr=argv[++i];
         else if(!strcmp(argv[i],"-l")&&i+1<argc) listen_port=atoi(argv[++i]);
@@ -38,39 +38,48 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"-C")&&i+1<argc) control_path_arg=argv[++i];
         else if(!strcmp(argv[i],"-E")&&i+1<argc) exit_routes_path=argv[++i];
         else if(!strcmp(argv[i],"-o")&&i+1<argc) outbound_ip=argv[++i];
+        else if(!strcmp(argv[i],"--max-sessions")&&i+1<argc){
+            unsigned long value=strtoul(argv[++i],NULL,10);if(value<1||value>MAX_CONN){fprintf(stderr,"invalid max sessions\n");return 1;}
+            instance->session_limit=(uint32_t)value;
+        }
+        else if(!strcmp(argv[i],"--max-queue-bytes")&&i+1<argc){
+            unsigned long long value=strtoull(argv[++i],NULL,10);if(value<1048576ULL||value>1073741824ULL){fprintf(stderr,"invalid max queue bytes\n");return 1;}
+            instance->queue_limit_bytes=(uint64_t)value;
+        }
     }
     if(rolestr==NULL){ usage(argv[0]); return 1; }
     if(!strcmp(rolestr,"entry")) G.role=ROLE_ENTRY;
     else if(!strcmp(rolestr,"middle")) G.role=ROLE_MIDDLE;
     else if(!strcmp(rolestr,"exit")) G.role=ROLE_EXIT;
     else { usage(argv[0]); return 1; }
-    { const char* worker=getenv("NB_WORKER_ID");if(!worker)worker="0";const char* dir=getenv("NB_CONTROL_DIR");if(!dir||!dir[0])dir="/run";
-      const char* prefix=getenv("NB_CONTROL_PREFIX");char fallback[48];
+    { const char* worker=nb_instance_env(nb_current_instance,"NB_WORKER_ID");if(!worker)worker="0";const char* dir=nb_instance_env(nb_current_instance,"NB_CONTROL_DIR");if(!dir||!dir[0])dir="/run";
+      const char* prefix=nb_instance_env(nb_current_instance,"NB_CONTROL_PREFIX");char fallback[48];
       if(!prefix||!prefix[0]){snprintf(fallback,sizeof(fallback),"nb-%s",role_name(G.role));prefix=fallback;}
       if(!nb_runtime_id_ok(prefix,64)||!nb_runtime_id_ok(worker,16)){fprintf(stderr,"invalid control socket identity\n");return 1;}
       int n=control_path_arg?snprintf(control_path,sizeof(control_path),"%s",control_path_arg)
           :snprintf(control_path,sizeof(control_path),"%s/%s-%s.ctl",dir,prefix,worker);
-      if(n<0||(size_t)n>=sizeof(control_path)){fprintf(stderr,"control socket path too long\n");return 1;} }
+      if(n<0||(size_t)n>=sizeof(control_path)){fprintf(stderr,"control socket path too long\n");return 1;}
+      memcpy(instance->control_path,control_path,(size_t)n+1); }
 
-    { char pname[96];const char* instance=getenv("NB_INSTANCE_ID");
-      if(instance&&instance[0]&&!nb_runtime_id_ok(instance,48)){fprintf(stderr,"invalid instance identity\n");return 1;}
-      if(instance&&instance[0])snprintf(pname,sizeof(pname),"nb-%s-%s",instance,role_name(G.role));
+    { char pname[96];const char* instance_name=nb_instance_env(nb_current_instance,"NB_INSTANCE_ID");
+      if(instance_name&&instance_name[0]&&!nb_runtime_id_ok(instance_name,64)){fprintf(stderr,"invalid instance identity\n");return 1;}
+      if(instance_name&&instance_name[0])snprintf(pname,sizeof(pname),"nb-%s-%s",instance_name,role_name(G.role));
       else snprintf(pname,sizeof(pname),"nb-%s",role_name(G.role));
-      log4c_init(pname);
+      if(!instance->managed)log4c_init(pname);
       /* 生产默认 INFO(高频 per-stream 日志已降为 DEBUG, 不输出), 避免海量流日志拖慢单线程事件循环。
        * 需调试时 NB_LOG_LEVEL=DEBUG。 */
-      const char* lv=getenv("NB_LOG_LEVEL"); int lvl=LOG4C_INFO;
+      const char* lv=nb_instance_env(nb_current_instance,"NB_LOG_LEVEL"); int lvl=LOG4C_INFO;
       if(lv){ if(!strcmp(lv,"DEBUG"))lvl=LOG4C_DEBUG; else if(!strcmp(lv,"WARN"))lvl=LOG4C_WARN; else if(!strcmp(lv,"ERROR"))lvl=LOG4C_ERROR; }
       log4c_set_level(lvl); }
     g_run_id=picoquic_current_time()^((uint64_t)(unsigned)getpid()<<32);
-    nb_runtime_init();
+    if(!instance->managed)nb_runtime_init();
     log4c_info("runtime identity run=%llx worker=%s pid=%d",
-        (unsigned long long)g_run_id,getenv("NB_WORKER_ID")?getenv("NB_WORKER_ID"):"0",(int)getpid());
+        (unsigned long long)g_run_id,nb_instance_env(nb_current_instance,"NB_WORKER_ID")?nb_instance_env(nb_current_instance,"NB_WORKER_ID"):"0",(int)getpid());
 
-    { const char* ug=getenv("NB_UDP_GSO");
+    { const char* ug=nb_instance_env(nb_current_instance,"NB_UDP_GSO");
       if(ug&&(!strcmp(ug,"off")||!strcmp(ug,"0")))g_udp_gso_enabled=0;
       log4c_info("UDP GSO aggregation: %s",g_udp_gso_enabled?"enabled":"disabled"); }
-    { const char* rg=getenv("NB_REORDER_GAP"); const char* rd=getenv("NB_REORDER_DELAY_US");
+    { const char* rg=nb_instance_env(nb_current_instance,"NB_REORDER_GAP"); const char* rd=nb_instance_env(nb_current_instance,"NB_REORDER_DELAY_US");
       if(rg&&rg[0])g_reorder_gap=strtoull(rg,NULL,10);
       if(rd&&rd[0])g_reorder_delay_us=strtoull(rd,NULL,10);
       if(G.role==ROLE_ENTRY || G.role==ROLE_MIDDLE)log4c_info("%s loss reorder tolerance: gap=%llu delay=%lluus (PTO unchanged)",
@@ -85,31 +94,31 @@ int main(int argc,char**argv){
     }
     if(G.role==ROLE_ENTRY)g_udp_control_grace_us=env_ms_to_us("NB_UDP_CONTROL_GRACE_MS",120000,100,120000);
 
-    { const char* fe=getenv("NB_FEC");
+    { const char* fe=nb_instance_env(nb_current_instance,"NB_FEC");
       if(fe&&fe[0])log4c_warn("NB_FEC is retired and ignored; use NB_FEC_V15_ACTIVE only for controlled tests"); }
-    { const char* fv=getenv("NB_FEC_V15");
+    { const char* fv=nb_instance_env(nb_current_instance,"NB_FEC_V15");
       if(fv && (!strcmp(fv,"off")||!strcmp(fv,"0"))){ g_fec_v15_observe=0; }
       if(fv && (!strcmp(fv,"on")||!strcmp(fv,"1"))){
           log4c_warn("NB_FEC_V15=%s now means observe-only; use NB_FEC_V15_ACTIVE=on only in controlled tests", fv);
       }
-      const char* fa=getenv("NB_FEC_V15_ACTIVE");
+      const char* fa=nb_instance_env(nb_current_instance,"NB_FEC_V15_ACTIVE");
       if(fa && (!strcmp(fa,"on")||!strcmp(fa,"1"))){
           g_fec_v15_active=1;
           g_fec_v15_observe=1;
       }
       log4c_info("FEC v1.5 mode: observe=%d active=%d", g_fec_v15_observe, g_fec_v15_active); }
-    { const char* ff=getenv("NB_FEC_V15_FORCE"); /* V1.5 测试强开: 无需 line_bad 即开启 sidecar */
+    { const char* ff=nb_instance_env(nb_current_instance,"NB_FEC_V15_FORCE"); /* V1.5 测试强开: 无需 line_bad 即开启 sidecar */
       if(ff && (!strcmp(ff,"on")||!strcmp(ff,"1"))){ g_fec_v15_force=1; log4c_info("FEC v1.5 sidecar force mode: ENABLED (NB_FEC_V15_FORCE=%s)",ff); } }
-    { const char* fr=getenv("NB_FEC_V15_FORCE_ROBUST");
+    { const char* fr=nb_instance_env(nb_current_instance,"NB_FEC_V15_FORCE_ROBUST");
       if(fr && (!strcmp(fr,"on")||!strcmp(fr,"1"))){ g_fec_v15_force_robust=1; log4c_info("FEC robust profile override: ENABLED"); } }
-    { const char* ds=getenv("NB_FEC_V15_DROP_SRC_MOD");
+    { const char* ds=nb_instance_env(nb_current_instance,"NB_FEC_V15_DROP_SRC_MOD");
       if(ds && atoi(ds)>0){ g_fec_v15_drop_src_mod=(uint32_t)atoi(ds); log4c_info("FEC v1.5 test drop source mod=%u", g_fec_v15_drop_src_mod); } }
-    { const char* dr=getenv("NB_FEC_V15_DROP_REPAIR_MOD");
+    { const char* dr=nb_instance_env(nb_current_instance,"NB_FEC_V15_DROP_REPAIR_MOD");
       if(dr && atoi(dr)>0){ g_fec_v15_drop_repair_mod=(uint32_t)atoi(dr); log4c_info("FEC v1.5 test drop repair mod=%u", g_fec_v15_drop_repair_mod); } }
     {
-      const char* eb=getenv("NB_FEC_BDP_BITRATE_BPS"); if(eb&&strtoull(eb,NULL,10)>0) g_fec_bdp_bitrate_bps=strtoull(eb,NULL,10);
-      const char* er=getenv("NB_FEC_BDP_RTT_US"); if(er&&strtoull(er,NULL,10)>0) g_fec_bdp_rtt_us=strtoull(er,NULL,10);
-      const char* em=getenv("NB_FEC_BDP_MULTIPLIER"); if(em&&atoi(em)>0) g_fec_bdp_multiplier=(unsigned)atoi(em);
+      const char* eb=nb_instance_env(nb_current_instance,"NB_FEC_BDP_BITRATE_BPS"); if(eb&&strtoull(eb,NULL,10)>0) g_fec_bdp_bitrate_bps=strtoull(eb,NULL,10);
+      const char* er=nb_instance_env(nb_current_instance,"NB_FEC_BDP_RTT_US"); if(er&&strtoull(er,NULL,10)>0) g_fec_bdp_rtt_us=strtoull(er,NULL,10);
+      const char* em=nb_instance_env(nb_current_instance,"NB_FEC_BDP_MULTIPLIER"); if(em&&atoi(em)>0) g_fec_bdp_multiplier=(unsigned)atoi(em);
       if(nb_fec_config_for_bdp(&g_fec_cfg,NB_FEC_DEFAULT_K,NB_FEC_DEFAULT_R,
           g_fec_bdp_bitrate_bps,g_fec_bdp_rtt_us,g_fec_bdp_multiplier)!=NB_FEC_OK){
           log4c_error("FEC config invalid"); log4c_shutdown(); return 1;
@@ -120,14 +129,15 @@ int main(int argc,char**argv){
           (unsigned long long)g_fec_cfg.nack_retry_us,g_fec_cfg.max_nack_retries);
     }
 
-    { char whitelist_error[256];if(nb_whitelist_init(wl_path,whitelist_error,sizeof(whitelist_error))!=0){
+    { char whitelist_error[256];instance->whitelist=nb_whitelist_create(wl_path,whitelist_error,sizeof(whitelist_error));if(instance->whitelist==NULL){
         log4c_error("whitelist requested but could not be loaded: %s; refusing to start",whitelist_error);
         log4c_shutdown();return 1;
     } }
-    nb_policy_init(tiktok_rules_path ? tiktok_rules_path : getenv("NB_TIKTOK_RULES"));
+    instance->policy=nb_policy_create(tiktok_rules_path ? tiktok_rules_path : nb_instance_env(nb_current_instance,"NB_TIKTOK_RULES"));
+    if(instance->policy==NULL){log4c_error("flow policy allocation failed");log4c_shutdown();return 1;}
 
     int insecure_test=0;
-    { const char* value=getenv("NB_INSECURE_TEST_MODE");insecure_test=value&&(!strcmp(value,"1")||!strcmp(value,"on")); }
+    { const char* value=nb_instance_env(nb_current_instance,"NB_INSECURE_TEST_MODE");insecure_test=value&&(!strcmp(value,"1")||!strcmp(value,"on")); }
     if(!insecure_test&&(!cert||!key||!cert_root)){
         log4c_error("secure mode requires -c node certificate, -k private key and -a CA certificate");
         log4c_shutdown();return 1;
@@ -144,7 +154,7 @@ int main(int argc,char**argv){
         }
     }
     if(G.role==ROLE_ENTRY&&G.socks_enabled){
-        const char* udp_advertise=getenv("NB_SOCKS_UDP_ADVERTISE_IP");
+        const char* udp_advertise=nb_instance_env(nb_current_instance,"NB_SOCKS_UDP_ADVERTISE_IP");
         if(udp_advertise&&udp_advertise[0]){
             if(inet_pton(AF_INET,udp_advertise,&g_socks_udp_advertise_addr)!=1){
                 log4c_error("invalid NB_SOCKS_UDP_ADVERTISE_IP=%s",udp_advertise);log4c_shutdown();return 1;
@@ -152,8 +162,8 @@ int main(int argc,char**argv){
             g_socks_udp_advertise_configured=1;
             log4c_info("SOCKS UDP advertise address: %s",udp_advertise);
         }else log4c_info("SOCKS UDP advertise address: accepted TCP local address");
-        const char* udp_port_min=getenv("NB_SOCKS_UDP_PORT_MIN");
-        const char* udp_port_max=getenv("NB_SOCKS_UDP_PORT_MAX");
+        const char* udp_port_min=nb_instance_env(nb_current_instance,"NB_SOCKS_UDP_PORT_MIN");
+        const char* udp_port_max=nb_instance_env(nb_current_instance,"NB_SOCKS_UDP_PORT_MAX");
         if((udp_port_min&&udp_port_min[0])||(udp_port_max&&udp_port_max[0])){
             char* end_min=NULL;char* end_max=NULL;unsigned long min_port=udp_port_min?strtoul(udp_port_min,&end_min,10):0;
             unsigned long max_port=udp_port_max?strtoul(udp_port_max,&end_max,10):0;
@@ -175,7 +185,7 @@ int main(int argc,char**argv){
             }
             g_socks_auth_enabled=1;log4c_info("SOCKS authentication loaded users=%zu",g_socks_users.count);
         }
-        if(tenants_path){char error[256],state_path[512];const char* configured_state=getenv("NB_TENANT_STATE");
+        if(tenants_path){char error[256],state_path[512];const char* configured_state=nb_instance_env(nb_current_instance,"NB_TENANT_STATE");
             if(nb_tenants_load(&g_tenants,tenants_path,error,sizeof(error))!=0){log4c_error("tenant config rejected: %s",error);log4c_shutdown();return 1;}
             if(configured_state&&*configured_state)snprintf(state_path,sizeof(state_path),"%s",configured_state);
             else if(snprintf(state_path,sizeof(state_path),"%s.state",tenants_path)<0||strlen(state_path)>=sizeof(state_path)-1){log4c_error("tenant state path is too long");log4c_shutdown();return 1;}
@@ -224,8 +234,8 @@ int main(int argc,char**argv){
         picoquic_set_cookie_mode(G.quic,2);
         if(!insecure_test)picoquic_set_client_authentication(G.quic,1);
     }
-    { const char* cc=getenv("NB_CC");
-      const char* bbr_options=getenv("NB_BBR_OPTIONS");
+    { const char* cc=nb_instance_env(nb_current_instance,"NB_CC");
+      const char* bbr_options=nb_instance_env(nb_current_instance,"NB_BBR_OPTIONS");
       if(cc&&strcmp(cc,"cubic")==0){
           picoquic_set_default_congestion_algorithm(G.quic,picoquic_cubic_algorithm);
           log4c_info("congestion control: cubic");
@@ -244,7 +254,7 @@ int main(int argc,char**argv){
               picoquic_set_default_congestion_algorithm(G.quic,picoquic_bbr_algorithm);
           log4c_info("congestion control: bbr options=%s",(bbr_options&&bbr_options[0])?bbr_options:"default");
       } }
-    { const char* value=getenv("NB_CWIN_MAX_BYTES");
+    { const char* value=nb_instance_env(nb_current_instance,"NB_CWIN_MAX_BYTES");
       if(value&&value[0]){
           char* end=NULL; errno=0;
           unsigned long long limit=strtoull(value,&end,10);
@@ -257,7 +267,7 @@ int main(int argc,char**argv){
       }else{
           log4c_info("congestion window cap: unlimited");
       } }
-    { const char* value=getenv("NB_MTU_MAX");
+    { const char* value=nb_instance_env(nb_current_instance,"NB_MTU_MAX");
       if(value&&value[0]){
           char* end=NULL;errno=0;unsigned long mtu=strtoul(value,&end,10);
           if(errno!=0||end==value||*end!='\0'||mtu<1280||mtu>PICOQUIC_MAX_PACKET_SIZE){
@@ -281,19 +291,13 @@ int main(int argc,char**argv){
 
     /* UDP socket: entry 用临时端口(client); middle/exit bind quic_port(server)。 */
     G.udp_fd=socket(AF_INET,SOCK_DGRAM,0);
+    if(G.udp_fd<0||nb_udp_enable_rxq_overflow(G.udp_fd)!=0){
+        log4c_error("udp SO_RXQ_OVFL enable failed: %s",strerror(errno));log4c_shutdown();return 1;
+    }
     { int one=1;if(setsockopt(G.udp_fd,SOL_SOCKET,SO_REUSEPORT,&one,sizeof(one))!=0){
         log4c_error("udp SO_REUSEPORT failed: %s",strerror(errno));log4c_shutdown();return 1;
     } }
-    /* 调大 UDP 收发缓冲(默认~200KB, 高吞吐/突发下溢出丢包致 QUIC 重传崩)。
-     * SO_*BUFFORCE(需 root/CAP_NET_ADMIN)绕过 net.core.rmem_max 上限, 失败回退普通 SO_*BUF。 */
-    { int bufsz=16*1024*1024, rb=0, sb=0; socklen_t ol=sizeof(int);
-      if(setsockopt(G.udp_fd,SOL_SOCKET,SO_RCVBUFFORCE,&bufsz,sizeof(bufsz))<0)
-          setsockopt(G.udp_fd,SOL_SOCKET,SO_RCVBUF,&bufsz,sizeof(bufsz));
-      if(setsockopt(G.udp_fd,SOL_SOCKET,SO_SNDBUFFORCE,&bufsz,sizeof(bufsz))<0)
-          setsockopt(G.udp_fd,SOL_SOCKET,SO_SNDBUF,&bufsz,sizeof(bufsz));
-      getsockopt(G.udp_fd,SOL_SOCKET,SO_RCVBUF,&rb,&ol);
-      getsockopt(G.udp_fd,SOL_SOCKET,SO_SNDBUF,&sb,&ol);
-      log4c_info("udp buffers rcvbuf=%d sndbuf=%d (req %d; 若<请求值则受 net.core.*mem_max 限)",rb,sb,bufsz); }
+    if(configure_udp_socket_buffers(G.udp_fd,"server/main")!=0){log4c_shutdown();return 1;}
     { struct sockaddr_in a; memset(&a,0,sizeof(a)); a.sin_family=AF_INET; a.sin_addr.s_addr=INADDR_ANY;
       a.sin_port=htons(G.role==ROLE_ENTRY?0:(uint16_t)quic_port);
       if(bind(G.udp_fd,(struct sockaddr*)&a,sizeof(a))<0){ log4c_error("bind udp fail: %s",strerror(errno)); log4c_shutdown(); return 1; }
@@ -302,7 +306,7 @@ int main(int argc,char**argv){
       getsockname(G.udp_fd,(struct sockaddr*)&G.local_addr,&ll);
       if(G.local_addr.ss_family==AF_INET){ struct sockaddr_in* s4=(struct sockaddr_in*)&G.local_addr;
         if(s4->sin_addr.s_addr==INADDR_ANY) s4->sin_addr.s_addr=htonl(INADDR_LOOPBACK); } }
-    if(G.role==ROLE_MIDDLE){struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=INADDR_ANY;G.client_udp_fd=socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);if(G.client_udp_fd<0||bind(G.client_udp_fd,(struct sockaddr*)&a,sizeof(a))<0){log4c_error("middle client udp bind failed: %s",strerror(errno));return 1;}set_nonblock(G.client_udp_fd);socklen_t ll=sizeof(G.client_local_addr);getsockname(G.client_udp_fd,(struct sockaddr*)&G.client_local_addr,&ll);}
+    if(G.role==ROLE_MIDDLE){struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=INADDR_ANY;G.client_udp_fd=socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC,0);if(G.client_udp_fd<0||nb_udp_enable_rxq_overflow(G.client_udp_fd)!=0||configure_udp_socket_buffers(G.client_udp_fd,"middle/client")!=0||bind(G.client_udp_fd,(struct sockaddr*)&a,sizeof(a))<0){log4c_error("middle client udp bind failed: %s",strerror(errno));return 1;}set_nonblock(G.client_udp_fd);socklen_t ll=sizeof(G.client_local_addr);getsockname(G.client_udp_fd,(struct sockaddr*)&G.client_local_addr,&ll);}
 
     if(G.role==ROLE_ENTRY){
         G.tcp_listen_fd=socket(AF_INET,SOCK_STREAM,0);
@@ -316,18 +320,19 @@ int main(int argc,char**argv){
         if(entry_open_upstream()!=0){ log4c_error("entry open upstream fail"); log4c_shutdown(); return 1; }
         if(G.socks_enabled)
             log4c_info("entry up: SOCKS5 :%d -> QUIC %s:%d mid=[%s] cc=%s",listen_port,next_host,next_port,G.mid_route,
-                (getenv("NB_CC")&&getenv("NB_CC")[0])?getenv("NB_CC"):"bbr");
+                (nb_instance_env(nb_current_instance,"NB_CC")&&nb_instance_env(nb_current_instance,"NB_CC")[0])?nb_instance_env(nb_current_instance,"NB_CC"):"bbr");
         else
             log4c_info("entry up: TCP :%d -> QUIC %s:%d route=%s cc=%s",listen_port,next_host,next_port,route,
-                (getenv("NB_CC")&&getenv("NB_CC")[0])?getenv("NB_CC"):"bbr");
+                (nb_instance_env(nb_current_instance,"NB_CC")&&nb_instance_env(nb_current_instance,"NB_CC")[0])?nb_instance_env(nb_current_instance,"NB_CC"):"bbr");
     } else {
         log4c_info("%s up: QUIC :%d cc=%s",role_name(G.role),quic_port,
-            (getenv("NB_CC")&&getenv("NB_CC")[0])?getenv("NB_CC"):"bbr");
+            (nb_instance_env(nb_current_instance,"NB_CC")&&nb_instance_env(nb_current_instance,"NB_CC")[0])?nb_instance_env(nb_current_instance,"NB_CC"):"bbr");
     }
 
-    if(nb_dns_init(G.outbound_configured?G.outbound_addr.ss_family:AF_UNSPEC,DNS_WORKERS)!=0){ log4c_error("async DNS init fail"); log4c_shutdown(); return 1; }
+    nb_current_instance->dns=nb_dns_create(G.outbound_configured?G.outbound_addr.ss_family:AF_UNSPEC,DNS_WORKERS);
+    if(nb_current_instance->dns==NULL){ log4c_error("async DNS init fail"); log4c_shutdown(); return 1; }
     log4c_info("async DNS: %d workers ready",DNS_WORKERS);
-    if(g_socks_auth_enabled&&nb_auth_async_init(&g_socks_users,AUTH_WORKERS)!=0){
+    if(g_socks_auth_enabled&&(nb_current_instance->auth_async=nb_auth_async_create(&g_socks_users,AUTH_WORKERS))==NULL){
         log4c_error("async SOCKS authentication init fail");log4c_shutdown();return 1;
     }
     if(g_socks_auth_enabled)log4c_info("async SOCKS authentication: %d workers ready",AUTH_WORKERS);
@@ -342,23 +347,28 @@ int main(int argc,char**argv){
         if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.udp_fd,&ev)!=0){log4c_error("epoll add udp fail: %s",strerror(errno));return 1;}
         if(G.client_udp_fd>=0){ev.data.u64=NB_EPOLL_TAG_CLIENT_UDP;if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.client_udp_fd,&ev)!=0)return 1;}
         ev.data.u64=NB_EPOLL_TAG_DNS;
-        if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_dns_result_fd(),&ev)!=0){log4c_error("epoll add dns fail: %s",strerror(errno));return 1;}
+        if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_dns_context_result_fd(nb_current_instance->dns),&ev)!=0){log4c_error("epoll add dns fail: %s",strerror(errno));return 1;}
         if(g_socks_auth_enabled){ev.data.u64=NB_EPOLL_TAG_AUTH;
-            if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_auth_async_result_fd(),&ev)!=0){log4c_error("epoll add auth fail: %s",strerror(errno));return 1;}}
+            if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_auth_async_context_result_fd(nb_current_instance->auth_async),&ev)!=0){log4c_error("epoll add auth fail: %s",strerror(errno));return 1;}}
         if(G.tcp_listen_fd>=0){ev.data.u64=NB_EPOLL_TAG_LISTEN;
             if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.tcp_listen_fd,&ev)!=0){log4c_error("epoll add listen fail: %s",strerror(errno));return 1;}}
         ev.data.u64=NB_EPOLL_TAG_CONTROL;
         if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.control_fd,&ev)!=0){log4c_error("epoll add control fail: %s",strerror(errno));return 1;}
     }
     log4c_info("event loop: epoll enabled");
+    atomic_store(&instance->ready,1);atomic_store(&instance->running,1);
 
     /* ---- 自定义事件循环 ---- */
     uint64_t loop_stat_at=picoquic_current_time(),loop_busy_max=0,loop_wake_late_max=0;
     uint64_t loop_iterations=0,loop_over_5ms=0,loop_over_20ms=0;
-    for(;;){
+    while(!atomic_load(&instance->stop_requested)){
         uint64_t now=picoquic_current_time();
         udp_lifecycle_wake_due(now);
         int64_t wd=picoquic_get_next_wake_delay(G.quic,now,1000000); /* us, cap 1s */
+        if(g_tenants_enabled)for(i=0;i<MAX_CONN;i++){
+            proxy_stream_t* p=&G.streams[i];if(!p->in_use||p->tcp_fd<0)continue;
+            wd=nb_tenant_wake_delay(p->tenant_throttled_until,now,wd);
+        }
         for(i=0;i<MAX_CONN;i++){
             proxy_stream_t* p=&G.streams[i];if(!p->in_use||p->fec_engine==NULL)continue;
             uint64_t dl=nb_fec_next_deadline(p->fec_engine);if(dl==0)continue;
@@ -384,9 +394,9 @@ int main(int argc,char**argv){
             if(tag==NB_EPOLL_TAG_UDP){udp_drain_fd(G.udp_fd,&G.local_addr,now);continue;}
             if(tag==NB_EPOLL_TAG_CLIENT_UDP){udp_drain_fd(G.client_udp_fd,&G.client_local_addr,now);continue;}
             if(tag==NB_EPOLL_TAG_AUTH){
-                char drain[256];while(read(nb_auth_async_result_fd(),drain,sizeof(drain))>0){}
+                char drain[256];while(read(nb_auth_async_context_result_fd(nb_current_instance->auth_async),drain,sizeof(drain))>0){}
                 nb_auth_async_result_t result;
-                while(nb_auth_async_pop(&result)){
+                while(nb_auth_async_context_pop(nb_current_instance->auth_async,&result)){
                     if(result.valid)nb_auth_cache_store(&g_socks_users,result.fingerprint,
                         picoquic_current_time(),SOCKS_AUTH_CACHE_TTL_US);
                     for(int i=0;i<MAX_CONN;i++){
@@ -402,7 +412,7 @@ int main(int argc,char**argv){
                 continue;
             }
             if(tag==NB_EPOLL_TAG_DNS){
-                char drain[256];while(read(nb_dns_result_fd(),drain,sizeof(drain))>0){}
+                char drain[256];while(read(nb_dns_context_result_fd(nb_current_instance->dns),drain,sizeof(drain))>0){}
                 dns_res_t r;
                 while(dns_pop_result(&r)){
                     proxy_stream_t* p=ps_find_by_id(r.ps_id);
@@ -489,7 +499,7 @@ int main(int argc,char**argv){
                 if(ps_is_rtc_webcast(p)) log4c_info("exit id=%u target connect result=ok latency=%.1fms route=%s",
                     p->id,(p->target_connect_done_at-p->target_connect_at)/1000.0,p->route);
             }
-            if(p->in_use&&!p->tcp_connecting&&(ee&(EPOLLIN|EPOLLRDHUP|EPOLLHUP|EPOLLERR))){
+            if(p->in_use&&!p->tcp_connecting&&!p->tcp_eof&&(ee&(EPOLLIN|EPOLLRDHUP|EPOLLHUP|EPOLLERR))){
                 if(p->udp_association){
                     uint8_t control[64];ssize_t n=recv(p->tcp_fd,control,sizeof(control),0);
                     if(n==0||(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
@@ -537,9 +547,32 @@ int main(int argc,char**argv){
                 log4c_warn("id=%u idle timeout(%llus), teardown route=%s",p->id,
                     (unsigned long long)((tnow-p->last_active)/1000000),p->route);
                 ps_teardown_reason(p,"idle-timeout"); } } }
+        /* 空队列只保留正常突发所需容量；高水位容量由后续 append 按需重建。 */
+        {
+          uint64_t memory_now=picoquic_current_time();
+          if(memory_now-nb_current_instance->memory_scan_at>=NB_MEMORY_SCAN_INTERVAL_US){
+            nb_current_instance->memory_scan_at=memory_now;uint64_t released=0;
+            for(i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];if(!p->in_use)continue;
+                released+=nb_ring_release_empty(&p->down_tx,NB_EMPTY_QUEUE_RETAIN_MAX);
+                released+=nb_ring_release_empty(&p->up_tx,NB_EMPTY_QUEUE_RETAIN_MAX);
+                released+=nb_ring_release_empty(&p->q2t,NB_EMPTY_QUEUE_RETAIN_MAX);
+            }
+            g_memory_released_pending+=released;
+#if defined(__GLIBC__)
+            if(g_memory_released_pending>=NB_MALLOC_TRIM_MIN_RELEASED&&
+                memory_now-nb_current_instance->malloc_trim_at>=NB_MALLOC_TRIM_INTERVAL_US){
+                int trimmed=malloc_trim(0);nb_current_instance->malloc_trim_at=memory_now;
+                log4c_info("memory reclaim released=%llu malloc_trim=%d",
+                    (unsigned long long)g_memory_released_pending,trimmed);g_memory_released_pending=0;
+            }
+#else
+            if(g_memory_released_pending>0){log4c_info("memory reclaim released=%llu",
+                (unsigned long long)g_memory_released_pending);g_memory_released_pending=0;}
+#endif
+          } }
         /* 过载保护: 流表用量观测(每10s), 峰值接近 MAX_CONN 告警, 供扩容/限流决策 */
-        { static uint64_t su_last=0; uint64_t tn=picoquic_current_time();
-            if(tn - su_last > 10000000ULL){ su_last=tn;
+        { uint64_t tn=picoquic_current_time();
+            if(tn - nb_current_instance->stream_usage_last_at > 10000000ULL){ nb_current_instance->stream_usage_last_at=tn;
                 if(g_ps_peak*10 >= MAX_CONN*9) log4c_warn("stream table HIGH: inuse=%d peak=%d / max=%d",g_ps_inuse,g_ps_peak,MAX_CONN);
                 else log4c_info("stream table: inuse=%d peak=%d / max=%d",g_ps_inuse,g_ps_peak,MAX_CONN); } }
         { uint64_t metrics_now=picoquic_current_time();
@@ -555,13 +588,17 @@ int main(int argc,char**argv){
           if(G.role==ROLE_ENTRY)logical_reconnect_tick(metrics_now);
         }
         /* 白名单热重载(限流 ~5s 检查一次文件 mtime) */
-        if(nb_whitelist_configured()){ static uint64_t wl_last=0; uint64_t tn=picoquic_current_time();
-            if(tn-wl_last>5000000ULL){char error[256];wl_last=tn;
-                if(nb_whitelist_reload_if_changed(error,sizeof(error))<0)log4c_error("whitelist reload rejected; keeping previous rules: %s",error); } }
+        { uint64_t tn=picoquic_current_time();
+          if(tn-nb_current_instance->whitelist_last_at>5000000ULL){char error[256];nb_current_instance->whitelist_last_at=tn;
+              if(nb_whitelist_context_configured(instance->whitelist)&&
+                  nb_whitelist_context_reload_if_changed(instance->whitelist,error,sizeof(error))<0)
+                  log4c_error("whitelist reload rejected; keeping previous rules: %s",error);
+              if(nb_policy_reload_if_changed(instance->policy)<0)
+                  log4c_error("flow policy reload rejected; keeping previous rules"); } }
         /* 链路质量观测(每10s): 记录到下一跳各连接的 RTT/丢包, 定位抖动/丢包在哪跳(FEC 动态冗余输入)。
          * entry 观测 entry->middle 段, middle 观测 middle->exit 段, 两段全覆盖。 */
-        if(G.pool_count>0){ static uint64_t lq_last=0; uint64_t tn=picoquic_current_time();
-            if(tn - lq_last > 10000000ULL){ lq_last=tn;
+        if(G.pool_count>0){ uint64_t tn=picoquic_current_time();
+            if(tn - nb_current_instance->link_quality_last_at > 10000000ULL){ nb_current_instance->link_quality_last_at=tn;
                 for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int k=0;k<POOL_SIZE;k++){
                     cnx_pool_t* pool=&G.pools[pool_id];if(!pool->cnx[k])continue;
                     picoquic_path_quality_t q; memset(&q,0,sizeof(q));
@@ -606,7 +643,7 @@ int main(int argc,char**argv){
                         pool_id,k,pmtu_event>0?"promote":"blackhole-fallback",path?path->send_mtu:0,
                         nb_pmtu_effective(&pool->pmtu[k]),(unsigned long long)pool->pmtu[k].cooldown_until_us);
                     log4c_info("linkq pool[%d:%d] run=%llx worker=%s cid=%llx mtu=%zu pmtu=%zu rtt=%.1fms(min%.1f/max%.1f) jit=%.1fms loss=%.2f%% dsent=%llu loss_raw=%llu eff=%llu spur=%llu timer=%llu repeat=%llu retx=%llu/%llu pre=%llu/%llu reorder=%.1fms/%llu tol=%llu/%.1fms ack=%.1fms(min%.1f/max%.1f) cc=%s:%s(%llu)/%llu cwin=%lluKB bif=%lluKB block=%u/%u/%u bw=%lluKbps sent=%lluKB",
-                        pool_id,k,(unsigned long long)g_run_id,getenv("NB_WORKER_ID")?getenv("NB_WORKER_ID"):"0",
+                        pool_id,k,(unsigned long long)g_run_id,nb_instance_env(nb_current_instance,"NB_WORKER_ID")?nb_instance_env(nb_current_instance,"NB_WORKER_ID"):"0",
                         (unsigned long long)picoquic_val64_connection_id(cnx->initial_cnxid),
                         path?path->send_mtu:0,
                         nb_pmtu_effective(&pool->pmtu[k]),
@@ -634,8 +671,8 @@ int main(int argc,char**argv){
         }
         /* 4) QUIC -> UDP (GSO 批量发送, 降 syscall; 不支持时逐段回退) */
         if(g_fec_v15_observe || g_fec_v15_active){
-            static uint64_t fecv15_last=0; uint64_t ftn=picoquic_current_time();
-            if(ftn - fecv15_last > 10000000ULL){ fecv15_last=ftn;
+            uint64_t ftn=picoquic_current_time();
+            if(ftn - nb_current_instance->fec_stats_last_at > 10000000ULL){ nb_current_instance->fec_stats_last_at=ftn;
                 uint64_t ctrl_open=0, ctrl_ready=0, dgq=0, dgs=0, dgr=0, dga=0, dgl=0, stageq=0;
                 nb_fec_metrics_t fm=g_fec_metrics_done;
                 for(i=0;i<MAX_CONN;i++){ proxy_stream_t* p=&G.streams[i];
@@ -678,14 +715,38 @@ int main(int argc,char**argv){
           if(busy>=20000)loop_over_20ms++;
           if(loop_end-loop_stat_at>=10000000ULL){
               log4c_info("eventloop stat worker=%s iterations=%llu busy_max=%.1fms wake_late_max=%.1fms over5ms=%llu over20ms=%llu",
-                  getenv("NB_WORKER_ID")?getenv("NB_WORKER_ID"):"0",
+                  nb_instance_env(nb_current_instance,"NB_WORKER_ID")?nb_instance_env(nb_current_instance,"NB_WORKER_ID"):"0",
                   (unsigned long long)loop_iterations,loop_busy_max/1000.0,loop_wake_late_max/1000.0,
                   (unsigned long long)loop_over_5ms,(unsigned long long)loop_over_20ms);
               loop_stat_at=loop_end;loop_busy_max=0;loop_wake_late_max=0;
               loop_iterations=0;loop_over_5ms=0;loop_over_20ms=0;
           } }
     }
-    if(g_tenants_enabled)nb_tenants_close(&g_tenants);
-    log4c_shutdown();
+    atomic_store(&instance->running,0);
     return 0;
+}
+
+static void nb_node_instance_cleanup(nb_instance_t* instance){
+    if(instance==NULL)return;
+    nb_current_instance=instance;
+    for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use)ps_free(&G.streams[i]);
+    nb_auth_async_destroy(instance->auth_async);instance->auth_async=NULL;
+    nb_dns_destroy(instance->dns);instance->dns=NULL;
+    nb_whitelist_destroy(instance->whitelist);instance->whitelist=NULL;
+    nb_policy_destroy(instance->policy);instance->policy=NULL;
+    if(g_tenants_enabled){nb_tenants_close(&g_tenants);g_tenants_enabled=0;}
+    if(G.quic){picoquic_free(G.quic);G.quic=NULL;}
+    int descriptors[]={G.control_fd,G.tcp_listen_fd,G.client_udp_fd,G.udp_fd,G.epoll_fd};
+    for(size_t i=0;i<sizeof(descriptors)/sizeof(descriptors[0]);i++)if(descriptors[i]>=0){
+        int duplicate=0;for(size_t j=0;j<i;j++)if(descriptors[j]==descriptors[i])duplicate=1;
+        if(!duplicate)close(descriptors[i]);
+    }
+    G.control_fd=G.tcp_listen_fd=G.client_udp_fd=G.udp_fd=G.epoll_fd=-1;
+    if(instance->control_path[0])unlink(instance->control_path);
+    atomic_store(&instance->running,0);
+}
+
+static int nb_node_instance_execute(int argc,char**argv,nb_instance_t* instance){
+    int status=nb_node_instance_loop(argc,argv,instance);instance->exit_code=status;
+    nb_node_instance_cleanup(instance);if(!instance->managed)log4c_shutdown();return status;
 }

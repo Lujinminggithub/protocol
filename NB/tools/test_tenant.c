@@ -1,5 +1,6 @@
 #include "nb_tenant.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -8,6 +9,10 @@
 #endif
 
 int main(void){
+    assert(nb_tenant_wake_delay(0,1000000,1000000)==1000000);
+    assert(nb_tenant_wake_delay(1010000,1000000,1000000)==10000);
+    assert(nb_tenant_wake_delay(999999,1000000,1000000)==0);
+    assert(nb_tenant_wake_delay(1020000,1000000,5000)==5000);
     char path[96],state_path[112],error[128],json[1024];
 #ifdef _WIN32
     snprintf(path,sizeof(path),"nb-tenant-%ld.tmp",(long)getpid());

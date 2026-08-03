@@ -7,12 +7,21 @@
  */
 #include "../src/nb_fec_rs.h"
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAXK 8
 #define MAXR 2
 #define MAXN (MAXK + MAXR)
+
+static void* concurrent_init(void* unused){
+    (void)unused;
+    uint8_t source[4][64],repair[2][64];uint8_t* sources[4];uint8_t* repairs[2];
+    for(size_t i=0;i<4;i++){sources[i]=source[i];memset(source[i],(int)(i+1),sizeof(source[i]));}
+    for(size_t i=0;i<2;i++)repairs[i]=repair[i];
+    return nb_rs_encode(4,2,sources,repairs,sizeof(source[0]))==0?NULL:(void*)1;
+}
 
 /* 返回该配置下的失败次数 */
 static int test_config(size_t K, size_t R, size_t shard_size, unsigned seed){
@@ -72,7 +81,9 @@ static int test_config(size_t K, size_t R, size_t shard_size, unsigned seed){
 }
 
 int main(void){
-    nb_rs_init();
+    pthread_t initializers[32];
+    for(size_t i=0;i<32;i++)if(pthread_create(&initializers[i],NULL,concurrent_init,NULL)!=0)return 1;
+    for(size_t i=0;i<32;i++){void* result=NULL;if(pthread_join(initializers[i],&result)!=0||result!=NULL)return 1;}
     struct { size_t K, R; } cfgs[] = { {4,2}, {8,2}, {6,2}, {2,2}, {1,2}, {3,2} };
     size_t sizes[] = { 1, 7, 8, 15, 960, 1024 };
     int total_fail = 0, total_case = 0;

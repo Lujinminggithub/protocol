@@ -194,3 +194,22 @@ func TestControlPlaneRejectsUnauthenticatedMutation(t *testing.T) {
 		t.Fatalf("status=%d", response.StatusCode)
 	}
 }
+
+func TestRXQDeltaHandlesFirstSampleIncrementAndReset(t *testing.T) {
+	for _, test := range []struct {
+		previous float64
+		current  float64
+		seen     bool
+		expected float64
+	}{
+		{0, 7, false, 7},
+		{7, 11, true, 4},
+		{11, 11, true, 0},
+		{11, 3, true, 3},
+	} {
+		if actual := rxqDelta(test.previous, test.current, test.seen); actual != test.expected {
+			t.Fatalf("rxqDelta(%v,%v,%v)=%v want=%v", test.previous, test.current,
+				test.seen, actual, test.expected)
+		}
+	}
+}

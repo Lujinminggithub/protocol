@@ -7,9 +7,12 @@ static int receive(void* ctx,const nb_lstream_frame_t* f){receiver_t* r=ctx;r->c
     memcpy(r->data+r->length,f->payload,f->payload_length);r->length+=f->payload_length;r->next+=f->payload_length;}return 0;}
 int main(void){uint64_t hi=0x0102030405060708ULL,lo=0x1112131415161718ULL;char flow[33];CHECK(nb_lstream_flow_render(flow,hi,lo)==0);
     uint64_t a=0,b=0;CHECK(nb_lstream_flow_parse(flow,&a,&b)==0&&a==hi&&b==lo);nb_lstream_tx_t tx;nb_lstream_tx_init(&tx,hi,lo);
+    uint64_t budget_used=0;nb_lstream_tx_bind_budget(&tx,&budget_used,32777);
     uint8_t source[32777];for(size_t i=0;i<sizeof(source);i++)source[i]=(uint8_t)(i*17u);uint64_t offset=99;
     CHECK(nb_lstream_tx_append(&tx,source,sizeof(source),&offset)==0&&offset==0&&tx.next_offset==sizeof(source));
+    CHECK(budget_used==sizeof(source)&&nb_lstream_tx_append(&tx,source,1,NULL)!=0);
     CHECK(nb_lstream_tx_ack(&tx,12345)==0&&tx.base_offset==12345&&tx.replay_length==sizeof(source)-12345);
+    CHECK(budget_used==sizeof(source)-12345);
     CHECK(memcmp(tx.replay,source+12345,tx.replay_length)==0);CHECK(nb_lstream_tx_ack(&tx,tx.next_offset+1)!=0);
     CHECK(nb_lstream_tx_fin(&tx)==0&&tx.fin_offset==sizeof(source));uint8_t frames[40000];size_t wire_length=0;
     for(size_t pos=0;pos<sizeof(source);){size_t n=sizeof(source)-pos;if(n>NB_LSTREAM_DATA_MAX)n=NB_LSTREAM_DATA_MAX;
@@ -34,4 +37,16 @@ int main(void){uint64_t hi=0x0102030405060708ULL,lo=0x1112131415161718ULL;char f
         (size_t)bootstrap_length-route_header_length,&bootstrap_frame)==0);
     CHECK(bootstrap_frame.type==NB_LSTREAM_RESUME&&bootstrap_frame.offset==12345);
     CHECK(nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,"T:bad\nroute",NB_LSTREAM_OPEN,hi,lo,0)<0);
-    nb_lstream_tx_dispose(&tx);puts("nb_lstream_test: ok");return 0;}
+    CHECK(nb_lstream_reset_requires_resume(1,1,NB_LSTREAM_RELAY_RESTART_ERROR)==1);
+    CHECK(nb_lstream_reset_requires_resume(0,1,NB_LSTREAM_RELAY_RESTART_ERROR)==0);
+    CHECK(nb_lstream_reset_requires_resume(1,0,NB_LSTREAM_RELAY_RESTART_ERROR)==0);
+    CHECK(nb_lstream_reset_requires_resume(1,1,0)==0);
+    CHECK(nb_lstream_stop_requires_reset_wait(1,1)==1);
+    CHECK(nb_lstream_stop_requires_reset_wait(0,1)==0);
+    CHECK(nb_lstream_stop_requires_reset_wait(1,0)==0);
+    CHECK(nb_lstream_reconnect_delay_us(0)==250000ULL);
+    CHECK(nb_lstream_reconnect_delay_us(1)==500000ULL);
+    CHECK(nb_lstream_reconnect_delay_us(4)==4000000ULL);
+    CHECK(nb_lstream_reconnect_delay_us(5)==5000000ULL);
+    CHECK(nb_lstream_reconnect_delay_us(100)==5000000ULL);
+    nb_lstream_tx_dispose(&tx);CHECK(budget_used==0);puts("nb_lstream_test: ok");return 0;}

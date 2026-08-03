@@ -1,6 +1,12 @@
 static proxy_stream_t* ps_alloc(void){
+    if(g_ps_inuse>=(int)nb_current_instance->session_limit)return NULL;
     int i; for(i=0;i<MAX_CONN;i++) if(!G.streams[i].in_use){
         memset(&G.streams[i],0,sizeof(G.streams[i]));
+        G.streams[i].queue_clocks=calloc(1,sizeof(*G.streams[i].queue_clocks));
+        if(G.streams[i].queue_clocks==NULL)return NULL;
+        nb_ring_bind_budget(&G.streams[i].down_tx,&nb_current_instance->queue_bytes,nb_current_instance->queue_limit_bytes);
+        nb_ring_bind_budget(&G.streams[i].up_tx,&nb_current_instance->queue_bytes,nb_current_instance->queue_limit_bytes);
+        nb_ring_bind_budget(&G.streams[i].q2t,&nb_current_instance->queue_bytes,nb_current_instance->queue_limit_bytes);
         G.streams[i].in_use=1; G.streams[i].tcp_fd=-1; G.streams[i].udp_fd=-1; G.streams[i].id=++G.next_ps_id;
         G.streams[i].down_pool_idx=-1;
         G.streams[i].down_pool_id=-1;
@@ -8,13 +14,16 @@ static proxy_stream_t* ps_alloc(void){
         G.streams[i].route_index=-1;
         G.streams[i].last_active=picoquic_current_time();
         G.streams[i].created_at=G.streams[i].last_active;
-        nb_udp_reassembly_init(&G.streams[i].udp_reassembly);
         (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_ID,G.streams[i].id,0,0,&G.streams[i]);
         g_ps_inuse++; if(g_ps_inuse>g_ps_peak) g_ps_peak=g_ps_inuse;
         return &G.streams[i]; }
     return NULL;
 }
 static void ps_touch(proxy_stream_t* p){ p->last_active=picoquic_current_time(); }
+static void instance_queue_release(size_t length){
+    if((uint64_t)length>=nb_current_instance->queue_bytes)nb_current_instance->queue_bytes=0;
+    else nb_current_instance->queue_bytes-=(uint64_t)length;
+}
 static void ps_index_refresh(proxy_stream_t* p){
     if(p==NULL||!p->in_use)return;
     (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_ID,p->id,0,0,p);
@@ -68,8 +77,34 @@ static proxy_stream_t* ps_find_logical(uint64_t hi,uint64_t lo,const proxy_strea
 
 static int logical_endpoint_init(proxy_stream_t* p,uint64_t hi,uint64_t lo){
     if(p==NULL||p->udp_mode||(hi==0&&lo==0))return -1;
+    if(p->logical_decoder==NULL){
+        p->logical_decoder=calloc(1,sizeof(*p->logical_decoder));
+        if(p->logical_decoder==NULL)return -1;
+    }
     p->logical_mode=1;p->logical_endpoint=1;p->logical_flow_hi=hi;p->logical_flow_lo=lo;
-    nb_lstream_tx_init(&p->logical_tx,hi,lo);nb_lstream_decoder_init(&p->logical_decoder);return 0;
+    nb_lstream_tx_init(&p->logical_tx,hi,lo);
+    nb_lstream_tx_bind_budget(&p->logical_tx,&nb_current_instance->queue_bytes,
+        nb_current_instance->queue_limit_bytes);
+    nb_lstream_decoder_init(p->logical_decoder);return 0;
+}
+
+static int udp_reassembly_ensure(proxy_stream_t* p){
+    if(p==NULL)return -1;
+    if(p->udp_reassembly!=NULL)return 0;
+    p->udp_reassembly=calloc(1,sizeof(*p->udp_reassembly));
+    if(p->udp_reassembly==NULL)return -1;
+    nb_udp_reassembly_init(p->udp_reassembly);return 0;
+}
+
+static uint64_t ps_dynamic_capacity(const proxy_stream_t* p){
+    if(p==NULL)return 0;
+    uint64_t total=p->down_tx.cap+p->up_tx.cap+p->q2t.cap+p->logical_tx.replay_capacity+
+        p->fec_dg_tx_cap+p->fec_stage_tx_cap+p->udp_down_tx_cap+p->udp_up_tx_cap+p->udp_pending_tx_cap;
+    if(p->queue_clocks)total+=sizeof(*p->queue_clocks);
+    if(p->logical_decoder)total+=sizeof(*p->logical_decoder);
+    if(p->fec_ctrl_rxbuf)total+=NB_FEC_CTRL_RX_CAP;
+    if(p->udp_reassembly)total+=sizeof(*p->udp_reassembly);
+    return total;
 }
 
 static int logical_entry_init(proxy_stream_t* p){
@@ -82,9 +117,20 @@ static int logical_entry_init(proxy_stream_t* p){
 
 static void ps_release_rebind_shell(proxy_stream_t* shell){
     if(shell==NULL||!shell->in_use)return;
+    g_memory_released_pending+=ps_dynamic_capacity(shell);
     nb_session_index_remove_value(&g_session_index,shell);
     nb_ring_dispose(&shell->down_tx);nb_ring_dispose(&shell->up_tx);nb_ring_dispose(&shell->q2t);
-    nb_udp_reassembly_dispose(&shell->udp_reassembly);if(g_ps_inuse>0)g_ps_inuse--;memset(shell,0,sizeof(*shell));
+    instance_queue_release(shell->fec_dg_tx_len+shell->fec_stage_tx_len+shell->udp_down_tx_len+
+        shell->udp_up_tx_len+shell->udp_pending_tx_len);
+    free(shell->fec_dg_tx);free(shell->fec_stage_tx);free(shell->udp_down_tx);
+    free(shell->udp_up_tx);free(shell->udp_pending_tx);
+    nb_lstream_tx_dispose(&shell->logical_tx);
+    free(shell->queue_clocks);shell->queue_clocks=NULL;
+    free(shell->logical_decoder);shell->logical_decoder=NULL;
+    free(shell->fec_ctrl_rxbuf);shell->fec_ctrl_rxbuf=NULL;
+    if(shell->udp_reassembly){nb_udp_reassembly_dispose(shell->udp_reassembly);free(shell->udp_reassembly);shell->udp_reassembly=NULL;}
+    if(g_ps_inuse>0)g_ps_inuse--;
+    memset(shell,0,sizeof(*shell));
 }
 
 static proxy_stream_t* logical_rebind_upstream(proxy_stream_t* shell,proxy_stream_t* existing){
@@ -92,12 +138,14 @@ static proxy_stream_t* logical_rebind_upstream(proxy_stream_t* shell,proxy_strea
     picoquic_cnx_t* cnx=shell->up_cnx;uint64_t sid=shell->up_stream_id;
     picoquic_cnx_t* old_cnx=existing->up_cnx;uint64_t old_sid=existing->up_stream_id;
     nb_session_index_remove_value(&g_session_index,existing);
-    nb_send_clear(&existing->up_tx,&existing->up_tx_clock);
-    nb_send_clear(&existing->q2t,&existing->q2t_clock);existing->logical_rx_next=existing->logical_rx_delivered;
+    nb_send_clear(&existing->up_tx,&existing->queue_clocks->up_tx);
+    nb_send_clear(&existing->q2t,&existing->queue_clocks->q2t);existing->logical_rx_next=existing->logical_rx_delivered;
     if(!existing->logical_rx_fin_acked_sent){existing->logical_rx_fin_seen=0;existing->logical_rx_fin_offset=0;existing->q2t_fin=0;}
-    nb_lstream_decoder_init(&existing->logical_decoder);existing->up_cnx=cnx;existing->up_stream_id=sid;
+    if(existing->logical_decoder)nb_lstream_decoder_init(existing->logical_decoder);
+    existing->up_cnx=cnx;existing->up_stream_id=sid;
     existing->logical_reconnect_pending=0;existing->logical_disconnected_at=0;
-    existing->logical_reconnect_last_attempt=0;
+    existing->logical_reconnect_last_attempt=0;existing->logical_resume_inflight=0;
+    existing->logical_reconnect_failures=0;
     picoquic_set_app_stream_ctx(cnx,sid,existing);
     if(old_cnx&&old_cnx!=cnx){picoquic_set_app_stream_ctx(old_cnx,old_sid,NULL);picoquic_discard_stream(old_cnx,old_sid,0);}
     ps_release_rebind_shell(shell);ps_index_refresh(existing);return existing;
@@ -161,6 +209,7 @@ static void ps_clear_stream_ctx_once(picoquic_cnx_t* cnx, uint64_t sid,
 }
 static void ps_free(proxy_stream_t* p){
     if(!p->in_use) return;               /* 幂等: 防拆流/回调重入导致 double free */
+    g_memory_released_pending+=ps_dynamic_capacity(p);
     if(p->close_reason[0] == 0) ps_set_close_reason(p, "released");
     if(p->logical_endpoint)log4c_info("%s logical flow close id=%u flow=%016llx%016llx reason=%s tx_base=%llu tx_next=%llu replay=%zu rx_delivered=%llu rx_next=%llu",
         role_name(G.role),p->id,(unsigned long long)p->logical_flow_hi,(unsigned long long)p->logical_flow_lo,p->close_reason,
@@ -223,13 +272,18 @@ static void ps_free(proxy_stream_t* p){
     if(p->udp_fd>=0){ if(G.epoll_fd>=0)epoll_ctl(G.epoll_fd,EPOLL_CTL_DEL,p->udp_fd,NULL); close(p->udp_fd); }
     nb_ring_dispose(&p->down_tx);
     nb_ring_dispose(&p->up_tx);
+    free(p->queue_clocks);p->queue_clocks=NULL;
     nb_lstream_tx_dispose(&p->logical_tx);
+    free(p->logical_decoder);p->logical_decoder=NULL;
+    free(p->fec_ctrl_rxbuf);p->fec_ctrl_rxbuf=NULL;
+    instance_queue_release(p->fec_dg_tx_len+p->fec_stage_tx_len+p->udp_down_tx_len+
+        p->udp_up_tx_len+p->udp_pending_tx_len);
     free(p->fec_dg_tx); p->fec_dg_tx=NULL;
     free(p->fec_stage_tx); p->fec_stage_tx=NULL;
     free(p->udp_down_tx);p->udp_down_tx=NULL;
     free(p->udp_up_tx);p->udp_up_tx=NULL;
     free(p->udp_pending_tx);p->udp_pending_tx=NULL;
-    nb_udp_reassembly_dispose(&p->udp_reassembly);
+    if(p->udp_reassembly){nb_udp_reassembly_dispose(p->udp_reassembly);free(p->udp_reassembly);p->udp_reassembly=NULL;}
     fec_session_index_remove(p->fec_session_id,p);
     if(p->fec_engine!=NULL) fec_metrics_add(&g_fec_metrics_done,nb_fec_metrics(p->fec_engine));
     nb_fec_session_destroy(p->fec_engine); p->fec_engine=NULL;
@@ -257,7 +311,7 @@ static void ps_teardown_reason(proxy_stream_t* p, const char* reason){
 
 /* q2t 动态追加(永不丢数据; 背压靠 QUIC connection flow control 限总量) */
 static int q2t_append(proxy_stream_t* p, const uint8_t* d, size_t n){
-    if(nb_send_append(&p->q2t,&p->q2t_clock,d,n,NB_Q2T_MAX,picoquic_current_time(),&p->media_q2t_peak)!=0){
+    if(nb_send_append(&p->q2t,&p->queue_clocks->q2t,d,n,NB_Q2T_MAX,picoquic_current_time(),&p->media_q2t_peak)!=0){
         log4c_warn("id=%u q2t over limit %zu+%zu > %d",p->id,p->q2t.len,n,NB_Q2T_MAX);return -1;
     }
     if(n>0 && p->first_q2t_queue_at==0) p->first_q2t_queue_at=picoquic_current_time();
@@ -270,6 +324,10 @@ static int append_bytes(uint8_t** buf, size_t* len, size_t* cap, size_t limit, c
         log4c_warn("id=%u %s over limit %zu+%zu > %zu", ps_id, tag, *len, n, limit);
         return -1;
     }
+    if(nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
+        n>nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes){
+        log4c_warn("id=%u %s instance queue budget exceeded",ps_id,tag);return -1;
+    }
     if(*len + n > *cap){
         size_t ncap = *cap ? (*cap * 2) : 4096;
         while(ncap < *len + n) ncap *= 2;
@@ -280,7 +338,7 @@ static int append_bytes(uint8_t** buf, size_t* len, size_t* cap, size_t limit, c
         }
         *buf = nb; *cap = ncap;
     }
-    memcpy(*buf + *len, d, n);
+    nb_current_instance->queue_bytes+=(uint64_t)n;memcpy(*buf + *len, d, n);
     *len += n;
     return 0;
 }
@@ -298,6 +356,10 @@ static int dgramq_append(uint8_t** buf, size_t* len, size_t* cap, const uint8_t*
         log4c_warn("id=%u fec datagram queue over limit %zu+%zu > %d", ps_id, *len, need, NB_DGRAM_QUEUE_MAX);
         return -1;
     }
+    if(nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
+        need>nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes){
+        log4c_warn("id=%u datagram instance queue budget exceeded",ps_id);return -1;
+    }
     if(*len + need > *cap){
         size_t ncap = *cap ? (*cap * 2) : 4096;
         while(ncap < *len + need) ncap *= 2;
@@ -308,7 +370,7 @@ static int dgramq_append(uint8_t** buf, size_t* len, size_t* cap, const uint8_t*
         }
         *buf = nb; *cap = ncap;
     }
-    nb_put_u16(*buf + *len, (uint16_t)n);
+    nb_current_instance->queue_bytes+=(uint64_t)need;nb_put_u16(*buf + *len, (uint16_t)n);
     nb_put_u64(*buf + *len + 2,picoquic_current_time());
     memcpy(*buf + *len + 10, d, n);
     *len += need;
@@ -327,8 +389,8 @@ static int dgramq_peek(uint8_t* buf, size_t len, const uint8_t** d, size_t* n,ui
 static void dgramq_consume(uint8_t* buf, size_t* len){
     const uint8_t* d=NULL; size_t n=0;
     if(!dgramq_peek(buf,*len,&d,&n,NULL)) return;
-    memmove(buf, buf + 10 + n, *len - (10 + n));
-    *len -= (10 + n);
+    size_t consumed=10+n;memmove(buf,buf+consumed,*len-consumed);*len-=consumed;
+    instance_queue_release(consumed);
 }
 
 static uint64_t dgramq_drop_expired(uint8_t* buf,size_t* len,uint64_t deadline_us,uint64_t now){
@@ -414,6 +476,7 @@ static int fec_pump_staged(proxy_stream_t* p){
         if(rc!=NB_FEC_OK){ p->need_teardown=1; return -1; }
         memmove(p->fec_stage_tx,p->fec_stage_tx+take,p->fec_stage_tx_len-take);
         p->fec_stage_tx_len-=take;
+        instance_queue_release(take);
         if(send_fin) p->fec_stage_tx_fin=0;
     }
     if(p->fec_stage_tx_len==0&&p->fec_stage_tx_fin&&nb_fec_tx_finish_ready(p->fec_engine)){
@@ -612,8 +675,13 @@ static void fec_ctrl_handle_line(proxy_stream_t* p, const char* line, int from_d
 
 static void fec_ctrl_feed_bytes(proxy_stream_t* p, uint8_t* data, size_t n, int from_down){
     if(n == 0) return;
+    if(p->fec_ctrl_rxbuf==NULL){
+        p->fec_ctrl_rxbuf=calloc(1,NB_FEC_CTRL_RX_CAP);
+        if(p->fec_ctrl_rxbuf==NULL){p->need_teardown=1;return;}
+    }
+    if(p->fec_ctrl_rxlen>=NB_FEC_CTRL_RX_CAP-1){p->need_teardown=1;return;}
     size_t cp = n;
-    if(p->fec_ctrl_rxlen + cp >= sizeof(p->fec_ctrl_rxbuf)) cp = sizeof(p->fec_ctrl_rxbuf) - p->fec_ctrl_rxlen - 1;
+    if(p->fec_ctrl_rxlen + cp >= NB_FEC_CTRL_RX_CAP) cp = NB_FEC_CTRL_RX_CAP - p->fec_ctrl_rxlen - 1;
     memcpy(p->fec_ctrl_rxbuf + p->fec_ctrl_rxlen, data, cp);
     p->fec_ctrl_rxlen += cp;
     p->fec_ctrl_rxbuf[p->fec_ctrl_rxlen] = 0;
@@ -651,7 +719,7 @@ static void middle_upstream_fc_update(proxy_stream_t* p,uint64_t now_us){
     if(G.role!=ROLE_MIDDLE||p==NULL||!p->upstream_fc_enabled||p->up_cnx==NULL)return;
     nb_live_queue_limits_t limits=nb_live_queue_limits(p->flow_class,p->udp_mode);
     size_t queued=p->down_tx.len;
-    uint64_t age=nb_live_queue_age_us(&p->down_tx_clock,queued,now_us);
+    uint64_t age=nb_live_queue_age_us(&p->queue_clocks->down_tx,queued,now_us);
     int should_block=queued>=limits.high_bytes||age>=limits.deadline_us;
     if(should_block&&!p->upstream_fc_blocked){
         p->upstream_fc_blocked=1;
@@ -676,7 +744,7 @@ static void middle_upstream_fc_update(proxy_stream_t* p,uint64_t now_us){
 
 static int queue_down(proxy_stream_t* p, const uint8_t* d, size_t n, int fin){
     uint64_t now=picoquic_current_time();
-    if(nb_send_append(&p->down_tx,&p->down_tx_clock,d,n,NB_QTX_MAX,now,&p->media_down_q_peak)!=0){
+    if(nb_send_append(&p->down_tx,&p->queue_clocks->down_tx,d,n,NB_QTX_MAX,now,&p->media_down_q_peak)!=0){
         p->need_teardown = 1;
         return -1;
     }
@@ -709,7 +777,7 @@ static int queue_down_prefix(proxy_stream_t* p, const uint8_t* d, size_t n){
 }
 
 static int queue_up(proxy_stream_t* p, const uint8_t* d, size_t n, int fin){
-    if(nb_send_append(&p->up_tx,&p->up_tx_clock,d,n,NB_QTX_MAX,picoquic_current_time(),&p->media_up_q_peak)!=0){
+    if(nb_send_append(&p->up_tx,&p->queue_clocks->up_tx,d,n,NB_QTX_MAX,picoquic_current_time(),&p->media_up_q_peak)!=0){
         p->need_teardown = 1;
         return -1;
     }
@@ -751,6 +819,7 @@ static int logical_send_data(proxy_stream_t* p,int to_down,const uint8_t* data,s
         uint64_t offset=0;if(nb_lstream_tx_append(&p->logical_tx,data+position,part,&offset)!=0)return -1;
         if(logical_queue_frame(p,to_down,NB_LSTREAM_DATA,offset,data+position,(uint32_t)part)!=0)return -1;
         position+=part;}
+    if(fin&&p->logical_tx.fin_queued)return 0;
     if(fin){if(nb_lstream_tx_fin(&p->logical_tx)!=0||logical_queue_frame(p,to_down,NB_LSTREAM_FIN,
         p->logical_tx.fin_offset,NULL,0)!=0)return -1;}
     return 0;
@@ -769,6 +838,7 @@ static int logical_send_ack(proxy_stream_t* p,int force){
 static int logical_receive_frame(void* context,const nb_lstream_frame_t* frame){
     proxy_stream_t* p=context;if(p==NULL||!p->in_use||!p->logical_endpoint||
         frame->flow_hi!=p->logical_flow_hi||frame->flow_lo!=p->logical_flow_lo)return -1;
+    if(frame->type<=NB_LSTREAM_FIN_ACK)p->logical_rx_frames[frame->type]++;
     int to_down=G.role==ROLE_ENTRY;
     if(frame->type==NB_LSTREAM_OPEN)return frame->offset==0?0:-1;
     if(frame->type==NB_LSTREAM_ACK)return nb_lstream_tx_ack(&p->logical_tx,frame->offset);
@@ -791,14 +861,21 @@ static int logical_receive_frame(void* context,const nb_lstream_frame_t* frame){
         if(nb_lstream_tx_ack(&p->logical_tx,frame->offset)!=0)return -1;
         if(frame->type==NB_LSTREAM_RESUME&&logical_queue_frame(p,to_down,NB_LSTREAM_RESUME_ACK,
             p->logical_rx_delivered,NULL,0)!=0)return -1;
-        return logical_replay(p,to_down);
+        int result=logical_replay(p,to_down);
+        if(result==0&&frame->type==NB_LSTREAM_RESUME_ACK&&G.role==ROLE_ENTRY){
+            p->logical_resume_inflight=0;p->logical_reconnect_failures=0;
+            p->logical_disconnected_at=0;p->logical_reconnect_last_attempt=0;
+            log4c_info("entry logical flow resume confirmed id=%u",p->id);
+        }
+        return result;
     }
     if(frame->type==NB_LSTREAM_RST){p->need_teardown=1;return 0;}
     return -1;
 }
 
 static int logical_receive(proxy_stream_t* p,const uint8_t* data,size_t length){
-    return nb_lstream_decoder_feed(&p->logical_decoder,data,length,logical_receive_frame,p);
+    if(p==NULL||p->logical_decoder==NULL)return -1;
+    return nb_lstream_decoder_feed(p->logical_decoder,data,length,logical_receive_frame,p);
 }
 
 static void logical_note_delivered(proxy_stream_t* p,size_t length){
@@ -819,11 +896,14 @@ static void logical_detach(proxy_stream_t* p,picoquic_cnx_t* cnx){
     if(p==NULL||!p->logical_endpoint)return;
     nb_session_index_remove_value(&g_session_index,p);
     if(G.role==ROLE_ENTRY&&p->down_cnx==cnx){p->down_cnx=NULL;p->down_opened=0;p->down_prefix_len=p->down_prefix_off=0;
-        nb_send_clear(&p->down_tx,&p->down_tx_clock);p->logical_reconnect_pending=1;}
-    else if(G.role==ROLE_EXIT&&p->up_cnx==cnx){p->up_cnx=NULL;nb_send_clear(&p->up_tx,&p->up_tx_clock);p->logical_reconnect_pending=1;}
-    nb_send_clear(&p->q2t,&p->q2t_clock);p->logical_rx_next=p->logical_rx_delivered;
+        if(p->logical_resume_inflight&&p->logical_reconnect_failures<UINT_MAX)p->logical_reconnect_failures++;
+        p->logical_resume_inflight=0;nb_send_clear(&p->down_tx,&p->queue_clocks->down_tx);p->logical_reconnect_pending=1;}
+    else if(G.role==ROLE_EXIT&&p->up_cnx==cnx){p->up_cnx=NULL;nb_send_clear(&p->up_tx,&p->queue_clocks->up_tx);p->logical_reconnect_pending=1;}
+    nb_send_clear(&p->q2t,&p->queue_clocks->q2t);p->logical_rx_next=p->logical_rx_delivered;
     if(!p->logical_rx_fin_acked_sent){p->logical_rx_fin_seen=0;p->logical_rx_fin_offset=0;p->q2t_fin=0;}
-    nb_lstream_decoder_init(&p->logical_decoder);p->logical_disconnected_at=picoquic_current_time();ps_index_refresh(p);
+    if(p->logical_decoder)nb_lstream_decoder_init(p->logical_decoder);
+    if(p->logical_disconnected_at==0)p->logical_disconnected_at=picoquic_current_time();
+    ps_index_refresh(p);
 }
 
 /* 非阻塞 connect 目标 TCP(exit): 用已(异步)解析好的地址, 不在事件循环内做阻塞 DNS */
@@ -842,6 +922,7 @@ static int tcp_connect_addr(struct sockaddr* sa, socklen_t sl){
 
 static int udp_connect_addr(struct sockaddr* sa,socklen_t sl){
     int fd=socket(sa->sa_family,SOCK_DGRAM,0);if(fd<0)return -1;
+    if(nb_udp_enable_rxq_overflow(fd)!=0){int saved=errno;close(fd);errno=saved;return -1;}
     if(set_nonblock(fd)!=0){close(fd);return -1;}
     if(G.outbound_configured){
         if(G.outbound_addr.ss_family!=sa->sa_family){close(fd);errno=EAFNOSUPPORT;return -1;}

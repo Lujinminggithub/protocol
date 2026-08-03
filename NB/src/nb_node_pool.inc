@@ -271,7 +271,7 @@ static uint64_t pool_slot_queue_age(picoquic_cnx_t* cnx,uint64_t now,int* eligib
             const uint8_t* data=NULL;size_t length=0;uint64_t queued_at=0;
             if(dgramq_peek(p->udp_down_tx,p->udp_down_tx_len,&data,&length,&queued_at)&&
                 queued_at&&now>=queued_at)age=now-queued_at;
-        }else age=nb_live_queue_age_us(&p->down_tx_clock,p->down_tx.len,now);
+        }else age=nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now);
         if(age>oldest)oldest=age;
         (*eligible)++;
     }
@@ -329,7 +329,9 @@ static void pool_drain_tick(cnx_pool_t* pool,int pool_id,int idx){
 }
 
 static void pool_health_tick(uint64_t now){
-    static uint64_t last=0;if(last&&now-last<250000ULL)return;last=now;
+    uint64_t* last=&nb_current_instance->pool_health_last_at;
+    if(*last&&now-*last<250000ULL)return;
+    *last=now;
     for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
         cnx_pool_t* pool=&G.pools[pool_id];pool_drain_tick(pool,pool_id,idx);
         picoquic_cnx_t* cnx=pool->cnx[idx];if(cnx==NULL)continue;
@@ -352,7 +354,7 @@ static void pool_health_tick(uint64_t now){
         if(action==NB_POOL_RECOVERY_START_REPLACEMENT)(void)pool_start_replacement(pool,pool_id,idx);
         else if(action==NB_POOL_RECOVERY_PROMOTE_REPLACEMENT){if(pool_promote_replacement(pool,pool_id,idx))continue;}
         else if(action==NB_POOL_RECOVERY_CLOSE_REPLACEMENT)pool_close_candidate(pool,idx);
-        if(retire)log4c_warn("pool[%d:%d] retire deferred queue_age=%.1fms pto=%llu streams=%d replacement_ready=%d",
+        if(retire)log4c_warn("pool[%d:%d] replacement promotion armed queue_age=%.1fms pto=%llu streams=%d replacement_ready=%d",
             pool_id,idx,age/1000.0,(unsigned long long)pto,streams,replacement_ready);
         g_metrics_state.pool_retire_suppressed+=suppressed;
     }
@@ -438,7 +440,7 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
             resume?p->logical_rx_delivered:0);
         if(length<0||queue_down_prefix(p,bootstrap,(size_t)length)!=0){
             log4c_error("id=%u queue logical route bootstrap fail",p->id);return -1;}
-        p->logical_reconnect_pending=0;p->logical_disconnected_at=0;p->logical_reconnect_last_attempt=0;
+        p->logical_reconnect_pending=0;p->logical_resume_inflight=resume;
     }else{
         char hdr[390],flow[33];int hl=0;
         if(p->logical_mode&&nb_lstream_flow_render(flow,p->logical_flow_hi,p->logical_flow_lo)==0)
@@ -457,7 +459,8 @@ static void logical_reconnect_tick(uint64_t now){
     if(G.role!=ROLE_ENTRY)return;
     for(int i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
         if(!p->in_use||!p->logical_endpoint||!p->logical_reconnect_pending||p->down_cnx!=NULL)continue;
-        if(p->logical_reconnect_last_attempt&&now-p->logical_reconnect_last_attempt<250000ULL)continue;
+        uint64_t retry_delay=nb_lstream_reconnect_delay_us(p->logical_reconnect_failures);
+        if(p->logical_reconnect_last_attempt&&now-p->logical_reconnect_last_attempt<retry_delay)continue;
         p->logical_reconnect_last_attempt=now;
         if(p->logical_disconnected_at&&now>p->logical_disconnected_at&&
             now-p->logical_disconnected_at>60000000ULL){
@@ -465,9 +468,9 @@ static void logical_reconnect_tick(uint64_t now){
         nb_flow_policy_t pol;nb_flow_policy_default(&pol);pol.prio=p->prio;pol.flow_class=p->flow_class;
         pol.lane_hint=p->lane_hint;pol.fec_hint=p->fec_hint;snprintf(pol.rule_name,sizeof(pol.rule_name),"%s",p->flow_rule);
         if(downstream_open_stream(p,p->route,&pol)==0)
-            log4c_warn("entry logical flow resumed id=%u flow=%016llx%016llx sid=%llu",
+            log4c_warn("entry logical flow resume started id=%u flow=%016llx%016llx sid=%llu failures=%u",
                 p->id,(unsigned long long)p->logical_flow_hi,(unsigned long long)p->logical_flow_lo,
-                (unsigned long long)p->down_stream_id);
+                (unsigned long long)p->down_stream_id,p->logical_reconnect_failures);
         else log4c_warn("entry logical flow resume deferred id=%u flow=%016llx%016llx",
             p->id,(unsigned long long)p->logical_flow_hi,(unsigned long long)p->logical_flow_lo);
     }

@@ -117,7 +117,8 @@ static void socks_handshake(proxy_stream_t* p){
             if(pending!=p&&pending->in_use&&pending->socks_auth_pending&&
                 memcmp(pending->socks_auth_fingerprint,fingerprint,sizeof(fingerprint))==0){coalesced=1;break;}
         }
-        int submitted=(cache_hit||coalesced)?0:nb_auth_async_submit(p->id,username,p->socks_buf+3+ulen,plen);
+        int submitted=(cache_hit||coalesced)?0:nb_auth_async_context_submit(
+            nb_current_instance->auth_async,p->id,username,p->socks_buf+3+ulen,plen);
         memset(p->socks_buf+3+ulen,0,plen);
         memmove(p->socks_buf,p->socks_buf+used,p->socks_len-used);p->socks_len-=used;
         if(cache_hit){if(!socks_auth_finish(p,username,1,1,0))return;}
@@ -248,7 +249,7 @@ static void flush_q2t(proxy_stream_t* p){
                     trace_delta_ms(p->first_q2t_flush_at,p->created_at),
                     trace_delta_ms(p->first_q2t_flush_at,p->first_q2t_queue_at),n,p->q2t.len,p->route);
             }
-            nb_send_consume(&p->q2t,&p->q2t_clock,(size_t)n);
+            nb_send_consume(&p->q2t,&p->queue_clocks->q2t,(size_t)n);
             logical_note_delivered(p,(size_t)n);ps_touch(p);
         }
         else if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK){
@@ -256,7 +257,7 @@ static void flush_q2t(proxy_stream_t* p){
              * 否则 q2t 恒非空使 maybe_free 永不满足, 流泄漏。 */
             log4c_debug("id=%u q2t send err=%s, drop %zu & teardown",p->id,strerror(errno),p->q2t.len);
             ps_set_close_reason(p,"tcp-send-error");
-            p->tcp_eof=1; nb_send_clear(&p->q2t,&p->q2t_clock);
+            p->tcp_eof=1; nb_send_clear(&p->q2t,&p->queue_clocks->q2t);
             break;
         }
         else break; /* EAGAIN: 等下轮可写 */
@@ -269,7 +270,7 @@ static void flush_q2t(proxy_stream_t* p){
 
 static int tcp_read_allowed(proxy_stream_t* p){
     size_t main_q=(G.role==ROLE_ENTRY)?p->down_tx.len:p->up_tx.len;
-    nb_live_queue_clock_t* main_clock=(G.role==ROLE_ENTRY)?&p->down_tx_clock:&p->up_tx_clock;
+    nb_live_queue_clock_t* main_clock=(G.role==ROLE_ENTRY)?&p->queue_clocks->down_tx:&p->queue_clocks->up_tx;
     size_t stage_q=p->fec_stage_tx_len;
     size_t dg_q=p->fec_dg_tx_len;
     size_t replay_q=p->logical_endpoint?p->logical_tx.replay_length:0;
@@ -302,7 +303,7 @@ static int epoll_tcp_update(proxy_stream_t* p,int add){
     uint32_t events=EPOLLERR|EPOLLHUP|EPOLLRDHUP;
     if(G.socks_enabled&&p->socks_stage<3){
         if(!p->socks_auth_pending)events|=EPOLLIN;
-    }else if(p->tcp_connecting||tcp_read_allowed(p))events|=EPOLLIN;
+    }else if(p->tcp_connecting||(!p->tcp_eof&&tcp_read_allowed(p)))events|=EPOLLIN;
     if(nb_send_local_write_pending(p->q2t.len,p->tcp_connecting,p->q2t_fin))events|=EPOLLOUT;
     size_t index=(size_t)(p-G.streams);if(index>=MAX_CONN)return -1;
     struct epoll_event ev;memset(&ev,0,sizeof(ev));ev.events=events;
@@ -328,7 +329,7 @@ static proxy_stream_t* udp_entry_child_get(proxy_stream_t* parent,const char* ho
     p=ps_alloc();if(p==NULL){if(reject_reason!=NULL)*reject_reason="session-capacity";return NULL;}p->udp_mode=1;p->udp_parent_id=parent->id;
     p->tenant_index=parent->tenant_index;snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",parent->tenant_name);
     p->udp_session_id=udp_session_id_new();p->down_pool_id=0;
-    if(p->udp_session_id==0||G.pool_count<=0){if(reject_reason!=NULL)*reject_reason="child-init";ps_set_close_reason(p,"udp-child-init-fail");ps_free(p);return NULL;}
+    if(p->udp_session_id==0||G.pool_count<=0||udp_reassembly_ensure(p)!=0){if(reject_reason!=NULL)*reject_reason="child-init";ps_set_close_reason(p,"udp-child-init-fail");ps_free(p);return NULL;}
     snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);p->udp_target_port=port;
     ps_index_refresh(p);
     const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(parent->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
@@ -348,12 +349,23 @@ static proxy_stream_t* udp_entry_child_get(proxy_stream_t* parent,const char* ho
     return p;
 }
 
+static void udp_rxq_overflow_note(const char* path,uint32_t stream_id,uint64_t dropped){
+    if(dropped==0)return;
+    nb_metrics_note_udp_rxq_overflow(&g_metrics_state,dropped);
+    uint64_t now=picoquic_current_time();
+    if(now-nb_current_instance->rxq_last_warn_at>=1000000ULL){nb_current_instance->rxq_last_warn_at=now;
+        log4c_warn("udp receive queue overflow path=%s id=%u dropped=%llu",
+            path,stream_id,(unsigned long long)dropped);}
+}
+
 static void udp_local_drain(proxy_stream_t* p){
     uint8_t buffer[65535+300];
     for(;;){
         if(p->udp_association){
             struct sockaddr_storage from;socklen_t from_len=sizeof(from);
-            ssize_t n=recvfrom(p->udp_fd,buffer,sizeof(buffer),0,(struct sockaddr*)&from,&from_len);
+            uint64_t dropped=0;ssize_t n=nb_udp_recv(p->udp_fd,buffer,sizeof(buffer),0,
+                (struct sockaddr*)&from,&from_len,&p->udp_rxq_state,&dropped);
+            udp_rxq_overflow_note("socks-relay",p->id,dropped);
             if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK))break;
             if(n<=0){if(n<0)log4c_warn("entry UDP relay recv fail id=%u error=%s",p->id,strerror(errno));break;}
             p->udp_assoc_raw_rx++;
@@ -394,7 +406,9 @@ static void udp_local_drain(proxy_stream_t* p){
             }
             child->udp_packets_c2s++;child->bytes_c2s+=payload_len;ps_touch(child);ps_touch(p);
         }else if(G.role==ROLE_EXIT){
-            ssize_t n=recv(p->udp_fd,buffer,NB_UDP_MAX_PAYLOAD,0);
+            uint64_t dropped=0;ssize_t n=nb_udp_recv(p->udp_fd,buffer,NB_UDP_MAX_PAYLOAD,0,
+                NULL,NULL,&p->udp_rxq_state,&dropped);
+            udp_rxq_overflow_note("exit-target",p->id,dropped);
             if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK))break;
             if(n<=0){if(n<0)log4c_warn("exit UDP recv fail id=%u error=%s",p->id,strerror(errno));break;}
             if(p->udp_first_target_rx_at==0){
@@ -413,6 +427,7 @@ static void udp_local_drain(proxy_stream_t* p){
 }
 
 static void pump_tcp(proxy_stream_t* p){
+    if(p==NULL||p->tcp_eof)return;
     uint8_t buf[16384]; ssize_t n;
     for(;;){
         size_t desired=sizeof(buf);
@@ -470,26 +485,37 @@ static void maybe_free(proxy_stream_t* p){
  * 单线程事件循环, 用 function-local static 缓冲复用, 一次 syscall 收多达 UDP_RECV_BATCH 个包。 */
 #define UDP_RECV_BATCH 32
 static void udp_drain_fd(int fd,const struct sockaddr_storage* local,uint64_t now){
-    static struct mmsghdr msgs[UDP_RECV_BATCH];
-    static struct iovec iovs[UDP_RECV_BATCH];
-    static uint8_t bufs[UDP_RECV_BATCH][1536];
-    static struct sockaddr_storage froms[UDP_RECV_BATCH];
-    static int inited=0;
+    static _Thread_local struct mmsghdr msgs[UDP_RECV_BATCH];
+    static _Thread_local struct iovec iovs[UDP_RECV_BATCH];
+    static _Thread_local uint8_t bufs[UDP_RECV_BATCH][1536];
+    static _Thread_local struct sockaddr_storage froms[UDP_RECV_BATCH];
+    static _Thread_local union { struct cmsghdr align;uint8_t bytes[CMSG_SPACE(sizeof(uint32_t))]; }
+        controls[UDP_RECV_BATCH];
+    static _Thread_local int inited=0;
     if(!inited){
         for(int i=0;i<UDP_RECV_BATCH;i++){
             iovs[i].iov_base=bufs[i]; iovs[i].iov_len=sizeof(bufs[i]);
             msgs[i].msg_hdr.msg_iov=&iovs[i]; msgs[i].msg_hdr.msg_iovlen=1;
-            msgs[i].msg_hdr.msg_name=&froms[i]; msgs[i].msg_hdr.msg_control=NULL; msgs[i].msg_hdr.msg_controllen=0;
+            msgs[i].msg_hdr.msg_name=&froms[i];msgs[i].msg_hdr.msg_control=controls[i].bytes;
+            msgs[i].msg_hdr.msg_controllen=sizeof(controls[i].bytes);
         }
         inited=1;
     }
     for(;;){
+        for(int i=0;i<UDP_RECV_BATCH;i++){
+            msgs[i].msg_hdr.msg_controllen=sizeof(controls[i].bytes);
+            msgs[i].msg_hdr.msg_flags=0;
+        }
         for(int i=0;i<UDP_RECV_BATCH;i++) msgs[i].msg_hdr.msg_namelen=sizeof(froms[i]); /* namelen 是 in/out, 每次重置 */
         int got=recvmmsg(fd,msgs,UDP_RECV_BATCH,0,NULL);
         if(got<=0){if(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)nb_metrics_note_udp_error(&g_metrics_state,0);break;}
-        for(int m=0;m<got;m++)
+        nb_udp_rxq_state_t* rxq_state=fd==G.client_udp_fd?&g_udp_rxq_client:&g_udp_rxq_main;
+        for(int m=0;m<got;m++){
+            uint64_t dropped=nb_udp_rxq_overflow_update(rxq_state,&msgs[m].msg_hdr);
+            udp_rxq_overflow_note(fd==G.client_udp_fd?"middle-client-quic":"quic",0,dropped);
             picoquic_incoming_packet(G.quic,bufs[m],(size_t)msgs[m].msg_len,
                 (struct sockaddr*)&froms[m],(struct sockaddr*)local,0,0,now);
+        }
         if(got<UDP_RECV_BATCH) break; /* 已排空 */
     }
 }
@@ -509,9 +535,8 @@ static void udp_send_batch(uint64_t now){
         if(!g_udp_gso_enabled){
             if(sendto(fd,sb,sl,0,(struct sockaddr*)&to,tl)<0){
                 nb_metrics_note_udp_error(&g_metrics_state,1);
-                static uint64_t last_warn=0;
-                if(now-last_warn>=1000000ULL){
-                    last_warn=now;
+                if(now-nb_current_instance->udp_send_last_warn_at>=1000000ULL){
+                    nb_current_instance->udp_send_last_warn_at=now;
                     log4c_warn("udp sendto failed: %s",strerror(errno));
                 }
             }

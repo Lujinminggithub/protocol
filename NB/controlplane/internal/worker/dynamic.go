@@ -7,8 +7,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 )
+
+var privateFileRenameMu sync.Mutex
 
 type dynamicDevice struct {
 	ID        string `json:"id"`
@@ -227,14 +231,45 @@ func writePrivateJSON(path string, value any) error {
 	if err != nil {
 		return err
 	}
+	return writePrivateFile(path, append(data, '\n'))
+}
+
+func writePrivateFile(path string, data []byte) (err error) {
 	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	temporary := path + ".new"
-	if err = os.WriteFile(temporary, append(data, '\n'), 0600); err != nil {
+	temporary, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".new-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(temporary, path)
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		if err != nil {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err = temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err = temporary.Write(data); err != nil {
+		return err
+	}
+	if err = temporary.Sync(); err != nil {
+		return err
+	}
+	if err = temporary.Close(); err != nil {
+		return err
+	}
+	privateFileRenameMu.Lock()
+	defer privateFileRenameMu.Unlock()
+	if err = os.Rename(temporaryPath, path); err != nil && runtime.GOOS == "windows" {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+		err = os.Rename(temporaryPath, path)
+	}
+	return err
 }
 
 func (r *Runner) ensureDynamicKnownHosts(lineState string) (string, error) {
@@ -251,14 +286,7 @@ func (r *Runner) ensureDynamicKnownHosts(lineState string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err = os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-		return "", err
-	}
-	temporary := target + ".new"
-	if err = os.WriteFile(temporary, contents, 0600); err != nil {
-		return "", err
-	}
-	if err = os.Rename(temporary, target); err != nil {
+	if err = writePrivateFile(target, contents); err != nil {
 		return "", err
 	}
 	return target, nil

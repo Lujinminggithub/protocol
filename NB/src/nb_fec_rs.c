@@ -1,13 +1,14 @@
 #include "nb_fec_rs.h"
 
+#include <pthread.h>
 #include <string.h>
 
 #define NB_RS_GF_SIZE 256
 #define NB_RS_PRIM_POLY 0x11d
 
-static int g_rs_inited = 0;
 static uint8_t g_rs_log[NB_RS_GF_SIZE];
 static uint8_t g_rs_exp[NB_RS_GF_SIZE * 2];
+static pthread_once_t g_rs_once = PTHREAD_ONCE_INIT;
 
 static uint8_t gf_add(uint8_t a, uint8_t b){ return (uint8_t)(a ^ b); }
 
@@ -25,8 +26,7 @@ static uint8_t gf_pow_alpha(size_t p){
     return g_rs_exp[p % 255];
 }
 
-int nb_rs_init(void){
-    if(g_rs_inited) return 0;
+static void rs_init_once(void){
     uint16_t x = 1;
     for(int i=0;i<255;i++){
         g_rs_exp[i] = (uint8_t)x;
@@ -36,9 +36,9 @@ int nb_rs_init(void){
     }
     for(int i=255;i<NB_RS_GF_SIZE * 2;i++) g_rs_exp[i] = g_rs_exp[i - 255];
     g_rs_log[0] = 0;
-    g_rs_inited = 1;
-    return 0;
 }
+
+int nb_rs_init(void){return pthread_once(&g_rs_once,rs_init_once);}
 
 static uint8_t coeff_for(size_t repair_row, size_t src_col){
     /* Vandermonde: row j uses alpha^((j+1)*col), col 0 => 1 */

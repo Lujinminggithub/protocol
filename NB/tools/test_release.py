@@ -36,6 +36,36 @@ def main() -> None:
         loaded = nb_release.load_and_validate_manifest(manifest_path, root, binary)
         assert loaded["release_id"] == nb_release.sha256_file(binary)[:16]
         assert loaded["deployment_id"].startswith(loaded["release_id"] + "-")
+
+        with tempfile.TemporaryDirectory(prefix="nb-line-state-") as external:
+            external_root = pathlib.Path(external)
+            external_topology = external_root / "bootstrap-hosts.json"
+            external_profile = external_root / "bootstrap-profile.json"
+            external_topology.write_bytes(topology.read_bytes())
+            external_profile.write_bytes(profile.read_bytes())
+            external_manifest = nb_release.create_manifest(
+                root, binary, "linux-x86_64", {"src/node.c": source},
+                external_topology, external_profile,
+                {"tools/runtime.json": runtime},
+            )
+            external_manifest_path = root / "build" / "external-release-manifest.json"
+            nb_release.write_manifest(external_manifest_path, external_manifest)
+            validated = nb_release.load_and_validate_manifest(
+                external_manifest_path, root, binary,
+                external_topology, external_profile,
+            )
+            assert validated["deployment_id"] == external_manifest["deployment_id"]
+            external_topology.write_bytes(b'{"changed":true}\n')
+            try:
+                nb_release.load_and_validate_manifest(
+                    external_manifest_path, root, binary,
+                    external_topology, external_profile,
+                )
+            except ValueError as error:
+                assert "topology" in str(error)
+            else:
+                raise AssertionError("external topology change was accepted")
+
         alternate_topology=root/"tools"/"hosts-alt.json";alternate_topology.write_bytes(b'{"line":"alternate"}\n')
         alternate=nb_release.create_manifest(root,binary,"linux-x86_64",{"src/node.c":source},alternate_topology,profile)
         assert alternate["release_id"]==loaded["release_id"] and alternate["deployment_id"]!=loaded["deployment_id"]

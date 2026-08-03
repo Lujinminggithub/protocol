@@ -24,11 +24,15 @@ class WorkerSnapshotTest(unittest.TestCase):
             self.assertNotIn("_bytes_total", first)
 
             record["metrics"]["bytes"] = {"c2s": 1_000_600, "s2c": 1_000_400}
+            record["metrics"]["udp_errors"] = {"rxq_overflow": 7}
             second = worker_snapshot.snapshot("line-1", "entry", "2026-07-29T00:00:10Z", record)
             worker_snapshot.apply_throughput([second], state_file)
             self.assertAlmostEqual(second["throughput_mbps"], 1.6)
+            self.assertEqual(second["health"], "degraded")
+            self.assertEqual(second["payload"]["rxq_overflow_delta"], 7)
             persisted = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertEqual(persisted["nb-entry-0"]["bytes_total"], 2_001_000)
+            self.assertEqual(persisted["nb-entry-0"]["rxq_overflow_total"], 7)
 
 
 if __name__ == "__main__":

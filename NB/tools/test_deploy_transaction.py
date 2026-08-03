@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import pathlib
+import tempfile
 
 import deploy
 
@@ -23,14 +25,17 @@ def main() -> None:
         "_node_command", "_activate_release", "_install_and_restart_role",
         "_verify_release_health", "_rollback_release", "_smoke_socks", "_prune_releases",
         "_remote_current_deployment", "_activate_existing_deployment",
-        "_append_exact_rollback_audit",
+        "_append_exact_rollback_audit", "BUILD_DIR",
     ]
     original = {name: getattr(deploy, name) for name in names}
     old_user = os.environ.get("NB_SOCKS_USERNAME"); old_password = os.environ.get("NB_SOCKS_PASSWORD")
     events = []
     manifest = {"release_id": "0123456789abcdef", "artifact": {"sha256": "0" * 64}}
+    temporary = tempfile.TemporaryDirectory()
     try:
         os.environ["NB_SOCKS_USERNAME"] = "test"; os.environ["NB_SOCKS_PASSWORD"] = "test"
+        deploy.BUILD_DIR = pathlib.Path(temporary.name)
+        (deploy.BUILD_DIR / "nb_node").write_bytes(b"transaction-test-binary")
         deploy._require_local_build = lambda: manifest
         deploy._require_security_material = lambda: None
         deploy.connect = lambda role: FakeClient(role)
@@ -100,6 +105,7 @@ def main() -> None:
         assert ("exact","exit","cccccccccccccccc-dddddddddddd") in events
     finally:
         for name, value in original.items(): setattr(deploy, name, value)
+        temporary.cleanup()
         if old_user is None: os.environ.pop("NB_SOCKS_USERNAME", None)
         else: os.environ["NB_SOCKS_USERNAME"] = old_user
         if old_password is None: os.environ.pop("NB_SOCKS_PASSWORD", None)

@@ -144,6 +144,20 @@ func (a *App) evaluateNode(result nodeCollection, observed string) {
 	if loss := number(link, "effective_loss_max_pct"); loss > 5 {
 		a.recordCollectorIncident("effective-loss", "critical", result.nodeID, observed, "effective loss exceeds 5 percent", link)
 	}
+	udp := nestedMap(result.metrics, "udp_errors")
+	rxqTotal := number(udp, "rxq_overflow")
+	a.collectorMu.Lock()
+	previousRXQ, seenRXQ := a.udpRXQLast[result.nodeID]
+	a.udpRXQLast[result.nodeID] = rxqTotal
+	a.collectorMu.Unlock()
+	if delta := rxqDelta(previousRXQ, rxqTotal, seenRXQ); delta > 0 {
+		severity := "warning"
+		if delta >= 10 {
+			severity = "critical"
+		}
+		a.recordCollectorIncident("udp-rxq-overflow", severity, result.nodeID, observed,
+			"UDP kernel receive queue dropped packets", map[string]float64{"delta": delta, "total": rxqTotal})
+	}
 	loop := nestedMap(result.metrics, "event_loop")
 	if number(loop, "wake_late_max_us") > 20000 {
 		a.recordCollectorIncident("event-loop-delay", "warning", result.nodeID, observed, "event loop wake delay exceeds 20ms", loop)

@@ -13,6 +13,13 @@
 #include "nb_policy.h"
 #include "nb_ring.h"
 #include "nb_udp.h"
+#include "nb_udp_io.h"
+
+typedef struct {
+    nb_live_queue_clock_t down_tx;
+    nb_live_queue_clock_t up_tx;
+    nb_live_queue_clock_t q2t;
+} nb_stream_queue_clocks_t;
 
 typedef struct proxy_stream {
     int in_use;
@@ -36,18 +43,16 @@ typedef struct proxy_stream {
     /* qtx: 面向 QUIC 的待发送缓冲。V1.5 起主数据路径改走 prepare_to_send，避免 add_to_stream
      * 额外排队复制。down_tx=left->right(发下游), up_tx=right->left(写回上游)。 */
     nb_ring_t down_tx;
-    nb_live_queue_clock_t down_tx_clock;
+    nb_stream_queue_clocks_t* queue_clocks;
     int down_tx_fin;
     uint8_t down_prefix[768];
     size_t down_prefix_len;
     size_t down_prefix_off;
     nb_ring_t up_tx;
-    nb_live_queue_clock_t up_tx_clock;
     int up_tx_fin;
     /* q2t: 面向 TCP 的待写缓冲(entry 写回客户端 / exit 写目标)。动态增长, 永不丢数据;
      * 总量上限由 QUIC connection flow control(max_data) 自然背压 */
     nb_ring_t q2t;
-    nb_live_queue_clock_t q2t_clock;
     int q2t_fin;                 /* 待对 TCP 做半关 */
     int need_teardown;           /* 过载保护: q2t 超限, 主循环兜底回收(不在回调栈内拆) */
     int tcp_eof;                 /* 本地 TCP 读到 EOF */
@@ -66,12 +71,14 @@ typedef struct proxy_stream {
     int logical_mode;
     int logical_endpoint;
     int logical_reconnect_pending;
+    int logical_resume_inflight;
+    unsigned logical_reconnect_failures;
     uint64_t logical_disconnected_at;
     uint64_t logical_reconnect_last_attempt;
     uint64_t logical_flow_hi;
     uint64_t logical_flow_lo;
     nb_lstream_tx_t logical_tx;
-    nb_lstream_decoder_t logical_decoder;
+    nb_lstream_decoder_t* logical_decoder;
     uint64_t logical_rx_next;
     uint64_t logical_rx_delivered;
     uint64_t logical_rx_fin_offset;
@@ -79,6 +86,7 @@ typedef struct proxy_stream {
     int logical_rx_fin_acked_sent;
     uint64_t logical_last_ack_offset;
     uint64_t logical_last_ack_at;
+    uint64_t logical_rx_frames[NB_LSTREAM_FIN_ACK + 1];
     /* fin 追踪(去程 left->right, 回程 right->left) */
     int up_fin_seen;             /* 收到 left QUIC fin(仅 middle/exit) */
     int down_fin_seen;           /* 收到 right QUIC fin(仅 entry/middle) */
@@ -104,7 +112,7 @@ typedef struct proxy_stream {
     int fec_ctrl_peer_ready;
     int fec_rx_to_down;          /* sidecar 接收恢复后应继续往下游转发(如 entry->middle 保护段) */
     char fec_route[300];         /* sidecar 会话携带的坏跳目标 route(一般为 T:host:port) */
-    char fec_ctrl_rxbuf[4096];
+    char* fec_ctrl_rxbuf;
     size_t fec_ctrl_rxlen;
     picoquic_cnx_t* fec_dg_cnx;  /* sidecar datagram 所属连接(目前与控制流/坏跳数据流同 cnx) */
     uint8_t* fec_dg_tx;
@@ -172,6 +180,7 @@ typedef struct proxy_stream {
     int udp_mode;
     int udp_association;
     int udp_fd;
+    nb_udp_rxq_state_t udp_rxq_state;
     uint32_t udp_session_id;
     uint32_t udp_parent_id;
     uint32_t udp_tx_sequence;
@@ -192,7 +201,7 @@ typedef struct proxy_stream {
     uint8_t* udp_pending_tx;
     size_t udp_pending_tx_len;
     size_t udp_pending_tx_cap;
-    nb_udp_reassembly_t udp_reassembly;
+    nb_udp_reassembly_t* udp_reassembly;
     uint64_t udp_packets_c2s;
     uint64_t udp_packets_s2c;
     uint64_t udp_assoc_raw_rx;

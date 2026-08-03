@@ -17,6 +17,29 @@
 | **middle** | 上游 QUIC(上一跳) | 下游 QUIC(下一跳) | 读首部 `H:host:port` 动态连下一跳，转发剩余 route+数据。**无状态** |
 | **exit** | 上游 QUIC(上一跳) | 目标 TCP | 读首部 `T:host:port`，connect 目标，QUIC↔TCP双向泵 |
 
+### 1.1 固定 shard 进程与线路实例
+
+生产节点不再按线路创建独立进程。每个角色固定运行两个
+`nb-{role}-shard@{0,1}.service`，每条线路在进程内对应一个 `nb_instance_t`：
+
+- `nb_instance_t` 独占运行状态、租户与认证表、证书、DNS、白名单/策略、监听
+  socket、路由、会话索引、指标和 FEC 状态，线路间不得共享可变数据。
+- shard 每 2 秒扫描一次 `/etc/NB/shards/configs/{role}/{worker}`，也支持
+  `SIGHUP` 立即扫描。新增、修改或删除单条配置只装载、替换或停止对应实例，
+  不重启进程，也不影响同一 shard 内其他线路。
+- Entry 的同一线路两个 worker 共享一个 SOCKS 入口端口并使用
+  `SO_REUSEPORT`；不同线路的 Entry 端口必须唯一。middle/exit 的实际监听端口
+  为线路基础端口加 worker lane，端口注册表会拒绝跨线路冲突。
+- 每个实例必须配置 `--max-sessions` 与 `--max-queue-bytes`。所有 stream、
+  replay、FEC 和 UDP 队列都计入同一线路预算，超限仅拒绝该线路的新工作，
+  不能消耗其他实例的保留资源。
+- health 在 Entry 下游连接池尚未就绪时返回 `starting`，就绪后才返回 `ok`；
+  health 同时暴露当前/上限 session、当前/上限 queue bytes、线路 deployment、
+  binary release 和逻辑帧计数。
+- shard 二进制是节点级共享资源。配置发布和精确回滚是单线路原子操作；若回滚
+  需要切换共享二进制，部署器必须确认所有实例均无活跃会话，否则拒绝执行，
+  禁止为了单线路回滚强制中断其他线路。
+
 ## 2. source-route 协议
 
 stream 首部第一行（文本 + `\n`），语义 = 接收节点出发的剩余路径：

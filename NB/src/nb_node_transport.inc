@@ -3,6 +3,7 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
     if(!whitelist_allowed(host,port))return NULL;
     proxy_stream_t* p=ps_alloc();if(p==NULL)return NULL;
     p->udp_mode=1;p->udp_session_id=view->session_id;p->up_cnx=cnx;
+    if(udp_reassembly_ensure(p)!=0){ps_set_close_reason(p,"udp-exit-state-allocation");ps_free(p);return NULL;}
     ps_index_refresh(p);
     snprintf(p->route,sizeof(p->route),"%s",route);snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);
     p->udp_target_port=port;p->target_port=port;nb_flow_policy_t pol;flow_policy_for_host(host,port,&pol);apply_flow_policy(p,&pol);
@@ -80,7 +81,8 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_c2s_rx_at,p->created_at),view->sequence,
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             nb_udp_reassembled_t complete;
-            int rc=nb_udp_reassembly_feed(&p->udp_reassembly,view,picoquic_current_time(),&complete);
+            if(p->udp_reassembly==NULL)return -6;
+            int rc=nb_udp_reassembly_feed(p->udp_reassembly,view,picoquic_current_time(),&complete);
             return rc<0?-6:(rc==1?(udp_deliver_reassembled(p,&complete)==0?0:-7):0);
         }
     }else if(view->type==NB_UDP_TYPE_S2C){
@@ -100,7 +102,8 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                 log4c_info("entry udp trace id=%u usid=%u stage=s2c-first-rx age=%.1fms seq=%u frag=%u/%u bytes=%u target=%s:%d",
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_s2c_rx_at,p->created_at),view->sequence,
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
-            nb_udp_reassembled_t complete;int rc=nb_udp_reassembly_feed(&p->udp_reassembly,view,picoquic_current_time(),&complete);
+            if(p->udp_reassembly==NULL)return -11;
+            nb_udp_reassembled_t complete;int rc=nb_udp_reassembly_feed(p->udp_reassembly,view,picoquic_current_time(),&complete);
             return rc<0?-11:(rc==1?(udp_deliver_reassembled(p,&complete)==0?0:-12):0);
         }
     }
@@ -399,7 +402,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         role_name(G.role),p->id,trace_delta_ms(p->first_down_prepare_at,p->created_at),
                         trace_delta_ms(p->first_down_prepare_at,p->first_down_queue_at),nb,p->down_tx.len,length,p->route);
                 }
-                (void)nb_send_copyout(&p->down_tx,&p->down_tx_clock,dst,nb);
+                (void)nb_send_copyout(&p->down_tx,&p->queue_clocks->down_tx,dst,nb);
                 middle_upstream_fc_update(p,picoquic_current_time());
                 ps_touch(p);
             } else if(dst == NULL && (nb > 0 || is_fin)) {
@@ -423,7 +426,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         role_name(G.role),p->id,trace_delta_ms(p->first_up_prepare_at,p->created_at),
                         trace_delta_ms(p->first_up_prepare_at,p->first_up_queue_at),nb,p->up_tx.len,length,p->route);
                 }
-                (void)nb_send_copyout(&p->up_tx,&p->up_tx_clock,dst,nb);
+                (void)nb_send_copyout(&p->up_tx,&p->queue_clocks->up_tx,dst,nb);
                 ps_touch(p);
             } else if(dst == NULL && (nb > 0 || is_fin)) {
                 log4c_warn("id=%u provide up buffer fail sid=%llu", p->id, (unsigned long long)stream_id);
@@ -435,14 +438,14 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
         break; }
     case picoquic_callback_prepare_datagram: {
         int handled = 0;
-        static uint32_t datagram_rr=0;uint64_t now=picoquic_current_time();
+        uint32_t* datagram_rr=&nb_current_instance->datagram_rr;uint64_t now=picoquic_current_time();
         { const uint8_t* control=NULL;size_t control_len=0,token=0;
           if(nb_udp_lifecycle_next(&g_udp_lifecycle,(uintptr_t)cnx,now,&control,&control_len,&token)){
             if(control_len<=length){uint8_t* dst=picoquic_provide_datagram_buffer_ex(bytes,control_len,picoquic_datagram_not_active);if(dst!=NULL){memcpy(dst,control,control_len);nb_udp_lifecycle_sent(&g_udp_lifecycle,token,now);handled=1;}}
             else {(void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_not_active);handled=1;} } }
         for(int media_pass=0;media_pass<2&&!handled;media_pass++){
           for(int scan=0;scan<MAX_CONN&&!handled;scan++){
-            int i=(int)((datagram_rr+(uint32_t)scan)%MAX_CONN);
+            int i=(int)((*datagram_rr+(uint32_t)scan)%MAX_CONN);
             p=&G.streams[i];if(!p->in_use||!p->udp_mode||p->udp_association)continue;
             if(media_pass==0&&p->flow_class!=NB_FLOW_CLASS_MEDIA)continue;
             if(media_pass==1&&p->flow_class==NB_FLOW_CLASS_MEDIA)continue;
@@ -474,7 +477,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         role_name(G.role),p->id,p->udp_session_id,trace_delta_ms(now,p->created_at),
                         trace_delta_ms(now,queued_at),dg_len,length,p->udp_target_host,p->udp_target_port);
                 }
-                memcpy(dst,dg,dg_len);dgramq_consume(queue,queue_len);datagram_rr=(uint32_t)(i+1);handled=1;
+                memcpy(dst,dg,dg_len);dgramq_consume(queue,queue_len);*datagram_rr=(uint32_t)(i+1);handled=1;
             }
           }
         }
@@ -573,7 +576,26 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_stop_sending:
         /* 对端 reset/stop 单条 stream -> 主动 teardown, discard 另一侧 stream 连锁通知(middle 据此回收) */
         if((p=ps_find_by_down(cnx,stream_id))!=NULL){
-            ps_teardown_reason(p,ev==picoquic_callback_stream_reset?"quic-stream-reset":"quic-stop-sending"); }
+            if(ev==picoquic_callback_stop_sending&&
+                nb_lstream_stop_requires_reset_wait(G.role==ROLE_ENTRY,p->logical_endpoint)){
+                /* discard_stream sends STOP_SENDING before RESET_STREAM. The
+                 * restart reason is only observable on the reset callback. */
+                log4c_debug("entry logical flow stop deferred id=%u sid=%llu",
+                    p->id,(unsigned long long)stream_id);
+                break;
+            }
+            uint64_t stream_error=picoquic_get_remote_stream_error(cnx,stream_id);
+            if(nb_lstream_reset_requires_resume(G.role==ROLE_ENTRY,p->logical_endpoint,
+                stream_error)){
+                const char* reason=ev==picoquic_callback_stream_reset?
+                    "quic-stream-reset":"quic-stop-sending";
+                picoquic_set_app_stream_ctx(cnx,stream_id,NULL);
+                logical_detach(p,cnx);
+                (void)picoquic_discard_stream(cnx,stream_id,0);
+                log4c_warn("entry logical flow detached id=%u reason=%s; resume scheduled",
+                    p->id,reason);
+            }else ps_teardown_reason(p,ev==picoquic_callback_stream_reset?
+                "quic-stream-reset":"quic-stop-sending"); }
         else if((p=ps_find_by_up(cnx,stream_id))!=NULL){
             ps_teardown_reason(p,ev==picoquic_callback_stream_reset?"quic-stream-reset":"quic-stop-sending"); }
         break;
@@ -588,6 +610,20 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                 (G.role==ROLE_EXIT&&affected->up_cnx==cnx))){
                 log4c_warn("%s logical flow detached id=%u reason=%s",role_name(G.role),affected->id,close_reason);
                 logical_detach(affected,cnx);
+            }else if(G.role==ROLE_MIDDLE&&affected->logical_mode&&affected->down_cnx==cnx&&
+                affected->up_cnx!=NULL){
+                /* Middle does not own end-to-end replay state. Reset the live
+                 * upstream stream so Entry preserves its TCP socket and opens
+                 * a new route+RESUME stream through the replacement link. */
+                picoquic_cnx_t* upstream=affected->up_cnx;
+                uint64_t upstream_sid=affected->up_stream_id;
+                picoquic_set_app_stream_ctx(upstream,upstream_sid,NULL);
+                (void)picoquic_discard_stream(upstream,upstream_sid,
+                    NB_LSTREAM_RELAY_RESTART_ERROR);
+                ps_set_close_reason(affected,"logical-relay-downstream-close");
+                log4c_warn("middle logical relay restart id=%u reason=%s upstream_sid=%llu",
+                    affected->id,close_reason,(unsigned long long)upstream_sid);
+                ps_free(affected);
             }else{ps_set_close_reason(affected,close_reason);ps_free(affected);}
         }
         for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(i=0;i<POOL_SIZE;i++){

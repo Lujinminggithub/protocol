@@ -64,14 +64,26 @@ int nb_lstream_decoder_feed(nb_lstream_decoder_t* decoder,const uint8_t* data,si
     return 0;
 }
 void nb_lstream_tx_init(nb_lstream_tx_t* tx,uint64_t flow_hi,uint64_t flow_lo){if(tx){memset(tx,0,sizeof(*tx));tx->flow_hi=flow_hi;tx->flow_lo=flow_lo;}}
-void nb_lstream_tx_dispose(nb_lstream_tx_t* tx){if(tx){free(tx->replay);memset(tx,0,sizeof(*tx));}}
+void nb_lstream_tx_bind_budget(nb_lstream_tx_t* tx,uint64_t* used,uint64_t limit){if(tx){tx->budget_used=used;tx->budget_limit=limit;}}
+static int tx_budget_take(nb_lstream_tx_t* tx,size_t length){
+    if(tx->budget_used==NULL||tx->budget_limit==0)return 0;
+    if(*tx->budget_used>tx->budget_limit||length>tx->budget_limit-*tx->budget_used)return -1;
+    *tx->budget_used+=(uint64_t)length;return 0;
+}
+static void tx_budget_release(nb_lstream_tx_t* tx,size_t length){
+    if(tx->budget_used==NULL)return;
+    if((uint64_t)length>=*tx->budget_used)*tx->budget_used=0;
+    else *tx->budget_used-=(uint64_t)length;
+}
+void nb_lstream_tx_dispose(nb_lstream_tx_t* tx){if(tx){tx_budget_release(tx,tx->replay_length);free(tx->replay);memset(tx,0,sizeof(*tx));}}
 int nb_lstream_tx_append(nb_lstream_tx_t* tx,const uint8_t* data,size_t length,uint64_t* offset){
     if(tx==NULL||(length>0&&data==NULL)||length>NB_LSTREAM_REPLAY_MAX-tx->replay_length)return -1;
     if(offset)*offset=tx->next_offset;
     if(length==0)return 0;
+    if(tx_budget_take(tx,length)!=0)return -1;
     size_t need=tx->replay_length+length;if(need>tx->replay_capacity){size_t cap=tx->replay_capacity?tx->replay_capacity:4096;
         while(cap<need){if(cap>NB_LSTREAM_REPLAY_MAX/2){cap=NB_LSTREAM_REPLAY_MAX;break;}cap*=2;}uint8_t* next=realloc(tx->replay,cap);
-        if(next==NULL)return -1;
+        if(next==NULL){tx_budget_release(tx,length);return -1;}
         tx->replay=next;tx->replay_capacity=cap;}
     memcpy(tx->replay+tx->replay_length,data,length);tx->replay_length+=length;tx->next_offset+=length;return 0;
 }
@@ -82,7 +94,7 @@ int nb_lstream_tx_ack(nb_lstream_tx_t* tx,uint64_t offset){
     if(consumed64>tx->replay_length)return -1;
     size_t consumed=(size_t)consumed64;
     memmove(tx->replay,tx->replay+consumed,tx->replay_length-consumed);
-    tx->replay_length-=consumed;tx->base_offset=offset;return 0;
+    tx->replay_length-=consumed;tx_budget_release(tx,consumed);tx->base_offset=offset;return 0;
 }
 int nb_lstream_tx_fin(nb_lstream_tx_t* tx){if(tx==NULL)return -1;tx->fin_queued=1;tx->fin_offset=tx->next_offset;return 0;}
 int nb_lstream_flow_render(char out[33],uint64_t hi,uint64_t lo){static const char hex[]="0123456789abcdef";
@@ -94,3 +106,14 @@ int nb_lstream_flow_parse(const char* text,uint64_t* hi,uint64_t* lo){if(text==N
     uint64_t a=0,b=0;for(int i=0;i<32;i++){int v=unhex(text[i]);if(v<0)return -1;if(i<16)a=(a<<4)|(unsigned)v;else b=(b<<4)|(unsigned)v;}
     if(a==0&&b==0)return -1;
     *hi=a;*lo=b;return 0;}
+int nb_lstream_reset_requires_resume(int is_entry,int logical_endpoint,uint64_t remote_error){
+    return is_entry&&logical_endpoint&&remote_error==NB_LSTREAM_RELAY_RESTART_ERROR;
+}
+int nb_lstream_stop_requires_reset_wait(int is_entry,int logical_endpoint){
+    return is_entry&&logical_endpoint;
+}
+uint64_t nb_lstream_reconnect_delay_us(unsigned failures){
+    uint64_t delay=250000ULL;
+    while(failures--&&delay<5000000ULL)delay*=2;
+    return delay>5000000ULL?5000000ULL:delay;
+}

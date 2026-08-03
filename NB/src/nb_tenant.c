@@ -69,6 +69,14 @@ void nb_tenant_refund(nb_tenants_t* tenants,int index,size_t bytes){
     if(burst)t->tokens=bytes>=burst||t->tokens>=burst-bytes?burst:t->tokens+bytes;
 }
 
+int64_t nb_tenant_wake_delay(uint64_t throttled_until_us,uint64_t now_us,
+    int64_t current_delay_us){
+    if(throttled_until_us==0)return current_delay_us;
+    uint64_t raw=throttled_until_us<=now_us?0:throttled_until_us-now_us;
+    int64_t delay=raw>(uint64_t)INT64_MAX?INT64_MAX:(int64_t)raw;
+    return current_delay_us<0||delay<current_delay_us?delay:current_delay_us;
+}
+
 void nb_tenant_account(nb_tenants_t* tenants,int index,uint64_t up,uint64_t down){if(!tenants||index<0||(size_t)index>=tenants->count)return;if(tenants->shared_state){nb_tenant_shared_account(tenants,index,up,down);return;}tenants->items[index].bytes_up+=up;tenants->items[index].bytes_down+=down;}
 
 int nb_tenants_render_json(const nb_tenants_t* tenants,char* out,size_t cap){

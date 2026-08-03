@@ -13,25 +13,25 @@
 #define NB_WHITELIST_MAX 8192
 
 typedef struct {uint32_t net,mask;} nb_whitelist_cidr_t;
-typedef struct {
+struct nb_whitelist {
     char domain_suffixes[NB_WHITELIST_MAX][128];int domain_suffix_count;
     char domain_exact[NB_WHITELIST_MAX][128];int domain_exact_count;
     char domain_keywords[NB_WHITELIST_MAX][128];int domain_keyword_count;
     nb_whitelist_cidr_t cidrs[NB_WHITELIST_MAX];int cidr_count;
     uint16_t ports[NB_WHITELIST_MAX];int port_count;
     int enabled;char path[256];time_t mtime;
-} nb_whitelist_state_t;
+};
 
-static nb_whitelist_state_t state;
+static _Thread_local nb_whitelist_t* legacy_state;
 
 static int fail(char* out,size_t cap,const char* format,...){
     if(out&&cap){va_list ap;va_start(ap,format);vsnprintf(out,cap,format,ap);va_end(ap);}
     return -1;
 }
 
-static int load(const char* path,char* error,size_t error_cap){
+static int load(nb_whitelist_t* state,const char* path,char* error,size_t error_cap){
     FILE* file=fopen(path,"r");if(!file)return fail(error,error_cap,"open %s: %s",path,strerror(errno));
-    nb_whitelist_state_t next;memset(&next,0,sizeof(next));
+    nb_whitelist_t next;memset(&next,0,sizeof(next));
     if(strlen(path)>=sizeof(next.path)){fclose(file);return fail(error,error_cap,"path too long");}
     strcpy(next.path,path);char line[512];
     while(fgets(line,sizeof(line),file)){
@@ -67,48 +67,59 @@ static int load(const char* path,char* error,size_t error_cap){
     fclose(file);
     if(!next.domain_suffix_count&&!next.domain_exact_count&&!next.domain_keyword_count&&!next.cidr_count)return fail(error,error_cap,"no domain or cidr rules");
     struct stat status;if(stat(path,&status)==0)next.mtime=status.st_mtime;
-    next.enabled=1;state=next;return 0;
+    next.enabled=1;*state=next;return 0;
 }
 
-int nb_whitelist_init(const char* path,char* error,size_t error_cap){
-    memset(&state,0,sizeof(state));
-    return !path||!*path?0:load(path,error,error_cap);
+nb_whitelist_t* nb_whitelist_create(const char* path,char* error,size_t error_cap){
+    nb_whitelist_t* state=calloc(1,sizeof(*state));if(state==NULL){fail(error,error_cap,"allocation failed");return NULL;}
+    if(path&&*path&&load(state,path,error,error_cap)!=0){free(state);return NULL;}
+    return state;
 }
 
-int nb_whitelist_allowed(const char* host,int port){
-    if(!state.enabled)return 1;
-    int port_allowed=state.port_count==0;
-    for(int i=0;i<state.port_count&&!port_allowed;i++)port_allowed=state.ports[i]==(uint16_t)port;
+void nb_whitelist_destroy(nb_whitelist_t* whitelist){free(whitelist);}
+
+int nb_whitelist_context_allowed(const nb_whitelist_t* state,const char* host,int port){
+    if(state==NULL||!state->enabled)return 1;
+    int port_allowed=state->port_count==0;
+    for(int i=0;i<state->port_count&&!port_allowed;i++)port_allowed=state->ports[i]==(uint16_t)port;
     if(!port_allowed||!host)return 0;
     struct in_addr address;
     if(inet_pton(AF_INET,host,&address)==1){
-        if(!state.cidr_count)return 1;
+        if(!state->cidr_count)return 1;
         uint32_t ip=ntohl(address.s_addr);
-        for(int i=0;i<state.cidr_count;i++)if((ip&state.cidrs[i].mask)==state.cidrs[i].net)return 1;
+        for(int i=0;i<state->cidr_count;i++)if((ip&state->cidrs[i].mask)==state->cidrs[i].net)return 1;
         return 0;
     }
-    if(!state.domain_suffix_count&&!state.domain_exact_count&&!state.domain_keyword_count)return 1;
+    if(!state->domain_suffix_count&&!state->domain_exact_count&&!state->domain_keyword_count)return 1;
     size_t host_length=strlen(host);
-    for(int i=0;i<state.domain_exact_count;i++)if(!strcasecmp(host,state.domain_exact[i]))return 1;
-    for(int i=0;i<state.domain_keyword_count;i++){
-        size_t length=strlen(state.domain_keywords[i]);
+    for(int i=0;i<state->domain_exact_count;i++)if(!strcasecmp(host,state->domain_exact[i]))return 1;
+    for(int i=0;i<state->domain_keyword_count;i++){
+        size_t length=strlen(state->domain_keywords[i]);
         for(size_t offset=0;offset+length<=host_length;offset++)
-            if(!strncasecmp(host+offset,state.domain_keywords[i],length))return 1;
+            if(!strncasecmp(host+offset,state->domain_keywords[i],length))return 1;
     }
-    for(int i=0;i<state.domain_suffix_count;i++){
-        size_t length=strlen(state.domain_suffixes[i]);
-        if((host_length==length&&!strcasecmp(host,state.domain_suffixes[i]))||
-           (host_length>length&&host[host_length-length-1]=='.'&&!strcasecmp(host+host_length-length,state.domain_suffixes[i])))return 1;
+    for(int i=0;i<state->domain_suffix_count;i++){
+        size_t length=strlen(state->domain_suffixes[i]);
+        if((host_length==length&&!strcasecmp(host,state->domain_suffixes[i]))||
+           (host_length>length&&host[host_length-length-1]=='.'&&!strcasecmp(host+host_length-length,state->domain_suffixes[i])))return 1;
     }
     return 0;
 }
 
-int nb_whitelist_reload_if_changed(char* error,size_t error_cap){
-    if(!state.path[0])return 0;
+int nb_whitelist_context_reload_if_changed(nb_whitelist_t* state,char* error,size_t error_cap){
+    if(state==NULL||!state->path[0])return 0;
     struct stat status;
-    if(stat(state.path,&status)!=0)return fail(error,error_cap,"stat %s: %s",state.path,strerror(errno));
-    if(status.st_mtime==state.mtime)return 0;
-    return load(state.path,error,error_cap)==0?1:-1;
+    if(stat(state->path,&status)!=0)return fail(error,error_cap,"stat %s: %s",state->path,strerror(errno));
+    if(status.st_mtime==state->mtime)return 0;
+    return load(state,state->path,error,error_cap)==0?1:-1;
 }
 
-int nb_whitelist_configured(void){return state.path[0]!=0;}
+int nb_whitelist_context_configured(const nb_whitelist_t* state){return state&&state->path[0]!=0;}
+
+int nb_whitelist_init(const char* path,char* error,size_t error_cap){
+    nb_whitelist_t* next=nb_whitelist_create(path,error,error_cap);if(next==NULL)return -1;
+    nb_whitelist_destroy(legacy_state);legacy_state=next;return 0;
+}
+int nb_whitelist_allowed(const char* host,int port){return nb_whitelist_context_allowed(legacy_state,host,port);}
+int nb_whitelist_reload_if_changed(char* error,size_t error_cap){return nb_whitelist_context_reload_if_changed(legacy_state,error,error_cap);}
+int nb_whitelist_configured(void){return nb_whitelist_context_configured(legacy_state);}

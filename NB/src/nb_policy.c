@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define NB_MAX_TIKTOK_RULES 64
 
@@ -40,9 +41,15 @@ static const char* g_default_rules[][5] = {
     {"aggr*",       "bulk",  "bulk",    "off",  "20"},
 };
 
-static nb_tiktok_rule_t g_rules[NB_MAX_TIKTOK_RULES];
-static size_t g_rule_count = 0;
-static int g_policy_inited = 0;
+struct nb_policy {
+    nb_tiktok_rule_t rules[NB_MAX_TIKTOK_RULES];
+    size_t rule_count;
+    int initialized;
+    char path[256];
+    time_t mtime;
+};
+
+static _Thread_local nb_policy_t* legacy_policy;
 
 static nb_flow_class_t parse_class(const char* s){
     if(strcmp(s, "ctrl") == 0) return NB_FLOW_CLASS_CTRL;
@@ -68,9 +75,9 @@ static void to_lower_ascii(char* s){
     for(; *s; s++) *s = (char)tolower((unsigned char)*s);
 }
 
-static int append_rule(const char* pattern, const char* klass, const char* lane, const char* fec, const char* prio){
-    if(g_rule_count >= NB_MAX_TIKTOK_RULES) return -1;
-    nb_tiktok_rule_t* r = &g_rules[g_rule_count];
+static int append_rule(nb_policy_t* policy,const char* pattern, const char* klass, const char* lane, const char* fec, const char* prio){
+    if(policy->rule_count >= NB_MAX_TIKTOK_RULES) return -1;
+    nb_tiktok_rule_t* r = &policy->rules[policy->rule_count];
     snprintf(r->pattern, sizeof(r->pattern), "%s", pattern);
     to_lower_ascii(r->pattern);
     r->flow_class = parse_class(klass);
@@ -78,14 +85,14 @@ static int append_rule(const char* pattern, const char* klass, const char* lane,
     r->fec_hint = parse_fec(fec);
     r->prio = atoi(prio);
     if(r->flow_class == NB_FLOW_CLASS_UNKNOWN || r->lane_hint == NB_FLOW_LANE_DEFAULT || r->prio <= 0) return -1;
-    g_rule_count++;
+    policy->rule_count++;
     return 0;
 }
 
-static void load_default_rules(void){
-    g_rule_count = 0;
+static void load_default_rules(nb_policy_t* policy){
+    policy->rule_count = 0;
     for(size_t i=0; i<sizeof(g_default_rules)/sizeof(g_default_rules[0]); i++){
-        (void)append_rule(g_default_rules[i][0], g_default_rules[i][1], g_default_rules[i][2], g_default_rules[i][3], g_default_rules[i][4]);
+        (void)append_rule(policy,g_default_rules[i][0], g_default_rules[i][1], g_default_rules[i][2], g_default_rules[i][3], g_default_rules[i][4]);
     }
 }
 
@@ -105,7 +112,7 @@ static int match_pattern_ci(const char* host, const char* pattern){
     return strstr(h, p) != NULL;
 }
 
-static void maybe_load_rule_file(const char* rules_path){
+static void maybe_load_rule_file(nb_policy_t* policy,const char* rules_path){
     FILE* f = NULL;
     if(rules_path && rules_path[0]){
         f = fopen(rules_path, "r");
@@ -114,6 +121,10 @@ static void maybe_load_rule_file(const char* rules_path){
         if(f == NULL) f = fopen("tiktok_flow_rules.conf", "r");
     }
     if(f == NULL) return;
+    if(rules_path&&rules_path[0]&&strlen(rules_path)<sizeof(policy->path)){
+        memcpy(policy->path,rules_path,strlen(rules_path)+1);
+        struct stat status;if(stat(rules_path,&status)==0)policy->mtime=status.st_mtime;
+    }
 
     nb_tiktok_rule_t tmp[NB_MAX_TIKTOK_RULES];
     size_t tmp_count = 0;
@@ -140,16 +151,31 @@ static void maybe_load_rule_file(const char* rules_path){
     }
     fclose(f);
     if(tmp_count > 0){
-        memset(g_rules, 0, sizeof(g_rules));
-        memcpy(g_rules, tmp, sizeof(nb_tiktok_rule_t) * tmp_count);
-        g_rule_count = tmp_count;
+        memset(policy->rules, 0, sizeof(policy->rules));
+        memcpy(policy->rules, tmp, sizeof(nb_tiktok_rule_t) * tmp_count);
+        policy->rule_count = tmp_count;
     }
 }
 
+nb_policy_t* nb_policy_create(const char* rules_path){
+    nb_policy_t* policy=calloc(1,sizeof(*policy));if(policy==NULL)return NULL;
+    load_default_rules(policy);maybe_load_rule_file(policy,rules_path);policy->initialized=1;return policy;
+}
+
+void nb_policy_destroy(nb_policy_t* policy){free(policy);}
+
+int nb_policy_reload_if_changed(nb_policy_t* policy){
+    if(policy==NULL||policy->path[0]==0)return 0;
+    struct stat status;
+    if(stat(policy->path,&status)!=0)return -1;
+    if(status.st_mtime==policy->mtime)return 0;
+    nb_policy_t* next=nb_policy_create(policy->path);if(next==NULL)return -1;
+    *policy=*next;free(next);return 1;
+}
+
 void nb_policy_init(const char* rules_path){
-    load_default_rules();
-    maybe_load_rule_file(rules_path);
-    g_policy_inited = 1;
+    nb_policy_t* next=nb_policy_create(rules_path);if(next==NULL)return;
+    nb_policy_destroy(legacy_policy);legacy_policy=next;
 }
 
 void nb_flow_policy_default(nb_flow_policy_t* out){
@@ -176,8 +202,8 @@ static int is_tiktok_udp_media_port(int port){
     }
 }
 
-int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out){
-    if(!g_policy_inited) nb_policy_init(NULL);
+int nb_policy_context_classify(nb_policy_t* policy,const char* host,int port,nb_flow_policy_t* out){
+    if(policy==NULL||!policy->initialized){nb_flow_policy_default(out);return 0;}
     nb_flow_policy_default(out);
     if(host == NULL || host[0] == 0) return 0;
     if(is_tiktok_udp_media_port(port)){
@@ -198,20 +224,25 @@ int nb_tiktok_flow_classify(const char* host, int port, nb_flow_policy_t* out){
             return 1;
         }
     }
-    for(size_t i=0; i<g_rule_count; i++){
-        if(match_pattern_ci(host, g_rules[i].pattern)){
+    for(size_t i=0; i<policy->rule_count; i++){
+        if(match_pattern_ci(host, policy->rules[i].pattern)){
             out->matched = 1;
-            out->flow_class = g_rules[i].flow_class;
-            out->lane_hint = g_rules[i].lane_hint;
-            out->fec_hint = g_rules[i].fec_hint;
-            out->prio = g_rules[i].prio;
-            size_t rule_len=strlen(g_rules[i].pattern);
+            out->flow_class = policy->rules[i].flow_class;
+            out->lane_hint = policy->rules[i].lane_hint;
+            out->fec_hint = policy->rules[i].fec_hint;
+            out->prio = policy->rules[i].prio;
+            size_t rule_len=strlen(policy->rules[i].pattern);
             if(rule_len>=sizeof(out->rule_name))rule_len=sizeof(out->rule_name)-1;
-            memcpy(out->rule_name,g_rules[i].pattern,rule_len);out->rule_name[rule_len]=0;
+            memcpy(out->rule_name,policy->rules[i].pattern,rule_len);out->rule_name[rule_len]=0;
             return 1;
         }
     }
     return 0;
+}
+
+int nb_tiktok_flow_classify(const char* host,int port,nb_flow_policy_t* out){
+    if(legacy_policy==NULL)nb_policy_init(NULL);
+    return nb_policy_context_classify(legacy_policy,host,port,out);
 }
 
 int nb_prio_is_latency(int prio){
