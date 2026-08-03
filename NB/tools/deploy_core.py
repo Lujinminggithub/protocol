@@ -850,7 +850,9 @@ def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None,bina
     if DEPLOY_INSTANCE:
         environment={"NB_FEC_V15":"on","NB_CC":cc,"NB_BBR_OPTIONS":bbr_options,
             "NB_UDP_GSO":"on" if udp_gso else "off","NB_RELEASE_ID":release_id or "unversioned",
-            "NB_LINE_PROFILE_ID":line_id,"NB_LINE_PROFILE_SCHEMA":str(line_schema)}
+            "NB_LINE_PROFILE_ID":line_id,"NB_LINE_PROFILE_SCHEMA":str(line_schema),
+            "NB_TRANSPORT_LINE_ID":line_id,
+            "NB_TRANSPORT_PROFILE_FILE":f"{INSTANCE_WORK}/transport-profiles/{role}-active.conf"}
         if cwin_max_bytes:environment["NB_CWIN_MAX_BYTES"]=str(cwin_max_bytes)
         if mtu_max:environment["NB_MTU_MAX"]=str(mtu_max)
         if role=="entry":

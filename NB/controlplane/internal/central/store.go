@@ -234,6 +234,10 @@ CREATE TABLE IF NOT EXISTS line_deletion_audit (
  requested_by TEXT NOT NULL, reason TEXT NOT NULL, snapshot BLOB NOT NULL,
  deleted_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS transport_generations (
+ line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
+ current_generation INTEGER NOT NULL CHECK(current_generation > 0), updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS snapshots_latest ON snapshots(line_id,node_id,worker_id,observed_at DESC);
 CREATE INDEX IF NOT EXISTS snapshots_latest_node ON snapshots(line_id,node_id,observed_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS incidents_line ON incidents(line_id,status,observed_at DESC);
@@ -447,6 +451,22 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) (Opera
 	return operation, false, err
 }
 
+func (s *Store) OperationByIdempotencyKey(ctx context.Context, key string) (Operation, error) {
+	var item Operation
+	err := scanOperation(s.db.QueryRowContext(ctx, `SELECT id,line_id,kind,status,requested_by,idempotency_key,
+	 request,result,created_at,updated_at FROM operations WHERE idempotency_key=?`, key), &item)
+	return item, err
+}
+
+func (s *Store) AllocateTransportGeneration(ctx context.Context, lineID string) (uint64, error) {
+	var generation uint64
+	err := s.db.QueryRowContext(ctx, `INSERT INTO transport_generations(line_id,current_generation,updated_at)
+	 VALUES(?,1,?) ON CONFLICT(line_id) DO UPDATE SET
+	 current_generation=transport_generations.current_generation+1,updated_at=excluded.updated_at
+	 RETURNING current_generation`, lineID, now()).Scan(&generation)
+	return generation, err
+}
+
 func (s *Store) Operations(ctx context.Context, lineID string, limit int) ([]Operation, error) {
 	query := `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at FROM operations`
 	args := []any{}
@@ -625,6 +645,13 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 			}
 		case "line.disable":
 			if _, err = tx.ExecContext(ctx, `UPDATE lines SET status='disabled',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+				return err
+			}
+		case "line.tune":
+			if values.Profile == "" {
+				return errors.New("successful transport tuning requires a profile result")
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE lines SET profile=?,updated_at=? WHERE id=?`, values.Profile, now(), lineID); err != nil {
 				return err
 			}
 		}

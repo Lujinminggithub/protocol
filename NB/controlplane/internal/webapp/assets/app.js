@@ -11,7 +11,7 @@ const number = (value, digits = 0) => Number(value || 0).toLocaleString("zh-CN",
 const formatDurationUS = (value) => { const us=Number(value||0); if(us<1000)return `${number(us)} μs`; if(us<1000000)return `${number(us/1000,2)} ms`; return `${number(us/1000000,2)} s`; };
 const statusText = {ok:"健康",healthy:"健康",degraded:"异常",down:"离线",unknown:"待采集",ready:"可用",provisioning:"初始化",offline:"离线",retired:"退役",active:"运行中",draft:"草稿",validating:"验证中",maintenance:"维护",disabled:"停用",queued:"排队中",dispatched:"已下发",running:"执行中",succeeded:"成功",failed:"失败",cancelled:"已取消",rolled_back:"已回滚",open:"未处理",firing:"告警中",resolved:"已恢复",critical:"严重",warning:"警告",info:"信息",pending:"等待",skipped:"跳过"};
 function healthState(value) { return value === "ok" ? "healthy" : (value || "unknown"); }
-const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用"};
+const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优"};
 const roleText = {entry:"Entry",relay:"Relay",exit:"Exit"};
 
 async function api(path, options = {}) {
@@ -142,7 +142,7 @@ function lineRow(line) {
   const detail = state.details[line.id];
   const nodes = detail?.spec?.nodes || [];
   const route = nodes.map((n) => n.device?.name || n.device_id).join(" → ") || `${line.entry_region} → ${line.exit_region}`;
-  const definitions = line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.validate","验证",""] ,["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
+  const definitions = line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.validate","验证",""] ,["line.tune","协议调优",""] ,["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
   const actions = definitions.map(([kind,label,style]) => { const a = operationAvailability(line.id,kind); return `<button class="action-button ${style}" ${a.enabled ? `data-action="${kind}" data-line="${escapeHTML(line.id)}"` : `disabled title="${escapeHTML(a.reason)}"`}>${label}</button>`; }).join("");
   const canDelete = !nodes.length || ["draft","disabled","archived"].includes(line.status);
   const deleteAction = canDelete ? `<button class="action-button danger-action" data-delete-line="${escapeHTML(line.id)}">删除</button>` : "";

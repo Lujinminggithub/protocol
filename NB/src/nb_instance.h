@@ -16,6 +16,7 @@
 #include "nb_runtime.h"
 #include "nb_session_index.h"
 #include "nb_tenant.h"
+#include "nb_transport_profile.h"
 #include "nb_udp_io.h"
 #include "nb_udp_lifecycle.h"
 #include "nb_whitelist.h"
@@ -27,7 +28,18 @@
 #define NB_INSTANCE_ENV_MAX 48
 
 typedef struct { uint32_t sid; proxy_stream_t* stream; } nb_fec_session_index_t;
-typedef struct { picoquic_cnx_t* cnx; nb_live_sched_t sched; } nb_sched_cnx_t;
+typedef struct {
+    picoquic_cnx_t* cnx;
+    nb_live_sched_t sched;
+    uint64_t transport_generation;
+    int transport_profile_bound;
+} nb_sched_cnx_t;
+
+typedef struct {
+    nb_transport_link_profile_t link;
+    uint64_t generation;
+    int active;
+} nb_transport_runtime_t;
 
 typedef struct nb_instance {
     nb_global_t global;
@@ -86,6 +98,9 @@ typedef struct nb_instance {
     uint64_t whitelist_last_at;
     uint64_t link_quality_last_at;
     uint64_t fec_stats_last_at;
+    nb_transport_profile_state_t transport_profiles;
+    nb_transport_runtime_t transport_ingress;
+    nb_transport_runtime_t transport_egress;
     struct {char name[64];char value[512];} environment[NB_INSTANCE_ENV_MAX];
     size_t environment_count;
     atomic_int stop_requested;

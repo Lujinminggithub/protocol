@@ -277,6 +277,24 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
           picoquic_set_mtu_max(G.quic,(uint32_t)mtu);
           log4c_info("path MTU cap: %lu bytes (IPv4 QUIC UDP payload <= %lu)",mtu,mtu-28);
       }else log4c_info("path MTU cap: picoquic discovery default"); }
+    { const char* path=nb_instance_env(nb_current_instance,"NB_TRANSPORT_PROFILE_FILE");
+      if(path&&path[0]&&access(path,F_OK)==0){
+          char error[256]={0};nb_transport_profile_t profile;
+          if(nb_transport_profile_load(path,&profile,error,sizeof(error))!=0){
+              log4c_error("startup transport profile rejected: %s",error);log4c_shutdown();return 1;
+          }
+          const char* expected_line=nb_instance_env(nb_current_instance,"NB_TRANSPORT_LINE_ID");
+          if(expected_line==NULL||strcmp(profile.line_id,expected_line)||strcmp(profile.role,role_name(G.role))){
+              log4c_error("startup transport profile identity mismatch");log4c_shutdown();return 1;
+          }
+          nb_current_instance->transport_profiles.active=profile;
+          nb_current_instance->transport_profiles.has_active=1;
+          if(transport_apply_active_profile()!=0){
+              log4c_error("startup transport profile apply failed");log4c_shutdown();return 1;
+          }
+      }else if(path&&path[0]&&errno!=ENOENT){
+          log4c_error("startup transport profile unavailable: %s",strerror(errno));log4c_shutdown();return 1;
+      } }
     /* 单流初始信用保持在 128 KiB。middle 对入站流启用应用流控，并按下游队列
      * 消费进度增发信用，避免自动扩窗把秒级媒体积压隐藏在桥接队列中。
      * connection 级 max_data 仍为 64 MiB，以支撑大量并发流。 */

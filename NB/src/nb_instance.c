@@ -23,6 +23,7 @@ void nb_instance_init(nb_instance_t* instance){
     instance->udp_control_grace_us=NB_UDP_CONTROL_GRACE_US;
     instance->queue_limit_bytes=NB_INSTANCE_DEFAULT_QUEUE_LIMIT;
     instance->session_limit=NB_MAX_CONNECTIONS;
+    nb_transport_profile_state_init(&instance->transport_profiles);
 }
 
 const char* nb_instance_env(const nb_instance_t* instance,const char* name){

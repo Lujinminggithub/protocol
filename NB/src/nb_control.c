@@ -34,7 +34,7 @@ int nb_control_serve(int listen_fd,nb_control_render_fn render,void* ctx){
         if(fd<0){if(errno==EAGAIN||errno==EWOULDBLOCK)return served;return -1;}
         struct timeval timeout={.tv_sec=0,.tv_usec=200000};
         (void)setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-        char request[128],response[8192];ssize_t n=read(fd,request,sizeof(request)-1);
+        char request[1024],response[8192];ssize_t n=read(fd,request,sizeof(request)-1);
         if(n>0){
             request[n]=0;request[strcspn(request,"\r\n")]=0;
             int len=render?render(request,response,sizeof(response),ctx):-1;

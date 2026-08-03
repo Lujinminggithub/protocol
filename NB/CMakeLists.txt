@@ -58,6 +58,12 @@ if(BUILD_TESTING)
   target_compile_options(nb_control_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_control COMMAND nb_control_test)
 
+  add_executable(nb_transport_profile_test tools/test_transport_profile.c src/nb_transport_profile.c)
+  target_include_directories(nb_transport_profile_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(nb_transport_profile_test PRIVATE _GNU_SOURCE)
+  target_compile_options(nb_transport_profile_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_transport_profile COMMAND nb_transport_profile_test)
+
   add_executable(nb_routes_test tools/test_routes.c src/nb_routes.c)
   target_include_directories(nb_routes_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_routes_test PRIVATE -O2 -Wall -Wextra)
@@ -164,7 +170,7 @@ if(BUILD_TESTING)
   target_compile_options(nb_whitelist_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_whitelist COMMAND nb_whitelist_test)
 
-  add_executable(nb_shard_config_test tools/test_shard_config.c src/nb_shard.c src/nb_instance.c src/log/log4c.c)
+  add_executable(nb_shard_config_test tools/test_shard_config.c src/nb_shard.c src/nb_instance.c src/nb_transport_profile.c src/log/log4c.c)
   target_include_directories(nb_shard_config_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/picoquic/src/picoquic
@@ -176,7 +182,7 @@ if(BUILD_TESTING)
   add_test(NAME nb_shard_config COMMAND nb_shard_config_test)
 
   foreach(_nb_test_target
-      nb_fec_test nb_fec_policy_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test
+      nb_fec_test nb_fec_policy_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test nb_transport_profile_test
       nb_auth_async_test nb_routes_test nb_udp_test nb_lstream_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_probe_test nb_metrics_test
       nb_session_index_test nb_session_memory_test nb_bridge_test nb_send_test nb_path_test
       nb_pool_health_test nb_dns_test nb_tenant_test nb_whitelist_test nb_shard_config_test)
@@ -201,7 +207,7 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_probe.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_udp.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_transport_profile.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_probe.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_udp.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
 target_compile_options(nb_node PRIVATE -O2 -Wall -Wextra -Werror)
 target_include_directories(nb_node PRIVATE

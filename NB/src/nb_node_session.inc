@@ -14,6 +14,8 @@ static proxy_stream_t* ps_alloc(void){
         G.streams[i].route_index=-1;
         G.streams[i].last_active=picoquic_current_time();
         G.streams[i].created_at=G.streams[i].last_active;
+        G.streams[i].transport_generation=nb_current_instance->transport_profiles.has_active?
+            nb_current_instance->transport_profiles.active.generation:0;
         (void)nb_session_index_put(&g_session_index,NB_SESSION_KEY_ID,G.streams[i].id,0,0,&G.streams[i]);
         g_ps_inuse++; if(g_ps_inuse>g_ps_peak) g_ps_peak=g_ps_inuse;
         return &G.streams[i]; }

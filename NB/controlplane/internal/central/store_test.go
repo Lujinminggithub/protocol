@@ -3,10 +3,86 @@ package central
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestTuneCompletionUpdatesLineProfile(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stamp := now()
+	_, err = store.db.Exec(`INSERT INTO lines
+	 (id,name,status,entry_region,exit_region,provider,capacity_mbps,profile,created_at,updated_at)
+	 VALUES('line-1','test','active','entry','exit','test',10,'line-1:1',?,?)`, stamp, stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := Operation{ID: "op-tune", LineID: "line-1", Kind: "line.tune", RequestedBy: "operator",
+		IdempotencyKey: "tune-1", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(context.Background(), operation); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimOperations(context.Background(), "line-1", 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	if err = store.CompleteOperation(context.Background(), "op-tune", "line-1", "succeeded",
+		json.RawMessage(`{"profile":"line-1:2","transport_generation":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := store.Line(context.Background(), "line-1")
+	if err != nil || line.Profile != "line-1:2" {
+		t.Fatalf("line=%+v err=%v", line, err)
+	}
+}
+
+func TestAllocateTransportGenerationIsAtomic(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stamp := now()
+	_, err = store.db.Exec(`INSERT INTO lines
+	 (id,name,status,entry_region,exit_region,provider,capacity_mbps,created_at,updated_at)
+	 VALUES('line-1','test','active','entry','exit','test',10,?,?)`, stamp, stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 16
+	values := make([]int, count)
+	errors := make(chan error, count)
+	var wait sync.WaitGroup
+	for index := range values {
+		wait.Add(1)
+		go func(at int) {
+			defer wait.Done()
+			generation, allocateErr := store.AllocateTransportGeneration(context.Background(), "line-1")
+			values[at] = int(generation)
+			errors <- allocateErr
+		}(index)
+	}
+	wait.Wait()
+	close(errors)
+	for allocateErr := range errors {
+		if allocateErr != nil {
+			t.Fatal(allocateErr)
+		}
+	}
+	sort.Ints(values)
+	for index, generation := range values {
+		if generation != index+1 {
+			t.Fatalf("generations=%v", values)
+		}
+	}
+}
 
 func TestOpenMigratesExitBindIP(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")

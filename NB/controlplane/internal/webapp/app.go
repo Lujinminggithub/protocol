@@ -14,13 +14,16 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 	"nb-controlplane/internal/central"
+	"nb-controlplane/internal/transportprofile"
 )
 
 const maxBody = 1 << 20
@@ -31,6 +34,28 @@ var (
 	safeEventKey  = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,160}$`)
 )
 
+func (a *App) planTransportProfile(r *http.Request, lineID string, bandwidthMbps int) (transportprofile.Profile, error) {
+	validation, err := a.store.LatestSuccessfulOperation(r.Context(), lineID, "line.validate")
+	if err != nil {
+		return transportprofile.Profile{}, errors.New("successful line validation evidence is required before tuning")
+	}
+	var validationResult struct {
+		Evidence json.RawMessage `json:"evidence"`
+	}
+	if json.Unmarshal(validation.Result, &validationResult) != nil || len(validationResult.Evidence) == 0 {
+		return transportprofile.Profile{}, errors.New("latest line validation has no transport evidence")
+	}
+	var probe transportprofile.Probe
+	if json.Unmarshal(validationResult.Evidence, &probe) != nil {
+		return transportprofile.Profile{}, errors.New("latest line validation evidence is invalid")
+	}
+	generation, err := a.store.AllocateTransportGeneration(r.Context(), lineID)
+	if err != nil {
+		return transportprofile.Profile{}, errors.New("transport generation allocation failed")
+	}
+	return transportprofile.Generate(lineID, generation, float64(bandwidthMbps), probe)
+}
+
 //go:embed assets/*
 var assets embed.FS
 
@@ -40,8 +65,9 @@ type Config struct {
 }
 
 type App struct {
-	store *central.Store
-	cfg   Config
+	store       *central.Store
+	cfg         Config
+	operationMu sync.Mutex
 }
 
 func New(store *central.Store, cfg Config) *App { return &App{store: store, cfg: cfg} }
@@ -339,6 +365,8 @@ func operationID() (string, error) {
 }
 
 func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
 	key := r.Header.Get("Idempotency-Key")
 	if !safeID.MatchString(key) {
 		problem(w, 400, "valid Idempotency-Key is required")
@@ -356,9 +384,21 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.upgrade": true, "line.rollback": true, "line.disable": true}
+	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.upgrade": true, "line.rollback": true, "line.disable": true, "line.tune": true}
 	if !safeID.MatchString(req.ID) || !safeID.MatchString(req.LineID) || !allowed[req.Kind] || !safeID.MatchString(req.RequestedBy) {
 		problem(w, 400, "invalid operation")
+		return
+	}
+	if existing, existingErr := a.store.OperationByIdempotencyKey(r.Context(), key); existingErr == nil {
+		if existing.LineID != req.LineID || existing.Kind != req.Kind || existing.RequestedBy != req.RequestedBy ||
+			!sameUserOperationRequest(existing.Request, req.Request) {
+			problem(w, http.StatusConflict, central.ErrConflict.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, existing)
+		return
+	} else if !errors.Is(existingErr, sql.ErrNoRows) {
+		problem(w, 500, existingErr.Error())
 		return
 	}
 	if _, err := a.store.Line(r.Context(), req.LineID); err != nil {
@@ -371,6 +411,14 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			values = map[string]any{}
 		}
 		values["plan"] = spec
+		if req.Kind == "line.tune" {
+			profile, planErr := a.planTransportProfile(r, req.LineID, spec.BandwidthMbps)
+			if planErr != nil {
+				problem(w, 409, planErr.Error())
+				return
+			}
+			values["transport_profile"] = profile
+		}
 		req.Request, _ = json.Marshal(values)
 	} else if req.Kind == "line.open" {
 		problem(w, 409, "line deployment specification is required before opening")
@@ -419,6 +467,19 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, result)
 }
 
+func sameUserOperationRequest(existing, requested json.RawMessage) bool {
+	decodeRequest := func(raw json.RawMessage) map[string]any {
+		values := map[string]any{}
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &values)
+		}
+		delete(values, "plan")
+		delete(values, "transport_profile")
+		return values
+	}
+	return reflect.DeepEqual(decodeRequest(existing), decodeRequest(requested))
+}
+
 func (a *App) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	if !safeID.MatchString(r.PathValue("id")) {
 		problem(w, 400, "invalid operation id")
@@ -453,7 +514,7 @@ func (a *App) executors(w http.ResponseWriter, r *http.Request) {
 
 func validOperationKind(kind string) bool {
 	return kind == "line.open" || kind == "line.validate" || kind == "line.upgrade" ||
-		kind == "line.rollback" || kind == "line.disable"
+		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune"
 }
 
 func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {

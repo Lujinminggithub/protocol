@@ -341,9 +341,11 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
         if(p==NULL){
             /* middle/exit: 新上游 stream(server 端被动收) */
             if(G.role==ROLE_ENTRY){ break; } /* entry 无 server, 忽略 */
+            if(transport_bind_connection(cnx,0)!=0){picoquic_discard_stream(cnx,stream_id,0);break;}
             p=ps_alloc(); if(!p){ log4c_warn("stream table full, reset sid=%llu",(unsigned long long)stream_id);
                 picoquic_discard_stream(cnx,stream_id,0); break; }
             p->up_cnx=cnx; p->up_stream_id=stream_id;
+            p->transport_generation=transport_connection_generation(cnx);
             ps_index_refresh(p);
             picoquic_set_app_stream_ctx(cnx,stream_id,p);
             if(G.role==ROLE_MIDDLE){

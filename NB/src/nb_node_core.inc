@@ -159,15 +159,19 @@ static int worker_lane_port(int base){
     return base+(int)worker;
 }
 
-static nb_live_sched_t* sched_for_cnx(picoquic_cnx_t* cnx,int create){
+static nb_sched_cnx_t* runtime_for_cnx(picoquic_cnx_t* cnx,int create){
     if(cnx==NULL)return NULL;
-    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==cnx)return &g_sched_cnx[i].sched;
+    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==cnx)return &g_sched_cnx[i];
     if(!create)return NULL;
     for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==NULL){
         g_sched_cnx[i].cnx=cnx;memset(&g_sched_cnx[i].sched,0,sizeof(g_sched_cnx[i].sched));
-        return &g_sched_cnx[i].sched;
+        return &g_sched_cnx[i];
     }
     return NULL;
+}
+
+static nb_live_sched_t* sched_for_cnx(picoquic_cnx_t* cnx,int create){
+    nb_sched_cnx_t* runtime=runtime_for_cnx(cnx,create);return runtime?&runtime->sched:NULL;
 }
 
 static void udp_lifecycle_wake_due(uint64_t now_us){uintptr_t link;while((link=nb_udp_lifecycle_mark_due(&g_udp_lifecycle,now_us))!=0)(void)picoquic_mark_datagram_ready((picoquic_cnx_t*)link,1);}
@@ -281,6 +285,71 @@ static int epoll_tcp_update(proxy_stream_t* p, int add);
 static int set_nonblock(int fd){ int fl=fcntl(fd,F_GETFL,0); return fl<0?-1:fcntl(fd,F_SETFL,fl|O_NONBLOCK); }
 static const char* role_name(nb_role_t r){ return nb_bridge_role_name((int)r); }
 
+static const picoquic_congestion_algorithm_t* transport_algorithm(const char* cc){
+    if(cc&&strcmp(cc,"cubic")==0)return picoquic_cubic_algorithm;
+    if(cc&&strcmp(cc,"dcubic")==0)return picoquic_dcubic_algorithm;
+    if(cc&&strcmp(cc,"fastcc")==0)return picoquic_fastcc_algorithm;
+    return picoquic_bbr_algorithm;
+}
+
+static void transport_set_default_cc(const nb_transport_link_profile_t* link){
+    const picoquic_congestion_algorithm_t* algorithm=transport_algorithm(link->cc);
+    if(algorithm==picoquic_bbr_algorithm&&link->bbr_options[0])
+        picoquic_set_default_congestion_algorithm_ex(G.quic,algorithm,link->bbr_options);
+    else picoquic_set_default_congestion_algorithm(G.quic,algorithm);
+}
+
+static void transport_set_connection_cc(picoquic_cnx_t* cnx,const nb_transport_link_profile_t* link){
+    const picoquic_congestion_algorithm_t* algorithm=transport_algorithm(link->cc);
+    if(algorithm==picoquic_bbr_algorithm&&link->bbr_options[0])
+        picoquic_set_congestion_algorithm_ex(cnx,algorithm,link->bbr_options);
+    else picoquic_set_congestion_algorithm(cnx,algorithm);
+}
+
+static const nb_transport_link_profile_t* transport_local_default(const nb_transport_profile_t* profile){
+    if(G.role==ROLE_ENTRY)return profile->egress.present?&profile->egress:NULL;
+    return profile->ingress.present?&profile->ingress:NULL;
+}
+
+static int transport_apply_active_profile(void){
+    nb_transport_profile_state_t* state=&nb_current_instance->transport_profiles;
+    if(!state->has_active)return -1;
+    const nb_transport_link_profile_t* local=transport_local_default(&state->active);
+    const nb_transport_link_profile_t* outbound=state->active.egress.present?&state->active.egress:local;
+    if(local==NULL||outbound==NULL)return -1;
+    memset(&nb_current_instance->transport_ingress,0,sizeof(nb_current_instance->transport_ingress));
+    memset(&nb_current_instance->transport_egress,0,sizeof(nb_current_instance->transport_egress));
+    if(state->active.ingress.present){nb_current_instance->transport_ingress.link=state->active.ingress;
+        nb_current_instance->transport_ingress.generation=state->active.generation;nb_current_instance->transport_ingress.active=1;}
+    if(state->active.egress.present){nb_current_instance->transport_egress.link=state->active.egress;
+        nb_current_instance->transport_egress.generation=state->active.generation;nb_current_instance->transport_egress.active=1;}
+    transport_set_default_cc(local);picoquic_set_cwin_max(G.quic,local->cwin_max_bytes);
+    picoquic_set_mtu_max(G.quic,local->mtu_max);g_udp_gso_enabled=local->udp_gso;
+    g_reorder_gap=outbound->reorder_gap;g_reorder_delay_us=outbound->reorder_delay_us;
+    g_fec_v15_observe=outbound->fec_observe;g_fec_v15_active=outbound->fec_active;
+    log4c_info("transport profile committed generation=%llu role=%s ingress=%d egress=%d cc=%s mtu=%u",
+        (unsigned long long)state->active.generation,role_name(G.role),state->active.ingress.present,
+        state->active.egress.present,local->cc,local->mtu_max);return 0;
+}
+
+static int transport_bind_connection(picoquic_cnx_t* cnx,int outbound){
+    nb_sched_cnx_t* runtime=runtime_for_cnx(cnx,1);if(runtime==NULL)return -1;
+    if(runtime->transport_profile_bound)return 0;
+    nb_transport_runtime_t* selected=outbound?&nb_current_instance->transport_egress:&nb_current_instance->transport_ingress;
+    if(!selected->active)selected=outbound?&nb_current_instance->transport_ingress:&nb_current_instance->transport_egress;
+    runtime->transport_profile_bound=1;runtime->transport_generation=selected->active?selected->generation:0;
+    if(!selected->active)return 0;
+    const nb_transport_link_profile_t* link=&selected->link;transport_set_connection_cc(cnx,link);
+    if((G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE)&&outbound&&
+        picoquic_set_loss_reorder_tolerance(cnx,link->reorder_gap,link->reorder_delay_us)!=0)return -1;
+    return 0;
+}
+
+static uint64_t transport_connection_generation(picoquic_cnx_t* cnx){
+    nb_sched_cnx_t* runtime=runtime_for_cnx(cnx,0);
+    return runtime&&runtime->transport_profile_bound?runtime->transport_generation:0;
+}
+
 static const char* cc_state_name(const char* alg,uint64_t state){
     if(alg&&(!strcmp(alg,"cubic")||!strcmp(alg,"dcubic"))){
         if(state==0)return "slow_start";
@@ -350,13 +419,47 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
     const char* schema_text=nb_instance_env(nb_current_instance,"NB_LINE_PROFILE_SCHEMA");char* schema_end=NULL;
     long schema_long=schema_text?strtol(schema_text,&schema_end,10):0;
     int profile_schema=(schema_text&&schema_end&&*schema_end==0&&schema_long>=0&&schema_long<=999999)?(int)schema_long:0;
+    if(!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))
+        return nb_transport_profile_render_status(&nb_current_instance->transport_profiles,out,cap);
+    unsigned long long generation=0,fingerprint=0;char line_id[65],path[768];
+    if(sscanf(command,"profile prepare %llu %llx %64s %767s",&generation,&fingerprint,line_id,path)==4){
+        char error[256];int rc=nb_transport_profile_prepare(&nb_current_instance->transport_profiles,path,
+            (uint64_t)generation,(uint64_t)fingerprint,line_id,role_name(G.role),error,sizeof(error));
+        return rc==0?snprintf(out,cap,"{\"status\":\"prepared\",\"generation\":%llu}\n",generation):
+            snprintf(out,cap,"{\"error\":\"%s\"}\n",error);
+    }
+    if(sscanf(command,"profile commit %llu",&generation)==1){
+        char error[256];int rc=nb_transport_profile_commit(&nb_current_instance->transport_profiles,(uint64_t)generation,error,sizeof(error));
+        if(rc==0&&transport_apply_active_profile()!=0){
+            uint64_t previous=nb_current_instance->transport_profiles.has_previous?
+                nb_current_instance->transport_profiles.previous.generation:0;
+            if(previous)(void)nb_transport_profile_rollback(&nb_current_instance->transport_profiles,previous,NULL,0);
+            rc=-1;snprintf(error,sizeof(error),"runtime profile apply failed");
+        }
+        return rc==0?snprintf(out,cap,"{\"status\":\"committed\",\"generation\":%llu}\n",generation):
+            snprintf(out,cap,"{\"error\":\"%s\"}\n",error);
+    }
+    if(sscanf(command,"profile abort %llu",&generation)==1){
+        (void)nb_transport_profile_abort(&nb_current_instance->transport_profiles,(uint64_t)generation);
+        return snprintf(out,cap,"{\"status\":\"aborted\",\"generation\":%llu}\n",generation);
+    }
+    if(sscanf(command,"profile rollback %llu",&generation)==1){
+        char error[256];int rc=nb_transport_profile_rollback(&nb_current_instance->transport_profiles,(uint64_t)generation,error,sizeof(error));
+        if(rc==0&&transport_apply_active_profile()!=0){rc=-1;snprintf(error,sizeof(error),"runtime profile rollback apply failed");}
+        return rc==0?snprintf(out,cap,"{\"status\":\"rolled-back\",\"generation\":%llu}\n",generation):
+            snprintf(out,cap,"{\"error\":\"%s\"}\n",error);
+    }
     if(!strcmp(command,"health")||!strcmp(command,"GET /health")){
         uint64_t logical[NB_LSTREAM_FIN_ACK+1]={0};
+        uint64_t active_generation=nb_current_instance->transport_profiles.has_active?
+            nb_current_instance->transport_profiles.active.generation:0,old_generation_sessions=0;
         for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use)for(int type=NB_LSTREAM_OPEN;type<=NB_LSTREAM_FIN_ACK;type++)
             logical[type]+=G.streams[i].logical_rx_frames[type];
+        for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use&&G.streams[i].transport_generation!=active_generation)old_generation_sessions++;
         const char* status=instance_transport_ready()?"ok":"starting";
-        return snprintf(out,cap,"{\"status\":\"%s\",\"role\":\"%s\",\"worker\":\"%s\",\"boot_id\":\"%016llx\",\"release_id\":\"%s\",\"binary_release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d,\"resources\":{\"sessions\":%d,\"sessions_limit\":%u,\"queue_bytes\":%llu,\"queue_limit_bytes\":%llu},\"logical_rx\":{\"open\":%llu,\"data\":%llu,\"ack\":%llu,\"resume\":%llu,\"resume_ack\":%llu,\"fin\":%llu,\"rst\":%llu,\"fin_ack\":%llu}}\n",
-            status,role_name(G.role),worker,(unsigned long long)g_run_id,release,binary_release,profile,profile_schema,g_ps_inuse,
+        return snprintf(out,cap,"{\"status\":\"%s\",\"role\":\"%s\",\"worker\":\"%s\",\"boot_id\":\"%016llx\",\"release_id\":\"%s\",\"binary_release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d,\"transport_generation\":%llu,\"old_generation_sessions\":%llu,\"resources\":{\"sessions\":%d,\"sessions_limit\":%u,\"queue_bytes\":%llu,\"queue_limit_bytes\":%llu},\"logical_rx\":{\"open\":%llu,\"data\":%llu,\"ack\":%llu,\"resume\":%llu,\"resume_ack\":%llu,\"fin\":%llu,\"rst\":%llu,\"fin_ack\":%llu}}\n",
+            status,role_name(G.role),worker,(unsigned long long)g_run_id,release,binary_release,profile,profile_schema,
+            (unsigned long long)active_generation,(unsigned long long)old_generation_sessions,g_ps_inuse,
             nb_current_instance->session_limit,(unsigned long long)nb_current_instance->queue_bytes,
             (unsigned long long)nb_current_instance->queue_limit_bytes,
             (unsigned long long)logical[NB_LSTREAM_OPEN],(unsigned long long)logical[NB_LSTREAM_DATA],

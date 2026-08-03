@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"nb-controlplane/internal/transportprofile"
 )
 
 type Operation struct {
@@ -25,17 +27,20 @@ type Operation struct {
 }
 
 type Result struct {
-	Deployment string `json:"deployment,omitempty"`
-	Profile    string `json:"profile,omitempty"`
-	ClientURL  string `json:"client_url,omitempty"`
-	LogFile    string `json:"log_file"`
-	Message    string `json:"message"`
+	Deployment          string          `json:"deployment,omitempty"`
+	Profile             string          `json:"profile,omitempty"`
+	ClientURL           string          `json:"client_url,omitempty"`
+	LogFile             string          `json:"log_file"`
+	Message             string          `json:"message"`
+	Evidence            json.RawMessage `json:"evidence,omitempty"`
+	TransportGeneration uint64          `json:"transport_generation,omitempty"`
 }
 
 type requestValues struct {
-	Deployment string      `json:"deployment"`
-	Note       string      `json:"note"`
-	Plan       dynamicPlan `json:"plan"`
+	Deployment       string                   `json:"deployment"`
+	Note             string                   `json:"note"`
+	Plan             dynamicPlan              `json:"plan"`
+	TransportProfile transportprofile.Profile `json:"transport_profile"`
 }
 
 type commandStep struct {
@@ -234,6 +239,8 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 		return []commandStep{{Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--socks-port", socks, "--via-entry-ssh", "--output", filepath.Join(operationDir, "validation.json")}}}, nil
+	case "line.tune":
+		return nil, nil
 	case "line.upgrade":
 		result := []commandStep{{Name: python, Stage: "build", Args: []string{deploy, "build"}}}
 		if line.WhitelistSourceEnv != "" {
@@ -368,10 +375,25 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		sequence++
 	}
 	result := Result{LogFile: logPath, Profile: line.LineID, Message: "operation completed"}
+	if operation.Kind == "line.tune" {
+		generation, profilePath, rolloutErr := r.applyPlannedProfile(ctx, line, request.TransportProfile, environment, logFile, &sequence)
+		result.TransportGeneration = generation
+		if profilePath != "" {
+			result.Profile = fmt.Sprintf("%s:%d", line.LineID, generation)
+		}
+		if rolloutErr != nil {
+			return result, rolloutErr
+		}
+	}
+	if operation.Kind == "line.validate" {
+		if evidence, readErr := os.ReadFile(filepath.Join(operationDir, "validation.json")); readErr == nil && json.Valid(evidence) {
+			result.Evidence = json.RawMessage(evidence)
+		}
+	}
 	if operation.Kind == "line.rollback" {
 		result.Deployment = request.Deployment
 	}
-	if operation.Kind != "line.validate" && operation.Kind != "line.disable" {
+	if operation.Kind != "line.validate" && operation.Kind != "line.disable" && operation.Kind != "line.tune" {
 		result.Deployment, err = r.currentDeployment(ctx, line, environment, logFile)
 		if err != nil {
 			return result, err

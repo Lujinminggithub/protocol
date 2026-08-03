@@ -18,7 +18,7 @@ var (
 
 var allowedKinds = map[string]bool{
 	"line.open": true, "line.validate": true, "line.upgrade": true,
-	"line.rollback": true, "line.disable": true,
+	"line.rollback": true, "line.disable": true, "line.tune": true,
 }
 
 const transportWorkerLanes = 2

@@ -147,6 +147,7 @@ typedef struct proxy_stream {
     uint8_t socks_buf[512];
     size_t socks_len;
     uint64_t created_at;
+    uint64_t transport_generation;
     uint64_t first_c2s_at;
     uint64_t first_s2c_at;
     uint64_t bytes_c2s;

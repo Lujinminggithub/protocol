@@ -2,8 +2,7 @@ static picoquic_cnx_t* pool_create_cnx(cnx_pool_t* pool, int idx){
     picoquic_cnx_t* c=picoquic_create_cnx(G.quic, picoquic_null_connection_id, picoquic_null_connection_id,
         (struct sockaddr*)&pool->addr, picoquic_current_time(), 0, NB_SNI, NB_ALPN, 1);
     if(c==NULL){ log4c_error("pool[%d] create cnx fail",idx); return NULL; }
-    if((G.role==ROLE_ENTRY || G.role==ROLE_MIDDLE) &&
-        picoquic_set_loss_reorder_tolerance(c,g_reorder_gap,g_reorder_delay_us)!=0){
+    if(transport_bind_connection(c,1)!=0){
         log4c_error("pool[%d] invalid reorder tolerance gap=%llu delay=%lluus",idx,
             (unsigned long long)g_reorder_gap,(unsigned long long)g_reorder_delay_us);
         picoquic_delete_cnx(c); return NULL;
