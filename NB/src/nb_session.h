@@ -13,6 +13,7 @@
 #include "nb_policy.h"
 #include "nb_ring.h"
 #include "nb_udp.h"
+#include "nb_udp_fec.h"
 #include "nb_udp_io.h"
 
 typedef struct {
@@ -203,6 +204,12 @@ typedef struct proxy_stream {
     size_t udp_pending_tx_len;
     size_t udp_pending_tx_cap;
     nb_udp_reassembly_t* udp_reassembly;
+    nb_udp_fec_tx_t* udp_fec_tx;
+    nb_udp_fec_rx_t* udp_fec_rx;
+    uint64_t udp_fec_source_packets;
+    uint64_t udp_fec_repairs_sent;
+    uint64_t udp_fec_repairs_received;
+    uint64_t udp_fec_recovered;
     uint64_t udp_packets_c2s;
     uint64_t udp_packets_s2c;
     uint64_t udp_assoc_raw_rx;

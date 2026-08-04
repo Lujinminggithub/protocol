@@ -286,6 +286,8 @@ static void ps_free(proxy_stream_t* p){
     free(p->udp_up_tx);p->udp_up_tx=NULL;
     free(p->udp_pending_tx);p->udp_pending_tx=NULL;
     if(p->udp_reassembly){nb_udp_reassembly_dispose(p->udp_reassembly);free(p->udp_reassembly);p->udp_reassembly=NULL;}
+    nb_udp_fec_tx_destroy(p->udp_fec_tx);p->udp_fec_tx=NULL;
+    nb_udp_fec_rx_destroy(p->udp_fec_rx);p->udp_fec_rx=NULL;
     fec_session_index_remove(p->fec_session_id,p);
     if(p->fec_engine!=NULL) fec_metrics_add(&g_fec_metrics_done,nb_fec_metrics(p->fec_engine));
     nb_fec_session_destroy(p->fec_engine); p->fec_engine=NULL;
@@ -427,6 +429,32 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
         int n=nb_udp_wire_encode(wire,sizeof(wire),type,p->udp_session_id,sequence,i,fragments,
             (uint16_t)payload_length,route,(uint16_t)route_length,payload+offset,(uint16_t)part);
         if(n<0||udp_queue_wire(p,to_down,wire,(size_t)n)!=0)return -1;
+    }
+    return 0;
+}
+
+static int udp_fec_record_source(proxy_stream_t* p,const nb_udp_wire_view_t* view,const char* route){
+    if(p==NULL||p->udp_fec_tx==NULL||view==NULL||route==NULL)return 0;
+    nb_udp_wire_view_t forwarded=*view;forwarded.route=(const uint8_t*)route;
+    forwarded.route_length=(uint16_t)strlen(route);
+    uint8_t repair[1280];int length=nb_udp_fec_tx_feed(p->udp_fec_tx,&forwarded,
+        picoquic_current_time(),repair,sizeof(repair));
+    if(length<0)return -1;
+    p->udp_fec_source_packets++;
+    if(length>0){
+        if(udp_queue_wire(p,1,repair,(size_t)length)!=0)return -1;
+        p->udp_fec_repairs_sent++;
+    }
+    return 0;
+}
+
+static int udp_fec_flush_due(proxy_stream_t* p,uint64_t now){
+    if(p==NULL||p->udp_fec_tx==NULL)return 0;
+    uint8_t repair[1280];int length=nb_udp_fec_tx_flush_due(p->udp_fec_tx,now,repair,sizeof(repair));
+    if(length<0)return -1;
+    if(length>0){
+        if(udp_queue_wire(p,1,repair,(size_t)length)!=0)return -1;
+        p->udp_fec_repairs_sent++;
     }
     return 0;
 }

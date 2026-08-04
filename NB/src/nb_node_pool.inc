@@ -44,6 +44,7 @@ static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr){
     for(int i=0;i<POOL_SIZE;i++)nb_pmtu_init(&pool->pmtu[i],
         NB_PMTU_DEFAULT_FLOOR,NB_PMTU_DEFAULT_CEILING);
     pool->fec_latched = 0;
+    memset(&pool->udp_fec,0,sizeof(pool->udp_fec));
     int ok=0; for(int i=0;i<POOL_SIZE;i++) if(pool_ensure(pool,i)==0) ok++;
     pool->configured=1;
     log4c_info("cnx pool ready: %d/%d connections up",ok,POOL_SIZE);
@@ -198,6 +199,20 @@ static int pool_line_bad(cnx_pool_t* pool, int prio, double* best_loss, double* 
         if(loss <= FEC_LOSS_OFF_PCT && pool->recent_rtt_var[eval_idx] <= FEC_JITTER_OFF_US) pool->fec_latched = 0;
     }
     return pool->fec_latched;
+}
+
+static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now){
+    if(pool==NULL)return 0;
+    int best=pool_quality_best(pool,-1,1);
+    int second=best>=0?pool_quality_best(pool,best,1):-1;
+    int sample=second>=0?second:best;
+    if(sample<0)return nb_udp_fec_adaptive_update(&pool->udp_fec,0,0,0,now);
+    double loss=pool->recent_loss[sample];uint64_t jitter=pool->recent_rtt_var[sample];
+    int previous=pool->udp_fec.active;
+    int active=nb_udp_fec_adaptive_update(&pool->udp_fec,loss,jitter,1,now);
+    if(active!=previous)log4c_info("udp FEC adaptive state=%s loss=%.3f%% jitter=%.1fms",
+        active?"on":"off",loss,jitter/1000.0);
+    return active;
 }
 
 /* FEC 从全池挑当前最稳连接；优先使用 30s 内有效样本，无样本时回退全池轮询。 */

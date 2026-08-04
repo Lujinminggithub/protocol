@@ -21,6 +21,9 @@ func appendLink(lines []string, name string, link *Link) []string {
 		{name + ".udp_gso", strconv.FormatBool(link.UDPGSO)},
 		{name + ".fec_observe", strconv.FormatBool(link.FECObserve)},
 		{name + ".fec_active", strconv.FormatBool(link.FECActive)},
+		{name + ".udp_fec_adaptive", strconv.FormatBool(link.UDPFECAdaptive)},
+		{name + ".udp_fec_k", strconv.Itoa(link.UDPFECK)},
+		{name + ".udp_fec_hold_us", strconv.FormatInt(link.UDPFECHoldUS, 10)},
 	}
 	for _, value := range values {
 		lines = append(lines, value[0]+"="+value[1])

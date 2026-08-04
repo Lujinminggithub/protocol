@@ -71,6 +71,19 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             if(p==NULL)return -3;
             if(udp_forward_fragment(p,1,view,rest)!=0)return -4;
+            if(p->flow_class==NB_FLOW_CLASS_MEDIA&&nb_current_instance->transport_egress.active&&
+                nb_current_instance->transport_egress.link.udp_fec_adaptive&&
+                pool_udp_fec_needed(&G.pools[p->down_pool_id],picoquic_current_time())){
+                if(p->udp_fec_tx==NULL){
+                    const nb_transport_link_profile_t* link=&nb_current_instance->transport_egress.link;
+                    p->udp_fec_tx=nb_udp_fec_tx_create((uint8_t)link->udp_fec_k,link->udp_fec_hold_us);
+                    if(p->udp_fec_tx==NULL)return -4;
+                    log4c_info("middle udp FEC flow armed id=%u usid=%u k=%u hold=%lluus target=%s:%d",
+                        p->id,p->udp_session_id,link->udp_fec_k,(unsigned long long)link->udp_fec_hold_us,
+                        p->udp_target_host,p->udp_target_port);
+                }
+                if(udp_fec_record_source(p,view,rest)!=0)return -4;
+            }
             p->udp_packets_c2s+=(view->fragment_index==0);p->bytes_c2s+=view->payload_length;ps_touch(p);return 0;
         }
         if(G.role==ROLE_EXIT){
@@ -528,6 +541,38 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_datagram_acked:
     case picoquic_callback_datagram_lost:
     case picoquic_callback_datagram_spurious: {
+        if(length>=24&&nb_get_u32(bytes)==NB_UDP_FEC_MAGIC){
+            if(ev==picoquic_callback_datagram){
+                uint32_t sid=0;uint8_t direction=0;
+                if(nb_udp_fec_peek(bytes,length,&sid,&direction)==0){
+                    p=G.role==ROLE_EXIT?ps_find_udp_up(cnx,sid):
+                        (G.role==ROLE_ENTRY?ps_find_udp_down(cnx,sid):NULL);
+                    if(p!=NULL&&p->flow_class==NB_FLOW_CLASS_MEDIA){
+                        if(p->udp_fec_rx==NULL)p->udp_fec_rx=nb_udp_fec_rx_create();
+                        if(p->udp_fec_rx!=NULL){
+                            uint8_t recovered[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
+                            int recovered_len=nb_udp_fec_rx_recover(p->udp_fec_rx,bytes,length,
+                                picoquic_current_time(),recovered,sizeof(recovered));
+                            p->udp_fec_repairs_received++;
+                            if(recovered_len>0){
+                                nb_udp_wire_view_t view;
+                                if(nb_udp_wire_decode(recovered,(size_t)recovered_len,&view)==0&&
+                                    udp_on_quic_datagram(cnx,&view)==0){
+                                    p->udp_fec_recovered++;
+                                    log4c_info("%s udp FEC recovered id=%u usid=%u seq=%u frag=%u/%u",
+                                        role_name(G.role),p->id,p->udp_session_id,view.sequence,
+                                        view.fragment_index+1,view.fragment_count);
+                                }
+                            }else if(recovered_len<0){
+                                log4c_warn("%s udp FEC repair rejected usid=%u length=%zu",
+                                    role_name(G.role),sid,length);
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
         if(length>=24&&nb_get_u32(bytes)==NB_UDP_MAGIC){
             if(ev==picoquic_callback_datagram){
                 nb_udp_wire_view_t view;
@@ -535,10 +580,21 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                 if(decode_rc!=0)log4c_warn("%s udp datagram reject stage=decode length=%zu",
                     role_name(G.role),length);
                 else {
+                    p=G.role==ROLE_EXIT?ps_find_udp_up(cnx,view.session_id):
+                        (G.role==ROLE_ENTRY?ps_find_udp_down(cnx,view.session_id):NULL);
+                    if(p!=NULL&&p->udp_fec_rx!=NULL&&nb_udp_fec_rx_seen(p->udp_fec_rx,&view))break;
                     int handler_rc=udp_on_quic_datagram(cnx,&view);
                     if(handler_rc!=0)log4c_warn("%s udp datagram reject stage=handler rc=%d length=%zu type=%u usid=%u seq=%u frag=%u/%u route_len=%u",
                         role_name(G.role),handler_rc,length,view.type,view.session_id,view.sequence,
                         view.fragment_index+1,view.fragment_count,view.route_length);
+                    else {
+                        p=G.role==ROLE_EXIT?ps_find_udp_up(cnx,view.session_id):
+                            (G.role==ROLE_ENTRY?ps_find_udp_down(cnx,view.session_id):NULL);
+                        if(p!=NULL&&p->flow_class==NB_FLOW_CLASS_MEDIA){
+                            if(p->udp_fec_rx==NULL)p->udp_fec_rx=nb_udp_fec_rx_create();
+                            if(p->udp_fec_rx!=NULL)(void)nb_udp_fec_rx_note(p->udp_fec_rx,&view,picoquic_current_time());
+                        }
+                    }
                 }
             }
             break;

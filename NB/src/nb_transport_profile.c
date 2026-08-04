@@ -47,10 +47,11 @@ static uint64_t directive_bit(const char* key){
     if(!strcmp(key,"generation"))return 1ULL<<2;
     if(!strcmp(key,"role"))return 1ULL<<3;
     static const char* fields[]={"cc","bbr_options","cwin_max_bytes","mtu_max","reorder_gap",
-        "reorder_delay_us","udp_gso","fec_observe","fec_active"};
+        "reorder_delay_us","udp_gso","fec_observe","fec_active","udp_fec_adaptive","udp_fec_k",
+        "udp_fec_hold_us"};
     const char* field=NULL;unsigned offset=0;
     if(!strncmp(key,"ingress.",8)){field=key+8;offset=4;}
-    else if(!strncmp(key,"egress.",7)){field=key+7;offset=13;}
+    else if(!strncmp(key,"egress.",7)){field=key+7;offset=16;}
     if(field)for(unsigned i=0;i<sizeof(fields)/sizeof(fields[0]);i++)if(!strcmp(field,fields[i]))return 1ULL<<(offset+i);
     return 0;
 }
@@ -74,6 +75,9 @@ static int parse_link(nb_transport_link_profile_t* link,const char* field,const 
     if(!strcmp(field,"udp_gso"))return parse_bool(value,&link->udp_gso);
     if(!strcmp(field,"fec_observe"))return parse_bool(value,&link->fec_observe);
     if(!strcmp(field,"fec_active"))return parse_bool(value,&link->fec_active);
+    if(!strcmp(field,"udp_fec_adaptive"))return parse_bool(value,&link->udp_fec_adaptive);
+    if(!strcmp(field,"udp_fec_k")){uint64_t parsed=0;if(parse_u64(value,2,8,&parsed))return -1;link->udp_fec_k=(uint32_t)parsed;return 0;}
+    if(!strcmp(field,"udp_fec_hold_us"))return parse_u64(value,100,1000000,&link->udp_fec_hold_us);
     return -1;
 }
 
@@ -82,6 +86,8 @@ static int validate_link(const nb_transport_link_profile_t* link){
     if(link->cc[0]==0||link->mtu_max<1280||link->reorder_gap<1||link->reorder_delay_us<1000)return -1;
     if(!strcmp(link->cc,"cubic")&&link->cwin_max_bytes<65536)return -1;
     if(link->fec_active&&!link->fec_observe)return -1;
+    if(link->udp_fec_adaptive&&(link->udp_fec_k<2||link->udp_fec_k>8||
+        link->udp_fec_hold_us<100||link->udp_fec_hold_us>1000000))return -1;
     return 0;
 }
 

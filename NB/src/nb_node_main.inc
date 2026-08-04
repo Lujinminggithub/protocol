@@ -392,6 +392,11 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             uint64_t dl=nb_fec_next_deadline(p->fec_engine);if(dl==0)continue;
             int64_t fwd=(dl<=now)?0:(int64_t)(dl-now);if(fwd<wd)wd=fwd;
         }
+        for(i=0;i<MAX_CONN;i++){
+            proxy_stream_t* p=&G.streams[i];if(!p->in_use||p->udp_fec_tx==NULL)continue;
+            uint64_t dl=nb_udp_fec_tx_next_deadline(p->udp_fec_tx);if(dl==0)continue;
+            int64_t fwd=(dl<=now)?0:(int64_t)(dl-now);if(fwd<wd)wd=fwd;
+        }
         { uint64_t dl=nb_udp_lifecycle_next_deadline(&g_udp_lifecycle);if(dl){int64_t d=(dl<=now)?0:(int64_t)(dl-now);if(d<wd)wd=d;} }
         int wait_ms=(wd<=0)?0:(int)((wd+999)/1000);if(wait_ms>1000)wait_ms=1000;
         uint64_t wait_started=now,iteration_wake_late=0;
@@ -550,6 +555,11 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             int rc=nb_fec_tick(p->fec_engine,fnow);
             if(rc!=NB_FEC_OK){ log4c_warn("id=%u fec engine tick fail rc=%d",p->id,rc); p->need_teardown=1; }
             else (void)fec_pump_staged(p);
+          } }
+        { uint64_t fnow=picoquic_current_time();
+          for(i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
+            if(p->in_use&&p->udp_fec_tx!=NULL&&udp_fec_flush_due(p,fnow)!=0)
+                p->need_teardown=1;
           } }
         /* 过载保护: q2t 超限标记的流, 主循环兜底 teardown(不在回调栈内拆, 避免重入/use-after-free) */
         for(i=0;i<MAX_CONN;i++){ proxy_stream_t*p=&G.streams[i]; if(p->in_use && p->need_teardown) ps_teardown_reason(p,"internal-error"); }

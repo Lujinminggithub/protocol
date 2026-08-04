@@ -6,6 +6,7 @@
 #include <picoquic.h>
 #include "nb_pool_health.h"
 #include "nb_pmtu.h"
+#include "nb_udp_fec.h"
 
 #define NB_POOL_SIZE 1
 
@@ -36,6 +37,7 @@ typedef struct cnx_pool {
     nb_pool_health_t health[NB_POOL_SIZE];
     nb_pmtu_state_t pmtu[NB_POOL_SIZE];
     int fec_latched;
+    nb_udp_fec_adaptive_t udp_fec;
 } cnx_pool_t;
 
 void nb_pool_slot_reset_quality(cnx_pool_t* pool, int idx);

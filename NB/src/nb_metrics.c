@@ -107,7 +107,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu,\"rxq_overflow\":%llu},"
         "\"pool_recovery\":{\"retired\":%llu,\"suppressed\":%llu,\"quarantined\":%llu,\"mbb_promotions\":%llu},"
         "\"pmtu\":{\"promotions\":%llu,\"fallbacks\":%llu},"
-        "\"fec\":{\"observe\":%d,\"active\":%d,\"tx_blocks\":%llu,\"rx_blocks\":%llu,\"recovered\":%llu,\"nack\":%llu,\"retx\":%llu}}\n",
+        "\"fec\":{\"observe\":%d,\"active\":%d,\"tx_blocks\":%llu,\"rx_blocks\":%llu,\"recovered\":%llu,\"nack\":%llu,\"retx\":%llu,"
+        "\"udp_adaptive_active\":%d,\"udp_source_packets\":%llu,\"udp_repairs_sent\":%llu,\"udp_repairs_received\":%llu,\"udp_recovered\":%llu}}\n",
         role,worker,release,profile,schema,
         (unsigned long long)s->sessions,(unsigned long long)s->sessions_peak,(unsigned long long)s->sessions_limit,
         (unsigned long long)s->pools,(unsigned long long)s->exit_routes,
@@ -134,5 +135,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->lifetime.pool_quarantine_total,(unsigned long long)s->lifetime.pool_mbb_promotions,
         (unsigned long long)s->lifetime.pmtu_promotions,(unsigned long long)s->lifetime.pmtu_fallbacks,
         f->observe,f->active,(unsigned long long)f->tx_blocks,(unsigned long long)f->rx_blocks,
-        (unsigned long long)f->recovered,(unsigned long long)f->nack,(unsigned long long)f->retx);
+        (unsigned long long)f->recovered,(unsigned long long)f->nack,(unsigned long long)f->retx,
+        f->udp_adaptive_active,(unsigned long long)f->udp_source_packets,
+        (unsigned long long)f->udp_repairs_sent,(unsigned long long)f->udp_repairs_received,
+        (unsigned long long)f->udp_recovered);
 }

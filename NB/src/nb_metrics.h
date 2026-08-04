@@ -80,6 +80,11 @@ typedef struct {
     uint64_t recovered;
     uint64_t nack;
     uint64_t retx;
+    int udp_adaptive_active;
+    uint64_t udp_source_packets;
+    uint64_t udp_repairs_sent;
+    uint64_t udp_repairs_received;
+    uint64_t udp_recovered;
 } nb_metrics_fec_t;
 
 void nb_metrics_note_close(nb_metrics_state_t* state, const char* reason);

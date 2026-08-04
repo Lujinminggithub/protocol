@@ -65,6 +65,9 @@ type Link struct {
 	UDPGSO         bool    `json:"udp_gso"`
 	FECObserve     bool    `json:"fec_observe"`
 	FECActive      bool    `json:"fec_active"`
+	UDPFECAdaptive bool    `json:"udp_fec_adaptive"`
+	UDPFECK        int     `json:"udp_fec_k"`
+	UDPFECHoldUS   int64   `json:"udp_fec_hold_us"`
 	TargetMbps     float64 `json:"target_mbps"`
 	Confidence     string  `json:"confidence"`
 }
@@ -176,7 +179,9 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 		confidence = "load-qualified"
 	}
 	link := Link{CC: cc, MTUMax: mtu, ReorderGap: gap, ReorderDelayUS: delayUS,
-		UDPGSO: false, FECObserve: true, FECActive: false, TargetMbps: targetMbps, Confidence: confidence}
+		UDPGSO: false, FECObserve: true, FECActive: false,
+		UDPFECAdaptive: true, UDPFECK: 8, UDPFECHoldUS: 2000,
+		TargetMbps: targetMbps, Confidence: confidence}
 	if cc == "cubic" {
 		link.CWinMaxBytes = cwin
 	} else {
@@ -207,6 +212,7 @@ func selectedCandidate(evidence SegmentEvidence, targetMbps float64) (Link, erro
 	result := Link{CC: candidate.CC, MTUMax: *candidate.MTUMax,
 		ReorderGap: candidate.ReorderGap, ReorderDelayUS: candidate.ReorderDelayUS,
 		UDPGSO: false, FECObserve: true, FECActive: false,
+		UDPFECAdaptive: true, UDPFECK: 8, UDPFECHoldUS: 2000,
 		TargetMbps: targetMbps, Confidence: candidate.Confidence}
 	if candidate.CC == "cubic" {
 		if candidate.CWinMaxBytes == nil || *candidate.CWinMaxBytes < 65536 ||

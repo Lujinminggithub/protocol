@@ -18,6 +18,9 @@ typedef struct {
     int udp_gso;
     int fec_observe;
     int fec_active;
+    int udp_fec_adaptive;
+    uint32_t udp_fec_k;
+    uint64_t udp_fec_hold_us;
 } nb_transport_link_profile_t;
 
 typedef struct {

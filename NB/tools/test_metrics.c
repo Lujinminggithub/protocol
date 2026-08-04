@@ -25,7 +25,8 @@ int main(void){
     nb_metrics_snapshot_add_transport(&snapshot,"bbr",2,10,4,2,24,100000,1000,500,9000,1);
     assert(snapshot.link_samples==1&&snapshot.link_effective_loss_max_pct==3.5);
     assert(state.close_total==4&&state.close_timeout==1&&state.close_error==1&&state.close_reset==1&&state.close_normal==1);
-    nb_metrics_fec_t fec={1,0,2,3,4,5,6};char json[4096];
+    nb_metrics_fec_t fec={.observe=1,.active=0,.tx_blocks=2,.rx_blocks=3,
+        .recovered=4,.nack=5,.retx=6};char json[4096];
     int len=nb_metrics_render_json(json,sizeof(json),"middle","0","abc","line",2,&snapshot,&fec);
     assert(len>0&&(size_t)len<sizeof(json));assert(strstr(json,"\"media\":1")!=NULL);
     assert(strstr(json,"\"busy_max_us\":25000")!=NULL);assert(strstr(json,"\"tx_blocks\":2")!=NULL);

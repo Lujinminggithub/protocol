@@ -32,6 +32,11 @@ func TestGenerateSeparatesPhysicalSegments(t *testing.T) {
 	if profile.Segments["middle_exit"].Source.FECActive {
 		t.Fatal("automatic generation must not enable active FEC")
 	}
+	if !profile.Segments["middle_exit"].Source.UDPFECAdaptive ||
+		profile.Segments["middle_exit"].Source.UDPFECK != 8 ||
+		profile.Segments["middle_exit"].Source.UDPFECHoldUS != 2000 {
+		t.Fatalf("adaptive UDP FEC capability missing: %#v", profile.Segments["middle_exit"].Source)
+	}
 	if profile.Segments["entry_middle"].Source.MTUMax != 1452 {
 		t.Fatalf("QUIC and DF evidence should retain proven IP MTU: %+v", profile.Segments["entry_middle"].Source)
 	}
@@ -95,7 +100,8 @@ func TestRoleRenderProducesMiddleIngressAndEgress(t *testing.T) {
 		t.Fatalf("render failed: %v", err)
 	}
 	text := string(data)
-	for _, expected := range []string{"role=middle", "ingress.cc=", "egress.cc=", "generation=9"} {
+	for _, expected := range []string{"role=middle", "ingress.cc=", "egress.cc=", "generation=9",
+		"egress.udp_fec_adaptive=true", "egress.udp_fec_k=8", "egress.udp_fec_hold_us=2000"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %q in %s", expected, text)
 		}
