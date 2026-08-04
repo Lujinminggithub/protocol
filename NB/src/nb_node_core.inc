@@ -277,6 +277,7 @@ static void transport_refresh_outbound_pools(void);
 static int transport_outbound_pools_current(void);
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol);
 static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now);
+static int pool_udp_fec_refresh(cnx_pool_t* pool,uint64_t now);
 #define parse_port_strict nb_bridge_parse_port
 #define parse_target_from_route nb_bridge_parse_target
 #define fec_parse_target_route nb_bridge_parse_target_exact

@@ -694,6 +694,9 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                         cnx->cwin_blocked,cnx->flow_blocked,cnx->stream_blocked,
                         (unsigned long long)(q.pacing_rate*8/1000),
                         (unsigned long long)(q.bytes_sent/1024));
+                    if(G.role==ROLE_MIDDLE&&nb_current_instance->transport_egress.active&&
+                        nb_current_instance->transport_egress.link.udp_fec_adaptive)
+                        (void)pool_udp_fec_refresh(pool,tn);
                 }
             }
         }

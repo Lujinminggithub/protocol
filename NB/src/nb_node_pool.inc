@@ -201,7 +201,7 @@ static int pool_line_bad(cnx_pool_t* pool, int prio, double* best_loss, double* 
     return pool->fec_latched;
 }
 
-static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now){
+static int pool_udp_fec_refresh(cnx_pool_t* pool,uint64_t now){
     if(pool==NULL)return 0;
     int best=pool_quality_best(pool,-1,1);
     int second=best>=0?pool_quality_best(pool,best,1):-1;
@@ -213,6 +213,11 @@ static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now){
     if(active!=previous)log4c_info("udp FEC adaptive state=%s loss=%.3f%% jitter=%.1fms",
         active?"on":"off",loss,jitter/1000.0);
     return active;
+}
+
+static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now){
+    (void)now;
+    return pool!=NULL&&pool->udp_fec.active;
 }
 
 /* FEC 从全池挑当前最稳连接；优先使用 30s 内有效样本，无样本时回退全池轮询。 */
