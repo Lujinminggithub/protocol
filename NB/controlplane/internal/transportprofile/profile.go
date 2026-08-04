@@ -32,9 +32,19 @@ type QUICEvidence struct {
 }
 
 type SegmentEvidence struct {
-	ICMP ICMP         `json:"icmp"`
-	MTU  MTUEvidence  `json:"mtu"`
-	QUIC QUICEvidence `json:"quic"`
+	ICMP      ICMP          `json:"icmp"`
+	MTU       MTUEvidence   `json:"mtu"`
+	QUIC      QUICEvidence  `json:"quic"`
+	Candidate LinkCandidate `json:"candidate"`
+}
+
+type LinkCandidate struct {
+	Confidence     string  `json:"confidence"`
+	CC             string  `json:"cc"`
+	CWinMaxBytes   *uint64 `json:"cwin_max_bytes"`
+	MTUMax         *int    `json:"mtu_max"`
+	ReorderGap     int     `json:"reorder_gap"`
+	ReorderDelayUS int64   `json:"reorder_delay_us"`
 }
 
 type Probe struct {
@@ -178,6 +188,45 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 	return link
 }
 
+func selectedCandidate(evidence SegmentEvidence, targetMbps float64) (Link, error) {
+	floor := calculateLink(evidence, targetMbps)
+	candidate := evidence.Candidate
+	if candidate.Confidence != "load-qualified" {
+		return Link{}, errors.New("probe evidence has no load-qualified transport candidate")
+	}
+	if candidate.CC != "cubic" && candidate.CC != "bbr" {
+		return Link{}, errors.New("transport candidate has invalid congestion control")
+	}
+	if candidate.ReorderGap < floor.ReorderGap || candidate.ReorderGap > 1024 ||
+		candidate.ReorderDelayUS < floor.ReorderDelayUS || candidate.ReorderDelayUS > 1_000_000 {
+		return Link{}, errors.New("transport candidate reduces the evidence-derived reorder safety envelope")
+	}
+	if candidate.MTUMax == nil || *candidate.MTUMax < 1280 || *candidate.MTUMax > floor.MTUMax {
+		return Link{}, errors.New("transport candidate has an unsafe MTU")
+	}
+	result := Link{CC: candidate.CC, MTUMax: *candidate.MTUMax,
+		ReorderGap: candidate.ReorderGap, ReorderDelayUS: candidate.ReorderDelayUS,
+		UDPGSO: false, FECObserve: true, FECActive: false,
+		TargetMbps: targetMbps, Confidence: candidate.Confidence}
+	if candidate.CC == "cubic" {
+		if candidate.CWinMaxBytes == nil || *candidate.CWinMaxBytes < 65536 ||
+			*candidate.CWinMaxBytes > 64*1024*1024 {
+			return Link{}, errors.New("CUBIC transport candidate has an invalid congestion window")
+		}
+		result.CWinMaxBytes = *candidate.CWinMaxBytes
+	} else {
+		result.BBROptions = "Q0.0001:"
+		pathRTT := evidence.ICMP.RTTAvgMS
+		if pathRTT <= 0 {
+			pathRTT = evidence.QUIC.RTTP95MS
+		}
+		if pathRTT >= 100 {
+			result.BBROptions = "Q0.0001:F0.25:"
+		}
+	}
+	return result, nil
+}
+
 func validEvidence(evidence SegmentEvidence) bool {
 	values := []float64{evidence.ICMP.LossPct, evidence.ICMP.RTTAvgMS, evidence.ICMP.RTTMaxMS,
 		evidence.ICMP.MDevMS, evidence.QUIC.RTTP95MS, evidence.QUIC.JitterP95MS,
@@ -210,8 +259,14 @@ func Generate(lineID string, generation uint64, committedMbps float64, probe Pro
 	// qualification_mbps is a validation load target with headroom. It is not
 	// a runtime service target and must never oversubscribe the purchased rate.
 	target := committedMbps
-	entryLink := calculateLink(entryEvidence, target)
-	middleLink := calculateLink(middleEvidence, target)
+	entryLink, err := selectedCandidate(entryEvidence, target)
+	if err != nil {
+		return Profile{}, fmt.Errorf("entry_middle: %w", err)
+	}
+	middleLink, err := selectedCandidate(middleEvidence, target)
+	if err != nil {
+		return Profile{}, fmt.Errorf("middle_exit: %w", err)
+	}
 	return Profile{SchemaVersion: SchemaVersion, LineID: lineID, Generation: generation,
 		Segments: map[string]Segment{
 			"entry_middle": {Source: entryLink, Target: entryLink},
