@@ -14,15 +14,15 @@
 #include <unistd.h>
 
 #define NB_TENANT_SHARED_MAGIC 0x4e425453U
-#define NB_TENANT_SHARED_VERSION 1U
+#define NB_TENANT_SHARED_VERSION 2U
 #define NB_TENANT_SHARED_WORKERS 32
 
 typedef struct {
     uint64_t bytes_up;
     uint64_t bytes_down;
     uint64_t rejected;
-    uint64_t tokens;
-    uint64_t token_updated_us;
+    uint64_t tokens[NB_TENANT_DIRECTIONS];
+    uint64_t token_updated_us[NB_TENANT_DIRECTIONS];
 } shared_tenant_t;
 
 typedef struct {
@@ -51,7 +51,7 @@ static uint64_t config_hash(const nb_tenants_t* tenants){
         const nb_tenant_t* t=&tenants->items[i];
         const unsigned char* p=(const unsigned char*)t->name;
         while(*p){h^=*p++;h*=1099511628211ULL;}
-        const uint64_t values[]={t->max_tcp,t->max_udp,t->rate_bytes_per_sec,t->byte_quota};
+        const uint64_t values[]={t->max_tcp,t->max_udp,t->rate_bytes_per_sec[NB_TENANT_UP],t->rate_bytes_per_sec[NB_TENANT_DOWN],t->burst_bytes[NB_TENANT_UP],t->burst_bytes[NB_TENANT_DOWN],t->byte_quota};
         for(size_t j=0;j<sizeof(values)/sizeof(values[0]);j++)for(unsigned k=0;k<8;k++){
             h^=(unsigned char)(values[j]>>(k*8));h*=1099511628211ULL;
         }
@@ -87,17 +87,15 @@ static void totals(shared_state_t* state,int index,uint32_t* tcp,uint32_t* udp){
     *tcp=a>UINT32_MAX?UINT32_MAX:(uint32_t)a;*udp=b>UINT32_MAX?UINT32_MAX:(uint32_t)b;
 }
 
-static void refill(const nb_tenant_t* config,shared_tenant_t* state,uint64_t now_us){
-    if(!config->rate_bytes_per_sec)return;
-    if(state->tokens>config->burst_bytes)state->tokens=config->burst_bytes;
-    if(!state->token_updated_us){state->token_updated_us=now_us;state->tokens=config->burst_bytes;return;}
-    if(now_us<=state->token_updated_us)return;
-    uint64_t elapsed=now_us-state->token_updated_us;
-    uint64_t add=elapsed>UINT64_MAX/config->rate_bytes_per_sec?UINT64_MAX:
-        elapsed*config->rate_bytes_per_sec/1000000ULL;
-    uint64_t burst=config->burst_bytes;
-    state->tokens=(add>=burst||state->tokens>=burst-add)?burst:state->tokens+add;
-    state->token_updated_us=now_us;
+static void refill(const nb_tenant_t* config,shared_tenant_t* state,uint64_t now_us,int direction){
+    uint64_t rate=config->rate_bytes_per_sec[direction],burst=config->burst_bytes[direction];if(!rate)return;
+    if(state->tokens[direction]>burst)state->tokens[direction]=burst;
+    if(!state->token_updated_us[direction]){state->token_updated_us[direction]=now_us;state->tokens[direction]=burst;return;}
+    if(now_us<=state->token_updated_us[direction])return;
+    uint64_t elapsed=now_us-state->token_updated_us[direction];
+    uint64_t add=elapsed>UINT64_MAX/rate?UINT64_MAX:elapsed*rate/1000000ULL;
+    state->tokens[direction]=(add>=burst||state->tokens[direction]>=burst-add)?burst:state->tokens[direction]+add;
+    state->token_updated_us[direction]=now_us;
 }
 
 int nb_tenant_shared_open(nb_tenants_t* tenants,const char* path,char* error,size_t error_cap){
@@ -114,7 +112,7 @@ int nb_tenant_shared_open(nb_tenants_t* tenants,const char* path,char* error,siz
        state->config_hash!=hash||state->tenant_count!=tenants->count){
         memset(state,0,sizeof(*state));state->magic=NB_TENANT_SHARED_MAGIC;
         state->version=NB_TENANT_SHARED_VERSION;state->config_hash=hash;state->tenant_count=(uint32_t)tenants->count;
-        for(size_t i=0;i<tenants->count;i++)state->tenants[i].tokens=tenants->items[i].burst_bytes;
+        for(size_t i=0;i<tenants->count;i++)for(int d=0;d<NB_TENANT_DIRECTIONS;d++)state->tenants[i].tokens[d]=tenants->items[i].burst_bytes[d];
         (void)msync(state,sizeof(*state),MS_SYNC);
     }
     tenants->shared_fd=fd;tenants->shared_state=state;
@@ -137,7 +135,7 @@ int nb_tenant_shared_acquire(nb_tenants_t* tenants,int index,int udp,uint64_t no
     nb_tenant_t* config=&tenants->items[index];shared_tenant_t* usage=&state->tenants[index];
     uint32_t active=udp?datagrams:tcp,limit=udp?config->max_udp:config->max_tcp;
     int rejected=slot<0||(limit&&active>=limit)||(config->byte_quota&&usage->bytes_up+usage->bytes_down>=config->byte_quota);
-    if(rejected)usage->rejected++;else {uint32_t* count=udp?&state->workers[slot].active_udp[index]:&state->workers[slot].active_tcp[index];(*count)++;if(!usage->token_updated_us)usage->token_updated_us=now_us;}
+    if(rejected)usage->rejected++;else {uint32_t* count=udp?&state->workers[slot].active_udp[index]:&state->workers[slot].active_tcp[index];(*count)++;for(int d=0;d<NB_TENANT_DIRECTIONS;d++)if(!usage->token_updated_us[d])usage->token_updated_us[d]=now_us;}
     unlock_state(tenants);return rejected?-1:0;
 }
 
@@ -148,20 +146,20 @@ void nb_tenant_shared_release(nb_tenants_t* tenants,int index,int udp){
     unlock_state(tenants);
 }
 
-size_t nb_tenant_shared_allowance(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int take){
-    if(lock_state(tenants)!=0)return 0;
+size_t nb_tenant_shared_allowance(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int take,int direction){
+    if((direction!=NB_TENANT_UP&&direction!=NB_TENANT_DOWN)||lock_state(tenants)!=0)return 0;
     shared_state_t* state=tenants->shared_state;
     nb_tenant_t* config=&tenants->items[index];shared_tenant_t* usage=&state->tenants[index];
     if(config->byte_quota){uint64_t used=usage->bytes_up+usage->bytes_down;if(used>=config->byte_quota)requested=0;else if(config->byte_quota-used<requested)requested=(size_t)(config->byte_quota-used);}
-    if(config->rate_bytes_per_sec){refill(config,usage,now_us);if(usage->tokens<requested)requested=(size_t)usage->tokens;if(take)usage->tokens-=requested;}
+    if(config->rate_bytes_per_sec[direction]){refill(config,usage,now_us,direction);if(usage->tokens[direction]<requested)requested=(size_t)usage->tokens[direction];if(take)usage->tokens[direction]-=requested;}
     unlock_state(tenants);return requested;
 }
 
-void nb_tenant_shared_refund(nb_tenants_t* tenants,int index,size_t bytes){
-    if(bytes==0||lock_state(tenants)!=0)return;
+void nb_tenant_shared_refund(nb_tenants_t* tenants,int index,size_t bytes,int direction){
+    if(bytes==0||(direction!=NB_TENANT_UP&&direction!=NB_TENANT_DOWN)||lock_state(tenants)!=0)return;
     shared_state_t* state=tenants->shared_state;
-    uint64_t burst=tenants->items[index].burst_bytes;shared_tenant_t* usage=&state->tenants[index];
-    if(burst)usage->tokens=bytes>=burst||usage->tokens>=burst-bytes?burst:usage->tokens+bytes;
+    uint64_t burst=tenants->items[index].burst_bytes[direction];shared_tenant_t* usage=&state->tenants[index];
+    if(burst)usage->tokens[direction]=bytes>=burst||usage->tokens[direction]>=burst-bytes?burst:usage->tokens[direction]+bytes;
     unlock_state(tenants);
 }
 
@@ -177,7 +175,7 @@ int nb_tenant_shared_snapshot(nb_tenants_t* tenants){
     (void)worker_slot(state,0);
     for(size_t i=0;i<tenants->count;i++){nb_tenant_t* local=&tenants->items[i];shared_tenant_t* usage=&state->tenants[i];
         totals(state,(int)i,&local->active_tcp,&local->active_udp);local->bytes_up=usage->bytes_up;local->bytes_down=usage->bytes_down;
-        local->rejected=usage->rejected;local->tokens=usage->tokens;local->token_updated_us=usage->token_updated_us;}
+        local->rejected=usage->rejected;for(int d=0;d<NB_TENANT_DIRECTIONS;d++){local->tokens[d]=usage->tokens[d];local->token_updated_us[d]=usage->token_updated_us[d];}}
     unlock_state(tenants);return 0;
 }
 
@@ -186,8 +184,8 @@ int nb_tenant_shared_open(nb_tenants_t* t,const char* p,char* e,size_t c){(void)
 void nb_tenant_shared_close(nb_tenants_t* t){(void)t;}
 int nb_tenant_shared_acquire(nb_tenants_t* t,int i,int u,uint64_t n){(void)t;(void)i;(void)u;(void)n;return -1;}
 void nb_tenant_shared_release(nb_tenants_t* t,int i,int u){(void)t;(void)i;(void)u;}
-size_t nb_tenant_shared_allowance(nb_tenants_t* t,int i,size_t r,uint64_t n,int k){(void)t;(void)i;(void)r;(void)n;(void)k;return 0;}
-void nb_tenant_shared_refund(nb_tenants_t* t,int i,size_t b){(void)t;(void)i;(void)b;}
+size_t nb_tenant_shared_allowance(nb_tenants_t* t,int i,size_t r,uint64_t n,int k,int d){(void)t;(void)i;(void)r;(void)n;(void)k;(void)d;return 0;}
+void nb_tenant_shared_refund(nb_tenants_t* t,int i,size_t b,int d){(void)t;(void)i;(void)b;(void)d;}
 void nb_tenant_shared_account(nb_tenants_t* t,int i,uint64_t u,uint64_t d){(void)t;(void)i;(void)u;(void)d;}
 int nb_tenant_shared_snapshot(nb_tenants_t* t){(void)t;return -1;}
 #endif

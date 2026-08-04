@@ -46,6 +46,27 @@ func TestWritePrivateJSONSupportsConcurrentWriters(t *testing.T) {
 	}
 }
 
+func TestSummarizeTransportRolloutOmitsPrivatePaths(t *testing.T) {
+	line := LineSpec{LineID: "line-1", StateDir: t.TempDir()}
+	state := profileRolloutState{LineID: line.LineID, Generation: 7, Status: "committed",
+		Prepared:     map[string]bool{"entry": true, "middle": true, "exit": true},
+		Committed:    map[string]bool{"entry": true, "middle": true, "exit": true},
+		Fingerprints: map[string]string{"entry": "entry-fp", "middle": "middle-fp", "exit": "exit-fp"},
+		Profiles:     map[string]string{"entry": "/private/entry-7.conf"}}
+	if err := atomicJSON(filepath.Join(line.StateDir, "transport", "rollout.json"), state); err != nil {
+		t.Fatal(err)
+	}
+	summary := summarizeTransportRollout(line, "")
+	if summary == nil || summary.Generation != 7 || summary.Status != "committed" ||
+		strings.Join(summary.CommitOrder, ",") != "exit,middle,entry" || !summary.Roles["middle"].Readback {
+		t.Fatalf("unexpected rollout summary: %+v", summary)
+	}
+	encoded, err := json.Marshal(summary)
+	if err != nil || bytes.Contains(encoded, []byte("/private/")) || !bytes.Contains(encoded, []byte("entry-fp")) {
+		t.Fatalf("rollout JSON leaks paths or omits fingerprint: %s err=%v", encoded, err)
+	}
+}
+
 func testRegistry(t *testing.T, operations []string) Registry {
 	t.Helper()
 	directory := t.TempDir()
@@ -245,14 +266,14 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	for _, name := range []string{"ENTRY", "RELAY", "EXIT"} {
 		t.Setenv("NB_TEST_"+name, "private-password-"+name)
 	}
-	t.Setenv("NB_TEST_SRS_URL", "https://example.invalid/whitelist.srs")
 	device := func(id, role, host, secret string) dynamicNode {
 		return dynamicNode{DeviceID: id, Role: role, Device: dynamicDevice{ID: id, Name: id, Host: host,
 			SSHPort: 22, SSHUser: "root", SecretRef: "env:" + secret}}
 	}
 	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "new", BandwidthMbps: 20,
+		UpstreamMbps: 6, DownstreamMbps: 14,
 		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, ExitBindIP: "192.0.2.30", UDPPortMin: 22048, UDPPortMax: 23071,
-		Whitelist: []string{"domain example.com"}, BuildMode: "auto", JumpPolicy: "auto", SRSRef: "env:NB_TEST_SRS_URL",
+		Whitelist: []string{"domain example.com"}, BuildMode: "auto", JumpPolicy: "auto", SRSRef: "https://example.invalid/whitelist.srs?key=private-key",
 		Nodes: []dynamicNode{device("entry-1", "entry", "192.0.2.1", "NB_TEST_ENTRY"),
 			device("relay-1", "relay", "192.0.2.2", "NB_TEST_RELAY"), device("exit-1", "exit", "192.0.2.3", "NB_TEST_EXIT")}}
 	runner := NewRunner(registry)
@@ -264,8 +285,12 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(data, []byte("private-password")) || line.WhitelistSourceEnv != "NB_TEST_SRS_URL" {
+	if bytes.Contains(data, []byte("private-password")) || line.WhitelistSourceEnv != "NB_WHITELIST_SOURCE_URL" ||
+		line.ExtraEnvironment[line.WhitelistSourceEnv] != plan.SRSRef {
 		t.Fatal("runtime plan persisted a secret value or lost the SRS source reference")
+	}
+	if line.UpstreamMbps != 6 || line.DownstreamMbps != 14 {
+		t.Fatalf("dynamic line lost asymmetric rates: %+v", line)
 	}
 	sourceData, err := os.ReadFile(filepath.Join(line.StateDir, "source-machines.json"))
 	if err != nil {
@@ -293,6 +318,15 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
 	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
 		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)
+	}
+	for _, argument := range steps[0].Args {
+		if strings.Contains(argument, "private-key") {
+			t.Fatal("whitelist URL leaked into the command line")
+		}
+	}
+	provisionArgs := strings.Join(steps[1].Args, " ")
+	if !strings.Contains(provisionArgs, "--upstream-mbps 6") || !strings.Contains(provisionArgs, "--downstream-mbps 14") {
+		t.Fatalf("provision command lost directional rates: %s", provisionArgs)
 	}
 	upgradeSteps, err := runner.steps(line, Operation{ID: "op-upgrade", LineID: plan.LineID, Kind: "line.upgrade"}, requestValues{Plan: plan}, t.TempDir())
 	if err != nil || len(upgradeSteps) != 4 || upgradeSteps[0].Stage != "build" ||

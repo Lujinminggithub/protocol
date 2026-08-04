@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,23 +33,25 @@ type dynamicNode struct {
 	Device         dynamicDevice `json:"device"`
 }
 type dynamicPlan struct {
-	LineID        string        `json:"line_id"`
-	ResourceGroup string        `json:"resource_group"`
-	InstanceID    string        `json:"instance_id"`
-	BandwidthMbps int           `json:"bandwidth_mbps"`
-	SocksPort     int           `json:"socks_port"`
-	UDPPortMin    int           `json:"udp_port_min"`
-	UDPPortMax    int           `json:"udp_port_max"`
-	RelayPort     int           `json:"relay_port"`
-	ExitPort      int           `json:"exit_port"`
-	ExitBindIP    string        `json:"exit_bind_ip"`
-	Whitelist     []string      `json:"whitelist"`
-	BuildMode     string        `json:"build_mode"`
-	ArtifactRef   string        `json:"artifact_ref"`
-	SourceRef     string        `json:"source_ref"`
-	SRSRef        string        `json:"srs_ref"`
-	JumpPolicy    string        `json:"jump_policy"`
-	Nodes         []dynamicNode `json:"nodes"`
+	LineID         string        `json:"line_id"`
+	ResourceGroup  string        `json:"resource_group"`
+	InstanceID     string        `json:"instance_id"`
+	BandwidthMbps  int           `json:"bandwidth_mbps"`
+	UpstreamMbps   int           `json:"upstream_mbps"`
+	DownstreamMbps int           `json:"downstream_mbps"`
+	SocksPort      int           `json:"socks_port"`
+	UDPPortMin     int           `json:"udp_port_min"`
+	UDPPortMax     int           `json:"udp_port_max"`
+	RelayPort      int           `json:"relay_port"`
+	ExitPort       int           `json:"exit_port"`
+	ExitBindIP     string        `json:"exit_bind_ip"`
+	Whitelist      []string      `json:"whitelist"`
+	BuildMode      string        `json:"build_mode"`
+	ArtifactRef    string        `json:"artifact_ref"`
+	SourceRef      string        `json:"source_ref"`
+	SRSRef         string        `json:"srs_ref"`
+	JumpPolicy     string        `json:"jump_policy"`
+	Nodes          []dynamicNode `json:"nodes"`
 }
 type localSecret struct {
 	Password    string `json:"password"`
@@ -156,6 +159,14 @@ func (r *Runner) resolveWhitelistSource(ref string) (string, map[string]string, 
 		}
 		return name, nil, nil
 	}
+	if strings.Contains(ref, "://") {
+		parsed, err := url.ParseRequestURI(ref)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return "", nil, errors.New("whitelist source URL must use HTTPS")
+		}
+		const name = "NB_WHITELIST_SOURCE_URL"
+		return name, map[string]string{name: ref}, nil
+	}
 	if r.registry.Dynamic.SecretsFile == "" {
 		return "", nil, errors.New("dynamic secrets file is not configured")
 	}
@@ -177,7 +188,7 @@ func (r *Runner) resolveWhitelistSource(ref string) (string, map[string]string, 
 	if secret.URL == "" {
 		return "", nil, errors.New("whitelist source URL is empty")
 	}
-	name := "NB_WHITELIST_SOURCE_URL"
+	const name = "NB_WHITELIST_SOURCE_URL"
 	return name, map[string]string{name: secret.URL}, nil
 }
 
@@ -189,7 +200,8 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 	if plan.LineID != operation.LineID || !safeID.MatchString(plan.LineID) || !contains(plan.ResourceGroup, cfg.ResourceGroups) {
 		return errors.New("dynamic line identity or resource group is not allowed")
 	}
-	if plan.InstanceID == "" || !safeID.MatchString(plan.InstanceID) || plan.BandwidthMbps < 1 || plan.BandwidthMbps > 1000 {
+	if plan.InstanceID == "" || !safeID.MatchString(plan.InstanceID) || plan.BandwidthMbps < 1 || plan.BandwidthMbps > 1000 ||
+		plan.UpstreamMbps < 1 || plan.UpstreamMbps > 1000 || plan.DownstreamMbps < 1 || plan.DownstreamMbps > 1000 {
 		return errors.New("invalid dynamic instance or bandwidth")
 	}
 	if plan.BuildMode != "auto" && plan.BuildMode != "binary" && plan.BuildMode != "source" {
@@ -294,6 +306,12 @@ func (r *Runner) ensureDynamicKnownHosts(lineState string) (string, error) {
 
 func (r *Runner) dynamicLine(operation Operation, request requestValues, operationDir string) (LineSpec, error) {
 	plan := request.Plan
+	if plan.UpstreamMbps <= 0 {
+		plan.UpstreamMbps = plan.BandwidthMbps
+	}
+	if plan.DownstreamMbps <= 0 {
+		plan.DownstreamMbps = plan.BandwidthMbps
+	}
 	if err := r.validateDynamicPlan(operation, plan); err != nil {
 		return LineSpec{}, err
 	}
@@ -389,7 +407,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	}
 	profile := filepath.Join(lineState, "provision", operation.LineID, "stable-profile.json")
 	hosts := filepath.Join(lineState, "provision", operation.LineID, "deployment-hosts.json")
-	return LineSpec{LineID: operation.LineID, ResourceGroup: plan.ResourceGroup, InstanceID: plan.InstanceID, HostsFile: hosts, SourceMachinesFile: sourcePath, LineProfileFile: profile, KnownHostsFile: knownHosts, SecurityDir: filepath.Join(lineState, "security"), ClientSecretFile: filepath.Join(lineState, "bootstrap-client-secret.json"), PackageMbps: float64(plan.BandwidthMbps), SocksPort: plan.SocksPort, UDPPortMin: plan.UDPPortMin, UDPPortMax: plan.UDPPortMax, MiddlePort: plan.RelayPort, ExitPort: plan.ExitPort, ExitBindIP: plan.ExitBindIP, EnabledOperations: append([]string(nil), r.registry.Dynamic.Operations...), StateDir: lineState, WhitelistFile: whitelistPath, WhitelistSourceEnv: whitelistSourceEnv, SingBox: r.registry.Dynamic.SingBox, ExtraEnvironment: extraEnvironment, BuildMode: plan.BuildMode}, nil
+	return LineSpec{LineID: operation.LineID, ResourceGroup: plan.ResourceGroup, InstanceID: plan.InstanceID, HostsFile: hosts, SourceMachinesFile: sourcePath, LineProfileFile: profile, KnownHostsFile: knownHosts, SecurityDir: filepath.Join(lineState, "security"), ClientSecretFile: filepath.Join(lineState, "bootstrap-client-secret.json"), PackageMbps: float64(plan.BandwidthMbps), UpstreamMbps: float64(plan.UpstreamMbps), DownstreamMbps: float64(plan.DownstreamMbps), SocksPort: plan.SocksPort, UDPPortMin: plan.UDPPortMin, UDPPortMax: plan.UDPPortMax, MiddlePort: plan.RelayPort, ExitPort: plan.ExitPort, ExitBindIP: plan.ExitBindIP, EnabledOperations: append([]string(nil), r.registry.Dynamic.Operations...), StateDir: lineState, WhitelistFile: whitelistPath, WhitelistSourceEnv: whitelistSourceEnv, SingBox: r.registry.Dynamic.SingBox, ExtraEnvironment: extraEnvironment, BuildMode: plan.BuildMode}, nil
 }
 
 func (r *Runner) resolveSnapshotLine(plan dynamicPlan) (LineSpec, error) {

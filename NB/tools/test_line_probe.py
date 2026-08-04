@@ -4,8 +4,9 @@ import os
 
 import line_probe
 from line_probe import (ENTRY_LOCAL_PROBE_SCRIPT, evaluate_admission, fnv1a64,
-                        parse_entry_probe_output, parse_linkq, parse_ping, recommend, recommend_mtu,
-                        run_entry_local_probe, summarize_linkq)
+                        control_link_sample, parse_entry_probe_output, parse_linkq, parse_ping,
+                        recommend, recommend_mtu,
+                        run_entry_local_probe, run_load_probe, summarize_linkq)
 
 
 class FakeChannel:
@@ -53,9 +54,52 @@ class FakeConnection:
         self.closed = True
 
 
+class FakeLogConnection:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProbeSocket:
+    def __init__(self):
+        self.shutdown_how = None
+
+    def sendall(self, value):
+        pass
+
+    def shutdown(self, how):
+        self.shutdown_how = how
+
+    def recv(self, size):
+        return b"NBPROBE OK bytes=0 hash=0000000000000000\n"
+
+    def close(self):
+        pass
+
+
+class Stopped:
+    def is_set(self):
+        return True
+
+
 def main() -> None:
     compile(ENTRY_LOCAL_PROBE_SCRIPT, "<entry-local-probe>", "exec")
+    assert "sock.shutdown(socket.SHUT_WR)" in ENTRY_LOCAL_PROBE_SCRIPT
     assert fnv1a64(b"abc") == 0xe71fa2190541574b
+    control_sample = control_link_sample([
+        {"link": {"sent_packets": 800, "rtt_max_us": 4500, "jitter_max_us": 600,
+                  "effective_loss_max_pct": 0.1, "spurious_total": 2,
+                  "reorder_gap_max": 3, "reorder_delay_max_us": 12000,
+                  "cwin_max_bytes": 262144, "blocked_connections": 0}},
+        {"link": {"sent_packets": 500, "rtt_max_us": 5100, "jitter_max_us": 800,
+                  "effective_loss_max_pct": 0.2, "spurious_total": 1,
+                  "reorder_gap_max": 4, "reorder_delay_max_us": 15000,
+                  "cwin_max_bytes": 524288, "blocked_connections": 1}},
+    ])
+    assert control_sample["sent"] == 1300 and control_sample["rtt"] == 5.1
+    assert control_sample["reorder_gap"] == 4 and control_sample["block"] == 1
     remote = parse_entry_probe_output([
         'NBPROBE_PROGRESS {"elapsed_s":5,"sent_bytes":625000,"achieved_mbps":1}',
         'NBPROBE_RESULT {"bytes":625000,"elapsed_s":5,"achieved_mbps":1,'
@@ -83,6 +127,42 @@ def main() -> None:
             os.environ.pop("NB_SOCKS_PASSWORD", None)
         else:
             os.environ["NB_SOCKS_PASSWORD"] = old_password
+    probe_socket = FakeProbeSocket()
+    original_socks_connect = line_probe.socks_connect
+    try:
+        line_probe.socks_connect = lambda *args, **kwargs: probe_socket
+        cancelled = run_load_probe("127.0.0.1", 1085, 1, 5, stop_event=Stopped())
+        assert cancelled["integrity"] == "cancelled"
+        assert probe_socket.shutdown_how == line_probe.socket.SHUT_WR
+    finally:
+        line_probe.socks_connect = original_socks_connect
+    original_connect = line_probe.deploy.connect
+    original_run = line_probe.deploy.run
+    original_log_path = line_probe.remote_log_path
+    log_connections = []
+    log_commands = []
+    try:
+        def connect_log(role):
+            connection = FakeLogConnection()
+            log_connections.append(connection)
+            return connection
+
+        def run_log(connection, command):
+            log_commands.append(command)
+            return "0\n" if "wc -c" in command else ""
+
+        line_probe.deploy.connect = connect_log
+        line_probe.deploy.run = run_log
+        line_probe.remote_log_path = lambda connection, role: "/etc/NB/instances/00006_1/logs/missing log.log"
+        assert line_probe.log_offset("entry") == 0
+        assert line_probe.log_since("entry", 0) == ""
+        assert all(connection.closed for connection in log_connections)
+        assert all("test -f '/etc/NB/instances/00006_1/logs/missing log.log'" in command
+                   for command in log_commands)
+    finally:
+        line_probe.deploy.connect = original_connect
+        line_probe.deploy.run = original_run
+        line_probe.remote_log_path = original_log_path
     ping = parse_ping("10 packets transmitted, 10 received, 0% packet loss\nrtt min/avg/max/mdev = 4.1/5.2/7.8/0.6 ms")
     assert ping["loss_pct"] == 0.0 and ping["rtt_avg_ms"] == 5.2
 

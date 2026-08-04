@@ -15,6 +15,7 @@ typedef struct cnx_pool {
     picoquic_cnx_t* draining_cnx[NB_POOL_SIZE];
     uint8_t replacement_closing[NB_POOL_SIZE];
     uint8_t draining_closing[NB_POOL_SIZE];
+    uint8_t generation_refresh[NB_POOL_SIZE];
     uint64_t next_sid[NB_POOL_SIZE];
     struct sockaddr_storage addr;
     int configured;

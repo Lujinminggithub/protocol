@@ -20,15 +20,21 @@ def verify(v:dict)->None:
     if not hmac.compare_digest(sig,hmac.new(key(),canonical(unsigned),hashlib.sha256).hexdigest()):raise ValueError("策略签名无效")
 
 def validate(policy:dict)->tuple[str,str]:
-    if policy.get("schema_version")!=1 or not NAME.fullmatch(str(policy.get("fixed_exit",""))):raise ValueError("schema/fixed_exit 非法")
+    if policy.get("schema_version") not in (1,2) or not NAME.fullmatch(str(policy.get("fixed_exit",""))):raise ValueError("schema/fixed_exit 非法")
     tenants=policy.get("tenants");routes=policy.get("routes")
     if not isinstance(tenants,list)or not tenants or not isinstance(routes,list)or not routes:raise ValueError("tenants/routes 不能为空")
     tlines=[];seen=set()
     for t in tenants:
-        name=str(t.get("name",""));values=[int(t.get(k,0)) for k in ("max_tcp","max_udp","rate_kbps","quota_mb")]
-        burst_seconds=int(t.get("burst_seconds",10))
-        if not NAME.fullmatch(name)or name in seen or not(0<=values[0]<=100000 and 0<=values[1]<=100000 and 0<=values[2]<=100000000 and 0<=values[3]<=10**9 and 1<=burst_seconds<=60):raise ValueError(f"非法 tenant: {t}")
-        seen.add(name);tlines.append(f"tenant {name} {' '.join(map(str,values))} {burst_seconds}")
+        name=str(t.get("name",""));max_tcp=int(t.get("max_tcp",0));max_udp=int(t.get("max_udp",0));quota=int(t.get("quota_mb",0))
+        if "rate_up_kbps" in t or "rate_down_kbps" in t:
+            up=int(t.get("rate_up_kbps",0));down=int(t.get("rate_down_kbps",0));up_burst=int(t.get("burst_up_seconds",10));down_burst=int(t.get("burst_down_seconds",10))
+            valid_rates=0<=up<=100000000 and 0<=down<=100000000 and 1<=up_burst<=60 and 1<=down_burst<=60
+            rendered=f"tenant {name} {max_tcp} {max_udp} {up} {down} {quota} {up_burst} {down_burst}"
+        else:
+            rate=int(t.get("rate_kbps",0));burst=int(t.get("burst_seconds",10));valid_rates=0<=rate<=100000000 and 1<=burst<=60
+            rendered=f"tenant {name} {max_tcp} {max_udp} {rate} {quota} {burst}"
+        if not NAME.fullmatch(name)or name in seen or not(0<=max_tcp<=100000 and 0<=max_udp<=100000 and 0<=quota<=10**9 and valid_rates):raise ValueError(f"非法 tenant: {t}")
+        seen.add(name);tlines.append(rendered)
     rlines=[];seen=set();fixed=str(policy["fixed_exit"])
     for r in routes:
         name=str(r.get("name",""));host=str(r.get("host",""));port=int(r.get("port",4443));weight=int(r.get("weight",1));capacity=int(r.get("capacity",0))

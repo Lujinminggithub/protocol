@@ -272,6 +272,9 @@ static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin);
 static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin);
 static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr);
 static int pool_get_or_create(struct sockaddr_storage* addr);
+static void pool_close_candidate(cnx_pool_t* pool,int idx);
+static void transport_refresh_outbound_pools(void);
+static int transport_outbound_pools_current(void);
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol);
 #define parse_port_strict nb_bridge_parse_port
 #define parse_target_from_route nb_bridge_parse_target
@@ -327,6 +330,7 @@ static int transport_apply_active_profile(void){
     picoquic_set_mtu_max(G.quic,local->mtu_max);g_udp_gso_enabled=local->udp_gso;
     g_reorder_gap=outbound->reorder_gap;g_reorder_delay_us=outbound->reorder_delay_us;
     g_fec_v15_observe=outbound->fec_observe;g_fec_v15_active=outbound->fec_active;
+    transport_refresh_outbound_pools();
     log4c_info("transport profile committed generation=%llu role=%s ingress=%d egress=%d cc=%s mtu=%u",
         (unsigned long long)state->active.generation,role_name(G.role),state->active.ingress.present,
         state->active.egress.present,local->cc,local->mtu_max);return 0;
@@ -419,6 +423,9 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
     const char* schema_text=nb_instance_env(nb_current_instance,"NB_LINE_PROFILE_SCHEMA");char* schema_end=NULL;
     long schema_long=schema_text?strtol(schema_text,&schema_end,10):0;
     int profile_schema=(schema_text&&schema_end&&*schema_end==0&&schema_long>=0&&schema_long<=999999)?(int)schema_long:0;
+    if((!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))&&
+        !transport_outbound_pools_current())
+        return snprintf(out,cap,"{\"error\":\"transport generation transition pending\"}\n");
     if(!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))
         return nb_transport_profile_render_status(&nb_current_instance->transport_profiles,out,cap);
     unsigned long long generation=0,fingerprint=0;char line_id[65],path[768];

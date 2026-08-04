@@ -31,7 +31,9 @@ func main() {
 		log.Fatal(err)
 	}
 	defer database.Close()
-	service := webapp.New(database, webapp.Config{AdminToken: os.Getenv("NB_WEB_ADMIN_TOKEN"), AgentToken: os.Getenv("NB_WEB_AGENT_TOKEN")})
+	secretsFile := env("NB_WEB_DEVICE_SECRETS_FILE", filepath.Join(stateDir, "device-secrets.json"))
+	service := webapp.New(database, webapp.Config{AdminToken: os.Getenv("NB_WEB_ADMIN_TOKEN"),
+		AgentToken: os.Getenv("NB_WEB_AGENT_TOKEN"), DeviceSecretsFile: secretsFile})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server := &http.Server{Addr: env("NB_WEB_LISTEN", "127.0.0.1:9091"), Handler: service.Handler(),

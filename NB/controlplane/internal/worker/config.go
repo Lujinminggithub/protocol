@@ -59,6 +59,8 @@ type LineSpec struct {
 	SecurityDir        string            `json:"security_dir"`
 	ClientSecretFile   string            `json:"client_secret_file"`
 	PackageMbps        float64           `json:"package_mbps"`
+	UpstreamMbps       float64           `json:"upstream_mbps,omitempty"`
+	DownstreamMbps     float64           `json:"downstream_mbps,omitempty"`
 	SocksPort          int               `json:"socks_port"`
 	UDPPortMin         int               `json:"udp_port_min"`
 	UDPPortMax         int               `json:"udp_port_max"`
@@ -106,6 +108,12 @@ func LoadRegistry(path string) (Registry, error) {
 	}
 	for index := range registry.Lines {
 		line := &registry.Lines[index]
+		if line.UpstreamMbps <= 0 {
+			line.UpstreamMbps = line.PackageMbps
+		}
+		if line.DownstreamMbps <= 0 {
+			line.DownstreamMbps = line.PackageMbps
+		}
 		line.HostsFile = resolve(line.HostsFile)
 		line.SourceMachinesFile = resolve(line.SourceMachinesFile)
 		line.LineProfileFile = resolve(line.LineProfileFile)

@@ -6,10 +6,93 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestCreateOperationRejectsAnotherActiveOperationOnLine(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-1", Name: "test", Status: "draft",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	first := Operation{ID: "op-open", LineID: "line-1", Kind: "line.open", RequestedBy: "operator",
+		IdempotencyKey: "open-1", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := Operation{ID: "op-validate", LineID: "line-1", Kind: "line.validate", RequestedBy: "operator",
+		IdempotencyKey: "validate-1", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(t.Context(), second); err == nil || !strings.Contains(err.Error(), "active operation") {
+		t.Fatalf("second active operation error=%v", err)
+	}
+	if err = store.CancelOperation(t.Context(), first.ID, "test complete"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = store.CreateOperation(t.Context(), second); err != nil {
+		t.Fatalf("completed line did not accept next operation: %v", err)
+	}
+}
+
+func TestAllocateLineSpecAssignsUniqueEntryPortAndSaveRechecksConflict(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, id := range []string{"line-1", "line-2"} {
+		if _, err = store.UpsertLine(t.Context(), Line{ID: id, Name: id, Status: "draft",
+			EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"entry-1", "relay-1", "exit-1"} {
+		if _, err = store.UpsertDevice(t.Context(), Device{ID: id, Name: id, Status: "ready", Host: "192.0.2.1",
+			SSHPort: 22, SSHUser: "root", SecretRef: "device:" + id, Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodes := []LineNode{{DeviceID: "entry-1", Role: "entry"}, {DeviceID: "relay-1", Role: "relay"}, {DeviceID: "exit-1", Role: "exit"}}
+	first := LineSpec{LineID: "line-1", ResourceGroup: "shared", InstanceID: "line-1_1", BandwidthMbps: 10,
+		UpstreamMbps: 6, DownstreamMbps: 14,
+		SocksPort: 1080, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		Whitelist: json.RawMessage(`[]`), BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Nodes: nodes}
+	savedFirst, err := store.SaveLineSpec(t.Context(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if savedFirst.UpstreamMbps != 6 || savedFirst.DownstreamMbps != 14 || savedFirst.BandwidthMbps != 14 {
+		t.Fatalf("asymmetric rates were not preserved: %+v", savedFirst)
+	}
+	second := first
+	second.LineID, second.InstanceID = "line-2", "line-2_1"
+	second.UpstreamMbps, second.DownstreamMbps = 0, 0
+	second.SocksPort, second.RelayPort, second.ExitPort, second.UDPPortMin, second.UDPPortMax = 0, 0, 0, 0, 0
+	second, err = store.AllocateLineSpec(t.Context(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.SocksPort != 1081 || second.RelayPort != 4447 || second.ExitPort != 4445 || second.UDPPortMin != 23072 {
+		t.Fatalf("unexpected automatic resources: %+v", second)
+	}
+	if second.UpstreamMbps != 10 || second.DownstreamMbps != 10 {
+		t.Fatalf("legacy bandwidth was not inherited by both directions: %+v", second)
+	}
+	conflicting := second
+	conflicting.SocksPort = 1080
+	if _, err = store.SaveLineSpec(t.Context(), conflicting); err == nil || !strings.Contains(err.Error(), "entry port conflicts") {
+		t.Fatalf("conflicting entry port error=%v", err)
+	}
+	if _, err = store.SaveLineSpec(t.Context(), second); err != nil {
+		t.Fatalf("allocated resources were rejected: %v", err)
+	}
+}
 
 func TestTuneCompletionUpdatesLineProfile(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
@@ -84,7 +167,7 @@ func TestAllocateTransportGenerationIsAtomic(t *testing.T) {
 	}
 }
 
-func TestOpenMigratesExitBindIP(t *testing.T) {
+func TestOpenMigratesLineSpecFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -101,6 +184,10 @@ func TestOpenMigratesExitBindIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = db.Exec(`INSERT INTO line_specs VALUES('legacy','group','instance',7,1080,20000,21023,4443,4443,'[]','auto','','repo://current','','auto','created','updated')`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +200,7 @@ func TestOpenMigratesExitBindIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	foundExit, foundUpstream, foundDownstream := false, false, false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, kind string
@@ -121,11 +208,17 @@ func TestOpenMigratesExitBindIP(t *testing.T) {
 		if err = rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
 			t.Fatal(err)
 		}
-		found = found || name == "exit_bind_ip"
+		foundExit = foundExit || name == "exit_bind_ip"
+		foundUpstream = foundUpstream || name == "upstream_mbps"
+		foundDownstream = foundDownstream || name == "downstream_mbps"
 	}
 	_ = rows.Close()
-	if !found {
-		t.Fatal("exit_bind_ip migration was not applied")
+	if !foundExit || !foundUpstream || !foundDownstream {
+		t.Fatal("line spec migrations were not applied")
+	}
+	var upstream, downstream int
+	if err = store.db.QueryRow(`SELECT upstream_mbps,downstream_mbps FROM line_specs WHERE line_id='legacy'`).Scan(&upstream, &downstream); err != nil || upstream != 7 || downstream != 7 {
+		t.Fatalf("legacy rates were not inherited: upstream=%d downstream=%d err=%v", upstream, downstream, err)
 	}
 }
 
@@ -166,6 +259,68 @@ func TestOpenCreatesLatestSnapshotIndex(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("snapshots_latest_node count=%d, want 1", count)
+	}
+}
+
+func TestOpenRemovesSyntheticCollectorSnapshots(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "central.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := now()
+	if _, err = store.db.Exec(`INSERT INTO lines
+ (id,name,status,entry_region,exit_region,provider,capacity_mbps,created_at,updated_at)
+ VALUES('line-1','test','active','entry','exit','test',10,?,?)`, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`INSERT INTO snapshots
+ (line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
+ queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at)
+ VALUES
+ ('line-1','nb-line-1-entry-collector','entry','collector',?,'down','','',0,0,0,0,0,0,'{}',?),
+ ('line-1','nb-line-1-entry-0','entry','entry-0',?,'ok','deployment-1','profile-1',0,0,0,0,1,0,'{}',?)`,
+		stamp, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var collectors, realWorkers int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE node_id LIKE '%-collector'`).Scan(&collectors); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE node_id='nb-line-1-entry-0'`).Scan(&realWorkers); err != nil {
+		t.Fatal(err)
+	}
+	if collectors != 0 || realWorkers != 1 {
+		t.Fatalf("collectors=%d real_workers=%d", collectors, realWorkers)
+	}
+}
+
+func TestRecordSnapshotRejectsSyntheticCollector(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stamp := now()
+	if _, err = store.db.Exec(`INSERT INTO lines
+ (id,name,status,entry_region,exit_region,provider,capacity_mbps,created_at,updated_at)
+ VALUES('line-1','test','active','entry','exit','test',10,?,?)`, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := store.RecordSnapshot(context.Background(), Snapshot{LineID: "line-1",
+		NodeID: "nb-line-1-entry-collector", Role: "entry", WorkerID: "collector",
+		ObservedAt: stamp, Health: "down"})
+	if err != nil || inserted {
+		t.Fatalf("inserted=%v err=%v", inserted, err)
 	}
 }
 

@@ -60,17 +60,22 @@ func (a *App) planTransportProfile(r *http.Request, lineID string, bandwidthMbps
 var assets embed.FS
 
 type Config struct {
-	AdminToken string
-	AgentToken string
+	AdminToken        string
+	AgentToken        string
+	DeviceSecretsFile string
 }
 
 type App struct {
-	store       *central.Store
-	cfg         Config
-	operationMu sync.Mutex
+	store         *central.Store
+	cfg           Config
+	operationMu   sync.Mutex
+	lineMu        sync.Mutex
+	deviceSecrets deviceSecretStore
 }
 
-func New(store *central.Store, cfg Config) *App { return &App{store: store, cfg: cfg} }
+func New(store *central.Store, cfg Config) *App {
+	return &App{store: store, cfg: cfg, deviceSecrets: deviceSecretStore{path: cfg.DeviceSecretsFile}}
+}
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -238,12 +243,21 @@ func validLine(line central.Line) error {
 }
 
 func (a *App) upsertLine(w http.ResponseWriter, r *http.Request) {
+	a.lineMu.Lock()
+	defer a.lineMu.Unlock()
 	var line central.Line
 	if !decode(w, r, &line) {
 		return
 	}
 	if err := validLine(line); err != nil {
 		problem(w, 400, err.Error())
+		return
+	}
+	if _, err := a.store.Line(r.Context(), line.ID); err == nil {
+		problem(w, http.StatusConflict, "line ID already exists")
+		return
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		problem(w, 500, err.Error())
 		return
 	}
 	result, err := a.store.UpsertLine(r.Context(), line)
@@ -536,7 +550,7 @@ func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, line := range item.Lines {
-		if (line.LineID != "*" && !safeID.MatchString(line.LineID)) || len(line.Reason) > 300 || len(line.Operations) > 5 {
+		if (line.LineID != "*" && !safeID.MatchString(line.LineID)) || len(line.Reason) > 300 || len(line.Operations) > 6 {
 			problem(w, 400, "invalid executor line")
 			return
 		}

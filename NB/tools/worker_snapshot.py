@@ -148,9 +148,8 @@ def collect(line_id: str) -> list[dict]:
     for role in ("entry", "middle", "exit"):
         try:
             records = query_role(role)
-        except Exception as error:  # A failed role must not suppress healthy roles.
-            records = [{"path": f"/run/{deploy._control_socket_prefix(role)}-collector.ctl",
-                        "error": f"{type(error).__name__}: {error}"}]
+        except Exception:  # A failed role must not suppress healthy roles or create a fake node.
+            continue
         result.extend(snapshot(line_id, role, observed, record) for record in records)
     return result
 

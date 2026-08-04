@@ -17,14 +17,40 @@ func TestGenerateSeparatesPhysicalSegments(t *testing.T) {
 	if profile.Segments["entry_middle"].Source.CC != "cubic" || profile.Segments["middle_exit"].Source.CC != "bbr" {
 		t.Fatalf("segments were not independently tuned: %#v", profile.Segments)
 	}
-	if profile.Segments["entry_middle"].Source.ReorderDelayUS >= profile.Segments["middle_exit"].Source.ReorderDelayUS {
-		t.Fatal("long-haul segment should have a larger reorder delay")
+	if profile.Segments["middle_exit"].Source.BBROptions != "Q0.0001:F0.25:" {
+		t.Fatalf("long-haul BBR recovery floor missing: %#v", profile.Segments["middle_exit"].Source)
 	}
 	if profile.Segments["middle_exit"].Source.FECActive {
 		t.Fatal("automatic generation must not enable active FEC")
 	}
 	if profile.Segments["entry_middle"].Source.MTUMax != 1452 {
 		t.Fatalf("QUIC and DF evidence should retain proven IP MTU: %+v", profile.Segments["entry_middle"].Source)
+	}
+}
+
+func TestGenerateDoesNotTurnLoadedShortHopIntoBBR(t *testing.T) {
+	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
+		"entry_middle": {ICMP: ICMP{RTTAvgMS: 4.4}, QUIC: QUICEvidence{RTTP95MS: 45.7, JitterP95MS: 46.5, PacketsObserved: 172992, WindowsValid: 18, ReorderGapMax: 4, ReorderDelayMaxMS: 220.6}},
+		"middle_exit":  {ICMP: ICMP{RTTAvgMS: 202.3}, QUIC: QUICEvidence{RTTP95MS: 186.1, JitterP95MS: 1.7, EffectiveLossP95Pct: .052, PacketsObserved: 145717, WindowsValid: 17}},
+	}}
+	probe.ServicePackage.QualificationMbps = 12.5
+	profile, err := Generate("gz-hk-kz", 2, 10, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := profile.Segments["entry_middle"].Source
+	middle := profile.Segments["middle_exit"].Source
+	if entry.CC != "cubic" || entry.CWinMaxBytes == 0 {
+		t.Fatalf("loaded short hop must stay window-bounded CUBIC: %+v", entry)
+	}
+	if entry.TargetMbps != 10 || middle.TargetMbps != 10 {
+		t.Fatalf("qualification headroom leaked into runtime target: entry=%g middle=%g", entry.TargetMbps, middle.TargetMbps)
+	}
+	if entry.ReorderGap != 13 || entry.ReorderDelayUS != 296000 {
+		t.Fatalf("unexpected evidence-derived entry reorder floors: %+v", entry)
+	}
+	if middle.ReorderGap != 8 || middle.ReorderDelayUS != 20000 {
+		t.Fatalf("clean long hop retained RTT-sized reorder floors: %+v", middle)
 	}
 }
 

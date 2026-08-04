@@ -8,6 +8,27 @@ import worker_snapshot
 
 
 class WorkerSnapshotTest(unittest.TestCase):
+    def test_role_collection_failure_does_not_create_collector_node(self):
+        original = worker_snapshot.query_role
+
+        def query(role):
+            if role == "entry":
+                raise RuntimeError("temporary entry collection failure")
+            return [{
+                "path": f"/run/nb-line-1-{role}-0.ctl",
+                "health": {"worker": f"{role}-0", "status": "ok"},
+                "metrics": {},
+            }]
+
+        worker_snapshot.query_role = query
+        try:
+            samples = worker_snapshot.collect("line-1")
+        finally:
+            worker_snapshot.query_role = original
+
+        self.assertEqual([sample["role"] for sample in samples], ["middle", "exit"])
+        self.assertFalse(any(sample["node_id"].endswith("-collector") for sample in samples))
+
     def test_protocol_sessions_and_interval_throughput(self):
         record = {
             "path": "/run/nb-entry-0.sock",

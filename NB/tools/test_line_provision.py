@@ -46,6 +46,8 @@ def main() -> None:
         "hosts_file": "hosts.json",
         "baseline_profile": "profile.json",
         "package_mbps": 10,
+        "upstream_mbps": 8,
+        "downstream_mbps": 12,
         "client": {"name": "测试线路", "port": 1023, "username": "u@ser",
                    "password_env": "CLIENT_PASSWORD"},
     }
@@ -65,8 +67,11 @@ def main() -> None:
     assert artifacts["profile"]["schema_version"] == 4
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["entry"]
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["middle"]
-    assert artifacts["policy"]["tenants"][0]["rate_kbps"] == 10000
-    assert artifacts["policy"]["tenants"][0]["burst_seconds"] == 10
+    assert artifacts["policy"]["schema_version"] == 2
+    assert artifacts["policy"]["tenants"][0]["rate_up_kbps"] == 8000
+    assert artifacts["policy"]["tenants"][0]["rate_down_kbps"] == 12000
+    assert artifacts["policy"]["tenants"][0]["burst_up_seconds"] == 10
+    assert artifacts["policy"]["tenants"][0]["burst_down_seconds"] == 10
     assert artifacts["client"]["server"] == "192.0.2.10"
     assert "u%40ser:p%3Aa%2Fss@" in artifacts["client"]["shadowrocket_url"]
 

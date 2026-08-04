@@ -9,6 +9,7 @@ User=root
 Group=root
 UMask=0077
 EnvironmentFile=/opt/nb-controlplane/etc/nb-web.env
+Environment=NB_WEB_DEVICE_SECRETS_FILE=/opt/nb-controlplane/data/secrets/device-secrets.json
 ExecStart=/opt/nb-controlplane/bin/nb-web
 Restart=on-failure
 RestartSec=5s
@@ -16,7 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/opt/nb-controlplane/data/web
+ReadWritePaths=/opt/nb-controlplane/data/web /opt/nb-controlplane/data/secrets
 
 [Install]
 WantedBy=multi-user.target

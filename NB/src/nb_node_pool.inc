@@ -27,6 +27,7 @@ static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr){
     memset(pool->draining_cnx,0,sizeof(pool->draining_cnx));
     memset(pool->replacement_closing,0,sizeof(pool->replacement_closing));
     memset(pool->draining_closing,0,sizeof(pool->draining_closing));
+    memset(pool->generation_refresh,0,sizeof(pool->generation_refresh));
     memset(pool->recent_loss, 0, sizeof(pool->recent_loss));
     memset(pool->recent_rtt, 0, sizeof(pool->recent_rtt));
     memset(pool->recent_rtt_max, 0, sizeof(pool->recent_rtt_max));
@@ -288,7 +289,47 @@ static int pool_start_replacement(cnx_pool_t* pool,int pool_id,int idx){
     if(pool->replacement_cnx[idx]!=NULL)return 0;
     picoquic_cnx_t* replacement=pool_create_cnx(pool,idx);if(replacement==NULL)return -1;
     pool->replacement_cnx[idx]=replacement;pool->replacement_closing[idx]=0;
-    log4c_warn("pool[%d:%d] quarantined replacement=started",pool_id,idx);return 0;
+    log4c_warn("pool[%d:%d] replacement=started",pool_id,idx);return 0;
+}
+
+static uint64_t transport_active_generation(void){
+    nb_transport_profile_state_t* state=&nb_current_instance->transport_profiles;
+    return state->has_active?state->active.generation:0;
+}
+
+static int pool_connection_is_current(picoquic_cnx_t* cnx){
+    uint64_t generation=transport_active_generation();
+    return cnx!=NULL&&generation>0&&transport_connection_generation(cnx)==generation;
+}
+
+static void transport_refresh_outbound_pools(void){
+    if(G.role!=ROLE_ENTRY&&G.role!=ROLE_MIDDLE)return;
+    uint64_t generation=transport_active_generation();
+    if(generation==0)return;
+    for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
+        cnx_pool_t* pool=&G.pools[pool_id];if(!pool->configured)continue;
+        if(pool_connection_is_current(pool->cnx[idx])){
+            pool->generation_refresh[idx]=0;continue;
+        }
+        pool->generation_refresh[idx]=1;
+        if(pool->replacement_cnx[idx]&&
+            !pool_connection_is_current(pool->replacement_cnx[idx]))pool_close_candidate(pool,idx);
+        else if(pool->replacement_cnx[idx]==NULL)(void)pool_start_replacement(pool,pool_id,idx);
+        log4c_info("pool[%d:%d] transport generation refresh target=%llu",pool_id,idx,
+            (unsigned long long)generation);
+    }
+}
+
+static int transport_outbound_pools_current(void){
+    if(G.role!=ROLE_ENTRY&&G.role!=ROLE_MIDDLE)return 1;
+    uint64_t generation=transport_active_generation();
+    if(generation==0)return 1;
+    for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
+        cnx_pool_t* pool=&G.pools[pool_id];if(!pool->configured)continue;
+        if(pool->generation_refresh[idx]||!pool_cnx_ready(pool->cnx[idx])||
+            !pool_connection_is_current(pool->cnx[idx]))return 0;
+    }
+    return 1;
 }
 
 static void pool_close_candidate(cnx_pool_t* pool,int idx){
@@ -334,6 +375,20 @@ static void pool_health_tick(uint64_t now){
     for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
         cnx_pool_t* pool=&G.pools[pool_id];pool_drain_tick(pool,pool_id,idx);
         picoquic_cnx_t* cnx=pool->cnx[idx];if(cnx==NULL)continue;
+        if(pool->generation_refresh[idx]){
+            if(pool_connection_is_current(cnx)){
+                pool->generation_refresh[idx]=0;
+            }else{
+                picoquic_cnx_t* replacement=pool->replacement_cnx[idx];
+                if(replacement&&!pool_connection_is_current(replacement))pool_close_candidate(pool,idx);
+                else if(replacement==NULL)(void)pool_start_replacement(pool,pool_id,idx);
+                else if(pool_cnx_ready(replacement)&&pool->draining_cnx[idx]==NULL&&
+                    pool_promote_replacement(pool,pool_id,idx)){
+                    pool->generation_refresh[idx]=!pool_connection_is_current(pool->cnx[idx]);
+                }
+                continue;
+            }
+        }
         int eligible=0;uint64_t age=pool_slot_queue_age(cnx,now,&eligible);
         picoquic_path_t* path=cnx->nb_paths?cnx->path[0]:NULL;uint64_t pto=path?path->nb_retransmit:0,suppressed=0;
         int streams=pool_slot_streams(cnx);

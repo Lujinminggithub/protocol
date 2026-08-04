@@ -27,13 +27,30 @@ type Operation struct {
 }
 
 type Result struct {
-	Deployment          string          `json:"deployment,omitempty"`
-	Profile             string          `json:"profile,omitempty"`
-	ClientURL           string          `json:"client_url,omitempty"`
-	LogFile             string          `json:"log_file"`
-	Message             string          `json:"message"`
-	Evidence            json.RawMessage `json:"evidence,omitempty"`
-	TransportGeneration uint64          `json:"transport_generation,omitempty"`
+	Deployment          string                    `json:"deployment,omitempty"`
+	Profile             string                    `json:"profile,omitempty"`
+	ClientURL           string                    `json:"client_url,omitempty"`
+	LogFile             string                    `json:"log_file"`
+	Message             string                    `json:"message"`
+	Evidence            json.RawMessage           `json:"evidence,omitempty"`
+	TransportGeneration uint64                    `json:"transport_generation,omitempty"`
+	TransportProfile    *transportprofile.Profile `json:"transport_profile,omitempty"`
+	TransportRollout    *transportRolloutResult   `json:"transport_rollout,omitempty"`
+}
+
+type transportRolloutRoleResult struct {
+	Prepared    bool   `json:"prepared"`
+	Committed   bool   `json:"committed"`
+	Readback    bool   `json:"readback"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+}
+
+type transportRolloutResult struct {
+	Status       string                                `json:"status"`
+	Generation   uint64                                `json:"generation"`
+	PrepareOrder []string                              `json:"prepare_order"`
+	CommitOrder  []string                              `json:"commit_order"`
+	Roles        map[string]transportRolloutRoleResult `json:"roles"`
 }
 
 type requestValues struct {
@@ -228,6 +245,7 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 		}
 		result = append(result, commandStep{Name: python, Stage: "provision", Args: []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
 			"--line-id", line.LineID, "--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64),
+			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64), "--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
 			"--socks-port", socks, "--middle-port", strconv.Itoa(line.MiddlePort), "--exit-port", strconv.Itoa(line.ExitPort),
 			"--udp-port-min", strconv.Itoa(line.UDPPortMin), "--udp-port-max", strconv.Itoa(line.UDPPortMax),
 			"--output-dir", outputDir, "--build-mode", line.BuildMode, "--execute"}})
@@ -376,11 +394,13 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	}
 	result := Result{LogFile: logPath, Profile: line.LineID, Message: "operation completed"}
 	if operation.Kind == "line.tune" {
+		result.TransportProfile = &request.TransportProfile
 		generation, profilePath, rolloutErr := r.applyPlannedProfile(ctx, line, request.TransportProfile, environment, logFile, &sequence)
 		result.TransportGeneration = generation
 		if profilePath != "" {
 			result.Profile = fmt.Sprintf("%s:%d", line.LineID, generation)
 		}
+		result.TransportRollout = summarizeTransportRollout(line, r.registry.StateDir)
 		if rolloutErr != nil {
 			return result, rolloutErr
 		}
@@ -399,9 +419,11 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 			return result, err
 		}
 	}
-	if profile, loadErr := loadJSON(line.LineProfileFile); loadErr == nil {
-		if schema, ok := profile["schema_version"].(float64); ok {
-			result.Profile = fmt.Sprintf("%s:%d", line.LineID, int(schema))
+	if operation.Kind != "line.tune" {
+		if profile, loadErr := loadJSON(line.LineProfileFile); loadErr == nil {
+			if schema, ok := profile["schema_version"].(float64); ok {
+				result.Profile = fmt.Sprintf("%s:%d", line.LineID, int(schema))
+			}
 		}
 	}
 	if operation.Kind == "line.open" {

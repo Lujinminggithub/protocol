@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,6 +24,11 @@ type inventoryDiscovery struct {
 	WorkerID   string           `json:"worker_id"`
 	ObservedAt string           `json:"observed_at"`
 	Lines      []discoveredLine `json:"lines"`
+}
+
+type deviceUpsertRequest struct {
+	central.Device
+	Password string `json:"password"`
 }
 
 func validHost(value string) bool {
@@ -62,6 +68,14 @@ func validDevice(item central.Device) error {
 	return nil
 }
 
+func validWhitelistSource(value string) bool {
+	if strings.Contains(value, "://") {
+		parsed, err := url.ParseRequestURI(value)
+		return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.Fragment == ""
+	}
+	return safeSecretRef.MatchString(value) // Backward compatibility for existing env:/secret references.
+}
+
 func (a *App) devices(w http.ResponseWriter, r *http.Request) {
 	items, err := a.store.Devices(r.Context())
 	if err != nil {
@@ -72,19 +86,44 @@ func (a *App) devices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) upsertDevice(w http.ResponseWriter, r *http.Request) {
-	var item central.Device
-	if !decode(w, r, &item) {
+	var request deviceUpsertRequest
+	if !decode(w, r, &request) {
 		return
 	}
+	item := request.Device
 	if item.Status == "" {
 		item.Status = "ready"
 	}
 	if item.SSHPort == 0 {
 		item.SSHPort = 22
 	}
+	existing, existingErr := a.store.Device(r.Context(), item.ID)
+	if existingErr == nil && item.SecretRef == "" {
+		item.SecretRef = existing.SecretRef
+	}
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		problem(w, 500, existingErr.Error())
+		return
+	}
+	if request.Password != "" {
+		if len(request.Password) > 4096 {
+			problem(w, 400, "device password is too long")
+			return
+		}
+		item.SecretRef = "device:" + item.ID
+	} else if errors.Is(existingErr, sql.ErrNoRows) {
+		problem(w, 400, "SSH password is required when registering a device")
+		return
+	}
 	if err := validDevice(item); err != nil {
 		problem(w, 400, err.Error())
 		return
+	}
+	if request.Password != "" {
+		if err := a.deviceSecrets.update(item.SecretRef, request.Password); err != nil {
+			problem(w, 500, "failed to store device password")
+			return
+		}
 	}
 	result, err := a.store.UpsertDevice(r.Context(), item)
 	if err != nil {
@@ -104,9 +143,20 @@ func (a *App) device(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) deleteDevice(w http.ResponseWriter, r *http.Request) {
-	if err := a.store.DeleteDevice(r.Context(), r.PathValue("id")); err != nil {
+	item, lookupErr := a.store.Device(r.Context(), r.PathValue("id"))
+	if lookupErr != nil {
+		problem(w, 404, "device not found")
+		return
+	}
+	if err := a.store.DeleteDevice(r.Context(), item.ID); err != nil {
 		problem(w, 409, err.Error())
 		return
+	}
+	if strings.HasPrefix(item.SecretRef, "device:") {
+		if err := a.deviceSecrets.delete(item.SecretRef); err != nil {
+			problem(w, 500, "device was deleted but its local password could not be removed")
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -115,7 +165,8 @@ func validLineSpecRequest(spec central.LineSpec) error {
 	if !safeID.MatchString(spec.LineID) || !safeID.MatchString(spec.ResourceGroup) || (spec.InstanceID != "" && !safeID.MatchString(spec.InstanceID)) {
 		return errors.New("invalid line deployment identity")
 	}
-	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.SocksPort < 1 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65534 || spec.ExitPort < 0 || spec.ExitPort > 65534 {
+	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.UpstreamMbps < 1 || spec.UpstreamMbps > 1000 ||
+		spec.DownstreamMbps < 1 || spec.DownstreamMbps > 1000 || spec.SocksPort < 0 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65534 || spec.ExitPort < 0 || spec.ExitPort > 65534 {
 		return errors.New("invalid line ports or bandwidth")
 	}
 	if spec.ExitBindIP != "" {
@@ -133,8 +184,8 @@ func validLineSpecRequest(spec central.LineSpec) error {
 	if spec.JumpPolicy != "auto" && spec.JumpPolicy != "direct" && spec.JumpPolicy != "pinned" {
 		return errors.New("invalid jump policy")
 	}
-	if spec.SRSRef != "" && !safeSecretRef.MatchString(spec.SRSRef) {
-		return errors.New("SRS source must be a local secret reference")
+	if spec.SRSRef != "" && !validWhitelistSource(spec.SRSRef) {
+		return errors.New("whitelist update URL must use HTTPS")
 	}
 	if spec.ArtifactRef != "" && filepath.ToSlash(spec.ArtifactRef) != "build/nb_node" {
 		return errors.New("artifact_ref must use build/nb_node")
@@ -168,19 +219,22 @@ func validLineSpec(spec central.LineSpec) error {
 	if err := validLineSpecRequest(spec); err != nil {
 		return err
 	}
-	if spec.RelayPort == 0 || spec.ExitPort == 0 || spec.UDPPortMin == 0 || spec.UDPPortMax == 0 {
+	if spec.SocksPort == 0 || spec.RelayPort == 0 || spec.ExitPort == 0 || spec.UDPPortMin == 0 || spec.UDPPortMax == 0 {
 		return errors.New("internal line resources were not allocated")
 	}
 	return nil
 }
 
 func (a *App) saveLineSpec(w http.ResponseWriter, r *http.Request) {
+	a.lineMu.Lock()
+	defer a.lineMu.Unlock()
 	var spec central.LineSpec
 	if !decode(w, r, &spec) {
 		return
 	}
 	spec.LineID = r.PathValue("id")
 	spec.ExitBindIP = strings.TrimSpace(spec.ExitBindIP)
+	spec.NormalizeRates()
 	if _, err := a.store.Line(r.Context(), spec.LineID); err != nil {
 		problem(w, 404, "line not found")
 		return
@@ -325,6 +379,7 @@ func (a *App) discoverInventory(w http.ResponseWriter, r *http.Request) {
 			results = append(results, result)
 			continue
 		}
+		found.Spec.NormalizeRates()
 		if err := validLineSpec(found.Spec); err != nil {
 			result.Status, result.Message = "rejected", err.Error()
 		} else if conflict, err := a.store.LineSpecConflict(r.Context(), found.Spec); err != nil {

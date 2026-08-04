@@ -24,6 +24,14 @@ if (Get-NetTCPConnection -State Listen -LocalPort $listenPort -ErrorAction Silen
 if (-not (Test-Path -LiteralPath $registryPath -PathType Leaf)) {
     throw "worker registry does not exist: $registryPath"
 }
+$registryConfig = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+$deviceSecretsFile = [string]$registryConfig.dynamic.secrets_file
+if ([string]::IsNullOrWhiteSpace($deviceSecretsFile)) {
+    $deviceSecretsFile = Join-Path $StateDirectory "device-secrets.json"
+} elseif (-not [System.IO.Path]::IsPathRooted($deviceSecretsFile)) {
+    $deviceSecretsFile = Join-Path (Split-Path -Parent $registryPath) $deviceSecretsFile
+}
+$deviceSecretsFile = [System.IO.Path]::GetFullPath($deviceSecretsFile)
 
 Push-Location $root
 try {
@@ -34,6 +42,7 @@ try {
     $webEnvironment = @{
         NB_WEB_LISTEN = $Listen
         NB_WEB_STATE_DIR = $StateDirectory
+        NB_WEB_DEVICE_SECRETS_FILE = $deviceSecretsFile
     }
     $workerEnvironment = @{
         NB_WEB_BASE_URL = "http://127.0.0.1:$listenPort"

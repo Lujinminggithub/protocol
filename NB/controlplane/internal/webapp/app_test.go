@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,6 +98,101 @@ func TestAgentListsOnlyActiveLinePlans(t *testing.T) {
 	response, _ = call(t, server.Client(), http.MethodGet, server.URL+"/agent/v1/line-plans", "admin", "", nil)
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("admin accessed agent plans: %d", response.StatusCode)
+	}
+}
+
+func TestCreateLineRejectsDuplicateID(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	line := map[string]any{"id": "line-unique", "name": "unique", "status": "draft", "entry_region": "entry",
+		"exit_region": "exit", "provider": "test", "capacity_mbps": 10, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("first create status=%d body=%s", response.StatusCode, body)
+	}
+	line["name"] = "must not replace"
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("line ID already exists")) {
+		t.Fatalf("duplicate create status=%d body=%s", response.StatusCode, body)
+	}
+	stored, err := database.Line(t.Context(), "line-unique")
+	if err != nil || stored.Name != "unique" {
+		t.Fatalf("duplicate create changed line: %+v err=%v", stored, err)
+	}
+}
+
+func TestDevicePasswordIsStoredLocallyAndNeverReturned(t *testing.T) {
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	secretsFile := filepath.Join(directory, "private", "device-secrets.json")
+	if err = os.MkdirAll(filepath.Dir(secretsFile), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(secretsFile, []byte(`{"legacy":{"password_env":"NB_LEGACY_PASSWORD"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent",
+		DeviceSecretsFile: secretsFile}).Handler())
+	defer server.Close()
+
+	device := map[string]any{"id": "entry-new", "name": "new entry", "status": "ready",
+		"host": "192.0.2.20", "ssh_port": 22, "ssh_user": "root", "private_ip": "",
+		"region": "gz", "provider": "test", "os": "linux", "arch": "amd64", "labels": map[string]any{}}
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("SSH password is required")) {
+		t.Fatalf("passwordless create status=%d body=%s", response.StatusCode, body)
+	}
+
+	device["password"] = "initial-secret"
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated || !bytes.Contains(body, []byte(`"secret_ref":"device:entry-new"`)) || bytes.Contains(body, []byte("initial-secret")) {
+		t.Fatalf("password create status=%d body=%s", response.StatusCode, body)
+	}
+	contents, err := os.ReadFile(secretsFile)
+	if err != nil || !bytes.Contains(contents, []byte("initial-secret")) || !bytes.Contains(contents, []byte("NB_LEGACY_PASSWORD")) {
+		t.Fatalf("local device secret was not stored: err=%v contents=%s", err, contents)
+	}
+
+	delete(device, "password")
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte("initial-secret")) {
+		t.Fatalf("password-preserving update status=%d body=%s", response.StatusCode, body)
+	}
+	contents, _ = os.ReadFile(secretsFile)
+	if !bytes.Contains(contents, []byte("initial-secret")) {
+		t.Fatal("empty edit replaced the stored password")
+	}
+
+	device["password"] = "rotated-secret"
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte("rotated-secret")) {
+		t.Fatalf("password rotation status=%d body=%s", response.StatusCode, body)
+	}
+	contents, _ = os.ReadFile(secretsFile)
+	if !bytes.Contains(contents, []byte("rotated-secret")) || bytes.Contains(contents, []byte("initial-secret")) {
+		t.Fatalf("password was not atomically rotated: %s", contents)
+	}
+
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/devices/entry-new", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || bytes.Contains(body, []byte("rotated-secret")) {
+		t.Fatalf("device API exposed password status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodDelete, server.URL+"/api/v1/devices/entry-new", "admin", "", nil)
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("device delete status=%d body=%s", response.StatusCode, body)
+	}
+	contents, _ = os.ReadFile(secretsFile)
+	if bytes.Contains(contents, []byte("device:entry-new")) || bytes.Contains(contents, []byte("rotated-secret")) {
+		t.Fatalf("device delete retained password: %s", contents)
 	}
 }
 
@@ -278,29 +374,38 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte("NB 运营控制台")) {
 		t.Fatalf("static UI status=%d", response.StatusCode)
 	}
+	if !bytes.Contains(body, []byte(`白名单更新地址`)) || bytes.Contains(body, []byte(`env:NB_LINE_SRS_URL`)) {
+		t.Fatal("whitelist URL field is missing or still exposes environment references")
+	}
+	if !bytes.Contains(body, []byte(`name="password"`)) || bytes.Contains(body, []byte(`name="secret_ref"`)) {
+		t.Fatal("device form must collect an initial password instead of a secret reference")
+	}
 	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/app.js", "", "", nil)
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`operationAvailability`)) ||
 		!bytes.Contains(body, []byte(`disabled title=`)) ||
 		!bytes.Contains(body, []byte(`computer-icon`)) || !bytes.Contains(body, []byte(`队列最大等待`)) ||
 		!bytes.Contains(body, []byte(`clientConfigSection`)) || !bytes.Contains(body, []byte(`/client-qr`)) ||
+		!bytes.Contains(body, []byte(`tuneResultSection`)) || !bytes.Contains(body, []byte(`transport_rollout`)) ||
 		bytes.Contains(body, []byte(`event.currentTarget.reset()`)) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
 	}
 }
 
 func TestInventoryTopologyAndOperationEvents(t *testing.T) {
-	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent",
+		DeviceSecretsFile: filepath.Join(directory, "device-secrets.json")}).Handler())
 	defer server.Close()
 	client := server.Client()
 	for index, role := range []string{"entry", "relay", "exit"} {
 		device := map[string]any{"id": role + "-1", "name": role + " device", "status": "ready",
 			"host": "192.0.2." + string(rune('1'+index)), "ssh_port": 22, "ssh_user": "root",
-			"region": role, "provider": "test", "secret_ref": "env:NB_TEST_" + role, "labels": map[string]any{}}
+			"region": role, "provider": "test", "password": "test-" + role, "labels": map[string]any{}}
 		response, body := call(t, client, http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
 		if response.StatusCode != 201 {
 			t.Fatalf("create device status=%d body=%s", response.StatusCode, body)
@@ -320,11 +425,17 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	spec := map[string]any{"resource_group": "test-group", "instance_id": "test", "bandwidth_mbps": 20,
 		"socks_port": 1082, "relay_port": 4445, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "udp_port_min": 22048, "udp_port_max": 23071,
 		"whitelist": []string{"domain example.com"}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
-		"srs_ref": "env:NB_TEST_SRS_URL", "jump_policy": "auto", "nodes": nodes}
+		"srs_ref": "https://rules.example.invalid/whitelist.srs?key=test-key", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) {
 		t.Fatalf("save topology status=%d body=%s", response.StatusCode, body)
 	}
+	spec["srs_ref"] = "http://rules.example.invalid/whitelist.srs"
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("HTTPS")) {
+		t.Fatalf("insecure whitelist URL status=%d body=%s", response.StatusCode, body)
+	}
+	spec["srs_ref"] = "https://rules.example.invalid/whitelist.srs?key=test-key"
 	spec["exit_bind_ip"] = "2001:db8::1"
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
 	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("exit_bind_ip")) {
@@ -368,7 +479,7 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		t.Fatalf("internal resources were not independently allocated: %+v", allocated)
 	}
 	heartbeat := map[string]any{"worker_id": "worker-1", "status": "ready", "version": "test", "observed_at": time.Now().UTC(),
-		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open"}}}}
+		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open", "line.validate", "line.upgrade", "line.rollback", "line.disable", "line.tune"}}}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/executors/heartbeat", "agent", "", heartbeat)
 	if response.StatusCode != 200 {
 		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)

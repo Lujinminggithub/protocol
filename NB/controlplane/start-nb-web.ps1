@@ -1,6 +1,7 @@
 param(
     [string]$Listen = "127.0.0.1:9091",
-    [string]$StateDirectory = "./build/nb-web"
+    [string]$StateDirectory = "./build/nb-web",
+    [string]$DeviceSecretsFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,4 +26,8 @@ New-Item -ItemType Directory -Path "build" -Force | Out-Null
 go build -trimpath -o "build/nb-web.exe" ./cmd/nb-web
 $env:NB_WEB_LISTEN = $Listen
 $env:NB_WEB_STATE_DIR = $StateDirectory
+if ([string]::IsNullOrWhiteSpace($DeviceSecretsFile)) {
+    $DeviceSecretsFile = Join-Path $StateDirectory "device-secrets.json"
+}
+$env:NB_WEB_DEVICE_SECRETS_FILE = [System.IO.Path]::GetFullPath($DeviceSecretsFile)
 & "$root/build/nb-web.exe"

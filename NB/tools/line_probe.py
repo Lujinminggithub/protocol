@@ -18,6 +18,7 @@ import shlex
 import socket
 import statistics
 import struct
+import threading
 import time
 
 import deploy
@@ -150,6 +151,7 @@ elif mode == "load":
                 "sent_bytes": sent, "achieved_mbps": sent * 8.0 / elapsed / 1000000.0}), flush=True)
             next_progress = now + 5.0
     send_elapsed = time.monotonic() - started
+    sock.shutdown(socket.SHUT_WR)
     sock.settimeout(request["io_timeout"])
     response = bytearray()
     while b"NBPROBE OK " not in response:
@@ -437,6 +439,7 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
             continue
         count = min(len(chunk), target_bytes - sent, max(1, allowed - sent))
         sock.sendall(chunk[:count]); sent += count
+    sock.shutdown(socket.SHUT_WR)
     response = bytearray()
     while b"NBPROBE OK " not in response:
         data = sock.recv(4096)
@@ -448,7 +451,7 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
     if received != sent:
         raise RuntimeError(f"主动探针计数失败: sent={sent} exit={received} response={response[:100]!r}")
     return {"bytes": sent, "elapsed_s": elapsed,
-        "achieved_mbps": sent * 8.0 / elapsed / 1_000_000.0,
+        "achieved_mbps": sent * 8.0 / max(elapsed, 0.001) / 1_000_000.0,
         "integrity": "cancelled" if stop_event and stop_event.is_set() else "count-ok",
         "origin": "controller"}
 
@@ -528,23 +531,38 @@ def remote_log_path(connection, role: str) -> str:
         f"if test -f \"$dir/cfg/log4c.json\"; then echo {deploy._log_path(role)}; "
         f"else echo \"$dir/logs/nb-{role}.log\"; fi"
     )
-    return deploy.run(connection, command).strip()
+    output = deploy.run(connection, command).strip().splitlines()
+    path = output[-1].strip() if output else ""
+    if not path.startswith("/"):
+        raise RuntimeError(f"unable to resolve remote {role} log path")
+    return path
 
 
 def log_offset(role: str) -> int:
     connection = deploy.connect(role)
-    path = remote_log_path(connection, role)
-    value = deploy.run(connection, f"wc -c < {path}").strip()
-    connection.close()
-    return int(value or 0)
+    try:
+        path = remote_log_path(connection, role)
+        quoted = shlex.quote(path)
+        value = deploy.run(connection,
+            f"if test -f {quoted}; then wc -c < {quoted}; else printf '0\\n'; fi").strip()
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        if not lines or not lines[-1].isdigit():
+            raise RuntimeError(f"invalid remote {role} log size")
+        return int(lines[-1])
+    finally:
+        connection.close()
 
 
 def log_since(role: str, offset: int) -> str:
     connection = deploy.connect(role)
-    path = remote_log_path(connection, role)
-    text = deploy.run(connection, f"tail -c +{offset + 1} {path}")
-    connection.close()
-    return text
+    try:
+        path = remote_log_path(connection, role)
+        quoted = shlex.quote(path)
+        start = max(0, offset) + 1
+        return deploy.run(connection,
+            f"if test -f {quoted}; then tail -c +{start} -- {quoted} 2>/dev/null || true; fi")
+    finally:
+        connection.close()
 
 
 def probe_path_mtu(source_role: str, target: str,
@@ -600,6 +618,57 @@ def collect_segment(source_role: str, target: str, samples: int, target_mbps: fl
     }
 
 
+def control_link_sample(records: list[dict]) -> dict:
+    links = [record.get("link", {}) for record in records if isinstance(record, dict)]
+    return {
+        "sent": sum(int(link.get("sent_packets", 0) or 0) for link in links),
+        "spurious": sum(int(link.get("spurious_total", 0) or 0) for link in links),
+        "rtt": max((float(link.get("rtt_max_us", 0) or 0) / 1000.0 for link in links), default=0.0),
+        "jitter": max((float(link.get("jitter_max_us", 0) or 0) / 1000.0 for link in links), default=0.0),
+        "loss": max((float(link.get("effective_loss_max_pct", 0) or 0) for link in links), default=0.0),
+        "reorder_gap": max((int(link.get("reorder_gap_max", 0) or 0) for link in links), default=0),
+        "reorder_ms": max((float(link.get("reorder_delay_max_us", 0) or 0) / 1000.0 for link in links), default=0.0),
+        "cwin_kb": max((int(link.get("cwin_max_bytes", 0) or 0) // 1024 for link in links), default=0),
+        "block": int(any(int(link.get("blocked_connections", 0) or 0) > 0 for link in links)),
+        "mtu": 0,
+    }
+
+
+def collect_control_link_samples(role: str, stop_event: threading.Event,
+                                 ready_event: threading.Event, output: list[dict],
+                                 errors: list[str], interval_s: float = 5.0) -> None:
+    pattern = deploy._control_socket_glob(role)
+    prefix = deploy._control_socket_prefix(role)
+    socket_pattern = f"/run/{prefix}-[0-9]+\\.ctl"
+    script = f"""import glob,json,re,socket
+paths=[path for path in sorted(glob.glob({pattern!r})) if re.fullmatch({socket_pattern!r},path)]
+if not paths:raise RuntimeError('no matching control sockets')
+metrics=[]
+for path in paths:
+ client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);client.settimeout(3)
+ try:
+  client.connect(path);client.sendall(b'metrics\\n');metrics.append(json.loads(client.recv(65536).decode()))
+ finally:client.close()
+print(json.dumps(metrics,separators=(',',':')))
+"""
+    connection = None
+    try:
+        connection = deploy.connect(role)
+        while not stop_event.is_set():
+            raw = deploy.checked_run(connection, "python3 -c " + shlex.quote(script), tmo=20).strip()
+            records = json.loads(raw)
+            output.append(control_link_sample(records))
+            ready_event.set()
+            if stop_event.wait(interval_s):
+                break
+    except Exception as error:
+        errors.append(f"{role}: {type(error).__name__}: {error}")
+        ready_event.set()
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ping-samples", type=int, default=30)
@@ -641,16 +710,32 @@ def main() -> None:
     middle_target = middle.get("private_ip") or middle["host"]
     active_result = None
     active_logs = None
+    active_metric_samples = {"entry": [], "middle": []}
+    active_metric_errors = []
     if args.active:
         offsets = {role: log_offset(role) for role in ("entry", "middle")}
-        if args.probe_origin == "entry-local":
-            integrity = run_entry_local_probe("integrity", args.socks_port)
-            load = run_entry_local_probe("load", args.socks_port,
-                target_mbps=target_mbps, duration_s=args.duration)
-        else:
-            integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
-            load = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
-                target_mbps, args.duration)
+        sample_stop = threading.Event()
+        sample_ready = {role: threading.Event() for role in active_metric_samples}
+        sample_threads = [threading.Thread(target=collect_control_link_samples,
+            args=(role, sample_stop, sample_ready[role], active_metric_samples[role],
+                  active_metric_errors), daemon=True) for role in active_metric_samples]
+        for thread in sample_threads:
+            thread.start()
+        for ready in sample_ready.values():
+            ready.wait(30)
+        try:
+            if args.probe_origin == "entry-local":
+                integrity = run_entry_local_probe("integrity", args.socks_port)
+                load = run_entry_local_probe("load", args.socks_port,
+                    target_mbps=target_mbps, duration_s=args.duration)
+            else:
+                integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
+                load = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
+                    target_mbps, args.duration)
+        finally:
+            sample_stop.set()
+            for thread in sample_threads:
+                thread.join(25)
         time.sleep(12)
         active_logs = {role: log_since(role, offsets[role]) for role in offsets}
         active_result = {"integrity": integrity, "load": load}
@@ -659,7 +744,8 @@ def main() -> None:
     middle_segment = collect_segment("middle", exit_host["host"], args.ping_samples, target_mbps)
     if active_logs is not None:
         for role, segment in (("entry", entry_segment), ("middle", middle_segment)):
-            summary = summarize_linkq(parse_linkq(active_logs[role]))
+            samples = active_metric_samples[role]
+            summary = summarize_linkq(samples if samples else parse_linkq(active_logs[role]))
             segment["quic"] = summary
             segment["candidate"] = recommend(summary,
                 deploy.LAB.get("transport", {}).get(role, {}), target_mbps,
@@ -675,6 +761,7 @@ def main() -> None:
         "baseline_hosts_sha256": hashlib.sha256(deploy.LAB_FILE.read_bytes()).hexdigest(),
         "baseline_profile_sha256": hashlib.sha256(deploy.LINE_PROFILE.read_bytes()).hexdigest() if deploy.LINE_PROFILE.is_file() else None,
         "active_probe": active_result,
+        "metric_collection_errors": active_metric_errors,
         "service_package": {
             "committed_mbps": package_mbps,
             "qualification_mbps": target_mbps,

@@ -15,7 +15,7 @@
       "line.disable"
     ],
     "known_hosts_file": "/opt/nb-controlplane/etc/known_hosts",
-    "secrets_file": "/opt/nb-controlplane/etc/device-secrets.json",
+    "secrets_file": "/opt/nb-controlplane/data/secrets/device-secrets.json",
     "sing_box": "/usr/bin/sing-box",
     "socks_port_min": 1082,
     "socks_port_max": 1199,

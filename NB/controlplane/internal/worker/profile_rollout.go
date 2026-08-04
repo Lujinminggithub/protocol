@@ -51,6 +51,26 @@ func loadRollout(path string) profileRolloutState {
 	return state
 }
 
+func summarizeTransportRollout(line LineSpec, registryStateDir string) *transportRolloutResult {
+	lineState := line.StateDir
+	if lineState == "" {
+		lineState = filepath.Join(registryStateDir, "lines", line.LineID)
+	}
+	state := loadRollout(filepath.Join(lineState, "transport", "rollout.json"))
+	if state.Generation == 0 {
+		return nil
+	}
+	result := &transportRolloutResult{Status: state.Status, Generation: state.Generation,
+		PrepareOrder: []string{"entry", "middle", "exit"}, CommitOrder: []string{"exit", "middle", "entry"},
+		Roles: map[string]transportRolloutRoleResult{}}
+	for _, role := range result.PrepareOrder {
+		result.Roles[role] = transportRolloutRoleResult{Prepared: state.Prepared[role],
+			Committed: state.Committed[role], Readback: state.Status == "committed" && state.Committed[role],
+			Fingerprint: state.Fingerprints[role]}
+	}
+	return result
+}
+
 func (r *Runner) profileCommand(ctx context.Context, line LineSpec, environment map[string]string,
 	output io.Writer, phase, role string, generation uint64, fingerprint uint64, profile string) error {
 	args := []string{filepath.Join(r.registry.Root, "tools", "transport_profile_apply.py"), phase,
@@ -62,14 +82,14 @@ func (r *Runner) profileCommand(ctx context.Context, line LineSpec, environment 
 	}
 	step := commandStep{Name: r.registry.Python, Stage: "profile-" + phase, Args: args}
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 8; attempt++ {
 		if last = r.execute(ctx, step, environment, output); last == nil {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * time.Second):
+		case <-time.After(time.Duration(min(attempt+1, 3)) * time.Second):
 		}
 	}
 	return last

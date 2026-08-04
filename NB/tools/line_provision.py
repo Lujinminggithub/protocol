@@ -68,6 +68,11 @@ def validate_line(line: dict) -> None:
         raise ValueError(f"{line_id}: 套餐仅支持 5/10/15 Mbps；自定义值需 allow_custom_package=true")
     if package < 1 or package > 1000:
         raise ValueError(f"{line_id}: package_mbps 必须在 1..1000")
+    upstream = float(line.get("upstream_mbps", package))
+    downstream = float(line.get("downstream_mbps", package))
+    if not 1 <= upstream <= 1000 or not 1 <= downstream <= 1000:
+        raise ValueError(f"{line_id}: upstream_mbps/downstream_mbps 必须在 1..1000")
+    line["upstream_mbps"], line["downstream_mbps"] = upstream, downstream
     client = line["client"]
     if not client.get("username") or not client.get("password_env"):
         raise ValueError(f"{line_id}: client.username/password_env 不能为空")
@@ -165,6 +170,8 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
                     password: str, headroom_ratio: float,
                     allow_conservative_fallback: bool = False) -> dict:
     package = float(line["package_mbps"])
+    upstream = float(line.get("upstream_mbps", package))
+    downstream = float(line.get("downstream_mbps", package))
     qualification_error = ""
     try:
         assert_qualified(candidate, package, headroom_ratio)
@@ -181,6 +188,8 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
     generated_hosts["line_service"] = {
         "line_id": line["line_id"],
         "package_mbps": package,
+        "upstream_mbps": upstream,
+        "downstream_mbps": downstream,
         "qualification_mbps": qualification_rate(package, headroom_ratio),
         "headroom_ratio": headroom_ratio,
     }
@@ -205,7 +214,8 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
         profile["qualification_warning"] = qualification_error
 
     username = str(line["client"]["username"])
-    rate_kbps = int(round(package * 1000))
+    rate_up_kbps = int(round(upstream * 1000))
+    rate_down_kbps = int(round(downstream * 1000))
     routes = []
     for route in generated_hosts.get("exits", []):
         routes.append({
@@ -216,11 +226,11 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
     if not routes:
         raise ValueError("拓扑没有 exits[]，无法生成固定出口策略")
     policy = {
-        "schema_version": 1,
+        "schema_version": 2,
         "fixed_exit": profile.get("fixed_exit"),
         "tenants": [{"name": username, "max_tcp": 256, "max_udp": 64,
-                     "rate_kbps": rate_kbps, "quota_mb": 0,
-                     "burst_seconds": 10}],
+                     "rate_up_kbps": rate_up_kbps, "rate_down_kbps": rate_down_kbps,
+                     "quota_mb": 0, "burst_up_seconds": 10, "burst_down_seconds": 10}],
         "routes": routes,
     }
     return {"hosts": generated_hosts, "profile": profile, "policy": policy,
@@ -344,6 +354,8 @@ def main() -> None:
             summaries.append({
                 "line_id": line_id, "status": status,
                 "package_mbps": float(line["package_mbps"]),
+                "upstream_mbps": float(line["upstream_mbps"]),
+                "downstream_mbps": float(line["downstream_mbps"]),
                 "measured_mbps": artifacts["profile"]["service_package"]["measured_mbps"],
                 "profile": str(line_dir / "stable-profile.json"),
                 "hosts": str(line_dir / "deployment-hosts.json"),

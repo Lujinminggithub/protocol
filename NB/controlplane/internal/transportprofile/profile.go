@@ -108,35 +108,39 @@ func minPositive(values ...int) int {
 }
 
 func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
-	rtt := evidence.QUIC.RTTP95MS
-	if rtt <= 0 {
-		rtt = evidence.ICMP.RTTAvgMS
+	loadedRTT := evidence.QUIC.RTTP95MS
+	if loadedRTT <= 0 {
+		loadedRTT = evidence.ICMP.RTTAvgMS
 	}
-	if rtt <= 0 {
-		rtt = 250
+	if loadedRTT <= 0 {
+		loadedRTT = 250
 	}
-	jitter := evidence.QUIC.JitterP95MS
-	if jitter <= 0 {
-		jitter = evidence.ICMP.MDevMS
+	pathRTT := evidence.ICMP.RTTAvgMS
+	if pathRTT <= 0 {
+		pathRTT = loadedRTT
 	}
 	loss := evidence.QUIC.EffectiveLossP95Pct
 	if evidence.QUIC.PacketsObserved == 0 {
 		loss = evidence.ICMP.LossPct
 	}
 	cc := "bbr"
-	if rtt <= 30 && jitter <= 5 && loss <= 1 {
+	// Loaded QUIC RTT/jitter includes queueing created by the validation load.
+	// It must not turn a short physical segment into an uncapped BBR segment.
+	if pathRTT <= 30 && evidence.ICMP.LossPct <= 1 && loss <= 1 {
 		cc = "cubic"
 	}
-	bdp := targetMbps * 1_000_000 / 8 * rtt / 1000
+	bdp := targetMbps * 1_000_000 / 8 * loadedRTT / 1000
 	cwin := ceil64K(math.Max(256*1024, math.Min(8*1024*1024, bdp*2)))
-	gap := int(math.Ceil(float64(evidence.QUIC.ReorderGapMax) * 1.25))
-	if gap < 3 {
-		gap = 3
+	// These values are adaptive floors. Mirror picoquic's observed-reorder
+	// safety margin without making RTT itself a permanent retransmit delay.
+	gap := int(math.Ceil(float64(evidence.QUIC.ReorderGapMax)*1.125)) + 8
+	if gap < 8 {
+		gap = 8
 	}
 	if gap > 1024 {
 		gap = 1024
 	}
-	delayMS := math.Max(2*rtt, evidence.QUIC.ReorderDelayMaxMS*1.25+math.Max(10, .25*rtt))
+	delayMS := math.Max(20, evidence.QUIC.ReorderDelayMaxMS*1.25+20)
 	delayUS := int64(math.Ceil(delayMS) * 1000)
 	if delayUS > 1_000_000 {
 		delayUS = 1_000_000
@@ -167,6 +171,9 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 		link.CWinMaxBytes = cwin
 	} else {
 		link.BBROptions = "Q0.0001:"
+		if pathRTT >= 100 {
+			link.BBROptions = "Q0.0001:F0.25:"
+		}
 	}
 	return link
 }
@@ -200,10 +207,9 @@ func Generate(lineID string, generation uint64, committedMbps float64, probe Pro
 	if !validEvidence(entryEvidence) || !validEvidence(middleEvidence) {
 		return Profile{}, errors.New("probe evidence contains invalid transport measurements")
 	}
-	target := probe.ServicePackage.QualificationMbps
-	if target <= 0 {
-		target = committedMbps * 1.25
-	}
+	// qualification_mbps is a validation load target with headroom. It is not
+	// a runtime service target and must never oversubscribe the purchased rate.
+	target := committedMbps
 	entryLink := calculateLink(entryEvidence, target)
 	middleLink := calculateLink(middleEvidence, target)
 	return Profile{SchemaVersion: SchemaVersion, LineID: lineID, Generation: generation,

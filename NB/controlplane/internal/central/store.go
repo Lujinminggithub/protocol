@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,7 +15,11 @@ import (
 
 var ErrConflict = errors.New("idempotency key was already used for a different operation")
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db          *sql.DB
+	operationMu sync.Mutex
+	specMu      sync.Mutex
+}
 
 type scanner interface{ Scan(...any) error }
 
@@ -203,7 +208,8 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS line_specs (
  line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
  resource_group TEXT NOT NULL, instance_id TEXT NOT NULL,
- bandwidth_mbps INTEGER NOT NULL, socks_port INTEGER NOT NULL,
+ bandwidth_mbps INTEGER NOT NULL, upstream_mbps INTEGER NOT NULL DEFAULT 0,
+ downstream_mbps INTEGER NOT NULL DEFAULT 0, socks_port INTEGER NOT NULL,
  udp_port_min INTEGER NOT NULL, udp_port_max INTEGER NOT NULL,
  relay_port INTEGER NOT NULL, exit_port INTEGER NOT NULL,
  exit_bind_ip TEXT NOT NULL DEFAULT '',
@@ -255,7 +261,7 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	if err != nil {
 		return err
 	}
-	foundExitBindIP := false
+	foundExitBindIP, foundUpstreamMbps, foundDownstreamMbps := false, false, false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, kind string
@@ -265,13 +271,37 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 			return err
 		}
 		foundExitBindIP = foundExitBindIP || name == "exit_bind_ip"
+		foundUpstreamMbps = foundUpstreamMbps || name == "upstream_mbps"
+		foundDownstreamMbps = foundDownstreamMbps || name == "downstream_mbps"
 	}
 	if err = rows.Close(); err != nil {
 		return err
 	}
 	if !foundExitBindIP {
 		_, err = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN exit_bind_ip TEXT NOT NULL DEFAULT ''`)
+		if err != nil {
+			return err
+		}
 	}
+	if !foundUpstreamMbps {
+		if _, err = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN upstream_mbps INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !foundDownstreamMbps {
+		if _, err = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN downstream_mbps INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if _, err = s.db.ExecContext(ctx, `UPDATE line_specs SET
+	 upstream_mbps=CASE WHEN upstream_mbps<=0 THEN bandwidth_mbps ELSE upstream_mbps END,
+	 downstream_mbps=CASE WHEN downstream_mbps<=0 THEN bandwidth_mbps ELSE downstream_mbps END`); err != nil {
+		return err
+	}
+	// Older workers represented a role-wide collection failure as a fake node.
+	// Remove those placeholders so they cannot degrade an otherwise healthy line.
+	_, err = s.db.ExecContext(ctx, `DELETE FROM snapshots
+ WHERE worker_id='collector' AND health='down' AND node_id LIKE '%-collector'`)
 	return err
 }
 
@@ -379,6 +409,9 @@ func (s *Store) Lines(ctx context.Context) ([]Line, error) {
 }
 
 func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error) {
+	if item.WorkerID == "collector" && item.Health == "down" && strings.HasSuffix(item.NodeID, "-collector") {
+		return false, nil
+	}
 	payload := item.Payload
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
@@ -430,6 +463,8 @@ func (s *Store) Incidents(ctx context.Context, limit int) ([]Incident, error) {
 }
 
 func (s *Store) CreateOperation(ctx context.Context, operation Operation) (Operation, bool, error) {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
 	var existing Operation
 	err := scanOperation(s.db.QueryRowContext(ctx, `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at
 	 FROM operations WHERE idempotency_key=?`, operation.IdempotencyKey), &existing)
@@ -444,11 +479,23 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) (Opera
 	}
 	stamp := now()
 	operation.Status, operation.CreatedAt, operation.UpdatedAt = "queued", stamp, stamp
-	_, err = s.db.ExecContext(ctx, `INSERT INTO operations
+	inserted, err := s.db.ExecContext(ctx, `INSERT INTO operations
  (id,line_id,kind,status,requested_by,idempotency_key,request,created_at,updated_at)
- VALUES(?,?,?,?,?,?,?,?,?)`, operation.ID, operation.LineID, operation.Kind, operation.Status, operation.RequestedBy,
-		operation.IdempotencyKey, []byte(operation.Request), stamp, stamp)
-	return operation, false, err
+ SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (
+ SELECT 1 FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running'))`,
+		operation.ID, operation.LineID, operation.Kind, operation.Status, operation.RequestedBy,
+		operation.IdempotencyKey, []byte(operation.Request), stamp, stamp, operation.LineID)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	count, err := inserted.RowsAffected()
+	if err != nil {
+		return Operation{}, false, err
+	}
+	if count != 1 {
+		return Operation{}, false, errors.New("line already has an active operation")
+	}
+	return operation, false, nil
 }
 
 func (s *Store) OperationByIdempotencyKey(ctx context.Context, key string) (Operation, error) {

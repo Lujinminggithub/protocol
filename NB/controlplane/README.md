@@ -10,7 +10,13 @@ health/metrics and sends durable, idempotent events to an existing web service.
 binary and keeps device inventory, line
 topology, latest worker snapshots, incidents and typed operations in SQLite.
 It never stores SSH passwords or node private keys; a line stores only a
-`secret_ref` that points to the external secret owner.
+`secret_ref` that points to the local secret owner. When an operator registers a
+device in the Web UI, the initial SSH password is required and is written to the
+shared `/opt/nb-controlplane/data/secrets/device-secrets.json` with directory
+mode `0700`, file mode `0600`, and
+atomic replacement. SQLite and API responses keep only the generated
+`device:<device-id>` reference. Editing a device leaves the stored password
+unchanged unless a replacement password is entered.
 
 For local development and diagnostics only, start it on Windows:
 
@@ -90,9 +96,10 @@ shape, bandwidth and assigned port ranges before resolving local secret refs.
 
 Existing lines can remain fixed in the worker's ignored private registry
 (`tools/private/nb-web-worker.json`). New lines select registered devices in the
-web topology editor. A device stores an SSH endpoint and a `secret_ref`, never a
-password. The worker resolves that reference from an environment variable or
-its ignored local secrets file and creates private per-line deployment state.
+web topology editor. A device stores an SSH endpoint and a `secret_ref` in the
+database, never a password. The Web service accepts the initial password and
+updates the ignored local secrets file; the worker resolves that generated
+reference from the same file and creates private per-line deployment state.
 Restricted nmap probing is only used for the registered SSH port; configuration
 and artifact distribution continue to use SSH/SFTP.
 
@@ -164,10 +171,11 @@ pointer are atomic.
 
 ### Remote SRS whitelist
 
-Set a line's `srs_ref` to an environment reference such as
-`env:NB_LINE_SRS_URL`; do not store a URL containing a key in SQLite. Install
-sing-box 1.10 or newer on the Windows worker and set `dynamic.sing_box` when it
-is not on `PATH`. The updater accepts either an `MD5|HTTPS URL` metadata response
+Enter the line's HTTPS whitelist update URL in the Web console. The worker maps
+it to a private process environment value so query keys are not exposed in
+command lines or operation progress. Existing `env:` and local secret references
+remain supported for compatibility. Install sing-box 1.10 or newer on the worker
+and set `dynamic.sing_box` when it is not on `PATH`. The updater accepts either an `MD5|HTTPS URL` metadata response
 or a direct HTTPS SRS download. An unchanged metadata MD5 skips the download;
 a direct source is downloaded but only applied when its local MD5 changes.
 

@@ -330,6 +330,8 @@ def checkpoint_fingerprint(hosts_path: pathlib.Path, profile_path: pathlib.Path,
         "checkpoint_protocol": 2,
         "line_id": args.line_id,
         "package_mbps": args.package_mbps,
+        "upstream_mbps": args.upstream_mbps,
+        "downstream_mbps": args.downstream_mbps,
         "socks_port": args.socks_port,
         "middle_port": args.middle_port,
         "exit_port": args.exit_port,
@@ -465,6 +467,8 @@ def main() -> None:
     parser.add_argument("hosts", type=pathlib.Path, help="三台机器清单 JSON")
     parser.add_argument("--line-id", required=True)
     parser.add_argument("--package-mbps", type=float, required=True)
+    parser.add_argument("--upstream-mbps", type=float)
+    parser.add_argument("--downstream-mbps", type=float)
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--middle-port", type=int, default=int(os.environ.get("NB_MIDDLE_PORT", "4443")))
     parser.add_argument("--exit-port", type=int, default=int(os.environ.get("NB_EXIT_PORT", "4443")))
@@ -482,6 +486,10 @@ def main() -> None:
         parser.error(str(error))
     if not 1 <= args.package_mbps <= 1000:
         parser.error("--package-mbps must be between 1 and 1000")
+    args.upstream_mbps = args.package_mbps if args.upstream_mbps is None else args.upstream_mbps
+    args.downstream_mbps = args.package_mbps if args.downstream_mbps is None else args.downstream_mbps
+    if not 1 <= args.upstream_mbps <= 1000 or not 1 <= args.downstream_mbps <= 1000:
+        parser.error("--upstream-mbps and --downstream-mbps must be between 1 and 1000")
     if not 1 <= args.socks_port <= 65535:
         raise SystemExit("--socks-port 非法")
     if any(port < 1 or port > 65535 for port in (args.socks_port, args.middle_port, args.exit_port)):
@@ -508,6 +516,9 @@ def main() -> None:
         "lines": [{"line_id": args.line_id, "hosts_file": str(bootstrap_hosts),
                    "baseline_profile": str(bootstrap_profile),
                    "package_mbps": args.package_mbps,
+                   "allow_custom_package": True,
+                   "upstream_mbps": args.upstream_mbps,
+                   "downstream_mbps": args.downstream_mbps,
                    "client": {"name": args.line_id, "port": args.socks_port,
                               "username": args.client_username,
                               "password_env": "NB_OPEN_CLIENT_PASSWORD"}}],
@@ -515,7 +526,8 @@ def main() -> None:
     inventory_path = output / "provision-inventory.json"
     write_json(inventory_path, inventory)
     plan = {
-        "schema_version": 1, "line_id": args.line_id, "package_mbps": args.package_mbps,
+        "schema_version": 2, "line_id": args.line_id, "package_mbps": args.package_mbps,
+        "upstream_mbps": args.upstream_mbps, "downstream_mbps": args.downstream_mbps,
         "qualification_mbps": args.package_mbps * 1.25, "socks_port": args.socks_port,
         "instance_id": os.environ.get("NB_DEPLOY_INSTANCE", ""),
         "middle_port": args.middle_port, "exit_port": args.exit_port,
