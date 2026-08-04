@@ -297,11 +297,20 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	var source struct {
+		Entry struct {
+			Name string `json:"name"`
+		} `json:"entry"`
+		Middle struct {
+			Name string `json:"name"`
+		} `json:"middle"`
 		Exit struct {
+			Name  string `json:"name"`
 			OutIP string `json:"outip"`
 		} `json:"exit"`
 		Exits []struct {
-			Capacity int `json:"capacity"`
+			Capacity int    `json:"capacity"`
+			Name     string `json:"name"`
+			Fixed    string `json:"fixed_exit"`
 		} `json:"exits"`
 	}
 	if err := json.Unmarshal(sourceData, &source); err != nil {
@@ -309,6 +318,10 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	}
 	if source.Exit.OutIP != plan.ExitBindIP || len(source.Exits) != 1 || source.Exits[0].Capacity != 0 {
 		t.Fatalf("package bandwidth leaked into route session capacity: %#v", source.Exits)
+	}
+	if source.Entry.Name != "entry-1" || source.Middle.Name != "relay-1" || source.Exit.Name != "exit-1" ||
+		source.Exits[0].Name != "exit-1" || source.Exits[0].Fixed != "exit-1" {
+		t.Fatalf("protocol topology used mutable display names: %#v", source)
 	}
 	invalidPlan := plan
 	invalidPlan.ExitBindIP = "2001:db8::1"

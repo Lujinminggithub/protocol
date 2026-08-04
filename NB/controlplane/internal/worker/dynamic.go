@@ -338,7 +338,8 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 		if name == "relay" {
 			name = "middle"
 		}
-		host := map[string]any{"name": node.Device.Name, "host": node.Device.Host, "port": node.Device.SSHPort, "user": node.Device.SSHUser, "private_ip": node.Device.PrivateIP}
+		// Protocol identities must remain stable and safe even when operators localize display names.
+		host := map[string]any{"name": node.DeviceID, "host": node.Device.Host, "port": node.Device.SSHPort, "user": node.Device.SSHUser, "private_ip": node.Device.PrivateIP}
 		if secret.Password != "" {
 			envName := "NB_SSH_PASSWORD_" + strings.ToUpper(name)
 			host["password"] = secret.Password
