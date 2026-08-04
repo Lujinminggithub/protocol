@@ -87,28 +87,28 @@ func (r *Runner) resolveSecret(ref string) (localSecret, error) {
 	if strings.HasPrefix(ref, "env:") {
 		name := strings.TrimPrefix(ref, "env:")
 		if !safeID.MatchString(name) {
-			return localSecret{}, errors.New("invalid environment secret reference")
+			return localSecret{}, errors.New("环境变量凭据引用无效")
 		}
 		if os.Getenv(name) == "" {
-			return localSecret{}, fmt.Errorf("secret environment variable is unavailable: %s", name)
+			return localSecret{}, fmt.Errorf("凭据环境变量不可用：%s", name)
 		}
 		return localSecret{PasswordEnv: name}, nil
 	}
 	if strings.HasPrefix(ref, "worker-local:") {
 		parts := strings.Split(ref, ":")
 		if len(parts) != 3 || !safeID.MatchString(parts[1]) {
-			return localSecret{}, errors.New("invalid worker-local secret reference")
+			return localSecret{}, errors.New("worker 本地凭据引用无效")
 		}
 		role := parts[2]
 		if role == "relay" {
 			role = "middle"
 		}
 		if role != "entry" && role != "middle" && role != "exit" {
-			return localSecret{}, errors.New("invalid worker-local secret role")
+			return localSecret{}, errors.New("worker 本地凭据角色无效")
 		}
 		line, ok := r.registry.Line(parts[1])
 		if !ok {
-			return localSecret{}, errors.New("worker-local source line is unavailable")
+			return localSecret{}, errors.New("worker 本地来源线路不可用")
 		}
 		source, err := loadJSON(line.SourceMachinesFile)
 		if err != nil || len(source) == 0 {
@@ -119,16 +119,16 @@ func (r *Runner) resolveSecret(ref string) (localSecret, error) {
 		}
 		host := roleObject(source, role)
 		if host == nil {
-			return localSecret{}, errors.New("worker-local source role is unavailable")
+			return localSecret{}, errors.New("worker 本地来源角色不可用")
 		}
 		secret := localSecret{Password: text(host["password"]), PasswordEnv: text(host["password_env"])}
 		if secret.Password == "" && (secret.PasswordEnv == "" || os.Getenv(secret.PasswordEnv) == "") {
-			return localSecret{}, errors.New("resolved worker-local device secret is empty")
+			return localSecret{}, errors.New("解析后的 worker 本地设备凭据为空")
 		}
 		return secret, nil
 	}
 	if r.registry.Dynamic.SecretsFile == "" {
-		return localSecret{}, errors.New("dynamic secrets file is not configured")
+		return localSecret{}, errors.New("未配置动态凭据文件")
 	}
 	data, err := os.ReadFile(r.registry.Dynamic.SecretsFile)
 	if err != nil {
@@ -140,10 +140,10 @@ func (r *Runner) resolveSecret(ref string) (localSecret, error) {
 	}
 	secret, ok := values[ref]
 	if !ok {
-		return localSecret{}, fmt.Errorf("secret reference is not available: %s", ref)
+		return localSecret{}, fmt.Errorf("凭据引用不可用：%s", ref)
 	}
 	if secret.Password == "" && (secret.PasswordEnv == "" || os.Getenv(secret.PasswordEnv) == "") {
-		return localSecret{}, errors.New("resolved device secret is empty")
+		return localSecret{}, errors.New("解析后的设备凭据为空")
 	}
 	return secret, nil
 }
@@ -155,20 +155,20 @@ func (r *Runner) resolveWhitelistSource(ref string) (string, map[string]string, 
 	if strings.HasPrefix(ref, "env:") {
 		name := strings.TrimPrefix(ref, "env:")
 		if !safeID.MatchString(name) || os.Getenv(name) == "" {
-			return "", nil, errors.New("whitelist source environment variable is unavailable")
+			return "", nil, errors.New("白名单来源环境变量不可用")
 		}
 		return name, nil, nil
 	}
 	if strings.Contains(ref, "://") {
 		parsed, err := url.ParseRequestURI(ref)
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-			return "", nil, errors.New("whitelist source URL must use HTTPS")
+			return "", nil, errors.New("白名单来源地址必须使用 HTTPS")
 		}
 		const name = "NB_WHITELIST_SOURCE_URL"
 		return name, map[string]string{name: ref}, nil
 	}
 	if r.registry.Dynamic.SecretsFile == "" {
-		return "", nil, errors.New("dynamic secrets file is not configured")
+		return "", nil, errors.New("未配置动态凭据文件")
 	}
 	data, err := os.ReadFile(r.registry.Dynamic.SecretsFile)
 	if err != nil {
@@ -180,13 +180,13 @@ func (r *Runner) resolveWhitelistSource(ref string) (string, map[string]string, 
 	}
 	secret, ok := values[ref]
 	if !ok {
-		return "", nil, errors.New("whitelist source reference is unavailable")
+		return "", nil, errors.New("白名单来源引用不可用")
 	}
 	if secret.URLEnv != "" && os.Getenv(secret.URLEnv) != "" {
 		return secret.URLEnv, nil, nil
 	}
 	if secret.URL == "" {
-		return "", nil, errors.New("whitelist source URL is empty")
+		return "", nil, errors.New("白名单来源地址为空")
 	}
 	const name = "NB_WHITELIST_SOURCE_URL"
 	return name, map[string]string{name: secret.URL}, nil
@@ -195,45 +195,46 @@ func (r *Runner) resolveWhitelistSource(ref string) (string, map[string]string, 
 func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) error {
 	cfg := r.registry.Dynamic
 	if !cfg.Enabled || !contains(operation.Kind, cfg.Operations) {
-		return errors.New("dynamic operation is not enabled")
+		return errors.New("当前动态操作未启用")
 	}
 	if plan.LineID != operation.LineID || !safeID.MatchString(plan.LineID) || !contains(plan.ResourceGroup, cfg.ResourceGroups) {
-		return errors.New("dynamic line identity or resource group is not allowed")
+		return errors.New("线路标识或资源组不在 worker 授权范围内")
 	}
 	if plan.InstanceID == "" || !safeID.MatchString(plan.InstanceID) || plan.BandwidthMbps < 1 || plan.BandwidthMbps > 1000 ||
 		plan.UpstreamMbps < 1 || plan.UpstreamMbps > 1000 || plan.DownstreamMbps < 1 || plan.DownstreamMbps > 1000 {
-		return errors.New("invalid dynamic instance or bandwidth")
+		return errors.New("线路实例或上下行平均速率无效")
 	}
 	if plan.BuildMode != "auto" && plan.BuildMode != "binary" && plan.BuildMode != "source" {
-		return errors.New("invalid dynamic build mode")
+		return errors.New("线路构建策略无效")
 	}
 	if plan.ArtifactRef != "" && filepath.ToSlash(plan.ArtifactRef) != "build/nb_node" {
-		return errors.New("dynamic artifact must use the verified local build/nb_node")
+		return errors.New("线路二进制必须使用已校验的本地 build/nb_node")
 	}
 	if plan.SourceRef != "" && plan.SourceRef != "repo://current" {
-		return errors.New("dynamic source must use the current repository")
+		return errors.New("线路源码必须使用当前仓库")
 	}
 	if plan.SocksPort < cfg.SocksPortMin || plan.SocksPort > cfg.SocksPortMax || plan.RelayPort < cfg.RelayPortMin || plan.RelayPort+transportWorkerLanes-1 > cfg.RelayPortMax || plan.UDPPortMin < cfg.UDPPortMin || plan.UDPPortMax > cfg.UDPPortMax || plan.UDPPortMin > plan.UDPPortMax || plan.ExitPort < 1 || plan.ExitPort+transportWorkerLanes-1 > 65535 {
-		return errors.New("dynamic plan exceeds assigned port limits")
+		return fmt.Errorf("线路端口超出 worker 授权范围：入口 %d-%d，Relay %d-%d，UDP %d-%d",
+			cfg.SocksPortMin, cfg.SocksPortMax, cfg.RelayPortMin, cfg.RelayPortMax, cfg.UDPPortMin, cfg.UDPPortMax)
 	}
 	if plan.ExitBindIP != "" {
 		parsed := net.ParseIP(plan.ExitBindIP)
 		if parsed == nil || parsed.To4() == nil {
-			return errors.New("dynamic exit_bind_ip must be an IPv4 address")
+			return errors.New("线路出口 IP 必须是 IPv4 地址")
 		}
 	}
 	roles := map[string]int{}
 	for _, node := range plan.Nodes {
 		if node.Role != "entry" && node.Role != "relay" && node.Role != "exit" {
-			return errors.New("invalid dynamic node role")
+			return errors.New("线路节点角色无效")
 		}
 		if !safeID.MatchString(node.Device.ID) || node.Device.ID != node.DeviceID || !dynamicHostValid(node.Device.Host) || node.Device.SSHPort < 1 || node.Device.SSHPort > 65535 || node.Device.SSHUser == "" {
-			return errors.New("invalid dynamic device")
+			return errors.New("线路设备信息无效")
 		}
 		roles[node.Role]++
 	}
 	if roles["entry"] != 1 || roles["relay"] != 1 || roles["exit"] != 1 {
-		return errors.New("current NB topology requires one entry, relay and exit")
+		return errors.New("当前 NB 拓扑必须且只能包含一个 Entry、Relay 和 Exit")
 	}
 	return nil
 }
@@ -325,7 +326,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	}
 	knownHosts, err := r.ensureDynamicKnownHosts(lineState)
 	if err != nil {
-		return LineSpec{}, fmt.Errorf("initialize dynamic known_hosts: %w", err)
+		return LineSpec{}, fmt.Errorf("初始化动态 known_hosts 失败：%w", err)
 	}
 	sourcePath := filepath.Join(lineState, "source-machines.json")
 	roles := map[string]any{}
@@ -384,7 +385,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 		if strings.HasPrefix(value, "domain ") || strings.HasPrefix(value, "domain_suffix ") || strings.HasPrefix(value, "domain_exact ") || strings.HasPrefix(value, "domain_keyword ") || strings.HasPrefix(value, "ip ") || strings.HasPrefix(value, "port ") {
 			lines = append(lines, value)
 		} else {
-			return LineSpec{}, errors.New("invalid whitelist rule")
+			return LineSpec{}, errors.New("白名单规则无效")
 		}
 	}
 	if err := os.MkdirAll(lineState, 0700); err != nil {
@@ -395,7 +396,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 		if len(plan.Whitelist) == 0 {
 			contents, err = os.ReadFile(filepath.Join(r.registry.Root, "tools", "whitelist.local.conf"))
 			if err != nil {
-				return LineSpec{}, fmt.Errorf("default whitelist is unavailable: %w", err)
+				return LineSpec{}, fmt.Errorf("默认白名单不可用：%w", err)
 			}
 		}
 		if err := os.WriteFile(whitelistPath, contents, 0600); err != nil {

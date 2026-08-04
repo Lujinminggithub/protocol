@@ -13,6 +13,9 @@ const statusText = {ok:"健康",healthy:"健康",degraded:"异常",down:"离线"
 function healthState(value) { return value === "ok" ? "healthy" : (value || "unknown"); }
 const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优"};
 const roleText = {entry:"Entry",relay:"Relay",exit:"Exit"};
+const stageText = {prepare:"准备",build:"构建",provision:"开线部署",validate:"线路验证",deploy:"部署",rollback:"回滚",stop:"停用",whitelist:"白名单下发","whitelist-fetch":"白名单更新"};
+const legacyMessageText = {"preparing operation":"正在准备任务","operation prepared":"任务准备完成","step started":"步骤开始执行","step completed":"步骤执行完成","operation completed":"任务执行完成","dynamic plan exceeds assigned port limits":"线路端口超出 worker 授权范围"};
+function operationMessage(value) { return legacyMessageText[value] || value; }
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -207,8 +210,8 @@ async function hydrateClientConfig(container) {
   catch(error){status.textContent=`二维码生成失败：${error.message}`;}
 }
 function operationTimeline(operation, events) {
-  if (events.length) return events.map((event)=>`<div class="timeline-item ${escapeHTML(event.status)}"><span>${event.sequence}</span><div><strong>${escapeHTML(event.stage)}</strong><small>${escapeHTML(event.message||statusText[event.status]||event.status)} · ${formatTime(event.created_at)}</small></div></div>`).join("");
-  if (operation.status === "failed") return `<div class="timeline-item failed"><span>!</span><div><strong>prepare</strong><small>${escapeHTML(operation.result?.message || "任务在执行准备阶段失败")}</small></div></div>`;
+  if (events.length) return events.map((event)=>`<div class="timeline-item ${escapeHTML(event.status)}"><span>${event.sequence}</span><div><strong>${escapeHTML(stageText[event.stage]||event.stage)}</strong><small>${escapeHTML(operationMessage(event.message)||statusText[event.status]||event.status)} · ${formatTime(event.created_at)}</small></div></div>`).join("");
+  if (operation.status === "failed") return `<div class="timeline-item failed"><span>!</span><div><strong>准备</strong><small>${escapeHTML(operationMessage(operation.result?.message) || "任务在执行准备阶段失败")}</small></div></div>`;
   return `<div class="topology-empty">任务等待执行器领取</div>`;
 }
 function tuneResultSection(operation) {

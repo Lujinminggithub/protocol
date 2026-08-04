@@ -383,7 +383,7 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 	defer a.operationMu.Unlock()
 	key := r.Header.Get("Idempotency-Key")
 	if !safeID.MatchString(key) {
-		problem(w, 400, "valid Idempotency-Key is required")
+		problem(w, 400, "缺少有效的任务幂等键")
 		return
 	}
 	var req operationRequest
@@ -400,13 +400,13 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.upgrade": true, "line.rollback": true, "line.disable": true, "line.tune": true}
 	if !safeID.MatchString(req.ID) || !safeID.MatchString(req.LineID) || !allowed[req.Kind] || !safeID.MatchString(req.RequestedBy) {
-		problem(w, 400, "invalid operation")
+		problem(w, 400, "任务参数无效")
 		return
 	}
 	if existing, existingErr := a.store.OperationByIdempotencyKey(r.Context(), key); existingErr == nil {
 		if existing.LineID != req.LineID || existing.Kind != req.Kind || existing.RequestedBy != req.RequestedBy ||
 			!sameUserOperationRequest(existing.Request, req.Request) {
-			problem(w, http.StatusConflict, central.ErrConflict.Error())
+			problem(w, http.StatusConflict, "幂等键已用于其他任务")
 			return
 		}
 		writeJSON(w, http.StatusOK, existing)
@@ -416,10 +416,14 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := a.store.Line(r.Context(), req.LineID); err != nil {
-		problem(w, 404, "line not found")
+		problem(w, 404, "线路不存在")
 		return
 	}
 	if spec, specErr := a.store.LineSpec(r.Context(), req.LineID); specErr == nil {
+		if specErr = validLineSpec(spec); specErr != nil {
+			problem(w, 409, "线路部署参数无效："+specErr.Error())
+			return
+		}
 		var values map[string]any
 		if len(req.Request) == 0 || json.Unmarshal(req.Request, &values) != nil {
 			values = map[string]any{}
@@ -435,7 +439,7 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Request, _ = json.Marshal(values)
 	} else if req.Kind == "line.open" {
-		problem(w, 409, "line deployment specification is required before opening")
+		problem(w, 409, "开线前必须先保存线路部署参数")
 		return
 	}
 	executors, err := a.store.Executors(r.Context(), 45*time.Second)
@@ -462,7 +466,7 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !available {
-		problem(w, 409, "no online executor is authorized for this operation")
+		problem(w, 409, "当前没有在线且获得授权的执行器")
 		return
 	}
 	if len(req.Request) == 0 {

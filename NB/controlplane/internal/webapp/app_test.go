@@ -430,6 +430,12 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) {
 		t.Fatalf("save topology status=%d body=%s", response.StatusCode, body)
 	}
+	spec["socks_port"] = 1080
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("1082-1199")) {
+		t.Fatalf("out-of-range entry port status=%d body=%s", response.StatusCode, body)
+	}
+	spec["socks_port"] = 1082
 	spec["srs_ref"] = "http://rules.example.invalid/whitelist.srs"
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
 	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("HTTPS")) {
@@ -438,7 +444,7 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	spec["srs_ref"] = "https://rules.example.invalid/whitelist.srs?key=test-key"
 	spec["exit_bind_ip"] = "2001:db8::1"
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
-	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("exit_bind_ip")) {
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("IPv4")) {
 		t.Fatalf("IPv6 exit bind address status=%d body=%s", response.StatusCode, body)
 	}
 	spec["exit_bind_ip"] = "192.0.2.3"
@@ -453,7 +459,7 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		"whitelist": []string{}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-2/spec", "admin", "", conflictingSpec)
-	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("exit port conflicts")) {
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("Exit")) || !bytes.Contains(body, []byte("冲突")) {
 		t.Fatalf("shared exit port conflict status=%d body=%s", response.StatusCode, body)
 	}
 	autoLine := map[string]any{"id": "line-auto", "name": "auto allocated line", "status": "draft", "entry_region": "entry",
@@ -463,7 +469,7 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		t.Fatalf("create auto line status=%d body=%s", response.StatusCode, body)
 	}
 	autoSpec := map[string]any{"resource_group": "other-group", "instance_id": "", "bandwidth_mbps": 20,
-		"socks_port": 1282, "relay_port": 0, "exit_port": 0, "udp_port_min": 0, "udp_port_max": 0,
+		"socks_port": 1083, "relay_port": 0, "exit_port": 0, "udp_port_min": 0, "udp_port_max": 0,
 		"whitelist": []string{}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-auto/spec", "admin", "", autoSpec)
@@ -544,7 +550,7 @@ func TestAgentDiscoversMissingTopologyAndIncompleteLineCanBeDeleted(t *testing.T
 	}
 	discovery := map[string]any{"worker_id": "worker-1", "observed_at": time.Now().UTC(), "lines": []map[string]any{{
 		"line":    map[string]any{"id": "line-1", "name": "line-1", "status": "maintenance", "entry_region": "gz", "exit_region": "us", "provider": "mixed", "capacity_mbps": 10, "active_deployment": "", "profile": "", "secret_ref": ""},
-		"devices": devices, "spec": map[string]any{"line_id": "line-1", "resource_group": "shared", "instance_id": "us", "bandwidth_mbps": 10, "socks_port": 1080, "udp_port_min": 20000, "udp_port_max": 21023, "relay_port": 4443, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "whitelist": []string{}, "build_mode": "source", "artifact_ref": "build/nb_node", "source_ref": "repo://current", "srs_ref": "", "jump_policy": "auto", "nodes": nodes},
+		"devices": devices, "spec": map[string]any{"line_id": "line-1", "resource_group": "shared", "instance_id": "us", "bandwidth_mbps": 10, "socks_port": 1082, "udp_port_min": 22048, "udp_port_max": 23071, "relay_port": 4445, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "whitelist": []string{}, "build_mode": "source", "artifact_ref": "build/nb_node", "source_ref": "repo://current", "srs_ref": "", "jump_policy": "auto", "nodes": nodes},
 	}}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/inventory", "agent", "", discovery)
 	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"status":"discovered"`)) {

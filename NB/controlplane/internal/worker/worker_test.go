@@ -328,6 +328,11 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	if _, err = runner.dynamicLine(Operation{ID: "op-invalid", LineID: invalidPlan.LineID, Kind: "line.open"}, requestValues{Plan: invalidPlan}, t.TempDir()); err == nil {
 		t.Fatal("dynamic line accepted an IPv6 exit bind address")
 	}
+	invalidPlan = plan
+	invalidPlan.SocksPort = 1080
+	if _, err = runner.dynamicLine(Operation{ID: "op-invalid-port", LineID: invalidPlan.LineID, Kind: "line.open"}, requestValues{Plan: invalidPlan}, t.TempDir()); err == nil || !strings.Contains(err.Error(), "线路端口超出") {
+		t.Fatalf("dynamic line did not reject an out-of-range port in Chinese: %v", err)
+	}
 	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
 	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
 		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)

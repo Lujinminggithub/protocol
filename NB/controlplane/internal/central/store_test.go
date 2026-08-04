@@ -61,7 +61,7 @@ func TestAllocateLineSpecAssignsUniqueEntryPortAndSaveRechecksConflict(t *testin
 	nodes := []LineNode{{DeviceID: "entry-1", Role: "entry"}, {DeviceID: "relay-1", Role: "relay"}, {DeviceID: "exit-1", Role: "exit"}}
 	first := LineSpec{LineID: "line-1", ResourceGroup: "shared", InstanceID: "line-1_1", BandwidthMbps: 10,
 		UpstreamMbps: 6, DownstreamMbps: 14,
-		SocksPort: 1080, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
 		Whitelist: json.RawMessage(`[]`), BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Nodes: nodes}
 	savedFirst, err := store.SaveLineSpec(t.Context(), first)
 	if err != nil {
@@ -78,15 +78,15 @@ func TestAllocateLineSpecAssignsUniqueEntryPortAndSaveRechecksConflict(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.SocksPort != 1081 || second.RelayPort != 4447 || second.ExitPort != 4445 || second.UDPPortMin != 23072 {
+	if second.SocksPort != 1083 || second.RelayPort != 4447 || second.ExitPort != 4445 || second.UDPPortMin != 23072 {
 		t.Fatalf("unexpected automatic resources: %+v", second)
 	}
 	if second.UpstreamMbps != 10 || second.DownstreamMbps != 10 {
 		t.Fatalf("legacy bandwidth was not inherited by both directions: %+v", second)
 	}
 	conflicting := second
-	conflicting.SocksPort = 1080
-	if _, err = store.SaveLineSpec(t.Context(), conflicting); err == nil || !strings.Contains(err.Error(), "entry port conflicts") {
+	conflicting.SocksPort = 1082
+	if _, err = store.SaveLineSpec(t.Context(), conflicting); err == nil || !strings.Contains(err.Error(), "入口端口") {
 		t.Fatalf("conflicting entry port error=%v", err)
 	}
 	if _, err = store.SaveLineSpec(t.Context(), second); err != nil {

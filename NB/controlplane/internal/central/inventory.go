@@ -327,7 +327,20 @@ func lineDevice(spec LineSpec, role string) string {
 
 // Every NB transport instance currently starts two workers. Each worker binds
 // base+workerIndex, so relay and exit reservations must cover both lane ports.
-const transportWorkerLanes = 2
+const ManagedTransportWorkerLanes = 2
+
+const transportWorkerLanes = ManagedTransportWorkerLanes
+
+const (
+	ManagedSocksPortMin = 1082
+	ManagedSocksPortMax = 1199
+	ManagedRelayPortMin = 4445
+	ManagedRelayPortMax = 4599
+	ManagedExitPortMin  = 4443
+	ManagedExitPortMax  = 4599
+	ManagedUDPPortMin   = 22048
+	ManagedUDPPortMax   = 65535
+)
 
 func nextFreePortSpan(used map[int]bool, first, last, width int) (int, error) {
 	for port := first; port+width-1 <= last; port++ {
@@ -372,7 +385,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 	spec.NormalizeRates()
 	if spec.InstanceID == "" {
 		if len(spec.LineID)+2 > 48 {
-			return LineSpec{}, errors.New("line ID is too long for an automatic deployment instance")
+			return LineSpec{}, errors.New("线路 ID 过长，无法生成部署实例名称")
 		}
 		spec.InstanceID = spec.LineID + "_1"
 	}
@@ -380,15 +393,15 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 	relayDevice := lineDevice(spec, "relay")
 	exitDevice := lineDevice(spec, "exit")
 	if entryDevice == "" || relayDevice == "" || exitDevice == "" {
-		return LineSpec{}, errors.New("port allocation requires entry, relay, and exit devices")
+		return LineSpec{}, errors.New("分配端口前必须指定 Entry、Relay 和 Exit 设备")
 	}
 	if spec.SocksPort == 0 {
 		used, err := s.usedRolePortSpans(ctx, spec.LineID, entryDevice, "entry", "socks_port", 1)
 		if err != nil {
 			return LineSpec{}, err
 		}
-		if spec.SocksPort, err = nextFreePortSpan(used, 1080, 65535, 1); err != nil {
-			return LineSpec{}, errors.New("no entry SOCKS port is available")
+		if spec.SocksPort, err = nextFreePortSpan(used, ManagedSocksPortMin, ManagedSocksPortMax, 1); err != nil {
+			return LineSpec{}, errors.New("没有可用的入口 SOCKS 端口")
 		}
 	}
 	if spec.RelayPort == 0 {
@@ -396,7 +409,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 		if err != nil {
 			return LineSpec{}, err
 		}
-		if spec.RelayPort, err = nextFreePortSpan(used, 4445, 4599, transportWorkerLanes); err != nil {
+		if spec.RelayPort, err = nextFreePortSpan(used, ManagedRelayPortMin, ManagedRelayPortMax, transportWorkerLanes); err != nil {
 			return LineSpec{}, err
 		}
 	}
@@ -405,7 +418,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 		if err != nil {
 			return LineSpec{}, err
 		}
-		if spec.ExitPort, err = nextFreePortSpan(used, 4443, 4599, transportWorkerLanes); err != nil {
+		if spec.ExitPort, err = nextFreePortSpan(used, ManagedExitPortMin, ManagedExitPortMax, transportWorkerLanes); err != nil {
 			return LineSpec{}, err
 		}
 	}
@@ -428,7 +441,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 		if err = rows.Close(); err != nil {
 			return LineSpec{}, err
 		}
-		for first := 22048; first+1023 <= 65023; first += 1024 {
+		for first := ManagedUDPPortMin; first+1023 <= 65023; first += 1024 {
 			last, available := first+1023, true
 			for _, item := range ranges {
 				if first <= item[1] && item[0] <= last {
@@ -442,7 +455,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 			}
 		}
 		if spec.UDPPortMin == 0 {
-			return LineSpec{}, errors.New("no UDP relay range is available")
+			return LineSpec{}, errors.New("没有可用的 UDP Relay 端口段")
 		}
 	}
 	return spec, nil
@@ -457,7 +470,7 @@ func lineSpecConflict(ctx context.Context, queryer rowQuerier, spec LineSpec) (s
 		role, column, label string
 		port                int
 		width               int
-	}{{"entry", "socks_port", "entry", spec.SocksPort, 1}, {"relay", "relay_port", "relay", spec.RelayPort, transportWorkerLanes}, {"exit", "exit_port", "exit", spec.ExitPort, transportWorkerLanes}}
+	}{{"entry", "socks_port", "入口", spec.SocksPort, 1}, {"relay", "relay_port", "Relay", spec.RelayPort, transportWorkerLanes}, {"exit", "exit_port", "Exit", spec.ExitPort, transportWorkerLanes}}
 	for _, check := range checks {
 		deviceID := lineDevice(spec, check.role)
 		var conflictingLine string
@@ -466,7 +479,7 @@ func lineSpecConflict(ctx context.Context, queryer rowQuerier, spec LineSpec) (s
 	 WHERE s.line_id<>? AND ?<=s.%s+? AND s.%s<=? AND n.device_id=? LIMIT 1`, check.column, check.column)
 		err := queryer.QueryRowContext(ctx, query, check.role, spec.LineID, check.port, check.width-1, check.port+check.width-1, deviceID).Scan(&conflictingLine)
 		if err == nil {
-			return fmt.Sprintf("%s port conflicts with %s on device %s", check.label, conflictingLine, deviceID), nil
+			return fmt.Sprintf("%s端口与线路 %s 在设备 %s 上冲突", check.label, conflictingLine, deviceID), nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return "", err
@@ -479,7 +492,7 @@ func lineSpecConflict(ctx context.Context, queryer rowQuerier, spec LineSpec) (s
  WHERE s.line_id<>? AND n.device_id=? AND ?<=s.udp_port_max AND s.udp_port_min<=? LIMIT 1`,
 		spec.LineID, relayDevice, spec.UDPPortMin, spec.UDPPortMax).Scan(&conflictingLine)
 	if err == nil {
-		return fmt.Sprintf("UDP relay range conflicts with %s on device %s", conflictingLine, relayDevice), nil
+		return fmt.Sprintf("UDP Relay 端口段与线路 %s 在设备 %s 上冲突", conflictingLine, relayDevice), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err

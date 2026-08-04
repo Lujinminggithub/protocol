@@ -156,7 +156,7 @@ func clientURLFromFile(path string) (string, error) {
 	}
 	if err != nil || parsed == nil || parsed.Scheme != "socks5" || parsed.Host == "" || parsed.User == nil ||
 		parsed.User.Username() == "" || !hasPassword || password == "" || len(value) > 4096 {
-		return "", errors.New("generated client configuration is invalid")
+		return "", errors.New("生成的客户端配置无效")
 	}
 	return value, nil
 }
@@ -224,7 +224,7 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		values["NB_SOCKS_USERNAME"], values["NB_SOCKS_PASSWORD"] = text(secret["username"]), text(secret["password"])
 	}
 	if values["NB_KNOWN_HOSTS"] == "" {
-		return nil, errors.New("known_hosts is required")
+		return nil, errors.New("缺少 known_hosts 主机密钥文件")
 	}
 	return values, nil
 }
@@ -271,14 +271,14 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 		return result, nil
 	case "line.rollback":
 		if !safeDeployment.MatchString(request.Deployment) {
-			return nil, errors.New("rollback requires a valid deployment")
+			return nil, errors.New("回滚操作必须指定有效的 deployment")
 		}
 		return []commandStep{{Name: python, Stage: "rollback", Args: []string{deploy, "rollback-socks", "--deployment-id", request.Deployment,
 			"--socks-port", socks}}}, nil
 	case "line.disable":
 		return []commandStep{{Name: python, Stage: "stop", Args: []string{deploy, "stop"}}}, nil
 	default:
-		return nil, errors.New("operation kind is not allowlisted")
+		return nil, errors.New("该任务类型不在 worker 白名单中")
 	}
 }
 
@@ -308,7 +308,7 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 	marker := "CURRENT_JSON="
 	index := strings.LastIndex(captured.String(), marker)
 	if index < 0 {
-		return "", errors.New("deployment query did not return CURRENT_JSON")
+		return "", errors.New("部署状态查询未返回 CURRENT_JSON")
 	}
 	lineText := strings.SplitN(captured.String()[index+len(marker):], "\n", 2)[0]
 	var roles map[string]string
@@ -318,7 +318,7 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 	deployment := ""
 	for _, role := range []string{"entry", "middle", "exit"} {
 		if roles[role] == "" || (deployment != "" && roles[role] != deployment) {
-			return "", errors.New("deployment differs across roles")
+			return "", errors.New("各节点角色的 deployment 不一致")
 		}
 		deployment = roles[role]
 	}
@@ -326,14 +326,14 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 }
 
 func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
-	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "preparing operation"})
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "正在准备任务"})
 	failPreparation := func(err error, result Result) (Result, error) {
 		_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "failed", Message: err.Error()})
 		return result, err
 	}
 	var request requestValues
 	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
-		return failPreparation(errors.New("invalid operation request"), Result{})
+		return failPreparation(errors.New("任务请求无效"), Result{})
 	}
 	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
 	line, ok := r.registry.Line(operation.LineID)
@@ -370,14 +370,14 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	if err != nil {
 		return failPreparation(err, Result{LogFile: logPath})
 	}
-	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "succeeded", Message: "operation prepared"})
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "succeeded", Message: "任务准备完成"})
 	sequence := 3
 	for _, step := range steps {
 		stage := step.Stage
 		if stage == "" {
 			stage = "execute"
 		}
-		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "running", Message: "step started", Parameters: map[string]any{"program": filepath.Base(step.Name)}})
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "running", Message: "步骤开始执行", Parameters: map[string]any{"program": filepath.Base(step.Name)}})
 		sequence++
 		progress := newProgressWriter(logFile, 1500*time.Millisecond, 160, func(message string) {
 			emitProgress(ctx, &sequence, stage, message)
@@ -387,12 +387,12 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		if err != nil {
 			summary := commandFailureSummary(err, logPath)
 			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "failed", Message: summary})
-			return Result{LogFile: logPath}, fmt.Errorf("%s failed: %s", filepath.Base(step.Args[0]), summary)
+			return Result{LogFile: logPath}, fmt.Errorf("%s 执行失败：%s", filepath.Base(step.Args[0]), summary)
 		}
-		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "succeeded", Message: "step completed"})
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "succeeded", Message: "步骤执行完成"})
 		sequence++
 	}
-	result := Result{LogFile: logPath, Profile: line.LineID, Message: "operation completed"}
+	result := Result{LogFile: logPath, Profile: line.LineID, Message: "任务执行完成"}
 	if operation.Kind == "line.tune" {
 		result.TransportProfile = &request.TransportProfile
 		generation, profilePath, rolloutErr := r.applyPlannedProfile(ctx, line, request.TransportProfile, environment, logFile, &sequence)

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -167,41 +168,53 @@ func validLineSpecRequest(spec central.LineSpec) error {
 	}
 	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.UpstreamMbps < 1 || spec.UpstreamMbps > 1000 ||
 		spec.DownstreamMbps < 1 || spec.DownstreamMbps > 1000 || spec.SocksPort < 0 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65534 || spec.ExitPort < 0 || spec.ExitPort > 65534 {
-		return errors.New("invalid line ports or bandwidth")
+		return errors.New("线路端口或上下行平均速率无效")
+	}
+	if spec.SocksPort != 0 && (spec.SocksPort < central.ManagedSocksPortMin || spec.SocksPort > central.ManagedSocksPortMax) {
+		return fmt.Errorf("入口端口必须位于 %d-%d，留空可自动分配", central.ManagedSocksPortMin, central.ManagedSocksPortMax)
+	}
+	if spec.RelayPort != 0 && (spec.RelayPort < central.ManagedRelayPortMin || spec.RelayPort+central.ManagedTransportWorkerLanes-1 > central.ManagedRelayPortMax) {
+		return fmt.Errorf("Relay 端口必须位于 %d-%d", central.ManagedRelayPortMin, central.ManagedRelayPortMax)
+	}
+	if spec.ExitPort != 0 && (spec.ExitPort < central.ManagedExitPortMin || spec.ExitPort+central.ManagedTransportWorkerLanes-1 > central.ManagedExitPortMax) {
+		return fmt.Errorf("Exit 端口必须位于 %d-%d", central.ManagedExitPortMin, central.ManagedExitPortMax)
 	}
 	if spec.ExitBindIP != "" {
 		parsed := net.ParseIP(spec.ExitBindIP)
 		if parsed == nil || parsed.To4() == nil {
-			return errors.New("exit_bind_ip must be an IPv4 address")
+			return errors.New("出口 IP 必须是 IPv4 地址")
 		}
 	}
 	if (spec.UDPPortMin == 0) != (spec.UDPPortMax == 0) || spec.UDPPortMin < 0 || spec.UDPPortMax > 65535 || (spec.UDPPortMin != 0 && (spec.UDPPortMin < 1024 || spec.UDPPortMin > spec.UDPPortMax)) {
-		return errors.New("invalid UDP relay range")
+		return errors.New("UDP Relay 端口段无效")
+	}
+	if spec.UDPPortMin != 0 && (spec.UDPPortMin < central.ManagedUDPPortMin || spec.UDPPortMax > central.ManagedUDPPortMax) {
+		return fmt.Errorf("UDP Relay 端口段必须位于 %d-%d", central.ManagedUDPPortMin, central.ManagedUDPPortMax)
 	}
 	if spec.BuildMode != "auto" && spec.BuildMode != "binary" && spec.BuildMode != "source" {
-		return errors.New("invalid build mode")
+		return errors.New("构建策略无效")
 	}
 	if spec.JumpPolicy != "auto" && spec.JumpPolicy != "direct" && spec.JumpPolicy != "pinned" {
-		return errors.New("invalid jump policy")
+		return errors.New("跳板策略无效")
 	}
 	if spec.SRSRef != "" && !validWhitelistSource(spec.SRSRef) {
-		return errors.New("whitelist update URL must use HTTPS")
+		return errors.New("白名单更新地址必须使用 HTTPS")
 	}
 	if spec.ArtifactRef != "" && filepath.ToSlash(spec.ArtifactRef) != "build/nb_node" {
-		return errors.New("artifact_ref must use build/nb_node")
+		return errors.New("二进制引用必须是 build/nb_node")
 	}
 	if spec.SourceRef != "" && spec.SourceRef != "repo://current" {
-		return errors.New("source_ref must use repo://current")
+		return errors.New("源码引用必须是 repo://current")
 	}
 	if len(spec.Whitelist) > 64<<10 || (len(spec.Whitelist) > 0 && !json.Valid(spec.Whitelist)) {
-		return errors.New("invalid whitelist")
+		return errors.New("白名单配置无效")
 	}
 	roles := map[string]int{}
 	seen := map[string]bool{}
 	for _, node := range spec.Nodes {
 		key := node.Role + ":" + strconv.Itoa(node.Ordinal)
 		if !safeID.MatchString(node.DeviceID) || (node.Role != "entry" && node.Role != "relay" && node.Role != "exit") || node.Ordinal < 0 || seen[key] {
-			return errors.New("invalid or duplicate line node")
+			return errors.New("线路节点无效或角色重复")
 		}
 		seen[key] = true
 		roles[node.Role]++
@@ -210,7 +223,7 @@ func validLineSpecRequest(spec central.LineSpec) error {
 		}
 	}
 	if roles["entry"] != 1 || roles["exit"] != 1 {
-		return errors.New("line requires exactly one entry and one exit")
+		return errors.New("线路必须且只能包含一个 Entry 和一个 Exit")
 	}
 	return nil
 }
@@ -220,7 +233,7 @@ func validLineSpec(spec central.LineSpec) error {
 		return err
 	}
 	if spec.SocksPort == 0 || spec.RelayPort == 0 || spec.ExitPort == 0 || spec.UDPPortMin == 0 || spec.UDPPortMax == 0 {
-		return errors.New("internal line resources were not allocated")
+		return errors.New("线路内部端口资源尚未完成分配")
 	}
 	return nil
 }
