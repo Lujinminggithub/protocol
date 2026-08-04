@@ -27,11 +27,11 @@ def validate(policy:dict)->tuple[str,str]:
     for t in tenants:
         name=str(t.get("name",""));max_tcp=int(t.get("max_tcp",0));max_udp=int(t.get("max_udp",0));quota=int(t.get("quota_mb",0))
         if "rate_up_kbps" in t or "rate_down_kbps" in t:
-            up=int(t.get("rate_up_kbps",0));down=int(t.get("rate_down_kbps",0));up_burst=int(t.get("burst_up_seconds",10));down_burst=int(t.get("burst_down_seconds",10))
+            up=int(t.get("rate_up_kbps",0));down=int(t.get("rate_down_kbps",0));up_burst=int(t.get("burst_up_seconds",1));down_burst=int(t.get("burst_down_seconds",1))
             valid_rates=0<=up<=100000000 and 0<=down<=100000000 and 1<=up_burst<=60 and 1<=down_burst<=60
             rendered=f"tenant {name} {max_tcp} {max_udp} {up} {down} {quota} {up_burst} {down_burst}"
         else:
-            rate=int(t.get("rate_kbps",0));burst=int(t.get("burst_seconds",10));valid_rates=0<=rate<=100000000 and 1<=burst<=60
+            rate=int(t.get("rate_kbps",0));burst=int(t.get("burst_seconds",1));valid_rates=0<=rate<=100000000 and 1<=burst<=60
             rendered=f"tenant {name} {max_tcp} {max_udp} {rate} {quota} {burst}"
         if not NAME.fullmatch(name)or name in seen or not(0<=max_tcp<=100000 and 0<=max_udp<=100000 and 0<=quota<=10**9 and valid_rates):raise ValueError(f"非法 tenant: {t}")
         seen.add(name);tlines.append(rendered)

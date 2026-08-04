@@ -70,8 +70,8 @@ def main() -> None:
     assert artifacts["policy"]["schema_version"] == 2
     assert artifacts["policy"]["tenants"][0]["rate_up_kbps"] == 8000
     assert artifacts["policy"]["tenants"][0]["rate_down_kbps"] == 12000
-    assert artifacts["policy"]["tenants"][0]["burst_up_seconds"] == 10
-    assert artifacts["policy"]["tenants"][0]["burst_down_seconds"] == 10
+    assert artifacts["policy"]["tenants"][0]["burst_up_seconds"] == 1
+    assert artifacts["policy"]["tenants"][0]["burst_down_seconds"] == 1
     assert artifacts["client"]["server"] == "192.0.2.10"
     assert "u%40ser:p%3Aa%2Fss@" in artifacts["client"]["shadowrocket_url"]
 

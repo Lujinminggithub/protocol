@@ -6,6 +6,7 @@ import pathlib
 import tempfile
 
 import deploy
+import deploy_core
 
 
 class FakeClient:
@@ -14,6 +15,29 @@ class FakeClient:
 
 
 def main() -> None:
+    with tempfile.TemporaryDirectory(prefix="nb-security-push-") as security_tmp:
+        security = pathlib.Path(security_tmp)
+        for name in ("ca.pem", "socks.users", "tenant.conf", "entry.pem", "entry.key",
+                     "middle.pem", "middle.key", "exit.pem", "exit.key"):
+            (security / name).write_text(name, encoding="ascii")
+        saved = {name: getattr(deploy_core, name) for name in
+                 ("SECURITY_DIR", "INSTANCE_WORK", "DEPLOY_CERTS", "run", "push_bytes")}
+        pushed = []
+        try:
+            deploy_core.SECURITY_DIR = security
+            deploy_core.INSTANCE_WORK = "/runtime"
+            deploy_core.DEPLOY_CERTS = "/certs"
+            deploy_core.push_bytes = lambda _c, _data, remote, mode: pushed.append((remote, mode))
+            deploy_core.run = lambda *_args, **_kwargs: "PRESENT"
+            deploy_core._push_security(FakeClient("entry"), "entry")
+            assert "/runtime/socks.users" in {path for path, _mode in pushed}
+            assert "/runtime/tenant.conf" not in {path for path, _mode in pushed}
+            pushed.clear();deploy_core.run = lambda *_args, **_kwargs: ""
+            deploy_core._push_security(FakeClient("entry"), "entry")
+            assert "/runtime/tenant.conf" in {path for path, _mode in pushed}
+        finally:
+            for name, value in saved.items():
+                setattr(deploy_core, name, value)
     names = [
         "_require_local_build", "_require_security_material", "connect", "run",
         "_acquire_deploy_lock", "_release_deploy_lock", "_stage_release",

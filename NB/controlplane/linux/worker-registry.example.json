@@ -10,6 +10,7 @@
     "operations": [
       "line.open",
       "line.validate",
+      "line.tune",
       "line.upgrade",
       "line.rollback",
       "line.disable"

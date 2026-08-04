@@ -659,7 +659,9 @@ def _push_security(c, role):
     push_bytes(c, (SECURITY_DIR / f"{role}.key").read_bytes(), paths["key"], mode=0o600)
     if role == "entry":
         push_bytes(c, (SECURITY_DIR / "socks.users").read_bytes(), paths["users"], mode=0o600)
-        push_bytes(c, (SECURITY_DIR / "tenant.conf").read_bytes(), paths["tenants"], mode=0o600)
+        existing = run(c, f"test -f {shlex.quote(paths['tenants'])} && echo PRESENT || true").strip()
+        if "PRESENT" not in existing:
+            push_bytes(c, (SECURITY_DIR / "tenant.conf").read_bytes(), paths["tenants"], mode=0o600)
 
 
 def _whitelist_remote():

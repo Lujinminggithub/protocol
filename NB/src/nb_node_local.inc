@@ -393,8 +393,6 @@ static void udp_local_drain(proxy_stream_t* p){
                 log4c_warn("entry UDP relay drop id=%u target=%s:%d reason=%s",p->id,host,port,reject_reason?reject_reason:"unknown");
                 continue;
             }
-            if(g_tenants_enabled){size_t taken=nb_tenant_take(&g_tenants,child->tenant_index,payload_len,picoquic_current_time(),NB_TENANT_UP);
-                if(taken<payload_len){nb_tenant_refund(&g_tenants,child->tenant_index,taken,NB_TENANT_UP);p->udp_assoc_policy_drop++;continue;}}
             if(child->udp_first_local_c2s_at==0){
                 child->udp_first_local_c2s_at=picoquic_current_time();
                 log4c_info("entry udp trace id=%u usid=%u stage=phone-first-rx association_age=%.1fms flow_age=%.1fms bytes=%zu target=%s:%d",
@@ -402,7 +400,6 @@ static void udp_local_drain(proxy_stream_t* p){
                     trace_delta_ms(child->udp_first_local_c2s_at,child->created_at),payload_len,host,port);
             }
             if(udp_queue_packet(child,1,NB_UDP_TYPE_C2S,child->route,payload,payload_len)!=0){
-                if(g_tenants_enabled)nb_tenant_refund(&g_tenants,child->tenant_index,payload_len,NB_TENANT_UP);
                 ps_teardown_reason(child,"udp-down-queue-fail");continue;
             }
             child->udp_packets_c2s++;child->bytes_c2s+=payload_len;ps_touch(child);ps_touch(p);
@@ -412,8 +409,6 @@ static void udp_local_drain(proxy_stream_t* p){
             udp_rxq_overflow_note("exit-target",p->id,dropped);
             if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK))break;
             if(n<=0){if(n<0)log4c_warn("exit UDP recv fail id=%u error=%s",p->id,strerror(errno));break;}
-            if(g_tenants_enabled){size_t taken=nb_tenant_take(&g_tenants,p->tenant_index,(size_t)n,picoquic_current_time(),NB_TENANT_DOWN);
-                if(taken<(size_t)n){nb_tenant_refund(&g_tenants,p->tenant_index,taken,NB_TENANT_DOWN);p->udp_assoc_policy_drop++;continue;}}
             if(p->udp_first_target_rx_at==0){
                 p->udp_first_target_rx_at=picoquic_current_time();
                 log4c_info("exit udp trace id=%u usid=%u stage=target-first-rx age=%.1fms send_to_rx=%.1fms bytes=%zd target=%s:%d",
@@ -422,7 +417,6 @@ static void udp_local_drain(proxy_stream_t* p){
                     p->udp_target_host,p->udp_target_port);
             }
             if(udp_queue_packet(p,0,NB_UDP_TYPE_S2C,p->route,buffer,(size_t)n)!=0){
-                if(g_tenants_enabled)nb_tenant_refund(&g_tenants,p->tenant_index,(size_t)n,NB_TENANT_DOWN);
                 ps_teardown_reason(p,"udp-up-queue-fail");break;
             }
             p->udp_packets_s2c++;p->bytes_s2c+=(size_t)n;ps_touch(p);

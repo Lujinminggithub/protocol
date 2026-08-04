@@ -466,6 +466,21 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                 (void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_active_any_path);
                 handled=1;break;
             }
+            int tenant_direction=-1;size_t tenant_charge=0;
+            if(g_tenants_enabled&&((G.role==ROLE_ENTRY&&queue==p->udp_down_tx)||
+                (G.role==ROLE_EXIT&&queue==p->udp_up_tx))){
+                nb_udp_wire_view_t view;
+                if(nb_udp_wire_decode(dg,dg_len,&view)==0){
+                    tenant_direction=G.role==ROLE_ENTRY?NB_TENANT_UP:NB_TENANT_DOWN;
+                    tenant_charge=view.payload_length;
+                    size_t taken=nb_tenant_take(&g_tenants,p->tenant_index,tenant_charge,now,tenant_direction);
+                    if(taken<tenant_charge){
+                        nb_tenant_refund(&g_tenants,p->tenant_index,taken,tenant_direction);
+                        (void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_active_any_path);
+                        handled=1;break;
+                    }
+                }
+            }
             uint8_t* dst=picoquic_provide_datagram_buffer_ex(bytes,dg_len,picoquic_datagram_active_any_path);
             if(dst!=NULL){
                 if(queue==p->udp_down_tx&&p->udp_first_c2s_prepare_at==0){
@@ -480,7 +495,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         trace_delta_ms(now,queued_at),dg_len,length,p->udp_target_host,p->udp_target_port);
                 }
                 memcpy(dst,dg,dg_len);dgramq_consume(queue,queue_len);*datagram_rr=(uint32_t)(i+1);handled=1;
-            }
+            }else if(tenant_charge>0)nb_tenant_refund(&g_tenants,p->tenant_index,tenant_charge,tenant_direction);
           }
         }
         for(int i=0;i<MAX_CONN&&!handled;i++){

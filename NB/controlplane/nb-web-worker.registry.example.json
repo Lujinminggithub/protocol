@@ -7,7 +7,7 @@
   "dynamic": {
     "enabled": true,
     "resource_groups": ["gz-hk-primary"],
-    "operations": ["line.open", "line.validate", "line.upgrade", "line.rollback", "line.disable"],
+    "operations": ["line.open", "line.validate", "line.tune", "line.upgrade", "line.rollback", "line.disable"],
     "known_hosts_file": "",
     "secrets_file": "",
     "sing_box": "sing-box",

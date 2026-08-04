@@ -230,7 +230,7 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
         "fixed_exit": profile.get("fixed_exit"),
         "tenants": [{"name": username, "max_tcp": 256, "max_udp": 64,
                      "rate_up_kbps": rate_up_kbps, "rate_down_kbps": rate_down_kbps,
-                     "quota_mb": 0, "burst_up_seconds": 10, "burst_down_seconds": 10}],
+                     "quota_mb": 0, "burst_up_seconds": 1, "burst_down_seconds": 1}],
         "routes": routes,
     }
     return {"hosts": generated_hosts, "profile": profile, "policy": policy,
