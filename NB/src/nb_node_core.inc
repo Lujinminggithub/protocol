@@ -383,10 +383,18 @@ static void transport_refresh_outbound_seed(picoquic_cnx_t* cnx,struct sockaddr*
     nb_transport_seed_plan_t plan;
     if(nb_transport_seed_plan(&runtime->link,observed_rtt_us,&plan)!=0||!plan.configured)return;
     uint8_t* ip=NULL;uint8_t ip_len=0;picoquic_get_ip_addr(peer,&ip,&ip_len);
-    if(ip==NULL||ip_len==0)return;
+    picoquic_path_t* path=cnx->nb_paths?cnx->path[0]:NULL;
+    if(ip==NULL||ip_len==0||path==NULL||path->rtt_min==0||
+        cnx->congestion_alg==NULL||cnx->congestion_alg->alg_notify==NULL)return;
     picoquic_seed_bandwidth(cnx,plan.rtt_us,plan.cwin_bytes,ip,ip_len);
+    picoquic_per_ack_state_t ack_state={0};
+    ack_state.pc=picoquic_packet_context_application;
+    ack_state.nb_bytes_acknowledged=plan.cwin_bytes;
+    cnx->cwin_notified_from_seed=1;
+    cnx->congestion_alg->alg_notify(cnx,path,picoquic_congestion_notification_seed_cwin,
+        &ack_state,picoquic_current_time());
     connection->seed_rtt_us=plan.rtt_us;connection->seed_cwin_bytes=plan.cwin_bytes;
-    log4c_info("transport BBR seed refreshed generation=%llu target_bps=%llu rtt_us=%llu cwin=%llu source=lane",
+    log4c_info("transport BBR seed applied generation=%llu target_bps=%llu rtt_us=%llu cwin=%llu source=lane",
         (unsigned long long)runtime->generation,(unsigned long long)runtime->link.target_rate_bps,
         (unsigned long long)plan.rtt_us,(unsigned long long)plan.cwin_bytes);
 }
