@@ -411,6 +411,9 @@ static void pool_health_tick(uint64_t now){
         }
         int eligible=0;uint64_t age=pool_slot_queue_age(cnx,now,&eligible);
         picoquic_path_t* path=cnx->nb_paths?cnx->path[0]:NULL;uint64_t pto=path?path->nb_retransmit:0,suppressed=0;
+        uint64_t lane_rtt_us=pool->recent_rtt[idx];
+        if(lane_rtt_us==0&&path&&path->rtt_min>0)lane_rtt_us=path->smoothed_rtt;
+        transport_refresh_outbound_seed(cnx,(struct sockaddr*)&pool->addr,lane_rtt_us);
         int streams=pool_slot_streams(cnx);
         int connection_candidate=pto>=2;
         int health_eligible=(eligible>0&&streams>0)||connection_candidate;

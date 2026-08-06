@@ -648,6 +648,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                     const char* cc_alg=(cnx->congestion_alg&&cnx->congestion_alg->congestion_algorithm_id)
                         ? cnx->congestion_alg->congestion_algorithm_id : "none";
                     picoquic_path_t* path=(cnx->nb_paths>0)?cnx->path[0]:NULL;
+                    transport_refresh_outbound_seed(cnx,(struct sockaddr*)&pool->addr,q.rtt);
                     if(path&&path->congestion_alg_state&&cnx->congestion_alg&&cnx->congestion_alg->alg_observe)
                         cnx->congestion_alg->alg_observe(path,&cc_state,&cc_param);
                     double loss = delta_sent ? (100.0*(double)eff_lost/(double)delta_sent) : 0.0;
