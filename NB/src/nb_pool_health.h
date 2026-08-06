@@ -35,5 +35,7 @@ int nb_pool_health_retire_now(nb_pool_health_t* state,const nb_pool_health_confi
     uint64_t now_us);
 nb_pool_recovery_action_t nb_pool_health_recovery_action(const nb_pool_health_t* state,
     int has_replacement, int replacement_ready, int has_draining);
+int nb_pool_route_pick(const unsigned char* available,const nb_pool_health_t* states,
+    int count,int start,int avoid);
 
 #endif

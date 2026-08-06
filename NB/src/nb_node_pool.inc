@@ -87,14 +87,13 @@ static int pool_get_or_create(struct sockaddr_storage* addr){
 }
 
 static int pool_pick_all_rr(cnx_pool_t* pool, int avoid_idx){
-    for(int k=0;k<POOL_SIZE;k++){
-        int idx=pool->rr_lat%POOL_SIZE;pool->rr_lat++;
-        if(idx==avoid_idx) continue;
-        if(pool->health[idx].quarantined)continue;
-        if(pool->cnx[idx]==NULL) pool_ensure(pool,idx);
-        if(pool->cnx[idx]!=NULL) return idx;
+    unsigned char available[POOL_SIZE];int start=pool->rr_lat%POOL_SIZE;
+    for(int idx=0;idx<POOL_SIZE;idx++){
+        if(idx!=avoid_idx&&pool->cnx[idx]==NULL)pool_ensure(pool,idx);
+        available[idx]=(unsigned char)(pool->cnx[idx]!=NULL);
     }
-    return -1;
+    int selected=nb_pool_route_pick(available,pool->health,POOL_SIZE,start,avoid_idx);
+    pool->rr_lat=selected>=0?selected+1:start+POOL_SIZE;return selected;
 }
 
 #define FEC_LOSS_ON_PCT 3.0
@@ -276,7 +275,7 @@ static int pool_pick(cnx_pool_t* pool, int is_latency){
         if(pool->cnx[k]==NULL)pool_ensure(pool,k);
         if(pool->cnx[k]!=NULL)return k;
     }
-    return -1;
+    return pool_pick_all_rr(pool,-1);
 }
 
 /* 分配下游 stream 并发首部(带 <prio>; 标记端到端传递)+ 设该 stream 优先级。 */

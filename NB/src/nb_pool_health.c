@@ -22,9 +22,9 @@ int nb_pool_health_update(nb_pool_health_t* state, const nb_pool_health_config_t
         queue_age_us>=config->queue_age_threshold_us;
     if(!degraded){state->degraded_since_us=0;state->quarantined=0;
         state->promotion_ready=0;return 0;}
-    state->quarantined=1;
     if(state->degraded_since_us==0){state->degraded_since_us=now_us;return 0;}
-    if(!progress_stalled)return 0;
+    if(!progress_stalled){state->quarantined=0;state->promotion_ready=0;return 0;}
+    state->quarantined=1;
     if(now_us<state->degraded_since_us||now_us-state->degraded_since_us<config->hold_us)return 0;
     state->degraded_since_us=0;return nb_pool_health_retire_now(state,config,now_us);
 }
@@ -38,4 +38,17 @@ nb_pool_recovery_action_t nb_pool_health_recovery_action(const nb_pool_health_t*
     if(state->promotion_ready&&replacement_ready&&!has_draining)
         return NB_POOL_RECOVERY_PROMOTE_REPLACEMENT;
     return NB_POOL_RECOVERY_NONE;
+}
+
+int nb_pool_route_pick(const unsigned char* available,const nb_pool_health_t* states,
+    int count,int start,int avoid){
+    if(available==0||states==0||count<=0)return -1;
+    if(start<0)start=0;
+    start%=count;
+    for(int pass=0;pass<2;pass++)for(int offset=0;offset<count;offset++){
+        int index=(start+offset)%count;
+        if(index==avoid||!available[index])continue;
+        if((states[index].quarantined?1:0)==pass)return index;
+    }
+    return -1;
 }

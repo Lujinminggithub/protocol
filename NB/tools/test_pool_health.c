@@ -6,10 +6,11 @@ int main(void){
     nb_pool_health_t state={0};
     nb_pool_health_config_t config={750000,5000000,12000000,30000000};
     assert(!nb_pool_health_update(&state,&config,1000000,1,800000,1,100));
+    assert(state.quarantined==0);
     assert(!nb_pool_health_update(&state,&config,11999999,1,800000,1,100));
-    assert(state.quarantined==1);
+    assert(state.quarantined==0);
     assert(nb_pool_health_update(&state,&config,13000000,1,800000,1,100));
-    assert(state.retire_count==1&&state.promotion_ready==1);
+    assert(state.quarantined==1&&state.retire_count==1&&state.promotion_ready==1);
     assert(!nb_pool_health_update(&state,&config,14000000,1,800000,1,100));
     assert(!nb_pool_health_update(&state,&config,19000000,1,800000,1,100));
     assert(state.suppressed_count==1);
@@ -30,9 +31,11 @@ int main(void){
     assert(spike.retire_count==0&&spike.degraded_since_us==0);
     /* Recovery clears quarantine without requiring a destructive retirement. */
     nb_pool_health_t transient={0};
-    assert(!nb_pool_health_update(&transient,&config,1000000,1,800000,1,100));
+    nb_pool_health_config_t transient_config=config;transient_config.hold_us=20000000;
+    assert(!nb_pool_health_update(&transient,&transient_config,1000000,1,800000,1,100));
+    assert(!nb_pool_health_update(&transient,&transient_config,13000000,1,800000,1,100));
     assert(transient.quarantined==1);
-    assert(!nb_pool_health_update(&transient,&config,7000000,1,100000,0,101));
+    assert(!nb_pool_health_update(&transient,&transient_config,14000000,1,100000,0,101));
     assert(transient.quarantined==0&&transient.retire_count==0&&transient.promotion_ready==0);
     nb_pool_health_t recovery={.quarantined=1};
     assert(nb_pool_health_recovery_action(&recovery,0,0,0)==NB_POOL_RECOVERY_START_REPLACEMENT);
@@ -43,5 +46,17 @@ int main(void){
     assert(nb_pool_health_recovery_action(&recovery,1,1,0)==NB_POOL_RECOVERY_PROMOTE_REPLACEMENT);
     recovery.quarantined=0;
     assert(nb_pool_health_recovery_action(&recovery,1,1,0)==NB_POOL_RECOVERY_CLOSE_REPLACEMENT);
+    {
+        unsigned char available[2]={1,0};
+        nb_pool_health_t routes[2]={{.quarantined=1},{0}};
+        assert(nb_pool_route_pick(available,routes,2,0,-1)==0);
+        available[1]=1;
+        assert(nb_pool_route_pick(available,routes,2,0,-1)==1);
+        assert(nb_pool_route_pick(available,routes,2,0,1)==0);
+        available[0]=0;
+        assert(nb_pool_route_pick(available,routes,2,0,-1)==1);
+        available[1]=0;
+        assert(nb_pool_route_pick(available,routes,2,0,-1)==-1);
+    }
     puts("RESULT PASS");return 0;
 }
