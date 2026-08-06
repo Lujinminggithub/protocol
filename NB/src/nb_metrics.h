@@ -18,6 +18,7 @@ typedef struct {
     uint64_t udp_rx_errors;
     uint64_t udp_tx_errors;
     uint64_t udp_rxq_overflow;
+    uint64_t udp_queue_pressure_dropped;
     uint64_t pool_retire_total;
     uint64_t pool_retire_suppressed;
     uint64_t pool_quarantine_total;
@@ -91,6 +92,7 @@ void nb_metrics_note_close(nb_metrics_state_t* state, const char* reason);
 void nb_metrics_note_loop(nb_metrics_state_t* state, uint64_t busy_us, uint64_t wake_late_us);
 void nb_metrics_note_udp_error(nb_metrics_state_t* state, int transmit);
 void nb_metrics_note_udp_rxq_overflow(nb_metrics_state_t* state, uint64_t dropped);
+void nb_metrics_note_udp_queue_pressure_drop(nb_metrics_state_t* state,uint64_t dropped);
 void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot, const nb_metrics_state_t* state,
     uint64_t sessions, uint64_t sessions_peak, uint64_t pools, uint64_t exit_routes);
 void nb_metrics_snapshot_add_stream(nb_metrics_snapshot_t* snapshot, int flow_class, int udp_mode,

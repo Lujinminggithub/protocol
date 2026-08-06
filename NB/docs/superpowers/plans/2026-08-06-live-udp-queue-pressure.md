@@ -58,9 +58,9 @@
 
 **Files:** `src/nb_live.[ch]`, `src/nb_node_transport.inc`, `src/nb_node_main.inc`, `tools/test_live.c`
 
-- [ ] Add a failing assertion that media UDP expiry is disabled while control and bulk expiry remain enabled.
-- [ ] Run `nb_live_test` and confirm the failure is the missing policy API.
-- [ ] Add the policy helper and guard only the two datagram expiry call sites; preserve capacity limits and complete-packet pressure eviction.
-- [ ] Re-run `nb_live_test`, `nb_udp_queue_test`, and the 1,000-line source gate.
-- [ ] Build on GZ and atomically activate one binary on KZ Exit, Middle, and Entry without changing generation 4 or FEC state.
+- [x] Add a failing assertion that media UDP expiry is disabled while control and bulk expiry remain enabled.
+- [x] Run `nb_live_test` and confirm the failure is the missing policy API.
+- [x] Add the policy helper and guard only the two datagram expiry call sites; preserve capacity limits and complete-packet pressure eviction.
+- [x] Re-run `nb_live_test`, `nb_udp_queue_test`, and the 1,000-line source gate.
+- [x] Build on GZ and atomically activate one binary on KZ Exit, Middle, and Entry without changing generation 4 or FEC state.
 - [ ] Require the next short canary to show zero media deadline drops and no unexplained packet gap.

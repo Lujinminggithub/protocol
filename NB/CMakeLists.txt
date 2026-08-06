@@ -74,6 +74,11 @@ if(BUILD_TESTING)
   target_compile_options(nb_udp_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp COMMAND nb_udp_test)
 
+  add_executable(nb_udp_queue_test tools/test_udp_queue.c src/nb_udp_queue.c)
+  target_include_directories(nb_udp_queue_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_udp_queue_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_udp_queue COMMAND nb_udp_queue_test)
+
   add_executable(nb_udp_fec_test tools/test_udp_fec.c src/nb_udp_fec.c src/nb_udp.c)
   target_include_directories(nb_udp_fec_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_udp_fec_test PRIVATE -O2 -Wall -Wextra)
@@ -162,7 +167,7 @@ if(BUILD_TESTING)
   add_executable(nb_dns_test tools/test_dns.c src/nb_dns.c)
   target_include_directories(nb_dns_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_dns_test PRIVATE -O2 -Wall -Wextra)
-  target_link_libraries(nb_dns_test Threads::Threads)
+  target_link_libraries(nb_dns_test Threads::Threads resolv)
   add_test(NAME nb_dns COMMAND nb_dns_test)
 
   add_executable(nb_tenant_test tools/test_tenant.c src/nb_tenant.c src/nb_tenant_shared.c)
@@ -188,7 +193,7 @@ if(BUILD_TESTING)
 
   foreach(_nb_test_target
       nb_fec_test nb_fec_policy_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test nb_transport_profile_test
-      nb_auth_async_test nb_routes_test nb_udp_test nb_lstream_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_probe_test nb_metrics_test
+      nb_auth_async_test nb_routes_test nb_udp_test nb_udp_queue_test nb_lstream_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_probe_test nb_metrics_test
       nb_session_index_test nb_session_memory_test nb_bridge_test nb_send_test nb_path_test
       nb_pool_health_test nb_dns_test nb_tenant_test nb_whitelist_test nb_shard_config_test)
     target_compile_options(${_nb_test_target} PRIVATE -UNDEBUG -Werror)
@@ -212,7 +217,7 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_transport_profile.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_probe.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_udp.c src/nb_udp_fec.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_transport_profile.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_probe.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_udp.c src/nb_udp_queue.c src/nb_udp_fec.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
 target_compile_options(nb_node PRIVATE -O2 -Wall -Wextra -Werror)
 target_include_directories(nb_node PRIVATE
@@ -232,10 +237,10 @@ set(PQ_LIBS
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
   target_link_libraries(nb_node
     -Wl,--start-group ${PQ_LIBS} -Wl,--end-group
-    OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    OpenSSL::SSL OpenSSL::Crypto Threads::Threads resolv)
 else()
   target_link_libraries(nb_node ${PQ_LIBS}
-    OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    OpenSSL::SSL OpenSSL::Crypto Threads::Threads resolv)
 endif()
 
 if(BUILD_TESTING AND UNIX)

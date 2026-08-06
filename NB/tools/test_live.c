@@ -11,6 +11,15 @@ int main(void){
     assert(media.high_bytes==256*1024&&media.low_bytes==128*1024&&media.deadline_us==200000);
     assert(nb_live_queue_limits(NB_FLOW_CLASS_MEDIA,0).deadline_us==500000);
     assert(bulk.high_bytes==1024*1024&&bulk.low_bytes==512*1024);
+    assert(nb_live_queue_limits_for_path(NB_FLOW_CLASS_MEDIA,1,100000).deadline_us==200000);
+    assert(nb_live_queue_limits_for_path(NB_FLOW_CLASS_MEDIA,1,573000).deadline_us==200000);
+    assert(nb_live_queue_limits_for_path(NB_FLOW_CLASS_MEDIA,1,900000).deadline_us==200000);
+    assert(nb_live_queue_limits_for_path(NB_FLOW_CLASS_CTRL,1,573000).deadline_us==100000);
+    assert(nb_live_queue_limits_for_path(NB_FLOW_CLASS_MEDIA,0,573000).deadline_us==500000);
+    assert(!nb_live_queue_expiry_enabled(NB_FLOW_CLASS_MEDIA,1));
+    assert(nb_live_queue_expiry_enabled(NB_FLOW_CLASS_MEDIA,0));
+    assert(nb_live_queue_expiry_enabled(NB_FLOW_CLASS_CTRL,1));
+    assert(nb_live_queue_expiry_enabled(NB_FLOW_CLASS_BULK,1));
 
     nb_live_queue_clock_t clock={0};
     nb_live_queue_appended(&clock,0,100,1000);assert(nb_live_queue_age_us(&clock,100,6000)==5000);

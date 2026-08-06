@@ -60,18 +60,27 @@ func TestGenerateDoesNotTurnLoadedShortHopIntoBBR(t *testing.T) {
 	if entry.TargetMbps != 10 || middle.TargetMbps != 10 {
 		t.Fatalf("qualification headroom leaked into runtime target: entry=%g middle=%g", entry.TargetMbps, middle.TargetMbps)
 	}
-	if entry.ReorderGap != 128 || entry.ReorderDelayUS != 450000 {
-		t.Fatalf("probe candidate safety envelope was not preserved: %+v", entry)
+	if entry.TargetRateBPS != 10_000_000 || middle.TargetRateBPS != 10_000_000 {
+		t.Fatalf("runtime target rate missing: entry=%d middle=%d", entry.TargetRateBPS, middle.TargetRateBPS)
 	}
-	if middle.ReorderGap != 128 || middle.ReorderDelayUS != 450000 {
-		t.Fatalf("long-haul safety envelope was not preserved: %+v", middle)
+	if entry.SeedRTTUS != 4400 || middle.SeedRTTUS != 202300 {
+		t.Fatalf("physical RTT seed missing: entry=%d middle=%d", entry.SeedRTTUS, middle.SeedRTTUS)
+	}
+	if middle.StartupCWinBytes != 524288 {
+		t.Fatalf("2x live startup BDP=%d, want 524288", middle.StartupCWinBytes)
+	}
+	if entry.ReorderGap > 64 || entry.ReorderDelayUS > 80000 {
+		t.Fatalf("short-hop reorder envelope is not bounded: %+v", entry)
+	}
+	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 120000 {
+		t.Fatalf("long-hop reorder envelope is not bounded: %+v", middle)
 	}
 }
 
 func TestGenerateUsesConservativeDFOnlyMTU(t *testing.T) {
 	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
-		"entry_middle": {MTU: MTUEvidence{MaxIPMTU: 1452}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
-		"middle_exit":  {MTU: MTUEvidence{MaxIPMTU: 1452}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
+		"entry_middle": {MTU: MTUEvidence{MaxIPMTU: 1452}, QUIC: QUICEvidence{PacketsObserved: 10000, WindowsValid: 6}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
+		"middle_exit":  {MTU: MTUEvidence{MaxIPMTU: 1452}, QUIC: QUICEvidence{PacketsObserved: 10000, WindowsValid: 6}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
 	}}
 	profile, err := Generate("line-df", 1, 5, probe)
 	if err != nil {
@@ -84,8 +93,8 @@ func TestGenerateUsesConservativeDFOnlyMTU(t *testing.T) {
 
 func TestRoleRenderProducesMiddleIngressAndEgress(t *testing.T) {
 	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
-		"entry_middle": {Candidate: candidate("bbr", 0, 1404, 8, 20000)},
-		"middle_exit":  {Candidate: candidate("bbr", 0, 1404, 8, 20000)},
+		"entry_middle": {QUIC: QUICEvidence{PacketsObserved: 10000, WindowsValid: 6}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
+		"middle_exit":  {QUIC: QUICEvidence{PacketsObserved: 10000, WindowsValid: 6}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
 	}}
 	profile, err := Generate("line-1", 9, 5, probe)
 	if err != nil {
@@ -101,14 +110,16 @@ func TestRoleRenderProducesMiddleIngressAndEgress(t *testing.T) {
 	}
 	text := string(data)
 	for _, expected := range []string{"role=middle", "ingress.cc=", "egress.cc=", "generation=9",
-		"egress.udp_fec_adaptive=true", "egress.udp_fec_k=8", "egress.udp_fec_hold_us=2000"} {
+		"egress.udp_fec_adaptive=true", "egress.udp_fec_k=8", "egress.udp_fec_hold_us=2000",
+		"egress.target_rate_bps=5000000", "egress.seed_rtt_us=250000",
+		"egress.startup_cwin_bytes=327680"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %q in %s", expected, text)
 		}
 	}
 }
 
-func TestGeneratePreservesKZProbeCandidateInsteadOfRecalculatingIt(t *testing.T) {
+func TestGenerateBoundsKZReorderInsteadOfPreservingProbeCandidate(t *testing.T) {
 	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
 		"entry_middle": {ICMP: ICMP{RTTAvgMS: 4.4}, QUIC: QUICEvidence{RTTP95MS: 6.937,
 			PacketsObserved: 220868, WindowsValid: 18, ReorderGapMax: 5,
@@ -122,19 +133,26 @@ func TestGeneratePreservesKZProbeCandidateInsteadOfRecalculatingIt(t *testing.T)
 		t.Fatal(err)
 	}
 	middle := profile.Segments["middle_exit"].Source
-	if middle.ReorderGap != 128 || middle.ReorderDelayUS != 573000 {
-		t.Fatalf("KZ load-qualified candidate was discarded: %+v", middle)
+	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 120000 {
+		t.Fatalf("KZ reorder envelope is not bounded for live traffic: %+v", middle)
 	}
 }
 
-func TestGenerateRejectsCandidateBelowEvidenceFloor(t *testing.T) {
+func TestGenerateUsesRobustEvidenceInsteadOfTransientMaximum(t *testing.T) {
 	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
-		"entry_middle": {Candidate: candidate("bbr", 0, 1404, 8, 20000)},
-		"middle_exit": {QUIC: QUICEvidence{ReorderGapMax: 98, ReorderDelayMaxMS: 345},
+		"entry_middle": {QUIC: QUICEvidence{PacketsObserved: 12000, WindowsValid: 6}, Candidate: candidate("bbr", 0, 1404, 8, 20000)},
+		"middle_exit": {ICMP: ICMP{RTTAvgMS: 203}, QUIC: QUICEvidence{PacketsObserved: 12000, WindowsValid: 7,
+			JitterP95MS: 8, ReorderGapMax: 98, ReorderDelayMaxMS: 345,
+			ReorderWindows: 7, ReorderGapP95: 7, ReorderDelayP95MS: 25},
 			Candidate: candidate("bbr", 0, 1404, 16, 390000)},
 	}}
-	if _, err := Generate("gz-hk-kz-00001", 2, 5, probe); err == nil {
-		t.Fatal("candidate below observed reorder floor was accepted")
+	profile, err := Generate("gz-hk-kz-00001", 2, 5, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	middle := profile.Segments["middle_exit"].Source
+	if middle.ReorderGap != 15 || middle.ReorderDelayUS != 49000 {
+		t.Fatalf("robust evidence was not used: %+v", middle)
 	}
 }
 

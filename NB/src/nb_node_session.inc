@@ -223,11 +223,12 @@ static void ps_free(proxy_stream_t* p){
     if(G.role==ROLE_ENTRY&&p->route_index>=0)nb_routes_finish_session(&G.exit_routes,(size_t)p->route_index);
     nb_metrics_note_close(&g_metrics_state,p->close_reason);
     if(p->udp_mode && !p->udp_association){
-        log4c_info("%s udp flow close id=%u usid=%u reason=%s age=%.1fms packets=%llu/%llu bytes=%llu/%llu milestones_ms=local_c2s:%.1f,c2s_rx:%.1f,c2s_prepare:%.1f,target_ready:%.1f,target_send:%.1f,target_rx:%.1f,s2c_rx:%.1f,s2c_prepare:%.1f,local_s2c:%.1f target=%s:%d route=%s",
+        log4c_info("%s udp flow close id=%u usid=%u reason=%s age=%.1fms packets=%llu/%llu bytes=%llu/%llu pressure_drop=%llu milestones_ms=local_c2s:%.1f,c2s_rx:%.1f,c2s_prepare:%.1f,target_ready:%.1f,target_send:%.1f,target_rx:%.1f,s2c_rx:%.1f,s2c_prepare:%.1f,local_s2c:%.1f target=%s:%d route=%s",
             role_name(G.role),p->id,p->udp_session_id,p->close_reason,
             (picoquic_current_time()-p->created_at)/1000.0,
             (unsigned long long)p->udp_packets_c2s,(unsigned long long)p->udp_packets_s2c,
             (unsigned long long)p->bytes_c2s,(unsigned long long)p->bytes_s2c,
+            (unsigned long long)p->udp_queue_pressure_dropped,
             trace_delta_ms(p->udp_first_local_c2s_at,p->created_at),
             trace_delta_ms(p->udp_first_c2s_rx_at,p->created_at),
             trace_delta_ms(p->udp_first_c2s_prepare_at,p->created_at),
@@ -354,119 +355,7 @@ static uint16_t nb_get_u16(const uint8_t* p){ return (uint16_t)(((uint16_t)p[0]<
 static uint32_t nb_get_u32(const uint8_t* p){ return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static uint64_t nb_get_u64(const uint8_t* p){uint64_t v=0;for(int i=0;i<8;i++)v=(v<<8)|p[i];return v;}
 
-static int dgramq_append(uint8_t** buf, size_t* len, size_t* cap, const uint8_t* d, size_t n, uint32_t ps_id){
-    size_t need = 10 + n;
-    if(*len + need > NB_DGRAM_QUEUE_MAX){
-        log4c_warn("id=%u fec datagram queue over limit %zu+%zu > %d", ps_id, *len, need, NB_DGRAM_QUEUE_MAX);
-        return -1;
-    }
-    if(nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
-        need>nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes){
-        log4c_warn("id=%u datagram instance queue budget exceeded",ps_id);return -1;
-    }
-    if(*len + need > *cap){
-        size_t ncap = *cap ? (*cap * 2) : 4096;
-        while(ncap < *len + need) ncap *= 2;
-        uint8_t* nb = realloc(*buf, ncap);
-        if(nb == NULL){
-            log4c_error("id=%u fec datagram queue realloc %zu fail", ps_id, ncap);
-            return -1;
-        }
-        *buf = nb; *cap = ncap;
-    }
-    nb_current_instance->queue_bytes+=(uint64_t)need;nb_put_u16(*buf + *len, (uint16_t)n);
-    nb_put_u64(*buf + *len + 2,picoquic_current_time());
-    memcpy(*buf + *len + 10, d, n);
-    *len += need;
-    return 0;
-}
-
-static int dgramq_peek(uint8_t* buf, size_t len, const uint8_t** d, size_t* n,uint64_t* queued_at){
-    if(len < 10) return 0;
-    *n = nb_get_u16(buf);
-    if(len < 10 + *n) return 0;
-    if(queued_at)*queued_at=nb_get_u64(buf+2);
-    *d = buf + 10;
-    return 1;
-}
-
-static void dgramq_consume(uint8_t* buf, size_t* len){
-    const uint8_t* d=NULL; size_t n=0;
-    if(!dgramq_peek(buf,*len,&d,&n,NULL)) return;
-    size_t consumed=10+n;memmove(buf,buf+consumed,*len-consumed);*len-=consumed;
-    instance_queue_release(consumed);
-}
-
-static uint64_t dgramq_drop_expired(uint8_t* buf,size_t* len,uint64_t deadline_us,uint64_t now){
-    uint64_t dropped=0,queued_at=0;const uint8_t* data=NULL;size_t data_len=0;
-    while(dgramq_peek(buf,*len,&data,&data_len,&queued_at)&&queued_at>0&&now>queued_at&&
-        now-queued_at>deadline_us){dgramq_consume(buf,len);dropped++;}
-    return dropped;
-}
-
-static int udp_queue_wire(proxy_stream_t* p,int to_down,const uint8_t* data,size_t length){
-    uint8_t** buf=to_down?&p->udp_down_tx:&p->udp_up_tx;
-    size_t* len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
-    size_t* cap=to_down?&p->udp_down_tx_cap:&p->udp_up_tx_cap;
-    picoquic_cnx_t* cnx=to_down?p->down_cnx:p->up_cnx;
-    if(cnx==NULL||dgramq_append(buf,len,cap,data,length,p->id)!=0)return -1;
-    if(to_down&&*len>p->media_down_q_peak)p->media_down_q_peak=*len;
-    if(!to_down&&*len>p->media_up_q_peak)p->media_up_q_peak=*len;
-    if(picoquic_mark_datagram_ready(cnx,1)!=0)return -1;
-    return 0;
-}
-
-static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const char* route,
-    const uint8_t* payload,size_t payload_length){
-    uint16_t fragments=nb_udp_fragment_count(payload_length);
-    size_t route_length=route?strlen(route):0;
-    if(fragments==0||route_length==0||route_length>=NB_UDP_ROUTE_MAX)return -1;
-    uint32_t sequence=++p->udp_tx_sequence;
-    for(uint16_t i=0;i<fragments;i++){
-        size_t offset=(size_t)i*NB_UDP_FRAGMENT_PAYLOAD;
-        size_t part=payload_length-offset;if(part>NB_UDP_FRAGMENT_PAYLOAD)part=NB_UDP_FRAGMENT_PAYLOAD;
-        uint8_t wire[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
-        int n=nb_udp_wire_encode(wire,sizeof(wire),type,p->udp_session_id,sequence,i,fragments,
-            (uint16_t)payload_length,route,(uint16_t)route_length,payload+offset,(uint16_t)part);
-        if(n<0||udp_queue_wire(p,to_down,wire,(size_t)n)!=0)return -1;
-    }
-    return 0;
-}
-
-static int udp_fec_record_source(proxy_stream_t* p,const nb_udp_wire_view_t* view,const char* route){
-    if(p==NULL||p->udp_fec_tx==NULL||view==NULL||route==NULL)return 0;
-    nb_udp_wire_view_t forwarded=*view;forwarded.route=(const uint8_t*)route;
-    forwarded.route_length=(uint16_t)strlen(route);
-    uint8_t repair[1280];int length=nb_udp_fec_tx_feed(p->udp_fec_tx,&forwarded,
-        picoquic_current_time(),repair,sizeof(repair));
-    if(length<0)return -1;
-    p->udp_fec_source_packets++;
-    if(length>0){
-        if(udp_queue_wire(p,1,repair,(size_t)length)!=0)return -1;
-        p->udp_fec_repairs_sent++;
-    }
-    return 0;
-}
-
-static int udp_fec_flush_due(proxy_stream_t* p,uint64_t now){
-    if(p==NULL||p->udp_fec_tx==NULL)return 0;
-    uint8_t repair[1280];int length=nb_udp_fec_tx_flush_due(p->udp_fec_tx,now,repair,sizeof(repair));
-    if(length<0)return -1;
-    if(length>0){
-        if(udp_queue_wire(p,1,repair,(size_t)length)!=0)return -1;
-        p->udp_fec_repairs_sent++;
-    }
-    return 0;
-}
-
-static int udp_forward_fragment(proxy_stream_t* p,int to_down,const nb_udp_wire_view_t* view,
-    const char* route){
-    size_t route_length=strlen(route);uint8_t wire[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
-    int n=nb_udp_wire_encode(wire,sizeof(wire),view->type,view->session_id,view->sequence,
-        view->fragment_index,view->fragment_count,view->total_length,route,(uint16_t)route_length,
-        view->payload,view->payload_length);
-    return n<0?-1:udp_queue_wire(p,to_down,wire,(size_t)n);
-}
+#include "nb_node_udp_queue.inc"
 
 static int fec_queue_datagram(proxy_stream_t* p, const uint8_t* d, size_t n){
     if(p->fec_dg_cnx == NULL) return -1;

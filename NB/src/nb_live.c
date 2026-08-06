@@ -9,7 +9,6 @@
 #define MEDIA_DOWNLINK_BULK_KBPS 512.0
 #define MEDIA_DOWNLINK_DOMINANCE 4.0
 #define MEDIA_DOWNLINK_WINDOWS 2
-
 nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_mode){
     nb_live_queue_limits_t limits;
     if(flow_class==NB_FLOW_CLASS_CTRL){
@@ -20,6 +19,17 @@ nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_
         limits.high_bytes=MIB;limits.low_bytes=512*KIB;limits.deadline_us=1000000ULL;
     }
     return limits;
+}
+
+nb_live_queue_limits_t nb_live_queue_limits_for_path(nb_flow_class_t flow_class, int udp_mode,
+    uint64_t reorder_delay_us){
+    nb_live_queue_limits_t limits=nb_live_queue_limits(flow_class,udp_mode);
+    (void)reorder_delay_us;
+    return limits;
+}
+
+int nb_live_queue_expiry_enabled(nb_flow_class_t flow_class,int udp_mode){
+    return !(udp_mode&&flow_class==NB_FLOW_CLASS_MEDIA);
 }
 
 void nb_live_queue_appended(nb_live_queue_clock_t* clock,size_t previous_len,size_t added,uint64_t now_us){

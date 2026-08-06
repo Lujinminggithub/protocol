@@ -46,6 +46,9 @@ typedef struct {
 } nb_live_sched_t;
 
 nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_mode);
+nb_live_queue_limits_t nb_live_queue_limits_for_path(nb_flow_class_t flow_class, int udp_mode,
+    uint64_t reorder_delay_us);
+int nb_live_queue_expiry_enabled(nb_flow_class_t flow_class, int udp_mode);
 void nb_live_queue_appended(nb_live_queue_clock_t* clock, size_t previous_len, size_t added, uint64_t now_us);
 void nb_live_queue_consumed(nb_live_queue_clock_t* clock, size_t consumed, size_t remaining);
 uint64_t nb_live_queue_age_us(const nb_live_queue_clock_t* clock, size_t length, uint64_t now_us);

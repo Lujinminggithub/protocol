@@ -57,6 +57,7 @@
 #include "nb_path.h"
 #include "nb_dns.h"
 #include "nb_udp.h"
+#include "nb_udp_queue.h"
 #include "nb_udp_io.h"
 #include "nb_udp_lifecycle.h"
 #include "nb_whitelist.h"
@@ -349,6 +350,19 @@ static int transport_bind_connection(picoquic_cnx_t* cnx,int outbound){
     if((G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE)&&outbound&&
         picoquic_set_loss_reorder_tolerance(cnx,link->reorder_gap,link->reorder_delay_us)!=0)return -1;
     return 0;
+}
+
+static void transport_seed_outbound_connection(picoquic_cnx_t* cnx,struct sockaddr* peer){
+    nb_transport_runtime_t* runtime=&nb_current_instance->transport_egress;
+    if(!runtime->active)runtime=&nb_current_instance->transport_ingress;
+    if(!runtime->active||strcmp(runtime->link.cc,"bbr")||runtime->link.target_rate_bps==0||
+        runtime->link.seed_rtt_us==0||runtime->link.startup_cwin_bytes==0)return;
+    uint8_t* ip=NULL;uint8_t ip_len=0;picoquic_get_ip_addr(peer,&ip,&ip_len);
+    if(ip==NULL||ip_len==0)return;
+    picoquic_seed_bandwidth(cnx,runtime->link.seed_rtt_us,runtime->link.startup_cwin_bytes,ip,ip_len);
+    log4c_info("transport BBR seed generation=%llu target_bps=%llu rtt_us=%llu cwin=%llu",
+        (unsigned long long)runtime->generation,(unsigned long long)runtime->link.target_rate_bps,
+        (unsigned long long)runtime->link.seed_rtt_us,(unsigned long long)runtime->link.startup_cwin_bytes);
 }
 
 static uint64_t transport_connection_generation(picoquic_cnx_t* cnx){

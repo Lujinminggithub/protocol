@@ -70,7 +70,7 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_c2s_rx_at,p->created_at),view->sequence,
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             if(p==NULL)return -3;
-            if(udp_forward_fragment(p,1,view,rest)!=0)return -4;
+            if(udp_forward_fragment(p,1,view,rest)<0)return -4;
             if(p->flow_class==NB_FLOW_CLASS_MEDIA&&nb_current_instance->transport_egress.active&&
                 nb_current_instance->transport_egress.link.udp_fec_adaptive&&
                 pool_udp_fec_needed(&G.pools[p->down_pool_id],picoquic_current_time())){
@@ -106,7 +106,7 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_s2c_rx_at,p->created_at),view->sequence,
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             if(p==NULL)return -8;
-            if(udp_forward_fragment(p,0,view,p->route)!=0)return -9;
+            if(udp_forward_fragment(p,0,view,p->route)<0)return -9;
             p->udp_packets_s2c+=(view->fragment_index==0);p->bytes_s2c+=view->payload_length;ps_touch(p);return 0;
         }
         if(G.role==ROLE_ENTRY){
@@ -468,8 +468,13 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
             if(p->down_cnx==cnx&&p->udp_down_tx_len>=10){queue=p->udp_down_tx;queue_len=&p->udp_down_tx_len;}
             else if(p->up_cnx==cnx&&p->udp_up_tx_len>=10){queue=p->udp_up_tx;queue_len=&p->udp_up_tx_len;}
             if(queue==NULL)continue;
-            nb_live_queue_limits_t limits=nb_live_queue_limits(p->flow_class,1);
-            uint64_t dropped=dgramq_drop_expired(queue,queue_len,limits.deadline_us,now);
+            const nb_transport_runtime_t* runtime=p->down_cnx==cnx?
+                &nb_current_instance->transport_egress:&nb_current_instance->transport_ingress;
+            uint64_t reorder_delay_us=runtime->active?runtime->link.reorder_delay_us:
+                nb_current_instance->reorder_delay_us;
+            nb_live_queue_limits_t limits=nb_live_queue_limits_for_path(p->flow_class,1,reorder_delay_us);
+            uint64_t dropped=nb_live_queue_expiry_enabled(p->flow_class,1)?
+                dgramq_drop_expired(queue,queue_len,limits.deadline_us,now):0;
             if(dropped>0)log4c_info("%s udp deadline drop id=%u packets=%llu deadline=%.1fms target=%s:%d",
                 role_name(G.role),p->id,(unsigned long long)dropped,limits.deadline_us/1000.0,
                 p->udp_target_host,p->udp_target_port);

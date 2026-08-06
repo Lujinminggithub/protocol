@@ -28,6 +28,9 @@ type QUICEvidence struct {
 	EffectiveLossP95Pct float64 `json:"effective_loss_p95_pct"`
 	ReorderGapMax       int     `json:"reorder_gap_max"`
 	ReorderDelayMaxMS   float64 `json:"reorder_delay_max_ms"`
+	ReorderWindows      int     `json:"reorder_percentile_windows"`
+	ReorderGapP95       int     `json:"reorder_gap_p95"`
+	ReorderDelayP95MS   float64 `json:"reorder_delay_p95_ms"`
 	QUICIPMTUProven     int     `json:"quic_ip_mtu_proven"`
 }
 
@@ -56,20 +59,23 @@ type Probe struct {
 }
 
 type Link struct {
-	CC             string  `json:"cc"`
-	BBROptions     string  `json:"bbr_options,omitempty"`
-	CWinMaxBytes   uint64  `json:"cwin_max_bytes,omitempty"`
-	MTUMax         int     `json:"mtu_max"`
-	ReorderGap     int     `json:"reorder_gap"`
-	ReorderDelayUS int64   `json:"reorder_delay_us"`
-	UDPGSO         bool    `json:"udp_gso"`
-	FECObserve     bool    `json:"fec_observe"`
-	FECActive      bool    `json:"fec_active"`
-	UDPFECAdaptive bool    `json:"udp_fec_adaptive"`
-	UDPFECK        int     `json:"udp_fec_k"`
-	UDPFECHoldUS   int64   `json:"udp_fec_hold_us"`
-	TargetMbps     float64 `json:"target_mbps"`
-	Confidence     string  `json:"confidence"`
+	CC               string  `json:"cc"`
+	BBROptions       string  `json:"bbr_options,omitempty"`
+	CWinMaxBytes     uint64  `json:"cwin_max_bytes,omitempty"`
+	MTUMax           int     `json:"mtu_max"`
+	ReorderGap       int     `json:"reorder_gap"`
+	ReorderDelayUS   int64   `json:"reorder_delay_us"`
+	UDPGSO           bool    `json:"udp_gso"`
+	FECObserve       bool    `json:"fec_observe"`
+	FECActive        bool    `json:"fec_active"`
+	UDPFECAdaptive   bool    `json:"udp_fec_adaptive"`
+	UDPFECK          int     `json:"udp_fec_k"`
+	UDPFECHoldUS     int64   `json:"udp_fec_hold_us"`
+	TargetMbps       float64 `json:"target_mbps"`
+	TargetRateBPS    uint64  `json:"target_rate_bps"`
+	SeedRTTUS        int64   `json:"seed_rtt_us"`
+	StartupCWinBytes uint64  `json:"startup_cwin_bytes"`
+	Confidence       string  `json:"confidence"`
 }
 
 type Segment struct {
@@ -132,6 +138,10 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 	if pathRTT <= 0 {
 		pathRTT = loadedRTT
 	}
+	targetRateBPS := uint64(math.Round(targetMbps * 1_000_000))
+	seedRTTUS := int64(math.Round(pathRTT * 1000))
+	startupBDP := targetMbps * 2 * 1_000_000 / 8 * pathRTT / 1000
+	startupCWin := ceil64K(math.Max(256*1024, math.Min(64*1024*1024, startupBDP)))
 	loss := evidence.QUIC.EffectiveLossP95Pct
 	if evidence.QUIC.PacketsObserved == 0 {
 		loss = evidence.ICMP.LossPct
@@ -144,20 +154,26 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 	}
 	bdp := targetMbps * 1_000_000 / 8 * loadedRTT / 1000
 	cwin := ceil64K(math.Max(256*1024, math.Min(8*1024*1024, bdp*2)))
-	// These values are adaptive floors. Mirror picoquic's observed-reorder
-	// safety margin without making RTT itself a permanent retransmit delay.
-	gap := int(math.Ceil(float64(evidence.QUIC.ReorderGapMax)*1.125)) + 8
+	reorderGap := evidence.QUIC.ReorderGapMax
+	reorderDelayMS := evidence.QUIC.ReorderDelayMaxMS
+	if evidence.QUIC.ReorderWindows > 0 {
+		reorderGap = evidence.QUIC.ReorderGapP95
+		reorderDelayMS = evidence.QUIC.ReorderDelayP95MS
+	}
+	gap := int(math.Ceil(float64(reorderGap))) + 8
 	if gap < 8 {
 		gap = 8
 	}
-	if gap > 1024 {
-		gap = 1024
+	if gap > 64 {
+		gap = 64
 	}
-	delayMS := math.Max(20, evidence.QUIC.ReorderDelayMaxMS*1.25+20)
+	delayCapMS := 120.0
+	if pathRTT <= 30 {
+		delayCapMS = 80
+	}
+	delayMS := math.Min(delayCapMS,
+		math.Max(20, reorderDelayMS+3*evidence.QUIC.JitterP95MS))
 	delayUS := int64(math.Ceil(delayMS) * 1000)
-	if delayUS > 1_000_000 {
-		delayUS = 1_000_000
-	}
 	quicMTU := evidence.QUIC.QUICIPMTUProven
 	dfMTU := evidence.MTU.MaxIPMTU
 	mtu := 0
@@ -181,7 +197,9 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 	link := Link{CC: cc, MTUMax: mtu, ReorderGap: gap, ReorderDelayUS: delayUS,
 		UDPGSO: false, FECObserve: true, FECActive: false,
 		UDPFECAdaptive: true, UDPFECK: 8, UDPFECHoldUS: 2000,
-		TargetMbps: targetMbps, Confidence: confidence}
+		TargetMbps: targetMbps, TargetRateBPS: targetRateBPS,
+		SeedRTTUS: seedRTTUS, StartupCWinBytes: startupCWin,
+		Confidence: confidence}
 	if cc == "cubic" {
 		link.CWinMaxBytes = cwin
 	} else {
@@ -194,41 +212,9 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 }
 
 func selectedCandidate(evidence SegmentEvidence, targetMbps float64) (Link, error) {
-	floor := calculateLink(evidence, targetMbps)
-	candidate := evidence.Candidate
-	if candidate.Confidence != "load-qualified" {
+	result := calculateLink(evidence, targetMbps)
+	if result.Confidence != "load-qualified" {
 		return Link{}, errors.New("probe evidence has no load-qualified transport candidate")
-	}
-	if candidate.CC != "cubic" && candidate.CC != "bbr" {
-		return Link{}, errors.New("transport candidate has invalid congestion control")
-	}
-	if candidate.ReorderGap < floor.ReorderGap || candidate.ReorderGap > 1024 ||
-		candidate.ReorderDelayUS < floor.ReorderDelayUS || candidate.ReorderDelayUS > 1_000_000 {
-		return Link{}, errors.New("transport candidate reduces the evidence-derived reorder safety envelope")
-	}
-	if candidate.MTUMax == nil || *candidate.MTUMax < 1280 || *candidate.MTUMax > floor.MTUMax {
-		return Link{}, errors.New("transport candidate has an unsafe MTU")
-	}
-	result := Link{CC: candidate.CC, MTUMax: *candidate.MTUMax,
-		ReorderGap: candidate.ReorderGap, ReorderDelayUS: candidate.ReorderDelayUS,
-		UDPGSO: false, FECObserve: true, FECActive: false,
-		UDPFECAdaptive: true, UDPFECK: 8, UDPFECHoldUS: 2000,
-		TargetMbps: targetMbps, Confidence: candidate.Confidence}
-	if candidate.CC == "cubic" {
-		if candidate.CWinMaxBytes == nil || *candidate.CWinMaxBytes < 65536 ||
-			*candidate.CWinMaxBytes > 64*1024*1024 {
-			return Link{}, errors.New("CUBIC transport candidate has an invalid congestion window")
-		}
-		result.CWinMaxBytes = *candidate.CWinMaxBytes
-	} else {
-		result.BBROptions = "Q0.0001:"
-		pathRTT := evidence.ICMP.RTTAvgMS
-		if pathRTT <= 0 {
-			pathRTT = evidence.QUIC.RTTP95MS
-		}
-		if pathRTT >= 100 {
-			result.BBROptions = "Q0.0001:F0.25:"
-		}
 	}
 	return result, nil
 }
@@ -236,7 +222,8 @@ func selectedCandidate(evidence SegmentEvidence, targetMbps float64) (Link, erro
 func validEvidence(evidence SegmentEvidence) bool {
 	values := []float64{evidence.ICMP.LossPct, evidence.ICMP.RTTAvgMS, evidence.ICMP.RTTMaxMS,
 		evidence.ICMP.MDevMS, evidence.QUIC.RTTP95MS, evidence.QUIC.JitterP95MS,
-		evidence.QUIC.EffectiveLossP95Pct, evidence.QUIC.ReorderDelayMaxMS}
+		evidence.QUIC.EffectiveLossP95Pct, evidence.QUIC.ReorderDelayMaxMS,
+		evidence.QUIC.ReorderDelayP95MS}
 	for _, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return false
@@ -246,6 +233,8 @@ func validEvidence(evidence SegmentEvidence) bool {
 		evidence.ICMP.RTTMaxMS <= 60_000 && evidence.QUIC.RTTP95MS <= 60_000 &&
 		evidence.QUIC.WindowsValid >= 0 && evidence.QUIC.PacketsObserved >= 0 &&
 		evidence.QUIC.ReorderGapMax >= 0 && evidence.QUIC.ReorderGapMax <= 1_000_000 &&
+		evidence.QUIC.ReorderWindows >= 0 && evidence.QUIC.ReorderWindows <= evidence.QUIC.WindowsValid &&
+		evidence.QUIC.ReorderGapP95 >= 0 && evidence.QUIC.ReorderGapP95 <= 1_000_000 &&
 		(evidence.MTU.MaxIPMTU == 0 || evidence.MTU.MaxIPMTU >= 1280 && evidence.MTU.MaxIPMTU <= 9000) &&
 		(evidence.QUIC.QUICIPMTUProven == 0 || evidence.QUIC.QUICIPMTUProven >= 1280 && evidence.QUIC.QUICIPMTUProven <= 9000)
 }

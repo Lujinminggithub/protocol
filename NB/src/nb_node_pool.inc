@@ -7,6 +7,7 @@ static picoquic_cnx_t* pool_create_cnx(cnx_pool_t* pool, int idx){
             (unsigned long long)g_reorder_gap,(unsigned long long)g_reorder_delay_us);
         picoquic_delete_cnx(c); return NULL;
     }
+    transport_seed_outbound_connection(c,(struct sockaddr*)&pool->addr);
     picoquic_set_callback(c, relay_quic_callback, NULL);
     if(picoquic_start_client_cnx(c)!=0){
         log4c_error("pool[%d] start cnx fail",idx);picoquic_delete_cnx(c);return NULL;

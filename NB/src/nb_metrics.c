@@ -34,6 +34,12 @@ void nb_metrics_note_udp_rxq_overflow(nb_metrics_state_t* state,uint64_t dropped
     else state->udp_rxq_overflow+=dropped;
 }
 
+void nb_metrics_note_udp_queue_pressure_drop(nb_metrics_state_t* state,uint64_t dropped){
+    if(state==NULL)return;
+    if(UINT64_MAX-state->udp_queue_pressure_dropped<dropped)state->udp_queue_pressure_dropped=UINT64_MAX;
+    else state->udp_queue_pressure_dropped+=dropped;
+}
+
 void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot,const nb_metrics_state_t* state,
     uint64_t sessions,uint64_t sessions_peak,uint64_t pools,uint64_t exit_routes){
     if(snapshot==NULL)return;
@@ -104,7 +110,7 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"cwin_max_bytes\":%llu,\"bytes_in_flight_max\":%llu,\"pacing_rate_max\":%llu,\"blocked_connections\":%llu,\"cc\":\"%s\",\"cc_state\":%llu},"
         "\"closed\":{\"total\":%llu,\"normal\":%llu,\"timeout\":%llu,\"error\":%llu,\"reset\":%llu},"
         "\"event_loop\":{\"iterations\":%llu,\"over_5ms\":%llu,\"over_20ms\":%llu,\"busy_max_us\":%llu,\"wake_late_max_us\":%llu},"
-        "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu,\"rxq_overflow\":%llu},"
+        "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu,\"rxq_overflow\":%llu,\"queue_pressure_dropped\":%llu},"
         "\"pool_recovery\":{\"retired\":%llu,\"suppressed\":%llu,\"quarantined\":%llu,\"mbb_promotions\":%llu},"
         "\"pmtu\":{\"promotions\":%llu,\"fallbacks\":%llu},"
         "\"fec\":{\"observe\":%d,\"active\":%d,\"tx_blocks\":%llu,\"rx_blocks\":%llu,\"recovered\":%llu,\"nack\":%llu,\"retx\":%llu,"
@@ -130,7 +136,7 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->lifetime.loop_iterations,(unsigned long long)s->lifetime.loop_over_5ms,(unsigned long long)s->lifetime.loop_over_20ms,
         (unsigned long long)s->lifetime.loop_busy_max_us,(unsigned long long)s->lifetime.loop_wake_late_max_us,
         (unsigned long long)s->lifetime.udp_rx_errors,(unsigned long long)s->lifetime.udp_tx_errors,
-        (unsigned long long)s->lifetime.udp_rxq_overflow,
+        (unsigned long long)s->lifetime.udp_rxq_overflow,(unsigned long long)s->lifetime.udp_queue_pressure_dropped,
         (unsigned long long)s->lifetime.pool_retire_total,(unsigned long long)s->lifetime.pool_retire_suppressed,
         (unsigned long long)s->lifetime.pool_quarantine_total,(unsigned long long)s->lifetime.pool_mbb_promotions,
         (unsigned long long)s->lifetime.pmtu_promotions,(unsigned long long)s->lifetime.pmtu_fallbacks,

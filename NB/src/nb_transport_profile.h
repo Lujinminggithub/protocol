@@ -21,6 +21,9 @@ typedef struct {
     int udp_fec_adaptive;
     uint32_t udp_fec_k;
     uint64_t udp_fec_hold_us;
+    uint64_t target_rate_bps;
+    uint64_t seed_rtt_us;
+    uint64_t startup_cwin_bytes;
 } nb_transport_link_profile_t;
 
 typedef struct {

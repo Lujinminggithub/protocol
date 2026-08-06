@@ -399,9 +399,11 @@ static void udp_local_drain(proxy_stream_t* p){
                     child->id,child->udp_session_id,trace_delta_ms(child->udp_first_local_c2s_at,p->created_at),
                     trace_delta_ms(child->udp_first_local_c2s_at,child->created_at),payload_len,host,port);
             }
-            if(udp_queue_packet(child,1,NB_UDP_TYPE_C2S,child->route,payload,payload_len)!=0){
+            int queue_rc=udp_queue_packet(child,1,NB_UDP_TYPE_C2S,child->route,payload,payload_len);
+            if(queue_rc<0){
                 ps_teardown_reason(child,"udp-down-queue-fail");continue;
             }
+            if(queue_rc>0)continue;
             child->udp_packets_c2s++;child->bytes_c2s+=payload_len;ps_touch(child);ps_touch(p);
         }else if(G.role==ROLE_EXIT){
             uint64_t dropped=0;ssize_t n=nb_udp_recv(p->udp_fd,buffer,NB_UDP_MAX_PAYLOAD,0,
@@ -416,9 +418,11 @@ static void udp_local_drain(proxy_stream_t* p){
                     trace_delta_ms(p->udp_first_target_rx_at,p->udp_first_target_send_at),n,
                     p->udp_target_host,p->udp_target_port);
             }
-            if(udp_queue_packet(p,0,NB_UDP_TYPE_S2C,p->route,buffer,(size_t)n)!=0){
+            int queue_rc=udp_queue_packet(p,0,NB_UDP_TYPE_S2C,p->route,buffer,(size_t)n);
+            if(queue_rc<0){
                 ps_teardown_reason(p,"udp-up-queue-fail");break;
             }
+            if(queue_rc>0)continue;
             p->udp_packets_s2c++;p->bytes_s2c+=(size_t)n;ps_touch(p);
         }else break;
     }
