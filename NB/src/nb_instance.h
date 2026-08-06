@@ -32,7 +32,10 @@ typedef struct {
     picoquic_cnx_t* cnx;
     nb_live_sched_t sched;
     uint64_t transport_generation;
+    uint64_t seed_rtt_us;
+    uint64_t seed_cwin_bytes;
     int transport_profile_bound;
+    int seed_configured;
 } nb_sched_cnx_t;
 
 typedef struct {

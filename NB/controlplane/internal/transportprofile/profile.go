@@ -139,9 +139,6 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 		pathRTT = loadedRTT
 	}
 	targetRateBPS := uint64(math.Round(targetMbps * 1_000_000))
-	seedRTTUS := int64(math.Round(pathRTT * 1000))
-	startupBDP := targetMbps * 2 * 1_000_000 / 8 * pathRTT / 1000
-	startupCWin := ceil64K(math.Max(256*1024, math.Min(64*1024*1024, startupBDP)))
 	loss := evidence.QUIC.EffectiveLossP95Pct
 	if evidence.QUIC.PacketsObserved == 0 {
 		loss = evidence.ICMP.LossPct
@@ -152,6 +149,13 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 	if pathRTT <= 30 && evidence.ICMP.LossPct <= 1 && loss <= 1 {
 		cc = "cubic"
 	}
+	seedRTT := pathRTT
+	if cc == "bbr" {
+		seedRTT = loadedRTT
+	}
+	seedRTTUS := int64(math.Round(seedRTT * 1000))
+	startupBDP := targetMbps * 2 * 1_000_000 / 8 * seedRTT / 1000
+	startupCWin := ceil64K(math.Max(256*1024, math.Min(64*1024*1024, startupBDP)))
 	bdp := targetMbps * 1_000_000 / 8 * loadedRTT / 1000
 	cwin := ceil64K(math.Max(256*1024, math.Min(8*1024*1024, bdp*2)))
 	reorderGap := evidence.QUIC.ReorderGapMax

@@ -63,8 +63,8 @@ func TestGenerateDoesNotTurnLoadedShortHopIntoBBR(t *testing.T) {
 	if entry.TargetRateBPS != 10_000_000 || middle.TargetRateBPS != 10_000_000 {
 		t.Fatalf("runtime target rate missing: entry=%d middle=%d", entry.TargetRateBPS, middle.TargetRateBPS)
 	}
-	if entry.SeedRTTUS != 4400 || middle.SeedRTTUS != 202300 {
-		t.Fatalf("physical RTT seed missing: entry=%d middle=%d", entry.SeedRTTUS, middle.SeedRTTUS)
+	if entry.SeedRTTUS != 4400 || middle.SeedRTTUS != 186100 {
+		t.Fatalf("QUIC RTT seed missing: entry=%d middle=%d", entry.SeedRTTUS, middle.SeedRTTUS)
 	}
 	if middle.StartupCWinBytes != 524288 {
 		t.Fatalf("2x live startup BDP=%d, want 524288", middle.StartupCWinBytes)
@@ -133,6 +133,9 @@ func TestGenerateBoundsKZReorderInsteadOfPreservingProbeCandidate(t *testing.T) 
 		t.Fatal(err)
 	}
 	middle := profile.Segments["middle_exit"].Source
+	if middle.SeedRTTUS != 286274 || middle.StartupCWinBytes != 393216 {
+		t.Fatalf("long-haul seed must use QUIC RTT and 2x average BDP: %+v", middle)
+	}
 	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 120000 {
 		t.Fatalf("KZ reorder envelope is not bounded for live traffic: %+v", middle)
 	}

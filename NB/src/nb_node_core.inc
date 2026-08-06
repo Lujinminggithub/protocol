@@ -52,6 +52,7 @@
 #include "nb_session.h"
 #include "nb_runtime.h"
 #include "nb_instance.h"
+#include "nb_transport_seed.h"
 #include "nb_bridge.h"
 #include "nb_send.h"
 #include "nb_path.h"
@@ -352,17 +353,23 @@ static int transport_bind_connection(picoquic_cnx_t* cnx,int outbound){
     return 0;
 }
 
-static void transport_seed_outbound_connection(picoquic_cnx_t* cnx,struct sockaddr* peer){
+static void transport_seed_outbound_connection(picoquic_cnx_t* cnx,struct sockaddr* peer,
+    uint64_t observed_rtt_us){
     nb_transport_runtime_t* runtime=&nb_current_instance->transport_egress;
     if(!runtime->active)runtime=&nb_current_instance->transport_ingress;
-    if(!runtime->active||strcmp(runtime->link.cc,"bbr")||runtime->link.target_rate_bps==0||
-        runtime->link.seed_rtt_us==0||runtime->link.startup_cwin_bytes==0)return;
+    if(!runtime->active)return;
+    nb_transport_seed_plan_t plan;
+    if(nb_transport_seed_plan(&runtime->link,observed_rtt_us,&plan)!=0||!plan.configured)return;
     uint8_t* ip=NULL;uint8_t ip_len=0;picoquic_get_ip_addr(peer,&ip,&ip_len);
     if(ip==NULL||ip_len==0)return;
-    picoquic_seed_bandwidth(cnx,runtime->link.seed_rtt_us,runtime->link.startup_cwin_bytes,ip,ip_len);
-    log4c_info("transport BBR seed generation=%llu target_bps=%llu rtt_us=%llu cwin=%llu",
+    picoquic_seed_bandwidth(cnx,plan.rtt_us,plan.cwin_bytes,ip,ip_len);
+    nb_sched_cnx_t* connection=runtime_for_cnx(cnx,1);
+    if(connection){connection->seed_configured=1;connection->seed_rtt_us=plan.rtt_us;
+        connection->seed_cwin_bytes=plan.cwin_bytes;}
+    log4c_info("transport BBR seed generation=%llu target_bps=%llu rtt_us=%llu cwin=%llu source=%s",
         (unsigned long long)runtime->generation,(unsigned long long)runtime->link.target_rate_bps,
-        (unsigned long long)runtime->link.seed_rtt_us,(unsigned long long)runtime->link.startup_cwin_bytes);
+        (unsigned long long)plan.rtt_us,(unsigned long long)plan.cwin_bytes,
+        observed_rtt_us?"lane":"profile");
 }
 
 static uint64_t transport_connection_generation(picoquic_cnx_t* cnx){
@@ -511,6 +518,9 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
                 nb_metrics_snapshot_add_transport(&snapshot,cc,cc_state,quality.lost,quality.spurious_losses,
                     quality.timer_losses,quality.max_reorder_gap,quality.max_reorder_delay,quality.cwin,
                     quality.bytes_in_transit,quality.pacing_rate,cnx->cwin_blocked||cnx->flow_blocked||cnx->stream_blocked);
+                nb_sched_cnx_t* connection=runtime_for_cnx(cnx,0);
+                if(connection&&connection->seed_configured)nb_metrics_snapshot_add_seed(&snapshot,
+                    cnx->cwin_notified_from_seed,connection->seed_rtt_us,connection->seed_cwin_bytes);
             }
         }
         nb_fec_metrics_t fm=g_fec_metrics_done;

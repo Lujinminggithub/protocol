@@ -92,6 +92,14 @@ void nb_metrics_snapshot_add_transport(nb_metrics_snapshot_t* s,const char* cc,u
     if(s->link_cc[0]==0&&cc){snprintf(s->link_cc,sizeof(s->link_cc),"%s",cc);s->link_cc_state=state;}
 }
 
+void nb_metrics_snapshot_add_seed(nb_metrics_snapshot_t* s,int applied,uint64_t rtt,uint64_t cwin){
+    if(s==NULL)return;
+    s->bdp_seed_configured++;
+    s->bdp_seed_applied+=applied!=0;
+    if(rtt>s->bdp_seed_rtt_max_us)s->bdp_seed_rtt_max_us=rtt;
+    if(cwin>s->bdp_seed_cwin_max_bytes)s->bdp_seed_cwin_max_bytes=cwin;
+}
+
 int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* worker,
     const char* release,const char* profile,int schema,const nb_metrics_snapshot_t* s,const nb_metrics_fec_t* f){
     if(out==NULL||cap==0||s==NULL||f==NULL)return -1;
@@ -108,6 +116,7 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"link\":{\"samples\":%llu,\"sent_packets\":%llu,\"effective_loss_max_pct\":%.3f,\"rtt_max_us\":%llu,\"jitter_max_us\":%llu,"
         "\"lost_total\":%llu,\"spurious_total\":%llu,\"timer_loss_total\":%llu,\"reorder_gap_max\":%llu,\"reorder_delay_max_us\":%llu,"
         "\"cwin_max_bytes\":%llu,\"bytes_in_flight_max\":%llu,\"pacing_rate_max\":%llu,\"blocked_connections\":%llu,\"cc\":\"%s\",\"cc_state\":%llu},"
+        "\"bdp_seed\":{\"configured\":%llu,\"applied\":%llu,\"rtt_us_max\":%llu,\"cwin_bytes_max\":%llu},"
         "\"closed\":{\"total\":%llu,\"normal\":%llu,\"timeout\":%llu,\"error\":%llu,\"reset\":%llu},"
         "\"event_loop\":{\"iterations\":%llu,\"over_5ms\":%llu,\"over_20ms\":%llu,\"busy_max_us\":%llu,\"wake_late_max_us\":%llu},"
         "\"udp_errors\":{\"rx\":%llu,\"tx\":%llu,\"rxq_overflow\":%llu,\"queue_pressure_dropped\":%llu},"
@@ -132,6 +141,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->link_cwin_max_bytes,(unsigned long long)s->link_bytes_in_flight_max,
         (unsigned long long)s->link_pacing_rate_max,(unsigned long long)s->link_blocked_connections,
         s->link_cc,(unsigned long long)s->link_cc_state,
+        (unsigned long long)s->bdp_seed_configured,(unsigned long long)s->bdp_seed_applied,
+        (unsigned long long)s->bdp_seed_rtt_max_us,(unsigned long long)s->bdp_seed_cwin_max_bytes,
         (unsigned long long)s->lifetime.close_total,(unsigned long long)s->lifetime.close_normal,(unsigned long long)s->lifetime.close_timeout,(unsigned long long)s->lifetime.close_error,(unsigned long long)s->lifetime.close_reset,
         (unsigned long long)s->lifetime.loop_iterations,(unsigned long long)s->lifetime.loop_over_5ms,(unsigned long long)s->lifetime.loop_over_20ms,
         (unsigned long long)s->lifetime.loop_busy_max_us,(unsigned long long)s->lifetime.loop_wake_late_max_us,

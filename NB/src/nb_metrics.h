@@ -70,6 +70,10 @@ typedef struct {
     uint64_t link_blocked_connections;
     char link_cc[16];
     uint64_t link_cc_state;
+    uint64_t bdp_seed_configured;
+    uint64_t bdp_seed_applied;
+    uint64_t bdp_seed_rtt_max_us;
+    uint64_t bdp_seed_cwin_max_bytes;
     nb_metrics_state_t lifetime;
 } nb_metrics_snapshot_t;
 
@@ -106,6 +110,8 @@ void nb_metrics_snapshot_add_link(nb_metrics_snapshot_t* snapshot, double effect
 void nb_metrics_snapshot_add_transport(nb_metrics_snapshot_t* snapshot,const char* cc,uint64_t cc_state,
     uint64_t lost,uint64_t spurious,uint64_t timer_loss,uint64_t reorder_gap,uint64_t reorder_delay_us,
     uint64_t cwin,uint64_t bytes_in_flight,uint64_t pacing_rate,int blocked);
+void nb_metrics_snapshot_add_seed(nb_metrics_snapshot_t* snapshot,int applied,
+    uint64_t rtt_us,uint64_t cwin_bytes);
 int nb_metrics_render_json(char* out, size_t cap, const char* role, const char* worker,
     const char* release, const char* profile, int profile_schema,
     const nb_metrics_snapshot_t* snapshot, const nb_metrics_fec_t* fec);
