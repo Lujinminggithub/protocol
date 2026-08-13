@@ -256,6 +256,8 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 	case "line.validate":
 		return []commandStep{{Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
+			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64),
+			"--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
 			"--socks-port", socks, "--via-entry-ssh", "--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.tune":
 		return nil, nil
@@ -337,11 +339,18 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	}
 	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
 	line, ok := r.registry.Line(operation.LineID)
+	dynamicResolved := false
 	if !ok {
 		var resolveErr error
 		line, resolveErr = r.dynamicLine(operation, request, operationDir)
 		if resolveErr != nil {
 			return failPreparation(resolveErr, Result{})
+		}
+		dynamicResolved = true
+	}
+	if dynamicResolved && operation.Kind == "line.open" {
+		if verifyErr := r.verifyDynamicSSHAccess(ctx, request.Plan); verifyErr != nil {
+			return failPreparation(verifyErr, Result{})
 		}
 	}
 	if !line.Allows(operation.Kind) {

@@ -20,6 +20,8 @@ type Snapshot struct {
 	Profile        string         `json:"profile"`
 	Sessions       int64          `json:"sessions"`
 	ThroughputMbps float64        `json:"throughput_mbps"`
+	UpstreamMbps   float64        `json:"upstream_mbps"`
+	DownstreamMbps float64        `json:"downstream_mbps"`
 	QueueAgeP95US  float64        `json:"queue_age_p95_us"`
 	EffectiveLoss  float64        `json:"effective_loss_pct"`
 	FECObserve     bool           `json:"fec_observe"`

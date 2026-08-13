@@ -49,6 +49,8 @@ type Snapshot struct {
 	Profile        string          `json:"profile"`
 	Sessions       int64           `json:"sessions"`
 	ThroughputMbps float64         `json:"throughput_mbps"`
+	UpstreamMbps   float64         `json:"upstream_mbps"`
+	DownstreamMbps float64         `json:"downstream_mbps"`
 	QueueAgeP95US  float64         `json:"queue_age_p95_us"`
 	EffectiveLoss  float64         `json:"effective_loss_pct"`
 	FECObserve     bool            `json:"fec_observe"`
@@ -123,6 +125,8 @@ type LineView struct {
 	Workers        int64   `json:"workers"`
 	Sessions       int64   `json:"sessions"`
 	ThroughputMbps float64 `json:"throughput_mbps"`
+	UpstreamMbps   float64 `json:"upstream_mbps"`
+	DownstreamMbps float64 `json:"downstream_mbps"`
 	QueueAgeP95US  float64 `json:"queue_age_p95_us"`
 	EffectiveLoss  float64 `json:"effective_loss_pct"`
 	FECObserve     bool    `json:"fec_observe"`
@@ -178,6 +182,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
  node_id TEXT NOT NULL, role TEXT NOT NULL, worker_id TEXT NOT NULL,
  observed_at TEXT NOT NULL, health TEXT NOT NULL, deployment TEXT NOT NULL,
  profile TEXT NOT NULL, sessions INTEGER NOT NULL, throughput_mbps REAL NOT NULL,
+ upstream_mbps REAL NOT NULL DEFAULT 0, downstream_mbps REAL NOT NULL DEFAULT 0,
  queue_age_p95_us REAL NOT NULL, effective_loss_pct REAL NOT NULL,
  fec_observe INTEGER NOT NULL, fec_active INTEGER NOT NULL, payload BLOB NOT NULL,
  received_at TEXT NOT NULL, UNIQUE(line_id,node_id,worker_id,observed_at)
@@ -199,6 +204,9 @@ CREATE TABLE IF NOT EXISTS executors (
 CREATE TABLE IF NOT EXISTS devices (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
  host TEXT NOT NULL, ssh_port INTEGER NOT NULL, ssh_user TEXT NOT NULL,
+	ssh_host_key TEXT NOT NULL DEFAULT '', ssh_host_key_type TEXT NOT NULL DEFAULT '',
+	ssh_host_key_sha256 TEXT NOT NULL DEFAULT '', ssh_host_key_status TEXT NOT NULL DEFAULT 'pending',
+	ssh_host_key_confirmed_at TEXT NOT NULL DEFAULT '',
  private_ip TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '',
  provider TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
  secret_ref TEXT NOT NULL DEFAULT '', labels BLOB NOT NULL DEFAULT '{}',
@@ -213,6 +221,7 @@ CREATE TABLE IF NOT EXISTS line_specs (
  udp_port_min INTEGER NOT NULL, udp_port_max INTEGER NOT NULL,
  relay_port INTEGER NOT NULL, exit_port INTEGER NOT NULL,
  exit_bind_ip TEXT NOT NULL DEFAULT '',
+ dns_servers BLOB NOT NULL DEFAULT '["1.1.1.1","8.8.8.8"]',
  whitelist BLOB NOT NULL, build_mode TEXT NOT NULL, artifact_ref TEXT NOT NULL,
  source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy TEXT NOT NULL,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -261,7 +270,7 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	if err != nil {
 		return err
 	}
-	foundExitBindIP, foundUpstreamMbps, foundDownstreamMbps := false, false, false
+	foundExitBindIP, foundUpstreamMbps, foundDownstreamMbps, foundDNSServers := false, false, false, false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, kind string
@@ -273,6 +282,7 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 		foundExitBindIP = foundExitBindIP || name == "exit_bind_ip"
 		foundUpstreamMbps = foundUpstreamMbps || name == "upstream_mbps"
 		foundDownstreamMbps = foundDownstreamMbps || name == "downstream_mbps"
+		foundDNSServers = foundDNSServers || name == "dns_servers"
 	}
 	if err = rows.Close(); err != nil {
 		return err
@@ -293,10 +303,71 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 			return err
 		}
 	}
+	if !foundDNSServers {
+		if _, err = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN dns_servers BLOB NOT NULL DEFAULT '["1.1.1.1","8.8.8.8"]'`); err != nil {
+			return err
+		}
+	}
 	if _, err = s.db.ExecContext(ctx, `UPDATE line_specs SET
 	 upstream_mbps=CASE WHEN upstream_mbps<=0 THEN bandwidth_mbps ELSE upstream_mbps END,
 	 downstream_mbps=CASE WHEN downstream_mbps<=0 THEN bandwidth_mbps ELSE downstream_mbps END`); err != nil {
 		return err
+	}
+	snapshotColumns := map[string]bool{}
+	snapshotRows, snapshotErr := s.db.QueryContext(ctx, `PRAGMA table_info(snapshots)`)
+	if snapshotErr != nil {
+		return snapshotErr
+	}
+	for snapshotRows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if snapshotErr = snapshotRows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); snapshotErr != nil {
+			_ = snapshotRows.Close()
+			return snapshotErr
+		}
+		snapshotColumns[name] = true
+	}
+	if snapshotErr = snapshotRows.Close(); snapshotErr != nil {
+		return snapshotErr
+	}
+	for _, name := range []string{"upstream_mbps", "downstream_mbps"} {
+		if !snapshotColumns[name] {
+			if _, snapshotErr = s.db.ExecContext(ctx, `ALTER TABLE snapshots ADD COLUMN `+name+` REAL NOT NULL DEFAULT 0`); snapshotErr != nil {
+				return snapshotErr
+			}
+		}
+	}
+	deviceColumns := map[string]bool{}
+	deviceRows, deviceErr := s.db.QueryContext(ctx, `PRAGMA table_info(devices)`)
+	if deviceErr != nil {
+		return deviceErr
+	}
+	for deviceRows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if deviceErr = deviceRows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); deviceErr != nil {
+			_ = deviceRows.Close()
+			return deviceErr
+		}
+		deviceColumns[name] = true
+	}
+	if deviceErr = deviceRows.Close(); deviceErr != nil {
+		return deviceErr
+	}
+	for name, definition := range map[string]string{
+		"ssh_host_key":              "TEXT NOT NULL DEFAULT ''",
+		"ssh_host_key_type":         "TEXT NOT NULL DEFAULT ''",
+		"ssh_host_key_sha256":       "TEXT NOT NULL DEFAULT ''",
+		"ssh_host_key_status":       "TEXT NOT NULL DEFAULT 'pending'",
+		"ssh_host_key_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+	} {
+		if !deviceColumns[name] {
+			if _, deviceErr = s.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN `+name+` `+definition); deviceErr != nil {
+				return deviceErr
+			}
+		}
 	}
 	// Older workers represented a role-wide collection failure as a fake node.
 	// Remove those placeholders so they cannot degrade an otherwise healthy line.
@@ -417,10 +488,10 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 		payload = json.RawMessage(`{}`)
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO snapshots
- (line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
- queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.LineID, item.NodeID, item.Role, item.WorkerID, item.ObservedAt,
-		item.Health, item.Deployment, item.Profile, item.Sessions, item.ThroughputMbps, item.QueueAgeP95US,
+	 (line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
+	 upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.LineID, item.NodeID, item.Role, item.WorkerID, item.ObservedAt,
+		item.Health, item.Deployment, item.Profile, item.Sessions, item.ThroughputMbps, item.UpstreamMbps, item.DownstreamMbps, item.QueueAgeP95US,
 		item.EffectiveLoss, item.FECObserve, item.FECActive, []byte(payload), now())
 	if err != nil {
 		return false, err
@@ -777,10 +848,10 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 	for _, line := range lines {
 		item := LineView{Line: line, Health: "unknown"}
 		rows, queryErr := s.db.QueryContext(ctx, `WITH ranked AS (
-	 SELECT role,health,deployment,profile,sessions,throughput_mbps,queue_age_p95_us,effective_loss_pct,
+	 SELECT role,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,
 	 fec_observe,fec_active,observed_at,ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY observed_at DESC,id DESC) AS rn
 	 FROM snapshots WHERE line_id=?
-	) SELECT role,health,deployment,profile,sessions,throughput_mbps,queue_age_p95_us,effective_loss_pct,
+	) SELECT role,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,
 	 fec_observe,fec_active,observed_at FROM ranked WHERE rn=1`, line.ID)
 		if queryErr != nil {
 			return Dashboard{}, queryErr
@@ -789,9 +860,9 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 		for rows.Next() {
 			var role, health, deployment, profile, observed string
 			var sessions int64
-			var throughput, queue, loss float64
+			var throughput, upstream, downstream, queue, loss float64
 			var observe, active bool
-			if queryErr = rows.Scan(&role, &health, &deployment, &profile, &sessions, &throughput, &queue, &loss, &observe, &active, &observed); queryErr != nil {
+			if queryErr = rows.Scan(&role, &health, &deployment, &profile, &sessions, &throughput, &upstream, &downstream, &queue, &loss, &observe, &active, &observed); queryErr != nil {
 				rows.Close()
 				return Dashboard{}, queryErr
 			}
@@ -799,6 +870,8 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 			if role == "entry" {
 				item.Sessions += sessions
 				item.ThroughputMbps += throughput
+				item.UpstreamMbps += upstream
+				item.DownstreamMbps += downstream
 			}
 			if queue > item.QueueAgeP95US {
 				item.QueueAgeP95US = queue

@@ -136,6 +136,14 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .full { width: 100%; margin-top: 16px; }
 .form-error { min-height: 18px; margin-top: 10px; color: var(--red); font-size: 12px; }
+.host-key-confirmation { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); display: grid; gap: 12px; }
+.host-key-confirmation.hidden { display: none; }
+.host-key-confirmation > div { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.host-key-confirmation > div span,.host-key-confirmation dt { color: var(--muted); font-size: 11px; }
+.host-key-confirmation dl { display: grid; grid-template-columns: 90px minmax(0,1fr); gap: 8px 12px; margin: 0; }
+.host-key-confirmation dd { margin: 0; overflow-wrap: anywhere; }
+.host-key-confirmation .fingerprint { font-size: 12px; }
+.host-key-confirmation button { justify-self: end; }
 .auth-error:not(:empty) { padding: 10px 12px; border: 1px solid #f1b7b7; border-radius: 4px; background: var(--red-soft); font-size: 13px; line-height: 1.45; }
 .auth-modal button:disabled { cursor: wait; opacity: .7; }
 .toast { position: fixed; z-index: 20; right: 22px; bottom: 22px; max-width: 360px; padding: 11px 14px; border-radius: 5px; background: #17272b; color: white; opacity: 0; transform: translateY(8px); pointer-events: none; transition: .18s ease; }

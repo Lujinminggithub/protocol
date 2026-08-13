@@ -12,6 +12,66 @@ import (
 	"time"
 )
 
+func TestDeviceHostKeyMigrationAndPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "central.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE devices (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+ host TEXT NOT NULL, ssh_port INTEGER NOT NULL, ssh_user TEXT NOT NULL,
+ private_ip TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '',
+ provider TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
+ secret_ref TEXT NOT NULL DEFAULT '', labels BLOB NOT NULL DEFAULT '{}',
+ last_health TEXT NOT NULL DEFAULT 'unknown', last_seen_at TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+INSERT INTO devices(id,name,status,host,ssh_port,ssh_user,created_at,updated_at)
+VALUES('legacy-exit','legacy','ready','192.0.2.40',5222,'root','2026-08-05T00:00:00Z','2026-08-05T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	legacyDevice, err := store.Device(t.Context(), "legacy-exit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyDevice.SSHHostKeyStatus != "pending" || legacyDevice.SSHHostKey != "" || legacyDevice.SSHHostKeySHA256 != "" {
+		t.Fatalf("legacy device did not migrate to pending trust: %+v", legacyDevice)
+	}
+
+	trusted := Device{ID: "trusted-exit", Name: "trusted", Status: "ready", Host: "192.0.2.41",
+		SSHPort: 5222, SSHUser: "root", SecretRef: "device:trusted-exit", Labels: json.RawMessage(`{}`),
+		SSHHostKey: "AAAAC3NzaC1lZDI1NTE5AAAAITestKey", SSHHostKeyType: "ssh-ed25519",
+		SSHHostKeySHA256: "SHA256:test-fingerprint", SSHHostKeyStatus: "trusted",
+		SSHHostKeyConfirmedAt: "2026-08-05T01:00:00Z"}
+	stored, err := store.UpsertDevice(t.Context(), trusted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.SSHHostKey != trusted.SSHHostKey || stored.SSHHostKeyType != trusted.SSHHostKeyType ||
+		stored.SSHHostKeySHA256 != trusted.SSHHostKeySHA256 || stored.SSHHostKeyStatus != "trusted" ||
+		stored.SSHHostKeyConfirmedAt != trusted.SSHHostKeyConfirmedAt {
+		t.Fatalf("trusted SSH identity was not persisted: %+v", stored)
+	}
+	pending, err := store.UpsertDevice(t.Context(), Device{ID: "discovered-exit", Name: "discovered", Status: "ready",
+		Host: "192.0.2.42", SSHPort: 22, SSHUser: "root", SecretRef: "worker-local:exit", Labels: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.SSHHostKeyStatus != "pending" {
+		t.Fatalf("device without a confirmed identity was not normalized to pending: %+v", pending)
+	}
+}
+
 func TestCreateOperationRejectsAnotherActiveOperationOnLine(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -200,7 +260,7 @@ func TestOpenMigratesLineSpecFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundExit, foundUpstream, foundDownstream := false, false, false
+	foundExit, foundUpstream, foundDownstream, foundDNS := false, false, false, false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, kind string
@@ -211,14 +271,19 @@ func TestOpenMigratesLineSpecFields(t *testing.T) {
 		foundExit = foundExit || name == "exit_bind_ip"
 		foundUpstream = foundUpstream || name == "upstream_mbps"
 		foundDownstream = foundDownstream || name == "downstream_mbps"
+		foundDNS = foundDNS || name == "dns_servers"
 	}
 	_ = rows.Close()
-	if !foundExit || !foundUpstream || !foundDownstream {
+	if !foundExit || !foundUpstream || !foundDownstream || !foundDNS {
 		t.Fatal("line spec migrations were not applied")
 	}
 	var upstream, downstream int
 	if err = store.db.QueryRow(`SELECT upstream_mbps,downstream_mbps FROM line_specs WHERE line_id='legacy'`).Scan(&upstream, &downstream); err != nil || upstream != 7 || downstream != 7 {
 		t.Fatalf("legacy rates were not inherited: upstream=%d downstream=%d err=%v", upstream, downstream, err)
+	}
+	var dnsServers string
+	if err = store.db.QueryRow(`SELECT dns_servers FROM line_specs WHERE line_id='legacy'`).Scan(&dnsServers); err != nil || dnsServers != `["1.1.1.1","8.8.8.8"]` {
+		t.Fatalf("legacy DNS defaults were not applied: dns=%q err=%v", dnsServers, err)
 	}
 }
 

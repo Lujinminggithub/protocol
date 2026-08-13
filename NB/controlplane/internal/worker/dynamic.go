@@ -1,6 +1,9 @@
 package worker
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,18 +14,26 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 var privateFileRenameMu sync.Mutex
 
 type dynamicDevice struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Host      string `json:"host"`
-	SSHPort   int    `json:"ssh_port"`
-	SSHUser   string `json:"ssh_user"`
-	PrivateIP string `json:"private_ip"`
-	SecretRef string `json:"secret_ref"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name"`
+	Host                  string `json:"host"`
+	SSHPort               int    `json:"ssh_port"`
+	SSHUser               string `json:"ssh_user"`
+	SSHHostKey            string `json:"ssh_host_key"`
+	SSHHostKeyType        string `json:"ssh_host_key_type"`
+	SSHHostKeySHA256      string `json:"ssh_host_key_sha256"`
+	SSHHostKeyStatus      string `json:"ssh_host_key_status"`
+	SSHHostKeyConfirmedAt string `json:"ssh_host_key_confirmed_at"`
+	PrivateIP             string `json:"private_ip"`
+	SecretRef             string `json:"secret_ref"`
 }
 type dynamicNode struct {
 	DeviceID       string        `json:"device_id"`
@@ -45,6 +56,7 @@ type dynamicPlan struct {
 	RelayPort      int           `json:"relay_port"`
 	ExitPort       int           `json:"exit_port"`
 	ExitBindIP     string        `json:"exit_bind_ip"`
+	DNSServers     []string      `json:"dns_servers"`
 	Whitelist      []string      `json:"whitelist"`
 	BuildMode      string        `json:"build_mode"`
 	ArtifactRef    string        `json:"artifact_ref"`
@@ -53,6 +65,56 @@ type dynamicPlan struct {
 	JumpPolicy     string        `json:"jump_policy"`
 	Nodes          []dynamicNode `json:"nodes"`
 }
+
+var requiredPublicDNSWhitelistRules = []string{
+	"ip 1.1.1.1/32", "ip 8.8.8.8/32", "ip 9.9.9.9/32", "ip 114.114.114.114/32",
+}
+
+func withRequiredPublicDNSWhitelistRules(rules []string) []string {
+	result := make([]string, 0, len(rules)+len(requiredPublicDNSWhitelistRules)+1)
+	seen, restricted := map[string]bool{}, false
+	appendRule := func(rule string) {
+		if !seen[rule] {
+			seen[rule] = true
+			result = append(result, rule)
+		}
+	}
+	for _, rule := range rules {
+		appendRule(rule)
+		restricted = restricted || strings.HasPrefix(rule, "port ")
+	}
+	for _, rule := range requiredPublicDNSWhitelistRules {
+		appendRule(rule)
+	}
+	if restricted {
+		appendRule("port 53")
+	}
+	return result
+}
+
+func normalizeDynamicDNSServers(servers []string) ([]string, error) {
+	if len(servers) == 0 {
+		servers = []string{"1.1.1.1", "8.8.8.8"}
+	}
+	if len(servers) > 3 {
+		return nil, errors.New("线路 DNS 最多允许 3 个 IPv4 地址")
+	}
+	result, seen := make([]string, 0, len(servers)), map[string]bool{}
+	for _, value := range servers {
+		value = strings.TrimSpace(value)
+		parsed := net.ParseIP(value)
+		if parsed == nil || parsed.To4() == nil {
+			return nil, errors.New("线路 DNS 必须是 IPv4 地址")
+		}
+		value = parsed.To4().String()
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	return result, nil
+}
+
 type localSecret struct {
 	Password    string `json:"password"`
 	PasswordEnv string `json:"password_env"`
@@ -81,6 +143,116 @@ func dynamicHostValid(value string) bool {
 		}
 	}
 	return true
+}
+
+var (
+	errDynamicSSHAuthentication = errors.New("SSH authentication failed")
+	errDynamicSSHHostKey        = errors.New("SSH host key changed")
+)
+
+func resolvedPassword(secret localSecret) string {
+	if secret.Password != "" {
+		return secret.Password
+	}
+	return os.Getenv(secret.PasswordEnv)
+}
+
+func dialDynamicSSH(ctx context.Context, node dynamicNode, password string, jump *ssh.Client) (*ssh.Client, error) {
+	raw, err := base64.StdEncoding.DecodeString(node.Device.SSHHostKey)
+	if err != nil {
+		return nil, errDynamicSSHHostKey
+	}
+	expected, err := ssh.ParsePublicKey(raw)
+	if err != nil {
+		return nil, errDynamicSSHHostKey
+	}
+	address := net.JoinHostPort(node.Device.Host, fmt.Sprintf("%d", node.Device.SSHPort))
+	var connection net.Conn
+	if jump == nil {
+		dialer := net.Dialer{Timeout: 8 * time.Second}
+		connection, err = dialer.DialContext(ctx, "tcp", address)
+	} else {
+		connection, err = jump.Dial("tcp", address)
+	}
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	_ = connection.SetDeadline(deadline)
+	configuration := &ssh.ClientConfig{
+		User:              node.Device.SSHUser,
+		Auth:              []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyAlgorithms: []string{expected.Type()},
+		HostKeyCallback: func(_ string, _ net.Addr, actual ssh.PublicKey) error {
+			if actual.Type() != expected.Type() || !bytes.Equal(actual.Marshal(), expected.Marshal()) {
+				return errDynamicSSHHostKey
+			}
+			return nil
+		},
+		Timeout: 10 * time.Second,
+	}
+	clientConnection, channels, requests, err := ssh.NewClientConn(connection, address, configuration)
+	if err != nil {
+		_ = connection.Close()
+		if errors.Is(err, errDynamicSSHHostKey) {
+			return nil, errDynamicSSHHostKey
+		}
+		if strings.Contains(err.Error(), "unable to authenticate") {
+			return nil, errDynamicSSHAuthentication
+		}
+		return nil, err
+	}
+	_ = connection.SetDeadline(time.Time{})
+	return ssh.NewClient(clientConnection, channels, requests), nil
+}
+
+func (r *Runner) verifyDynamicSSHAccess(ctx context.Context, plan dynamicPlan) error {
+	clients := make(map[string]*ssh.Client, len(plan.Nodes))
+	defer func() {
+		for _, client := range clients {
+			_ = client.Close()
+		}
+	}()
+	for _, node := range plan.Nodes {
+		secret, err := r.resolveSecret(node.Device.SecretRef)
+		if err != nil {
+			return err
+		}
+		password := resolvedPassword(secret)
+		client, directErr := dialDynamicSSH(ctx, node, password, nil)
+		if errors.Is(directErr, errDynamicSSHAuthentication) {
+			return fmt.Errorf("设备 %s SSH 密码认证失败，请重新录入正确密码", node.Device.ID)
+		}
+		if errors.Is(directErr, errDynamicSSHHostKey) {
+			return fmt.Errorf("设备 %s SSH 主机密钥已变化，请重新扫描并确认", node.Device.ID)
+		}
+		if directErr != nil {
+			for _, candidate := range node.JumpCandidates {
+				jump := clients[candidate]
+				if jump == nil {
+					continue
+				}
+				client, err = dialDynamicSSH(ctx, node, password, jump)
+				if err == nil {
+					break
+				}
+				if errors.Is(err, errDynamicSSHAuthentication) {
+					return fmt.Errorf("设备 %s SSH 密码认证失败，请重新录入正确密码", node.Device.ID)
+				}
+				if errors.Is(err, errDynamicSSHHostKey) {
+					return fmt.Errorf("设备 %s SSH 主机密钥已变化，请重新扫描并确认", node.Device.ID)
+				}
+			}
+		}
+		if client == nil {
+			return fmt.Errorf("设备 %s SSH 管理端口不可达，请检查网络或跳板配置", node.Device.ID)
+		}
+		clients[node.Device.ID] = client
+	}
+	return nil
 }
 
 func (r *Runner) resolveSecret(ref string) (localSecret, error) {
@@ -231,6 +403,16 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 		if !safeID.MatchString(node.Device.ID) || node.Device.ID != node.DeviceID || !dynamicHostValid(node.Device.Host) || node.Device.SSHPort < 1 || node.Device.SSHPort > 65535 || node.Device.SSHUser == "" {
 			return errors.New("线路设备信息无效")
 		}
+		if node.Device.SSHHostKeyStatus != "trusted" || node.Device.SSHHostKey == "" ||
+			node.Device.SSHHostKeyType == "" || node.Device.SSHHostKeySHA256 == "" {
+			return fmt.Errorf("设备 %s 尚未完成 SSH 主机密钥登记", node.Device.ID)
+		}
+		rawKey, decodeErr := base64.StdEncoding.DecodeString(node.Device.SSHHostKey)
+		key, parseErr := ssh.ParsePublicKey(rawKey)
+		if decodeErr != nil || parseErr != nil || key.Type() != node.Device.SSHHostKeyType ||
+			ssh.FingerprintSHA256(key) != node.Device.SSHHostKeySHA256 {
+			return fmt.Errorf("设备 %s 的 SSH 主机密钥登记无效", node.Device.ID)
+		}
 		roles[node.Role]++
 	}
 	if roles["entry"] != 1 || roles["relay"] != 1 || roles["exit"] != 1 {
@@ -285,21 +467,17 @@ func writePrivateFile(path string, data []byte) (err error) {
 	return err
 }
 
-func (r *Runner) ensureDynamicKnownHosts(lineState string) (string, error) {
+func (r *Runner) ensureDynamicKnownHosts(lineState string, nodes []dynamicNode) (string, error) {
 	target := filepath.Join(lineState, "security", "known_hosts")
-	if _, err := os.Stat(target); err == nil {
-		return target, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", err
+	var contents strings.Builder
+	for _, node := range nodes {
+		marker := node.Device.Host
+		if node.Device.SSHPort != 22 {
+			marker = fmt.Sprintf("[%s]:%d", node.Device.Host, node.Device.SSHPort)
+		}
+		_, _ = fmt.Fprintf(&contents, "%s %s %s\n", marker, node.Device.SSHHostKeyType, node.Device.SSHHostKey)
 	}
-	if r.registry.Dynamic.KnownHostsFile == "" {
-		return target, nil
-	}
-	contents, err := os.ReadFile(r.registry.Dynamic.KnownHostsFile)
-	if err != nil {
-		return "", err
-	}
-	if err = writePrivateFile(target, contents); err != nil {
+	if err := writePrivateFile(target, []byte(contents.String())); err != nil {
 		return "", err
 	}
 	return target, nil
@@ -313,6 +491,11 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	if plan.DownstreamMbps <= 0 {
 		plan.DownstreamMbps = plan.BandwidthMbps
 	}
+	normalizedDNS, err := normalizeDynamicDNSServers(plan.DNSServers)
+	if err != nil {
+		return LineSpec{}, err
+	}
+	plan.DNSServers = normalizedDNS
 	if err := r.validateDynamicPlan(operation, plan); err != nil {
 		return LineSpec{}, err
 	}
@@ -324,7 +507,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	if err = writePrivateJSON(filepath.Join(lineState, "runtime-plan.json"), plan); err != nil {
 		return LineSpec{}, err
 	}
-	knownHosts, err := r.ensureDynamicKnownHosts(lineState)
+	knownHosts, err := r.ensureDynamicKnownHosts(lineState, plan.Nodes)
 	if err != nil {
 		return LineSpec{}, fmt.Errorf("初始化动态 known_hosts 失败：%w", err)
 	}
@@ -374,7 +557,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	if plan.ExitBindIP != "" {
 		exit["outip"] = plan.ExitBindIP
 	}
-	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "workers": map[string]int{"entry": transportWorkerLanes, "middle": transportWorkerLanes, "exit": transportWorkerLanes}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false}}}
+	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "workers": map[string]int{"entry": transportWorkerLanes, "middle": transportWorkerLanes, "exit": transportWorkerLanes}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false, "dns_servers": plan.DNSServers}}}
 	if err := writePrivateJSON(sourcePath, source); err != nil {
 		return LineSpec{}, err
 	}
@@ -388,6 +571,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 			return LineSpec{}, errors.New("白名单规则无效")
 		}
 	}
+	lines = withRequiredPublicDNSWhitelistRules(lines)
 	if err := os.MkdirAll(lineState, 0700); err != nil {
 		return LineSpec{}, err
 	}

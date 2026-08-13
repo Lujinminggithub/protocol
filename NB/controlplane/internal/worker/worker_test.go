@@ -3,17 +3,165 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
+
+func trustedDynamicNode(t *testing.T, id, role, host string, port int, secretRef string) dynamicNode {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := signer.PublicKey()
+	return dynamicNode{DeviceID: id, Role: role, Device: dynamicDevice{ID: id, Name: id, Host: host,
+		SSHPort: port, SSHUser: "root", SecretRef: secretRef,
+		SSHHostKey: base64.StdEncoding.EncodeToString(key.Marshal()), SSHHostKeyType: key.Type(),
+		SSHHostKeySHA256: ssh.FingerprintSHA256(key), SSHHostKeyStatus: "trusted"}}
+}
+
+func startWorkerSSHServer(t *testing.T, password string) (string, int, ssh.PublicKey) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := &ssh.ServerConfig{PasswordCallback: func(metadata ssh.ConnMetadata, supplied []byte) (*ssh.Permissions, error) {
+		if metadata.User() == "root" && string(supplied) == password {
+			return nil, nil
+		}
+		return nil, errors.New("password rejected")
+	}}
+	configuration.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				server, _, _, _ := ssh.NewServerConn(connection, configuration)
+				if server != nil {
+					_ = server.Close()
+				} else {
+					_ = connection.Close()
+				}
+			}()
+		}
+	}()
+	address := listener.Addr().(*net.TCPAddr)
+	return "127.0.0.1", address.Port, signer.PublicKey()
+}
+
+func TestDynamicSSHAccessRejectsInvalidPasswordDuringPreparation(t *testing.T) {
+	host, port, publicKey := startWorkerSSHServer(t, "correct-password")
+	t.Setenv("NB_TEST_EXIT_PASSWORD", "wrong-password")
+	node := trustedDynamicNode(t, "exit-1", "exit", host, port, "env:NB_TEST_EXIT_PASSWORD")
+	node.Device.SSHHostKey = base64.StdEncoding.EncodeToString(publicKey.Marshal())
+	node.Device.SSHHostKeyType = publicKey.Type()
+	node.Device.SSHHostKeySHA256 = ssh.FingerprintSHA256(publicKey)
+	err := NewRunner(testRegistry(t, nil)).verifyDynamicSSHAccess(context.Background(), dynamicPlan{Nodes: []dynamicNode{node}})
+	if err == nil || !strings.Contains(err.Error(), "设备 exit-1 SSH 密码认证失败") {
+		t.Fatalf("unexpected SSH credential preflight error: %v", err)
+	}
+}
+
+func TestDynamicLineRejectsUntrustedDeviceBeforePreparingDeployment(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, ResourceGroups: []string{"shared-1"}, Operations: []string{"line.open"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599, UDPPortMin: 22048, UDPPortMax: 65535}
+	for _, name := range []string{"ENTRY", "RELAY", "EXIT"} {
+		t.Setenv("NB_TEST_"+name, "private-password")
+	}
+	nodes := []dynamicNode{
+		trustedDynamicNode(t, "entry-1", "entry", "192.0.2.1", 22, "env:NB_TEST_ENTRY"),
+		trustedDynamicNode(t, "relay-1", "relay", "192.0.2.2", 22, "env:NB_TEST_RELAY"),
+		trustedDynamicNode(t, "exit-1", "exit", "192.0.2.3", 5222, "env:NB_TEST_EXIT"),
+	}
+	nodes[2].Device.SSHHostKeyStatus = "pending"
+	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "line-new_1", BandwidthMbps: 5,
+		UpstreamMbps: 5, DownstreamMbps: 5, SocksPort: 1082, RelayPort: 4445, ExitPort: 4443,
+		UDPPortMin: 22048, UDPPortMax: 23071, BuildMode: "auto", JumpPolicy: "auto", Nodes: nodes}
+	lineState := filepath.Join(registry.StateDir, "lines", plan.LineID)
+	_, err := NewRunner(registry).dynamicLine(Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
+	if err == nil || err.Error() != "设备 exit-1 尚未完成 SSH 主机密钥登记" {
+		t.Fatalf("unexpected untrusted-device error: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(lineState, "source-machines.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("untrusted plan wrote deployment inputs: %v", statErr)
+	}
+}
+
+func TestDynamicLineReplacesKnownHostsWithConfirmedPlanDevices(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, ResourceGroups: []string{"shared-1"}, Operations: []string{"line.open"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599, UDPPortMin: 22048, UDPPortMax: 65535}
+	for _, name := range []string{"ENTRY", "RELAY", "EXIT"} {
+		t.Setenv("NB_TEST_"+name, "private-password")
+	}
+	nodes := []dynamicNode{
+		trustedDynamicNode(t, "entry-1", "entry", "192.0.2.1", 22, "env:NB_TEST_ENTRY"),
+		trustedDynamicNode(t, "relay-1", "relay", "192.0.2.2", 22, "env:NB_TEST_RELAY"),
+		trustedDynamicNode(t, "exit-1", "exit", "192.0.2.3", 5222, "env:NB_TEST_EXIT"),
+	}
+	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "line-new_1", BandwidthMbps: 5,
+		UpstreamMbps: 5, DownstreamMbps: 5, SocksPort: 1082, RelayPort: 4445, ExitPort: 4443,
+		UDPPortMin: 22048, UDPPortMax: 23071, BuildMode: "auto", JumpPolicy: "auto", Nodes: nodes}
+	lineState := filepath.Join(registry.StateDir, "lines", plan.LineID)
+	knownHosts := filepath.Join(lineState, "security", "known_hosts")
+	if err := os.MkdirAll(filepath.Dir(knownHosts), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(knownHosts, []byte("stale.example ssh-ed25519 AAAA\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	line, err := NewRunner(registry).dynamicLine(Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(line.KnownHostsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(contents)
+	if strings.Contains(text, "stale.example") || !strings.Contains(text, "[192.0.2.3]:5222 "+nodes[2].Device.SSHHostKeyType+" "+nodes[2].Device.SSHHostKey) {
+		t.Fatalf("known_hosts was not rebuilt from confirmed devices: %q", text)
+	}
+	if len(strings.Split(strings.TrimSpace(text), "\n")) != 3 {
+		t.Fatalf("known_hosts contains unexpected entries: %q", text)
+	}
+}
 
 func TestWritePrivateJSONSupportsConcurrentWriters(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "line", "source-machines.json")
@@ -43,6 +191,23 @@ func TestWritePrivateJSONSupportsConcurrentWriters(t *testing.T) {
 	}
 	if matches, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".source-machines.json.new-*")); len(matches) != 0 {
 		t.Fatalf("temporary files leaked: %v", matches)
+	}
+}
+
+func TestRequiredPublicDNSWhitelistRules(t *testing.T) {
+	unrestricted := withRequiredPublicDNSWhitelistRules([]string{"domain example.com"})
+	for _, rule := range []string{"ip 1.1.1.1/32", "ip 8.8.8.8/32", "ip 9.9.9.9/32", "ip 114.114.114.114/32"} {
+		if !slices.Contains(unrestricted, rule) {
+			t.Fatalf("unrestricted whitelist is missing %q: %#v", rule, unrestricted)
+		}
+	}
+	if slices.Contains(unrestricted, "port 53") {
+		t.Fatalf("unrestricted whitelist unexpectedly gained a global port restriction: %#v", unrestricted)
+	}
+
+	restricted := withRequiredPublicDNSWhitelistRules([]string{"domain example.com", "port 443"})
+	if !slices.Contains(restricted, "port 53") {
+		t.Fatalf("restricted whitelist did not preserve DNS access: %#v", restricted)
 	}
 }
 
@@ -267,13 +432,13 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 		t.Setenv("NB_TEST_"+name, "private-password-"+name)
 	}
 	device := func(id, role, host, secret string) dynamicNode {
-		return dynamicNode{DeviceID: id, Role: role, Device: dynamicDevice{ID: id, Name: id, Host: host,
-			SSHPort: 22, SSHUser: "root", SecretRef: "env:" + secret}}
+		return trustedDynamicNode(t, id, role, host, 22, "env:"+secret)
 	}
 	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "new", BandwidthMbps: 20,
 		UpstreamMbps: 6, DownstreamMbps: 14,
 		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, ExitBindIP: "192.0.2.30", UDPPortMin: 22048, UDPPortMax: 23071,
-		Whitelist: []string{"domain example.com"}, BuildMode: "auto", JumpPolicy: "auto", SRSRef: "https://example.invalid/whitelist.srs?key=private-key",
+		DNSServers: []string{"9.9.9.9", "1.1.1.1"},
+		Whitelist:  []string{"domain example.com"}, BuildMode: "auto", JumpPolicy: "auto", SRSRef: "https://example.invalid/whitelist.srs?key=private-key",
 		Nodes: []dynamicNode{device("entry-1", "entry", "192.0.2.1", "NB_TEST_ENTRY"),
 			device("relay-1", "relay", "192.0.2.2", "NB_TEST_RELAY"), device("exit-1", "exit", "192.0.2.3", "NB_TEST_EXIT")}}
 	runner := NewRunner(registry)
@@ -307,6 +472,11 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 			Name  string `json:"name"`
 			OutIP string `json:"outip"`
 		} `json:"exit"`
+		Transport struct {
+			Exit struct {
+				DNSServers []string `json:"dns_servers"`
+			} `json:"exit"`
+		} `json:"transport"`
 		Exits []struct {
 			Capacity int    `json:"capacity"`
 			Name     string `json:"name"`
@@ -318,6 +488,9 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	}
 	if source.Exit.OutIP != plan.ExitBindIP || len(source.Exits) != 1 || source.Exits[0].Capacity != 0 {
 		t.Fatalf("package bandwidth leaked into route session capacity: %#v", source.Exits)
+	}
+	if !slices.Equal(source.Transport.Exit.DNSServers, plan.DNSServers) {
+		t.Fatalf("dynamic line lost exit DNS servers: %#v", source.Transport.Exit.DNSServers)
 	}
 	if source.Entry.Name != "entry-1" || source.Middle.Name != "relay-1" || source.Exit.Name != "exit-1" ||
 		source.Exits[0].Name != "exit-1" || source.Exits[0].Fixed != "exit-1" {

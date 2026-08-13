@@ -9,23 +9,28 @@ import (
 )
 
 type Device struct {
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	Status     string          `json:"status"`
-	Host       string          `json:"host"`
-	SSHPort    int             `json:"ssh_port"`
-	SSHUser    string          `json:"ssh_user"`
-	PrivateIP  string          `json:"private_ip"`
-	Region     string          `json:"region"`
-	Provider   string          `json:"provider"`
-	OS         string          `json:"os"`
-	Arch       string          `json:"arch"`
-	SecretRef  string          `json:"secret_ref"`
-	Labels     json.RawMessage `json:"labels"`
-	LastHealth string          `json:"last_health"`
-	LastSeenAt string          `json:"last_seen_at"`
-	CreatedAt  string          `json:"created_at"`
-	UpdatedAt  string          `json:"updated_at"`
+	ID                    string          `json:"id"`
+	Name                  string          `json:"name"`
+	Status                string          `json:"status"`
+	Host                  string          `json:"host"`
+	SSHPort               int             `json:"ssh_port"`
+	SSHUser               string          `json:"ssh_user"`
+	SSHHostKey            string          `json:"ssh_host_key"`
+	SSHHostKeyType        string          `json:"ssh_host_key_type"`
+	SSHHostKeySHA256      string          `json:"ssh_host_key_sha256"`
+	SSHHostKeyStatus      string          `json:"ssh_host_key_status"`
+	SSHHostKeyConfirmedAt string          `json:"ssh_host_key_confirmed_at"`
+	PrivateIP             string          `json:"private_ip"`
+	Region                string          `json:"region"`
+	Provider              string          `json:"provider"`
+	OS                    string          `json:"os"`
+	Arch                  string          `json:"arch"`
+	SecretRef             string          `json:"secret_ref"`
+	Labels                json.RawMessage `json:"labels"`
+	LastHealth            string          `json:"last_health"`
+	LastSeenAt            string          `json:"last_seen_at"`
+	CreatedAt             string          `json:"created_at"`
+	UpdatedAt             string          `json:"updated_at"`
 }
 
 type LineNode struct {
@@ -51,6 +56,7 @@ type LineSpec struct {
 	RelayPort      int             `json:"relay_port"`
 	ExitPort       int             `json:"exit_port"`
 	ExitBindIP     string          `json:"exit_bind_ip"`
+	DNSServers     json.RawMessage `json:"dns_servers"`
 	Whitelist      json.RawMessage `json:"whitelist"`
 	BuildMode      string          `json:"build_mode"`
 	ArtifactRef    string          `json:"artifact_ref"`
@@ -73,6 +79,10 @@ func (spec *LineSpec) NormalizeRates() {
 		spec.BandwidthMbps = spec.UpstreamMbps
 	} else {
 		spec.BandwidthMbps = spec.DownstreamMbps
+	}
+	var servers []string
+	if len(spec.DNSServers) == 0 || json.Unmarshal(spec.DNSServers, &servers) != nil || len(servers) == 0 {
+		spec.DNSServers = json.RawMessage(`["1.1.1.1","8.8.8.8"]`)
 	}
 }
 
@@ -97,23 +107,32 @@ func normalizedJSON(value json.RawMessage, fallback string) []byte {
 func scanDevice(row scanner, item *Device) error {
 	var labels []byte
 	err := row.Scan(&item.ID, &item.Name, &item.Status, &item.Host, &item.SSHPort,
-		&item.SSHUser, &item.PrivateIP, &item.Region, &item.Provider, &item.OS, &item.Arch,
+		&item.SSHUser, &item.SSHHostKey, &item.SSHHostKeyType, &item.SSHHostKeySHA256,
+		&item.SSHHostKeyStatus, &item.SSHHostKeyConfirmedAt, &item.PrivateIP, &item.Region, &item.Provider, &item.OS, &item.Arch,
 		&item.SecretRef, &labels, &item.LastHealth, &item.LastSeenAt, &item.CreatedAt, &item.UpdatedAt)
 	item.Labels = json.RawMessage(labels)
 	return err
 }
 
-const deviceColumns = `id,name,status,host,ssh_port,ssh_user,private_ip,region,provider,os,arch,
+const deviceColumns = `id,name,status,host,ssh_port,ssh_user,ssh_host_key,ssh_host_key_type,
+ ssh_host_key_sha256,ssh_host_key_status,ssh_host_key_confirmed_at,private_ip,region,provider,os,arch,
  secret_ref,labels,last_health,last_seen_at,created_at,updated_at`
 
 func (s *Store) UpsertDevice(ctx context.Context, item Device) (Device, error) {
+	if item.SSHHostKeyStatus == "" {
+		item.SSHHostKeyStatus = "pending"
+	}
 	stamp := now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,host=excluded.host,
- ssh_port=excluded.ssh_port,ssh_user=excluded.ssh_user,private_ip=excluded.private_ip,
- region=excluded.region,provider=excluded.provider,os=excluded.os,arch=excluded.arch,
- secret_ref=excluded.secret_ref,labels=excluded.labels,updated_at=excluded.updated_at`,
-		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser, item.PrivateIP,
+	 ssh_port=excluded.ssh_port,ssh_user=excluded.ssh_user,ssh_host_key=excluded.ssh_host_key,
+	 ssh_host_key_type=excluded.ssh_host_key_type,ssh_host_key_sha256=excluded.ssh_host_key_sha256,
+	 ssh_host_key_status=excluded.ssh_host_key_status,ssh_host_key_confirmed_at=excluded.ssh_host_key_confirmed_at,
+	 private_ip=excluded.private_ip,
+	 region=excluded.region,provider=excluded.provider,os=excluded.os,arch=excluded.arch,
+	 secret_ref=excluded.secret_ref,labels=excluded.labels,updated_at=excluded.updated_at`,
+		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser,
+		item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256, item.SSHHostKeyStatus, item.SSHHostKeyConfirmedAt, item.PrivateIP,
 		item.Region, item.Provider, item.OS, item.Arch, item.SecretRef,
 		normalizedJSON(item.Labels, `{}`), item.LastHealth, item.LastSeenAt, stamp, stamp)
 	if err != nil {
@@ -124,9 +143,13 @@ func (s *Store) UpsertDevice(ctx context.Context, item Device) (Device, error) {
 
 // EnsureDevice adds worker-discovered inventory without overwriting operator-managed fields.
 func (s *Store) EnsureDevice(ctx context.Context, item Device) (Device, bool, error) {
+	if item.SSHHostKeyStatus == "" {
+		item.SSHHostKeyStatus = "pending"
+	}
 	stamp := now()
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser, item.PrivateIP,
+	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser,
+		item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256, item.SSHHostKeyStatus, item.SSHHostKeyConfirmedAt, item.PrivateIP,
 		item.Region, item.Provider, item.OS, item.Arch, item.SecretRef,
 		normalizedJSON(item.Labels, `{}`), item.LastHealth, item.LastSeenAt, stamp, stamp)
 	if err != nil {
@@ -202,17 +225,17 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 	stamp := now()
 	_, err = tx.ExecContext(ctx, `INSERT INTO line_specs
 	 (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
- relay_port,exit_port,exit_bind_ip,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
+	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
  resource_group=excluded.resource_group,instance_id=excluded.instance_id,
 	 bandwidth_mbps=excluded.bandwidth_mbps,upstream_mbps=excluded.upstream_mbps,
 	 downstream_mbps=excluded.downstream_mbps,socks_port=excluded.socks_port,
  udp_port_min=excluded.udp_port_min,udp_port_max=excluded.udp_port_max,
- relay_port=excluded.relay_port,exit_port=excluded.exit_port,exit_bind_ip=excluded.exit_bind_ip,whitelist=excluded.whitelist,
+	 relay_port=excluded.relay_port,exit_port=excluded.exit_port,exit_bind_ip=excluded.exit_bind_ip,dns_servers=excluded.dns_servers,whitelist=excluded.whitelist,
  build_mode=excluded.build_mode,artifact_ref=excluded.artifact_ref,source_ref=excluded.source_ref,
  srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at`,
 		spec.LineID, spec.ResourceGroup, spec.InstanceID, spec.BandwidthMbps, spec.UpstreamMbps, spec.DownstreamMbps, spec.SocksPort,
-		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort, spec.ExitBindIP,
+		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort, spec.ExitBindIP, normalizedJSON(spec.DNSServers, `["1.1.1.1","8.8.8.8"]`),
 		normalizedJSON(spec.Whitelist, `[]`), spec.BuildMode, spec.ArtifactRef, spec.SourceRef,
 		spec.SRSRef, spec.JumpPolicy, stamp, stamp)
 	if err != nil {
@@ -238,18 +261,19 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 
 func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 	var item LineSpec
-	var whitelist []byte
+	var dnsServers, whitelist []byte
 	err := s.db.QueryRowContext(ctx, `SELECT line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,
- socks_port,udp_port_min,udp_port_max,relay_port,exit_port,exit_bind_ip,whitelist,build_mode,artifact_ref,
+ socks_port,udp_port_min,udp_port_max,relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,
  source_ref,srs_ref,jump_policy,created_at,updated_at FROM line_specs WHERE line_id=?`, lineID).Scan(
 		&item.LineID, &item.ResourceGroup, &item.InstanceID, &item.BandwidthMbps, &item.UpstreamMbps, &item.DownstreamMbps, &item.SocksPort,
-		&item.UDPPortMin, &item.UDPPortMax, &item.RelayPort, &item.ExitPort, &item.ExitBindIP, &whitelist,
+		&item.UDPPortMin, &item.UDPPortMax, &item.RelayPort, &item.ExitPort, &item.ExitBindIP, &dnsServers, &whitelist,
 		&item.BuildMode, &item.ArtifactRef, &item.SourceRef, &item.SRSRef, &item.JumpPolicy,
 		&item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		return LineSpec{}, err
 	}
 	item.Whitelist = json.RawMessage(whitelist)
+	item.DNSServers = json.RawMessage(dnsServers)
 	rows, err := s.db.QueryContext(ctx, `SELECT device_id,role,ordinal,next_hop_device_id,jump_candidates,config
  FROM line_nodes WHERE line_id=? ORDER BY CASE role WHEN 'entry' THEN 1 WHEN 'relay' THEN 2 ELSE 3 END,ordinal`, lineID)
 	if err != nil {
@@ -541,11 +565,11 @@ func (s *Store) OperationEvents(ctx context.Context, operationID string) ([]Oper
 
 func (s *Store) LatestSnapshots(ctx context.Context, lineID string) ([]Snapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `WITH ranked AS (
-	 SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
+	 SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,
 	 queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at,
 	 ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY observed_at DESC,id DESC) AS rn
 	 FROM snapshots WHERE line_id=?
-	) SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
+	) SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,
 	 queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at FROM ranked WHERE rn=1
 	 ORDER BY CASE role WHEN 'entry' THEN 1 WHEN 'middle' THEN 2 WHEN 'relay' THEN 2 ELSE 3 END,node_id`, lineID)
 	if err != nil {
@@ -555,7 +579,7 @@ func (s *Store) LatestSnapshots(ctx context.Context, lineID string) ([]Snapshot,
 	var result []Snapshot
 	for rows.Next() {
 		var item Snapshot
-		if err = rows.Scan(&item.LineID, &item.NodeID, &item.Role, &item.WorkerID, &item.ObservedAt, &item.Health, &item.Deployment, &item.Profile, &item.Sessions, &item.ThroughputMbps, &item.QueueAgeP95US, &item.EffectiveLoss, &item.FECObserve, &item.FECActive, &item.Payload, &item.ReceivedAt); err != nil {
+		if err = rows.Scan(&item.LineID, &item.NodeID, &item.Role, &item.WorkerID, &item.ObservedAt, &item.Health, &item.Deployment, &item.Profile, &item.Sessions, &item.ThroughputMbps, &item.UpstreamMbps, &item.DownstreamMbps, &item.QueueAgeP95US, &item.EffectiveLoss, &item.FECObserve, &item.FECActive, &item.Payload, &item.ReceivedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, item)

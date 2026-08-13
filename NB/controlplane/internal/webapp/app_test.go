@@ -2,18 +2,193 @@ package webapp
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
 	"nb-controlplane/internal/central"
 )
+
+func startTestSSHServer(t *testing.T) (string, int, ssh.PublicKey) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := &ssh.ServerConfig{PasswordCallback: func(metadata ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+		if metadata.User() == "root" && (string(password) == "private-password" ||
+			string(password) == "initial-secret" || string(password) == "rotated-secret") {
+			return nil, nil
+		}
+		return nil, errors.New("password rejected")
+	}}
+	configuration.AddHostKey(signer)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				server, _, _, _ := ssh.NewServerConn(connection, configuration)
+				if server != nil {
+					_ = server.Close()
+				} else {
+					_ = connection.Close()
+				}
+			}()
+		}
+	}()
+	address := listener.Addr().(*net.TCPAddr)
+	return "127.0.0.1", address.Port, signer.PublicKey()
+}
+
+func confirmedDeviceFields(t *testing.T, app *App, host string, port int, supplied ...ssh.PublicKey) map[string]any {
+	t.Helper()
+	var publicKey ssh.PublicKey
+	if len(supplied) > 0 {
+		publicKey = supplied[0]
+	} else {
+		_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signer, err := ssh.NewSignerFromKey(privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		publicKey = signer.PublicKey()
+	}
+	key, keyType, fingerprint := publicKeyFields(publicKey)
+	confirmation := hostKeyConfirmation{Host: host, SSHPort: port, Key: key, KeyType: keyType,
+		Fingerprint: fingerprint, ExpiresAt: time.Now().Add(time.Minute).Unix()}
+	token, err := app.signHostKeyConfirmation(confirmation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{"ssh_host_key": key, "ssh_host_key_type": keyType,
+		"ssh_host_key_sha256": fingerprint, "host_key_confirmation_token": token}
+}
+
+func TestDeviceHostKeyMustBeScannedAndExplicitlyConfirmed(t *testing.T) {
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent",
+		DeviceSecretsFile: filepath.Join(directory, "device-secrets.json")}).Handler())
+	defer server.Close()
+	host, port, publicKey := startTestSSHServer(t)
+
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices/host-key/scan", "admin", "",
+		map[string]any{"host": host, "ssh_port": port})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("host-key scan status=%d body=%s", response.StatusCode, body)
+	}
+	var scanned struct {
+		Key         string `json:"ssh_host_key"`
+		KeyType     string `json:"ssh_host_key_type"`
+		Fingerprint string `json:"ssh_host_key_sha256"`
+		Token       string `json:"confirmation_token"`
+	}
+	if err = json.Unmarshal(body, &scanned); err != nil {
+		t.Fatal(err)
+	}
+	expectedKey := base64.StdEncoding.EncodeToString(publicKey.Marshal())
+	if scanned.Key != expectedKey || scanned.KeyType != publicKey.Type() ||
+		scanned.Fingerprint != ssh.FingerprintSHA256(publicKey) || scanned.Token == "" {
+		t.Fatalf("unexpected scan result: %+v", scanned)
+	}
+
+	device := map[string]any{"id": "exit-new", "name": "new exit", "status": "ready", "host": host,
+		"ssh_port": port, "ssh_user": "root", "password": "private-password", "labels": map[string]any{}}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("请先扫描并确认 SSH 主机密钥")) {
+		t.Fatalf("unconfirmed create status=%d body=%s", response.StatusCode, body)
+	}
+	device["ssh_host_key"] = scanned.Key
+	device["ssh_host_key_type"] = scanned.KeyType
+	device["ssh_host_key_sha256"] = "SHA256:mismatched"
+	device["host_key_confirmation_token"] = scanned.Token
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("SSH 主机密钥确认信息不匹配")) {
+		t.Fatalf("mismatched fingerprint status=%d body=%s", response.StatusCode, body)
+	}
+	device["ssh_host_key_sha256"] = scanned.Fingerprint
+	device["password"] = "wrong-password"
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("SSH 密码认证失败")) {
+		t.Fatalf("invalid password status=%d body=%s", response.StatusCode, body)
+	}
+	device["password"] = "private-password"
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated || !bytes.Contains(body, []byte(`"ssh_host_key_status":"trusted"`)) {
+		t.Fatalf("confirmed create status=%d body=%s", response.StatusCode, body)
+	}
+
+	delete(device, "password")
+	delete(device, "ssh_host_key")
+	delete(device, "ssh_host_key_type")
+	delete(device, "ssh_host_key_sha256")
+	delete(device, "host_key_confirmation_token")
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated || !bytes.Contains(body, []byte(`"ssh_host_key_status":"trusted"`)) {
+		t.Fatalf("same-endpoint update did not retain trust status=%d body=%s", response.StatusCode, body)
+	}
+	device["ssh_port"] = port + 1
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("SSH 地址或端口已变化，请重新扫描并确认主机密钥")) {
+		t.Fatalf("endpoint change retained trust status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestDeviceFormRequiresVisibleHostKeyConfirmation(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"deviceHostKeyConfirmation", "deviceHostKeyFingerprint", "confirmDeviceHostKey"} {
+		if !bytes.Contains(index, []byte(expected)) {
+			t.Fatalf("device form does not expose %s", expected)
+		}
+	}
+	for _, expected := range []string{"/api/v1/devices/host-key/scan", "host_key_confirmation_token", "ssh_host_key_sha256"} {
+		if !bytes.Contains(script, []byte(expected)) {
+			t.Fatalf("device form does not implement %s", expected)
+		}
+	}
+	if !bytes.Contains(script, []byte(`clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden")`)) {
+		t.Fatal("closing the device form does not clear pending credentials and host-key confirmation")
+	}
+}
 
 func TestClientConfigurationAndQRCode(t *testing.T) {
 	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
@@ -101,6 +276,22 @@ func TestAgentListsOnlyActiveLinePlans(t *testing.T) {
 	}
 }
 
+func TestLineSpecDNSDefaultsAndValidation(t *testing.T) {
+	spec := central.LineSpec{LineID: "line-dns", ResourceGroup: "group", InstanceID: "line-dns_1",
+		BandwidthMbps: 5, UpstreamMbps: 5, DownstreamMbps: 5, SocksPort: 1082,
+		UDPPortMin: 22048, UDPPortMax: 23071, RelayPort: 4445, ExitPort: 4443,
+		Whitelist: json.RawMessage(`[]`), BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto",
+		Nodes: []central.LineNode{{DeviceID: "entry", Role: "entry"}, {DeviceID: "exit", Role: "exit"}}}
+	spec.NormalizeRates()
+	if err := validLineSpecRequest(spec); err != nil {
+		t.Fatalf("default DNS was rejected: %v", err)
+	}
+	spec.DNSServers = json.RawMessage(`["1.1.1.1","dns.example"]`)
+	if err := validLineSpecRequest(spec); err == nil || !strings.Contains(err.Error(), "IPv4") {
+		t.Fatalf("invalid DNS was accepted: %v", err)
+	}
+}
+
 func TestCreateLineRejectsDuplicateID(t *testing.T) {
 	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -140,13 +331,17 @@ func TestDevicePasswordIsStoredLocallyAndNeverReturned(t *testing.T) {
 	if err = os.WriteFile(secretsFile, []byte(`{"legacy":{"password_env":"NB_LEGACY_PASSWORD"}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent",
-		DeviceSecretsFile: secretsFile}).Handler())
+	app := New(database, Config{AdminToken: "admin", AgentToken: "agent", DeviceSecretsFile: secretsFile})
+	server := httptest.NewServer(app.Handler())
 	defer server.Close()
+	host, port, publicKey := startTestSSHServer(t)
 
 	device := map[string]any{"id": "entry-new", "name": "new entry", "status": "ready",
-		"host": "192.0.2.20", "ssh_port": 22, "ssh_user": "root", "private_ip": "",
+		"host": host, "ssh_port": port, "ssh_user": "root", "private_ip": "",
 		"region": "gz", "provider": "test", "os": "linux", "arch": "amd64", "labels": map[string]any{}}
+	for key, value := range confirmedDeviceFields(t, app, host, port, publicKey) {
+		device[key] = value
+	}
 	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
 	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("SSH password is required")) {
 		t.Fatalf("passwordless create status=%d body=%s", response.StatusCode, body)
@@ -163,6 +358,10 @@ func TestDevicePasswordIsStoredLocallyAndNeverReturned(t *testing.T) {
 	}
 
 	delete(device, "password")
+	delete(device, "ssh_host_key")
+	delete(device, "ssh_host_key_type")
+	delete(device, "ssh_host_key_sha256")
+	delete(device, "host_key_confirmation_token")
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
 	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte("initial-secret")) {
 		t.Fatalf("password-preserving update status=%d body=%s", response.StatusCode, body)
@@ -385,6 +584,8 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 		!bytes.Contains(body, []byte(`disabled title=`)) ||
 		!bytes.Contains(body, []byte(`computer-icon`)) || !bytes.Contains(body, []byte(`队列最大等待`)) ||
 		!bytes.Contains(body, []byte(`clientConfigSection`)) || !bytes.Contains(body, []byte(`/client-qr`)) ||
+		!bytes.Contains(body, []byte(`upstream_mbps`)) || !bytes.Contains(body, []byte(`downstream_mbps`)) ||
+		!bytes.Contains(body, []byte(`item.role === "entry"`)) ||
 		!bytes.Contains(body, []byte(`tuneResultSection`)) || !bytes.Contains(body, []byte(`transport_rollout`)) ||
 		bytes.Contains(body, []byte(`event.currentTarget.reset()`)) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
@@ -398,14 +599,19 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent",
-		DeviceSecretsFile: filepath.Join(directory, "device-secrets.json")}).Handler())
+	app := New(database, Config{AdminToken: "admin", AgentToken: "agent",
+		DeviceSecretsFile: filepath.Join(directory, "device-secrets.json")})
+	app.verifySSHCredentials = func(context.Context, string, int, string, string, ssh.PublicKey) error { return nil }
+	server := httptest.NewServer(app.Handler())
 	defer server.Close()
 	client := server.Client()
 	for index, role := range []string{"entry", "relay", "exit"} {
 		device := map[string]any{"id": role + "-1", "name": role + " device", "status": "ready",
 			"host": "192.0.2." + string(rune('1'+index)), "ssh_port": 22, "ssh_user": "root",
 			"region": role, "provider": "test", "password": "test-" + role, "labels": map[string]any{}}
+		for key, value := range confirmedDeviceFields(t, app, device["host"].(string), 22) {
+			device[key] = value
+		}
 		response, body := call(t, client, http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
 		if response.StatusCode != 201 {
 			t.Fatalf("create device status=%d body=%s", response.StatusCode, body)

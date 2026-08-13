@@ -1,6 +1,7 @@
 package webapp
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/ssh"
 	"nb-controlplane/internal/central"
 	"nb-controlplane/internal/transportprofile"
 )
@@ -66,15 +68,22 @@ type Config struct {
 }
 
 type App struct {
-	store         *central.Store
-	cfg           Config
-	operationMu   sync.Mutex
-	lineMu        sync.Mutex
-	deviceSecrets deviceSecretStore
+	store                *central.Store
+	cfg                  Config
+	operationMu          sync.Mutex
+	lineMu               sync.Mutex
+	deviceSecrets        deviceSecretStore
+	hostKeyTokenKey      [32]byte
+	verifySSHCredentials func(context.Context, string, int, string, string, ssh.PublicKey) error
 }
 
 func New(store *central.Store, cfg Config) *App {
-	return &App{store: store, cfg: cfg, deviceSecrets: deviceSecretStore{path: cfg.DeviceSecretsFile}}
+	app := &App{store: store, cfg: cfg, deviceSecrets: deviceSecretStore{path: cfg.DeviceSecretsFile},
+		verifySSHCredentials: verifySSHPassword}
+	if _, err := rand.Read(app.hostKeyTokenKey[:]); err != nil {
+		panic("failed to initialize SSH host-key confirmation tokens")
+	}
+	return app
 }
 
 func (a *App) Handler() http.Handler {
@@ -91,6 +100,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/lines/{id}/spec", a.admin(a.lineSpec))
 	mux.HandleFunc("PUT /api/v1/lines/{id}/spec", a.admin(a.saveLineSpec))
 	mux.HandleFunc("GET /api/v1/devices", a.admin(a.devices))
+	mux.HandleFunc("POST /api/v1/devices/host-key/scan", a.admin(a.scanDeviceHostKey))
 	mux.HandleFunc("POST /api/v1/devices", a.admin(a.upsertDevice))
 	mux.HandleFunc("GET /api/v1/devices/{id}", a.admin(a.device))
 	mux.HandleFunc("DELETE /api/v1/devices/{id}", a.admin(a.deleteDevice))
@@ -603,7 +613,7 @@ func validSnapshot(item central.Snapshot) error {
 	if _, err := time.Parse(time.RFC3339Nano, item.ObservedAt); err != nil {
 		return errors.New("invalid observed_at")
 	}
-	if item.Sessions < 0 || item.ThroughputMbps < 0 || item.QueueAgeP95US < 0 || item.EffectiveLoss < 0 || item.EffectiveLoss > 100 {
+	if item.Sessions < 0 || item.ThroughputMbps < 0 || item.UpstreamMbps < 0 || item.DownstreamMbps < 0 || item.QueueAgeP95US < 0 || item.EffectiveLoss < 0 || item.EffectiveLoss > 100 {
 		return errors.New("invalid metrics")
 	}
 	return nil
@@ -671,6 +681,7 @@ func (a *App) legacySnapshot(w http.ResponseWriter, r *http.Request) {
 		ObservedAt: observed, Health: objectString(health, "status"), Deployment: objectString(health, "release_id"),
 		Profile: objectString(health, "line_profile"), Sessions: int64(objectNumber(metrics, "sessions_inuse")),
 		ThroughputMbps: objectNumber(metrics, "throughput_mbps"), QueueAgeP95US: queueAge,
+		UpstreamMbps: objectNumber(metrics, "upstream_mbps"), DownstreamMbps: objectNumber(metrics, "downstream_mbps"),
 		EffectiveLoss: objectNumber(link, "effective_loss_max_pct"), FECObserve: objectNumber(fec, "observe") != 0,
 		FECActive: objectNumber(fec, "active") != 0}
 	item.Payload, _ = json.Marshal(raw)

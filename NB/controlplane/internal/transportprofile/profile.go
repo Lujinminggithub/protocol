@@ -127,6 +127,7 @@ func minPositive(values ...int) int {
 }
 
 func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
+	const wireExpansion = 1.25
 	loadedRTT := evidence.QUIC.RTTP95MS
 	if loadedRTT <= 0 {
 		loadedRTT = evidence.ICMP.RTTAvgMS
@@ -154,7 +155,9 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 		seedRTT = loadedRTT
 	}
 	seedRTTUS := int64(math.Round(seedRTT * 1000))
-	startupBDP := targetMbps * 2 * 1_000_000 / 8 * seedRTT / 1000
+	// Billing is expressed as payload throughput. The congestion window is a
+	// wire-level limit and must also cover NB framing plus QUIC/UDP/IP overhead.
+	startupBDP := targetMbps * 2 * wireExpansion * 1_000_000 / 8 * seedRTT / 1000
 	startupCWin := ceil64K(math.Max(256*1024, math.Min(64*1024*1024, startupBDP)))
 	bdp := targetMbps * 1_000_000 / 8 * loadedRTT / 1000
 	cwin := ceil64K(math.Max(256*1024, math.Min(8*1024*1024, bdp*2)))

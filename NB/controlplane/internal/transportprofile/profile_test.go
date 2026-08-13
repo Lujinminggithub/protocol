@@ -66,8 +66,8 @@ func TestGenerateDoesNotTurnLoadedShortHopIntoBBR(t *testing.T) {
 	if entry.SeedRTTUS != 4400 || middle.SeedRTTUS != 186100 {
 		t.Fatalf("QUIC RTT seed missing: entry=%d middle=%d", entry.SeedRTTUS, middle.SeedRTTUS)
 	}
-	if middle.StartupCWinBytes != 524288 {
-		t.Fatalf("2x live startup BDP=%d, want 524288", middle.StartupCWinBytes)
+	if middle.StartupCWinBytes != 589824 {
+		t.Fatalf("2x live wire startup BDP=%d, want 589824", middle.StartupCWinBytes)
 	}
 	if entry.ReorderGap > 64 || entry.ReorderDelayUS > 80000 {
 		t.Fatalf("short-hop reorder envelope is not bounded: %+v", entry)
@@ -112,7 +112,7 @@ func TestRoleRenderProducesMiddleIngressAndEgress(t *testing.T) {
 	for _, expected := range []string{"role=middle", "ingress.cc=", "egress.cc=", "generation=9",
 		"egress.udp_fec_adaptive=true", "egress.udp_fec_k=8", "egress.udp_fec_hold_us=2000",
 		"egress.target_rate_bps=5000000", "egress.seed_rtt_us=250000",
-		"egress.startup_cwin_bytes=327680"} {
+		"egress.startup_cwin_bytes=393216"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %q in %s", expected, text)
 		}
@@ -133,8 +133,8 @@ func TestGenerateBoundsKZReorderInsteadOfPreservingProbeCandidate(t *testing.T) 
 		t.Fatal(err)
 	}
 	middle := profile.Segments["middle_exit"].Source
-	if middle.SeedRTTUS != 286274 || middle.StartupCWinBytes != 393216 {
-		t.Fatalf("long-haul seed must use QUIC RTT and 2x average BDP: %+v", middle)
+	if middle.SeedRTTUS != 286274 || middle.StartupCWinBytes != 458752 {
+		t.Fatalf("long-haul seed must use QUIC RTT and 2x average wire BDP: %+v", middle)
 	}
 	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 120000 {
 		t.Fatalf("KZ reorder envelope is not bounded for live traffic: %+v", middle)

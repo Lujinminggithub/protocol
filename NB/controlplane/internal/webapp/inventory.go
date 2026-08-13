@@ -1,6 +1,7 @@
 package webapp
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"nb-controlplane/internal/central"
 )
@@ -29,7 +31,8 @@ type inventoryDiscovery struct {
 
 type deviceUpsertRequest struct {
 	central.Device
-	Password string `json:"password"`
+	Password                 string `json:"password"`
+	HostKeyConfirmationToken string `json:"host_key_confirmation_token"`
 }
 
 func validHost(value string) bool {
@@ -116,11 +119,43 @@ func (a *App) upsertDevice(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "SSH password is required when registering a device")
 		return
 	}
+	endpointChanged := existingErr == nil && (existing.Host != item.Host || existing.SSHPort != item.SSHPort)
+	providedHostKey := item.SSHHostKey != "" || item.SSHHostKeyType != "" || item.SSHHostKeySHA256 != "" || request.HostKeyConfirmationToken != ""
+	if existingErr == nil && !endpointChanged && !providedHostKey {
+		item.SSHHostKey = existing.SSHHostKey
+		item.SSHHostKeyType = existing.SSHHostKeyType
+		item.SSHHostKeySHA256 = existing.SSHHostKeySHA256
+		item.SSHHostKeyStatus = existing.SSHHostKeyStatus
+		item.SSHHostKeyConfirmedAt = existing.SSHHostKeyConfirmedAt
+	} else {
+		if endpointChanged && !providedHostKey {
+			problem(w, 400, "SSH 地址或端口已变化，请重新扫描并确认主机密钥")
+			return
+		}
+		if _, err := confirmedHostKey(item.Host, item.SSHPort, item.SSHHostKey, item.SSHHostKeyType,
+			item.SSHHostKeySHA256, request.HostKeyConfirmationToken, a); err != nil {
+			problem(w, 400, err.Error())
+			return
+		}
+		item.SSHHostKeyStatus = "trusted"
+		item.SSHHostKeyConfirmedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	if err := validDevice(item); err != nil {
 		problem(w, 400, err.Error())
 		return
 	}
 	if request.Password != "" {
+		key, keyErr := validatePublicKey(item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256)
+		if keyErr != nil {
+			problem(w, 400, keyErr.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+		defer cancel()
+		if err := a.verifySSHCredentials(ctx, item.Host, item.SSHPort, item.SSHUser, request.Password, key); err != nil {
+			problem(w, 400, err.Error())
+			return
+		}
 		if err := a.deviceSecrets.update(item.SecretRef, request.Password); err != nil {
 			problem(w, 500, "failed to store device password")
 			return
@@ -183,6 +218,16 @@ func validLineSpecRequest(spec central.LineSpec) error {
 		parsed := net.ParseIP(spec.ExitBindIP)
 		if parsed == nil || parsed.To4() == nil {
 			return errors.New("出口 IP 必须是 IPv4 地址")
+		}
+	}
+	var dnsServers []string
+	if len(spec.DNSServers) == 0 || json.Unmarshal(spec.DNSServers, &dnsServers) != nil || len(dnsServers) < 1 || len(dnsServers) > 3 {
+		return errors.New("线路 DNS 必须包含 1 到 3 个 IPv4 地址")
+	}
+	for _, server := range dnsServers {
+		parsed := net.ParseIP(strings.TrimSpace(server))
+		if parsed == nil || parsed.To4() == nil {
+			return errors.New("线路 DNS 必须是 IPv4 地址")
 		}
 	}
 	if (spec.UDPPortMin == 0) != (spec.UDPPortMax == 0) || spec.UDPPortMin < 0 || spec.UDPPortMax > 65535 || (spec.UDPPortMin != 0 && (spec.UDPPortMin < 1024 || spec.UDPPortMin > spec.UDPPortMax)) {
