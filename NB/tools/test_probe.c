@@ -10,6 +10,12 @@ int main(void){
     uint8_t header[NB_PROBE_HEADER_SIZE];uint64_t expected=0;
     assert(nb_probe_header_format(262144,header,sizeof(header))==(int)NB_PROBE_HEADER_SIZE);
     assert(nb_probe_header_parse(header,sizeof(header),&expected)==0&&expected==262144);
+    assert(nb_probe_source_header_format(524288,header,sizeof(header))==(int)NB_PROBE_HEADER_SIZE);
+    assert(nb_probe_source_header_parse(header,sizeof(header),&expected)==0&&expected==524288);
+    assert(nb_probe_header_parse(header,sizeof(header),&expected)==-1);
+    uint8_t generated[4];nb_probe_source_fill(4095,generated,sizeof(generated));
+    assert(generated[0]==(uint8_t)((4095*13+29)&0xff));
+    assert(generated[1]==29);
     header[0]='X';assert(nb_probe_header_parse(header,sizeof(header),&expected)==-1);
     assert(nb_probe_header_format(0,header,sizeof(header))==-1);
     const uint8_t payload[]={0x61,0x62,0x63};

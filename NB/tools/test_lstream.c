@@ -23,20 +23,21 @@ int main(void){uint64_t hi=0x0102030405060708ULL,lo=0x1112131415161718ULL;char f
     CHECK(receiver.count==3&&receiver.length==sizeof(source)&&memcmp(receiver.data,source,sizeof(source))==0);
     frames[0]=0;nb_lstream_decoder_init(&decoder);CHECK(nb_lstream_decoder_feed(&decoder,frames,NB_LSTREAM_HEADER,receive,&receiver)!=0);
     uint8_t bootstrap[512];const char* route="H:relay.example:4443,T:target.example:443";
-    int bootstrap_length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,route,NB_LSTREAM_OPEN,hi,lo,0);
+    int bootstrap_length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,"live-user",route,NB_LSTREAM_OPEN,hi,lo,0);
     CHECK(bootstrap_length>NB_LSTREAM_HEADER);uint8_t* newline=memchr(bootstrap,'\n',(size_t)bootstrap_length);CHECK(newline!=NULL);
     size_t route_header_length=(size_t)(newline-bootstrap)+1;char expected_header[128];
-    int expected_length=snprintf(expected_header,sizeof(expected_header),"7;L=%s;%s\n",flow,route);
+    int expected_length=snprintf(expected_header,sizeof(expected_header),"7;A=live-user;L=%s;%s\n",flow,route);
     CHECK(expected_length>0&&route_header_length==(size_t)expected_length&&memcmp(bootstrap,expected_header,route_header_length)==0);
     nb_lstream_frame_t bootstrap_frame;CHECK(nb_lstream_frame_decode(bootstrap+route_header_length,
         (size_t)bootstrap_length-route_header_length,&bootstrap_frame)==0);
     CHECK(bootstrap_frame.type==NB_LSTREAM_OPEN&&bootstrap_frame.offset==0&&bootstrap_frame.flow_hi==hi&&bootstrap_frame.flow_lo==lo);
-    bootstrap_length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,route,NB_LSTREAM_RESUME,hi,lo,12345);
+    bootstrap_length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,"live-user",route,NB_LSTREAM_RESUME,hi,lo,12345);
     CHECK(bootstrap_length>0);newline=memchr(bootstrap,'\n',(size_t)bootstrap_length);CHECK(newline!=NULL);
     route_header_length=(size_t)(newline-bootstrap)+1;CHECK(nb_lstream_frame_decode(bootstrap+route_header_length,
         (size_t)bootstrap_length-route_header_length,&bootstrap_frame)==0);
     CHECK(bootstrap_frame.type==NB_LSTREAM_RESUME&&bootstrap_frame.offset==12345);
-    CHECK(nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,"T:bad\nroute",NB_LSTREAM_OPEN,hi,lo,0)<0);
+    CHECK(nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,"live-user","T:bad\nroute",NB_LSTREAM_OPEN,hi,lo,0)<0);
+    CHECK(nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),7,"bad;tenant",route,NB_LSTREAM_OPEN,hi,lo,0)<0);
     CHECK(nb_lstream_reset_requires_resume(1,1,NB_LSTREAM_RELAY_RESTART_ERROR)==1);
     CHECK(nb_lstream_reset_requires_resume(0,1,NB_LSTREAM_RELAY_RESTART_ERROR)==0);
     CHECK(nb_lstream_reset_requires_resume(1,0,NB_LSTREAM_RELAY_RESTART_ERROR)==0);

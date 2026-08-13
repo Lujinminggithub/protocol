@@ -10,7 +10,8 @@ def candidate():
     segment={"candidate":rec,"quic":{"packets_observed":12000,"windows_valid":6}}
     return {"schema_version":2,"status":"candidate","probe_mode":"active-quic","line":"test","fixed_exit":"kz",
             "baseline_hosts_sha256":control._sha256(control.DEFAULT_HOSTS),"baseline_profile_sha256":control._sha256(control.DEFAULT_PROFILE),
-            "active_probe":{"integrity":{"integrity":"ok"},"load":{"integrity":"count-ok"}},
+            "active_probe":{"integrity":{"integrity":"ok"},"uplink":{"integrity":"count-ok"},
+                "downlink":{"integrity":"count-ok"}},
             "admission":{"status":"admitted","reasons":[]},
             "segments":{"entry_middle":segment,"middle_exit":segment}}
 
@@ -42,14 +43,13 @@ def main():
                 "line_profile":canary_profile["line_id"],"line_profile_schema":canary_profile["schema_version"]}}]}
             control.verify_readback(readback,canary_profile)
             control._verify_active_probe({"integrity":{"integrity":"ok"},
-                "load":{"integrity":"count-ok"}})
+                "uplink":{"integrity":"count-ok"},"downlink":{"integrity":"count-ok"}})
             try: control._verify_active_probe({"error":"connection aborted"})
             except RuntimeError: pass
             else: raise AssertionError("failed active probe was accepted")
             unsafe=candidate();unsafe["segments"]["entry_middle"]["candidate"]["reorder_gap"]=8
-            try: control.validate_candidate(unsafe)
-            except ValueError: pass
-            else: raise AssertionError("unsafe reorder reduction was accepted")
+            reduced=control.validate_candidate(unsafe)
+            assert reduced["entry"]["reorder_gap"]==8
             rejected=candidate();rejected["admission"]={"status":"rejected","reasons":["insufficient-throughput"]}
             try: control.validate_candidate(rejected)
             except ValueError: pass

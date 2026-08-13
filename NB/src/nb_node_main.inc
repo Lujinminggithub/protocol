@@ -153,6 +153,15 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             log4c_error("private key rejected: %s",error);log4c_shutdown();return 1;
         }
     }
+    if(tenants_path&&(G.role==ROLE_ENTRY||G.role==ROLE_EXIT)){char error[256],state_path[512];const char* configured_state=nb_instance_env(nb_current_instance,"NB_TENANT_STATE");
+        if(nb_tenants_load(&g_tenants,tenants_path,error,sizeof(error))!=0){log4c_error("tenant config rejected: %s",error);log4c_shutdown();return 1;}
+        if(configured_state&&*configured_state)snprintf(state_path,sizeof(state_path),"%s",configured_state);
+        else if(snprintf(state_path,sizeof(state_path),"%s.state",tenants_path)<0||strlen(state_path)>=sizeof(state_path)-1){log4c_error("tenant state path is too long");log4c_shutdown();return 1;}
+        if(nb_tenants_enable_shared(&g_tenants,state_path,error,sizeof(error))!=0){log4c_error("shared tenant state rejected: %s",error);log4c_shutdown();return 1;}
+        g_tenants_enabled=1;nb_current_instance->tenant_generation=g_tenants.config_fingerprint;
+        log4c_info("tenant quotas loaded role=%s tenants=%zu generation=%llu shared_state=%s",
+            role_name(G.role),g_tenants.count,(unsigned long long)nb_current_instance->tenant_generation,state_path);
+    }
     if(G.role==ROLE_ENTRY&&G.socks_enabled){
         const char* udp_advertise=nb_instance_env(nb_current_instance,"NB_SOCKS_UDP_ADVERTISE_IP");
         if(udp_advertise&&udp_advertise[0]){
@@ -185,12 +194,6 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             }
             g_socks_auth_enabled=1;log4c_info("SOCKS authentication loaded users=%zu",g_socks_users.count);
         }
-        if(tenants_path){char error[256],state_path[512];const char* configured_state=nb_instance_env(nb_current_instance,"NB_TENANT_STATE");
-            if(nb_tenants_load(&g_tenants,tenants_path,error,sizeof(error))!=0){log4c_error("tenant config rejected: %s",error);log4c_shutdown();return 1;}
-            if(configured_state&&*configured_state)snprintf(state_path,sizeof(state_path),"%s",configured_state);
-            else if(snprintf(state_path,sizeof(state_path),"%s.state",tenants_path)<0||strlen(state_path)>=sizeof(state_path)-1){log4c_error("tenant state path is too long");log4c_shutdown();return 1;}
-            if(nb_tenants_enable_shared(&g_tenants,state_path,error,sizeof(error))!=0){log4c_error("shared tenant state rejected: %s",error);log4c_shutdown();return 1;}
-            g_tenants_enabled=1;log4c_info("tenant quotas loaded tenants=%zu shared_state=%s",g_tenants.count,state_path);}
         if(exit_routes_path){
             char error[256];
             if(nb_routes_load(&G.exit_routes,exit_routes_path,error,sizeof(error))!=0){
@@ -347,9 +350,10 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             (nb_instance_env(nb_current_instance,"NB_CC")&&nb_instance_env(nb_current_instance,"NB_CC")[0])?nb_instance_env(nb_current_instance,"NB_CC"):"bbr");
     }
 
-    nb_current_instance->dns=nb_dns_create(G.outbound_configured?G.outbound_addr.ss_family:AF_UNSPEC,DNS_WORKERS);
+    const char* dns_servers=G.role==ROLE_EXIT?nb_instance_env(nb_current_instance,"NB_DNS_SERVERS"):NULL;
+    nb_current_instance->dns=nb_dns_create_with_servers(G.outbound_configured?G.outbound_addr.ss_family:AF_UNSPEC,DNS_WORKERS,dns_servers);
     if(nb_current_instance->dns==NULL){ log4c_error("async DNS init fail"); log4c_shutdown(); return 1; }
-    log4c_info("async DNS: %d workers ready",DNS_WORKERS);
+    log4c_info("async DNS: %d workers ready servers=%s",DNS_WORKERS,(dns_servers&&dns_servers[0])?dns_servers:"system");
     if(g_socks_auth_enabled&&(nb_current_instance->auth_async=nb_auth_async_create(&g_socks_users,AUTH_WORKERS))==NULL){
         log4c_error("async SOCKS authentication init fail");log4c_shutdown();return 1;
     }
@@ -398,24 +402,25 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             int64_t fwd=(dl<=now)?0:(int64_t)(dl-now);if(fwd<wd)wd=fwd;
         }
         { uint64_t dl=nb_udp_lifecycle_next_deadline(&g_udp_lifecycle);if(dl){int64_t d=(dl<=now)?0:(int64_t)(dl-now);if(d<wd)wd=d;} }
-        int wait_ms=(wd<=0)?0:(int)((wd+999)/1000);if(wait_ms>1000)wait_ms=1000;
+        int64_t wait_us=wd<=0?0:(wd>1000000?1000000:wd);
         uint64_t wait_started=now,iteration_wake_late=0;
         struct epoll_event events[256];
-        int event_count=epoll_wait(G.epoll_fd,events,(int)(sizeof(events)/sizeof(events[0])),wait_ms);
+        int event_count=nb_epoll_wait_us(G.epoll_fd,events,
+            (int)(sizeof(events)/sizeof(events[0])),wait_us);
         if(event_count<0&&errno!=EINTR){log4c_error("epoll_wait fail: %s",strerror(errno));break;}
         if(event_count<0)event_count=0;
         now=picoquic_current_time();
         uint64_t busy_started=now;
         if(event_count==0){
-            uint64_t expected=(uint64_t)wait_ms*1000ULL,elapsed=now-wait_started;
+            uint64_t expected=(uint64_t)wait_us,elapsed=now-wait_started;
             uint64_t late=elapsed>expected?elapsed-expected:0;
             iteration_wake_late=late;
             if(late>loop_wake_late_max)loop_wake_late_max=late;
         }
         for(int ei=0;ei<event_count;ei++){
             uint64_t tag=events[ei].data.u64;uint32_t ee=events[ei].events;
-            if(tag==NB_EPOLL_TAG_UDP){udp_drain_fd(G.udp_fd,&G.local_addr,now);continue;}
-            if(tag==NB_EPOLL_TAG_CLIENT_UDP){udp_drain_fd(G.client_udp_fd,&G.client_local_addr,now);continue;}
+            if(tag==NB_EPOLL_TAG_UDP){udp_drain_fd(G.udp_fd,&G.local_addr);continue;}
+            if(tag==NB_EPOLL_TAG_CLIENT_UDP){udp_drain_fd(G.client_udp_fd,&G.client_local_addr);continue;}
             if(tag==NB_EPOLL_TAG_AUTH){
                 char drain[256];while(read(nb_auth_async_context_result_fd(nb_current_instance->auth_async),drain,sizeof(drain))>0){}
                 nb_auth_async_result_t result;
@@ -456,9 +461,14 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                         log4c_info("exit udp trace id=%u usid=%u stage=target-ready age=%.1fms pending=%zu target=%s:%d",
                             p->id,p->udp_session_id,trace_delta_ms(p->udp_target_ready_at,p->created_at),
                             p->udp_pending_tx_len,p->udp_target_host,p->udp_target_port);
-                        { nb_live_queue_limits_t limits=nb_live_queue_limits(p->flow_class,1);
-                          uint64_t dropped=dgramq_drop_expired(p->udp_pending_tx,&p->udp_pending_tx_len,
-                              limits.deadline_us,picoquic_current_time());
+                        { uint64_t reorder_delay_us=nb_current_instance->transport_ingress.active?
+                              nb_current_instance->transport_ingress.link.reorder_delay_us:
+                              nb_current_instance->reorder_delay_us;
+                          nb_live_queue_limits_t limits=nb_live_queue_limits_for_path(
+                              p->flow_class,1,reorder_delay_us);
+                          uint64_t dropped=nb_live_queue_expiry_enabled(p->flow_class,1)?
+                              dgramq_drop_expired(p->udp_pending_tx,&p->udp_pending_tx_len,
+                                  limits.deadline_us,picoquic_current_time()):0;
                           if(dropped>0)log4c_info("exit udp pending deadline drop id=%u packets=%llu",
                               p->id,(unsigned long long)dropped); }
                         while(p->udp_pending_tx_len>=10){
@@ -545,6 +555,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
         /* middle: 无 TCP 的流也要判释放 */
         for(i=0;i<MAX_CONN;i++){
             proxy_stream_t*p=&G.streams[i];
+            if(p->in_use&&p->probe_mode==4&&probe_source_pump(p)!=0)p->need_teardown=1;
             if(p->in_use&&p->tcp_fd<0&&(G.role==ROLE_MIDDLE||p->probe_mode))maybe_free(p);
         }
         /* V1.5 FEC sidecar: 部分 block 超时封口，避免小流量永远攒不满 K 个 symbol 而不发。 */
@@ -737,7 +748,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                 }
             }
         }
-        udp_send_batch(now);
+        udp_send_batch();
         /* 发送和 FEC tick 可能改变队列水位，循环末统一刷新 TCP EPOLLIN/EPOLLOUT。 */
         for(i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];if(p->in_use&&p->tcp_fd>=0)(void)epoll_tcp_update(p,0);}
         { uint64_t loop_end=picoquic_current_time();uint64_t busy=loop_end-busy_started;

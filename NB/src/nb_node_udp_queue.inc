@@ -93,7 +93,9 @@ static int udp_queue_optional_wire(proxy_stream_t* p,int to_down,const uint8_t* 
 
 static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const char* route,
     const uint8_t* payload,size_t payload_length){
-    uint16_t fragments=nb_udp_fragment_count(payload_length);size_t route_length=route?strlen(route):0;
+    char routed[NB_UDP_ROUTE_MAX];const char* wire_route=route;
+    if(to_down&&p->tenant_name[0]){if(nb_tenant_wire_render(routed,sizeof(routed),p->tenant_name,route)<0)return -1;wire_route=routed;}
+    uint16_t fragments=nb_udp_fragment_count(payload_length);size_t route_length=wire_route?strlen(wire_route):0;
     if(fragments==0||route_length==0||route_length>=NB_UDP_ROUTE_MAX)return -1;
     size_t need=payload_length+(size_t)fragments*(NB_UDP_QUEUE_RECORD_HEADER+24+route_length);
     uint8_t* queue=to_down?p->udp_down_tx:p->udp_up_tx;
@@ -105,7 +107,7 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
         size_t part=payload_length-offset;if(part>NB_UDP_FRAGMENT_PAYLOAD)part=NB_UDP_FRAGMENT_PAYLOAD;
         uint8_t wire[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
         int n=nb_udp_wire_encode(wire,sizeof(wire),type,p->udp_session_id,sequence,i,fragments,
-            (uint16_t)payload_length,route,(uint16_t)route_length,payload+offset,(uint16_t)part);
+            (uint16_t)payload_length,wire_route,(uint16_t)route_length,payload+offset,(uint16_t)part);
         if(n<0||udp_queue_wire_raw(p,to_down,wire,(size_t)n)!=0)return -1;
     }
     return 0;
@@ -113,8 +115,10 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
 
 static int udp_fec_record_source(proxy_stream_t* p,const nb_udp_wire_view_t* view,const char* route){
     if(p==NULL||p->udp_fec_tx==NULL||view==NULL||route==NULL)return 0;
-    nb_udp_wire_view_t forwarded=*view;forwarded.route=(const uint8_t*)route;
-    forwarded.route_length=(uint16_t)strlen(route);uint8_t repair[1280];
+    char routed[NB_UDP_ROUTE_MAX];const char* wire_route=route;
+    if(p->tenant_name[0]){if(nb_tenant_wire_render(routed,sizeof(routed),p->tenant_name,route)<0)return -1;wire_route=routed;}
+    nb_udp_wire_view_t forwarded=*view;forwarded.route=(const uint8_t*)wire_route;
+    forwarded.route_length=(uint16_t)strlen(wire_route);uint8_t repair[1280];
     int length=nb_udp_fec_tx_feed(p->udp_fec_tx,&forwarded,picoquic_current_time(),repair,sizeof(repair));
     if(length<0)return -1;
     p->udp_fec_source_packets++;
@@ -142,9 +146,11 @@ static int udp_fec_flush_due(proxy_stream_t* p,uint64_t now){
 }
 
 static int udp_forward_fragment(proxy_stream_t* p,int to_down,const nb_udp_wire_view_t* view,const char* route){
-    size_t route_length=strlen(route);uint8_t wire[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
+    char routed[NB_UDP_ROUTE_MAX];const char* wire_route=route;
+    if(to_down&&p->tenant_name[0]){if(nb_tenant_wire_render(routed,sizeof(routed),p->tenant_name,route)<0)return -1;wire_route=routed;}
+    size_t route_length=strlen(wire_route);uint8_t wire[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
     int n=nb_udp_wire_encode(wire,sizeof(wire),view->type,view->session_id,view->sequence,
-        view->fragment_index,view->fragment_count,view->total_length,route,(uint16_t)route_length,
+        view->fragment_index,view->fragment_count,view->total_length,wire_route,(uint16_t)route_length,
         view->payload,view->payload_length);
     return n<0?-1:udp_queue_wire(p,to_down,wire,(size_t)n);
 }

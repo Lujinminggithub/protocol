@@ -27,6 +27,7 @@ def candidate(package: float = 10, ratio: float = 1.25) -> dict:
     middle = copy.deepcopy(segment); middle["candidate"] = recommendation("bbr")
     return {
         "service_package": {"committed_mbps": package,
+                            "upstream_mbps": package,"downstream_mbps": package,
                             "qualification_mbps": package * ratio,
                             "headroom_ratio": ratio},
         "admission": {"status": "admitted", "achieved_mbps": package * ratio * 0.96},
@@ -67,11 +68,11 @@ def main() -> None:
     assert artifacts["profile"]["schema_version"] == 4
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["entry"]
     assert "cwin_max_bytes" not in artifacts["hosts"]["transport"]["middle"]
-    assert artifacts["policy"]["schema_version"] == 2
     assert artifacts["policy"]["tenants"][0]["rate_up_kbps"] == 8000
     assert artifacts["policy"]["tenants"][0]["rate_down_kbps"] == 12000
-    assert artifacts["policy"]["tenants"][0]["burst_up_seconds"] == 1
-    assert artifacts["policy"]["tenants"][0]["burst_down_seconds"] == 1
+    assert artifacts["policy"]["schema_version"] == 3
+    assert artifacts["policy"]["tenants"][0]["burst_up_bytes"] == 1000000
+    assert artifacts["policy"]["tenants"][0]["burst_down_bytes"] == 1500000
     assert artifacts["client"]["server"] == "192.0.2.10"
     assert "u%40ser:p%3Aa%2Fss@" in artifacts["client"]["shadowrocket_url"]
 
@@ -89,10 +90,10 @@ def main() -> None:
     except ValueError as error:
         assert "容量准入失败" in str(error)
 
-    marginal = candidate(); marginal["admission"]["achieved_mbps"] = 11.5
+    marginal = candidate(); marginal["admission"]["achieved_mbps"] = 8.9
     try:
         assert_qualified(marginal, 10, 1.25)
-        raise AssertionError("仅达到资格速率 92% 不得生成稳定配置")
+        raise AssertionError("业务整形未达到平均值 90% 不得生成稳定配置")
     except ValueError as error:
         assert "稳定配置余量不足" in str(error)
 

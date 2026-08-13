@@ -26,7 +26,7 @@ typedef struct { uint64_t flow_hi;uint64_t flow_lo;uint64_t base_offset;uint64_t
 int nb_lstream_type_valid(uint8_t type);
 int nb_lstream_frame_encode(uint8_t* out,size_t cap,uint8_t type,uint64_t flow_hi,
     uint64_t flow_lo,uint64_t offset,const uint8_t* payload,uint32_t payload_length);
-int nb_lstream_bootstrap_encode(uint8_t* out,size_t cap,int priority,const char* route,
+int nb_lstream_bootstrap_encode(uint8_t* out,size_t cap,int priority,const char* tenant,const char* route,
     uint8_t type,uint64_t flow_hi,uint64_t flow_lo,uint64_t offset);
 int nb_lstream_frame_decode(const uint8_t* wire,size_t length,nb_lstream_frame_t* out);
 void nb_lstream_decoder_init(nb_lstream_decoder_t* decoder);

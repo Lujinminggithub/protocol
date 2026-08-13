@@ -205,7 +205,8 @@ static void socks_handshake(proxy_stream_t* p){
             uint8_t r[10]={0x05,0x02,0,0x01,0,0,0,0,0,0}; (void)send(p->tcp_fd,r,10,MSG_NOSIGNAL); ps_free(p); return; }
         const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(p->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
         if(G.exit_routes_enabled&&!selected){uint8_t r[10]={5,1,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"no-healthy-route");ps_free(p);return;}if(selected){p->route_index=nb_routes_acquire(&G.exit_routes,selected);if(p->route_index<0){ps_free(p);return;}}
-        if(port==NB_PROBE_PORT&&(!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)))
+        if(port==NB_PROBE_PORT&&(!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
+            !strcasecmp(host,NB_PROBE_SOURCE_HOST)))
             p->probe_mode=3; /* entry 等待探针响应 FIN，不能在客户端半关闭后立即拆流 */
         uint8_t rep[10]={0x05,0x00,0x00,0x01,0,0,0,0,0,0}; /* 成功, BND 全 0 */
         (void)send(p->tcp_fd,rep,10,MSG_NOSIGNAL);
@@ -439,7 +440,9 @@ static void pump_tcp(proxy_stream_t* p){
             if(desired>replay_left)desired=replay_left;
         }
         int direction=G.role==ROLE_ENTRY?NB_TENANT_UP:NB_TENANT_DOWN;
-        size_t limit=g_tenants_enabled?nb_tenant_take(&g_tenants,p->tenant_index,desired,picoquic_current_time(),direction):desired;if(limit==0){p->tenant_throttled_until=picoquic_current_time()+10000ULL;break;}
+        uint64_t now=picoquic_current_time();
+        size_t limit=g_tenants_enabled?nb_tenant_take(&g_tenants,p->tenant_index,desired,now,direction):desired;
+        if(limit==0){p->tenant_throttled_until=now+nb_tenant_retry_after_us(&g_tenants,p->tenant_index,1,direction);break;}
         n=recv(p->tcp_fd,buf,limit,0);
         if(n>0){
             if(g_tenants_enabled&&(size_t)n<limit)nb_tenant_refund(&g_tenants,p->tenant_index,limit-(size_t)n,direction);
@@ -485,9 +488,11 @@ static void maybe_free(proxy_stream_t* p){
 }
 
 /* P1-2a: recvmmsg 批量收 UDP -> 降低高包率(大流量)下的接收 syscall 开销。
- * 单线程事件循环, 用 function-local static 缓冲复用, 一次 syscall 收多达 UDP_RECV_BATCH 个包。 */
+ * 每个 epoll 轮次只收一个有界批次。level-triggered epoll 会在下一轮继续
+ * 通知；轮次之间必须让 udp_send_batch() 运行，避免长 RTT 入站突发在发送
+ * 获得机会前灌满低延迟媒体队列。 */
 #define UDP_RECV_BATCH 32
-static void udp_drain_fd(int fd,const struct sockaddr_storage* local,uint64_t now){
+static void udp_drain_fd(int fd,const struct sockaddr_storage* local){
     static _Thread_local struct mmsghdr msgs[UDP_RECV_BATCH];
     static _Thread_local struct iovec iovs[UDP_RECV_BATCH];
     static _Thread_local uint8_t bufs[UDP_RECV_BATCH][1536];
@@ -504,42 +509,45 @@ static void udp_drain_fd(int fd,const struct sockaddr_storage* local,uint64_t no
         }
         inited=1;
     }
-    for(;;){
-        for(int i=0;i<UDP_RECV_BATCH;i++){
-            msgs[i].msg_hdr.msg_controllen=sizeof(controls[i].bytes);
-            msgs[i].msg_hdr.msg_flags=0;
-        }
-        for(int i=0;i<UDP_RECV_BATCH;i++) msgs[i].msg_hdr.msg_namelen=sizeof(froms[i]); /* namelen 是 in/out, 每次重置 */
-        int got=recvmmsg(fd,msgs,UDP_RECV_BATCH,0,NULL);
-        if(got<=0){if(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)nb_metrics_note_udp_error(&g_metrics_state,0);break;}
-        nb_udp_rxq_state_t* rxq_state=fd==G.client_udp_fd?&g_udp_rxq_client:&g_udp_rxq_main;
-        for(int m=0;m<got;m++){
-            uint64_t dropped=nb_udp_rxq_overflow_update(rxq_state,&msgs[m].msg_hdr);
-            udp_rxq_overflow_note(fd==G.client_udp_fd?"middle-client-quic":"quic",0,dropped);
-            picoquic_incoming_packet(G.quic,bufs[m],(size_t)msgs[m].msg_len,
-                (struct sockaddr*)&froms[m],(struct sockaddr*)local,0,0,now);
-        }
-        if(got<UDP_RECV_BATCH) break; /* 已排空 */
+    for(int i=0;i<UDP_RECV_BATCH;i++){
+        msgs[i].msg_hdr.msg_controllen=sizeof(controls[i].bytes);
+        msgs[i].msg_hdr.msg_flags=0;
+        msgs[i].msg_hdr.msg_namelen=sizeof(froms[i]); /* namelen 是 in/out, 每次重置 */
+    }
+    int got=recvmmsg(fd,msgs,UDP_RECV_BATCH,0,NULL);
+    if(got<=0){
+        if(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)
+            nb_metrics_note_udp_error(&g_metrics_state,0);
+        return;
+    }
+    nb_udp_rxq_state_t* rxq_state=fd==G.client_udp_fd?&g_udp_rxq_client:&g_udp_rxq_main;
+    for(int m=0;m<got;m++){
+        uint64_t dropped=nb_udp_rxq_overflow_update(rxq_state,&msgs[m].msg_hdr);
+        udp_rxq_overflow_note(fd==G.client_udp_fd?"middle-client-quic":"quic",0,dropped);
+        uint64_t packet_now=picoquic_current_time();
+        picoquic_incoming_packet(G.quic,bufs[m],(size_t)msgs[m].msg_len,
+            (struct sockaddr*)&froms[m],(struct sockaddr*)local,0,0,packet_now);
     }
 }
 
 /* P1-2b: UDP GSO 批量发送。picoquic 逐包 prepare, 我们把连续的、同目的地址、同段大小的包攒进一个
  * 缓冲, 用 sendmsg + UDP_SEGMENT 一次 syscall 发出(内核分段)。段大小需统一(除末段可更小)。
  * GSO 不支持(老内核/EIO)时逐段 sendto 回退, 保证正确性。 */
-static void udp_send_batch(uint64_t now){
+static void udp_send_batch(void){
     uint8_t gbuf[64*1536]; size_t glen=0; int gseg=0,gfd=-1; struct sockaddr_storage gto; socklen_t gtolen=0;
     for(;;){
         uint8_t sb[1536]; size_t sl=0; struct sockaddr_storage to,fr; int ifx=0;
         picoquic_connection_id_t lc; picoquic_cnx_t* lcnx=NULL;
-        int r=picoquic_prepare_next_packet(G.quic,now,sb,sizeof(sb),&sl,&to,&fr,&ifx,&lc,&lcnx);
+        uint64_t send_now=picoquic_current_time();
+        int r=picoquic_prepare_next_packet(G.quic,send_now,sb,sizeof(sb),&sl,&to,&fr,&ifx,&lc,&lcnx);
         if(r!=0||sl==0) break;
         int fd=(G.role==ROLE_MIDDLE&&pool_contains_cnx(lcnx))?G.client_udp_fd:G.udp_fd;
         socklen_t tl=(to.ss_family==AF_INET)?sizeof(struct sockaddr_in):sizeof(struct sockaddr_in6);
         if(!g_udp_gso_enabled){
             if(sendto(fd,sb,sl,0,(struct sockaddr*)&to,tl)<0){
                 nb_metrics_note_udp_error(&g_metrics_state,1);
-                if(now-nb_current_instance->udp_send_last_warn_at>=1000000ULL){
-                    nb_current_instance->udp_send_last_warn_at=now;
+                if(send_now-nb_current_instance->udp_send_last_warn_at>=1000000ULL){
+                    nb_current_instance->udp_send_last_warn_at=send_now;
                     log4c_warn("udp sendto failed: %s",strerror(errno));
                 }
             }

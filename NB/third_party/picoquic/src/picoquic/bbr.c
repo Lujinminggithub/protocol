@@ -740,6 +740,9 @@ static void BBRBoundCwndForModel(picoquic_bbr_state_t* bbr_state, picoquic_path_
          * conservative while allowing the measured delivery rate to recover. */
         uint64_t media_bdp_floor = BBRInflightWithBw(bbr_state, path_x, 1.0,
             bbr_state->max_bw);
+        if (media_bdp_floor < bbr_state->bdp_seed) {
+            media_bdp_floor = bbr_state->bdp_seed;
+        }
         if (cap < media_bdp_floor) {
             cap = media_bdp_floor;
         }
@@ -2330,9 +2333,13 @@ void BBRUpdateStartupLongRtt(picoquic_bbr_state_t* bbr_state, picoquic_path_t* p
     }
 }
 
-void BBRSetBdpSeed(picoquic_bbr_state_t* bbr_state, uint64_t bdp_seed)
+void BBRSetBdpSeed(picoquic_bbr_state_t* bbr_state, picoquic_path_t* path_x,
+    uint64_t bdp_seed)
 {
     bbr_state->bdp_seed = bdp_seed;
+    if (path_x->cnx->is_media_connection && path_x->cwin < bdp_seed) {
+        path_x->cwin = bdp_seed;
+    }
     if (bbr_state->state == picoquic_bbr_alg_startup &&
         bbr_state->bdp_seed > bbr_state->max_bw) {
         BBREnterStartupResume(bbr_state);
@@ -2600,7 +2607,7 @@ static void picoquic_bbr_notify(
             picoquic_bbr_reset(bbr_state, path_x, current_time);
             break;
         case picoquic_congestion_notification_seed_cwin:
-            BBRSetBdpSeed(bbr_state, ack_state->nb_bytes_acknowledged);
+            BBRSetBdpSeed(bbr_state, path_x, ack_state->nb_bytes_acknowledged);
             break;
         default:
             /* ignore */

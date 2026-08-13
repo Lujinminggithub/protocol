@@ -12,6 +12,7 @@ int main(void){
     nb_metrics_note_udp_error(&state,0);nb_metrics_note_udp_error(&state,1);
     nb_metrics_note_udp_rxq_overflow(&state,7);
     nb_metrics_note_udp_queue_pressure_drop(&state,3);
+    nb_metrics_note_traffic(&state,1000,2000);
     state.pool_retire_total=2;state.pool_retire_suppressed=3;
     state.pool_quarantine_total=4;state.pool_mbb_promotions=2;
     state.pmtu_promotions=4;state.pmtu_fallbacks=1;
@@ -20,7 +21,8 @@ int main(void){
     nb_metrics_snapshot_add_stream(&snapshot,2,1,0,1,1,0,100,200,10,20,30,1000,2000,3000,4000,5000);
     nb_metrics_snapshot_add_stream(&snapshot,1,0,1,0,0,1,300,400,5,6,7,500,600,700,1000,2000);
     assert(snapshot.media_sessions==1&&snapshot.ctrl_sessions==1&&snapshot.udp_sessions==1);
-    assert(snapshot.bytes_c2s==400&&snapshot.queue_q2t_bytes==37&&snapshot.queue_q2t_age_max_us==3000);
+    assert(snapshot.bytes_c2s==1400&&snapshot.bytes_s2c==2600);
+    assert(snapshot.queue_q2t_bytes==37&&snapshot.queue_q2t_age_max_us==3000);
     assert(snapshot.target_connect_failed==1&&snapshot.first_s2c_wait_max_us==5000);
     nb_metrics_snapshot_add_link(&snapshot,3.5,200000,12000,200);
     nb_metrics_snapshot_add_transport(&snapshot,"bbr",2,10,4,2,24,100000,1000,500,9000,1);

@@ -118,10 +118,12 @@ def assert_qualified(candidate: dict, package_mbps: float,
     if admission.get("status") != "admitted":
         raise ValueError(f"容量准入失败: {admission.get('reasons') or ['unknown']}")
     achieved = float(admission.get("achieved_mbps", 0) or 0)
-    if achieved < expected * STABLE_MIN_QUALIFICATION_RATIO:
+    shaping_target=min(float(service.get("upstream_mbps",package_mbps) or package_mbps),
+        float(service.get("downstream_mbps",package_mbps) or package_mbps))
+    if achieved < shaping_target * STABLE_MIN_QUALIFICATION_RATIO:
         raise ValueError(
             f"稳定配置余量不足: achieved={achieved:.3f} Mbps, "
-            f"required={expected * STABLE_MIN_QUALIFICATION_RATIO:.3f} Mbps")
+            f"required={shaping_target * STABLE_MIN_QUALIFICATION_RATIO:.3f} Mbps")
     for segment_name in ("entry_middle", "middle_exit"):
         segment = (candidate.get("segments") or {}).get(segment_name) or {}
         recommendation = segment.get("candidate") or {}
@@ -226,11 +228,13 @@ def build_artifacts(line: dict, candidate: dict, hosts: dict, baseline: dict,
     if not routes:
         raise ValueError("拓扑没有 exits[]，无法生成固定出口策略")
     policy = {
-        "schema_version": 2,
+        "schema_version": 3,
         "fixed_exit": profile.get("fixed_exit"),
         "tenants": [{"name": username, "max_tcp": 256, "max_udp": 64,
                      "rate_up_kbps": rate_up_kbps, "rate_down_kbps": rate_down_kbps,
-                     "quota_mb": 0, "burst_up_seconds": 1, "burst_down_seconds": 1}],
+                     "quota_mb": 0,
+                     "burst_up_bytes": max(256 * 1024, rate_up_kbps * 1000 // 8),
+                     "burst_down_bytes": max(256 * 1024, rate_down_kbps * 1000 // 8)}],
         "routes": routes,
     }
     return {"hosts": generated_hosts, "profile": profile, "policy": policy,
@@ -262,6 +266,8 @@ def run_probe(line: dict, inventory_dir: pathlib.Path, output: pathlib.Path,
     probe = {**defaults.get("probe", {}), **line.get("probe", {})}
     command = [sys.executable, str(ROOT / "tools" / "line_probe.py"), "--active",
                "--package-mbps", str(package), "--headroom-ratio", str(headroom),
+               "--upstream-mbps", str(float(line.get("upstream_mbps",package))),
+               "--downstream-mbps", str(float(line.get("downstream_mbps",package))),
                "--duration", str(int(probe.get("duration", 90))),
                "--ping-samples", str(int(probe.get("ping_samples", 30))),
                "--socks-port", str(int(line["client"].get("port", 1080))),

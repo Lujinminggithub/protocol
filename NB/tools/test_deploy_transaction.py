@@ -35,6 +35,10 @@ def main() -> None:
             pushed.clear();deploy_core.run = lambda *_args, **_kwargs: ""
             deploy_core._push_security(FakeClient("entry"), "entry")
             assert "/runtime/tenant.conf" in {path for path, _mode in pushed}
+            pushed.clear();deploy_core._push_security(FakeClient("exit"), "exit")
+            assert "/runtime/tenant.conf" in {path for path, _mode in pushed}
+            assert "-Q /runtime/tenant.conf" in deploy_core._node_command(
+                "exit", wl_remote="/runtime/whitelist.conf", release_id="release")
         finally:
             for name, value in saved.items():
                 setattr(deploy_core, name, value)

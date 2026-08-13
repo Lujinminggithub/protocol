@@ -87,6 +87,8 @@ class Stopped:
 def main() -> None:
     compile(ENTRY_LOCAL_PROBE_SCRIPT, "<entry-local-probe>", "exec")
     assert "sock.shutdown(socket.SHUT_WR)" in ENTRY_LOCAL_PROBE_SCRIPT
+    assert 'connect_socks("nb-probe-source.internal")' in ENTRY_LOCAL_PROBE_SCRIPT
+    assert 'b"NBP2"' in ENTRY_LOCAL_PROBE_SCRIPT
     assert fnv1a64(b"abc") == 0xe71fa2190541574b
     control_sample = control_link_sample([
         {"link": {"sent_packets": 800, "rtt_max_us": 4500, "jitter_max_us": 600,
@@ -177,11 +179,20 @@ def main() -> None:
     mtu_probe = {"status": "ok", "max_ip_mtu": 1500}
     candidate = recommend(summary, {"cc": "bbr", "mtu_max": 1280}, 10.0, mtu_probe)
     assert candidate["confidence"] == "load-qualified"
-    assert candidate["reorder_gap"] == 30
-    assert candidate["provisional"]["reorder_gap"] == 30
+    assert candidate["reorder_gap"] == 32
+    assert candidate["provisional"]["reorder_gap"] == 32
+    assert candidate["reorder_delay_us"] == 120000
     assert candidate["auto_apply_allowed"] is False
     assert candidate["mtu_max"] == 1452
     assert candidate["mtu_evidence"]["confidence"] == "quic-and-df"
+
+    normal = line.replace("reorder=163.0ms/24", "reorder=10.0ms/4")
+    transient = line.replace("reorder=163.0ms/24", "reorder=900.0ms/512")
+    robust = summarize_linkq(parse_linkq("\n".join([normal] * 6 + [transient])))
+    assert robust["reorder_gap_max"] == 512
+    assert robust["reorder_delay_max_ms"] == 900.0
+    assert robust["reorder_gap_p95"] == 4
+    assert robust["reorder_delay_p95_ms"] == 10.0
 
     clean = summarize_linkq(parse_linkq("\n".join([
         line.replace("rtt=210.0ms", "rtt=5.0ms")
@@ -193,8 +204,8 @@ def main() -> None:
         "reorder_gap": 128, "reorder_delay_us": 450000,
     }, 10.0, mtu_probe)
     assert protected["cwin_max_bytes"] == 524288
-    assert protected["reorder_gap"] == 128
-    assert protected["reorder_delay_us"] == 450000
+    assert protected["reorder_gap"] == 8
+    assert protected["reorder_delay_us"] == 20000
 
     idle = summarize_linkq([])
     current = {"cc": "bbr", "mtu_max": 1400,
@@ -207,11 +218,14 @@ def main() -> None:
     assert idle_candidate["auto_apply_allowed"] is False
     assert recommend_mtu(idle, None, current)["confidence"] == "unavailable-keep-current"
     admitted = evaluate_admission({"integrity": {"integrity": "ok"},
-        "load": {"integrity": "count-ok", "achieved_mbps": 9.2}}, 10.0)
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.2},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.4}}, 10.0)
     assert admitted["status"] == "admitted"
     rejected = evaluate_admission({"integrity": {"integrity": "ok"},
-        "load": {"integrity": "count-ok", "achieved_mbps": 8.9}}, 10.0)
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.1},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 8.9}}, 10.0)
     assert rejected["status"] == "rejected"
+    assert rejected["reasons"] == ["insufficient-downlink"]
     print("line_probe tests passed")
 
 

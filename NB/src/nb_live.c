@@ -104,10 +104,10 @@ nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
             runtime->high_downlink_windows++;
         else runtime->high_downlink_windows=0;
         return runtime->high_downlink_windows>=MEDIA_DOWNLINK_WINDOWS&&total_s2c>=256*KIB?
-            NB_LIVE_FLOW_DEMOTE_BULK:NB_LIVE_FLOW_KEEP;
+            NB_LIVE_FLOW_DEMOTE_DOWNLINK:NB_LIVE_FLOW_KEEP;
     }
     runtime->high_downlink_windows=0;
-    if(ck>=256.0&&ck>=sk*2.0)runtime->high_uplink_windows++;
+    if(ck>=256.0)runtime->high_uplink_windows++;
     else runtime->high_uplink_windows=0;
     return runtime->high_uplink_windows>=2?NB_LIVE_FLOW_PROMOTE_MEDIA:NB_LIVE_FLOW_KEEP;
 }

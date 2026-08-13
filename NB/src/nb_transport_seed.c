@@ -41,7 +41,13 @@ int nb_transport_seed_plan(const nb_transport_link_profile_t* link,
 
 int nb_transport_seed_should_refresh(int configured,int applied,
     uint64_t current_rtt_us,uint64_t observed_rtt_us){
-    if(!configured||applied)return 0;
+    if(!configured)return 0;
     if(observed_rtt_us<NB_SEED_MIN_RTT_US||observed_rtt_us>NB_SEED_MAX_RTT_US)return 0;
-    return current_rtt_us!=observed_rtt_us;
+    if(current_rtt_us==observed_rtt_us)return 0;
+    if(!applied)return 1;
+    uint64_t delta=current_rtt_us>observed_rtt_us?
+        current_rtt_us-observed_rtt_us:observed_rtt_us-current_rtt_us;
+    uint64_t threshold=current_rtt_us/8;
+    if(threshold<NB_SEED_MIN_RTT_US)threshold=NB_SEED_MIN_RTT_US;
+    return delta>=threshold;
 }

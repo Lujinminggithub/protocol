@@ -11,5 +11,6 @@ size_t nb_tenant_shared_allowance(nb_tenants_t* tenants,int index,size_t request
 void nb_tenant_shared_refund(nb_tenants_t* tenants,int index,size_t bytes,int direction);
 void nb_tenant_shared_account(nb_tenants_t* tenants,int index,uint64_t up,uint64_t down);
 int nb_tenant_shared_snapshot(nb_tenants_t* tenants);
+int nb_tenant_shared_reconfigure(nb_tenants_t* tenants,const nb_tenants_t* next,char* error,size_t error_cap);
 
 #endif

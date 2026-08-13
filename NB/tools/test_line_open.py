@@ -31,6 +31,11 @@ def main() -> None:
     assert "password" not in hosts["entry"]
     assert credentials["NB_SSH_PASSWORD_ENTRY"] == "e"
     assert hosts["exits"][0]["host"] == "192.0.2.3"
+    assert hosts["transport"]["exit"]["dns_servers"] == ["1.1.1.1", "8.8.8.8"]
+    custom_dns_source = dict(source)
+    custom_dns_source["transport"] = {"exit": {"dns_servers": ["9.9.9.9"]}}
+    custom_dns, _ = normalize_hosts(custom_dns_source)
+    assert custom_dns["transport"]["exit"]["dns_servers"] == ["9.9.9.9"]
     stale = dict(source)
     stale["exits"] = [{"name": "old", "host": "192.0.2.3", "port": 4444,
                        "fixed_exit": "exit-192-0-2-3"}]

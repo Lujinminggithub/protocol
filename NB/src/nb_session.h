@@ -60,7 +60,7 @@ typedef struct proxy_stream {
     int tcp_read_paused;
     int upstream_fc_enabled;
     int upstream_fc_blocked;
-    int probe_mode;              /* exit 内部探针: 1=sink/count, 2=echo */
+    int probe_mode;              /* exit internal probe: 1=sink, 2=echo, 4=downlink source */
     uint64_t probe_bytes;
     uint64_t probe_hash;
     uint64_t probe_expected_bytes;
@@ -161,6 +161,7 @@ typedef struct proxy_stream {
     size_t media_q2t_peak;
     unsigned int high_uplink_windows;
     nb_live_flow_runtime_t live_runtime;
+    int downlink_bulk;
     int sched_throttled;
     uint64_t target_connect_at;
     uint64_t target_connect_done_at;

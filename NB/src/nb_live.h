@@ -37,7 +37,8 @@ typedef struct {
 typedef enum {
     NB_LIVE_FLOW_KEEP = 0,
     NB_LIVE_FLOW_PROMOTE_MEDIA = 1,
-    NB_LIVE_FLOW_DEMOTE_BULK = 2
+    NB_LIVE_FLOW_DEMOTE_BULK = 2,
+    NB_LIVE_FLOW_DEMOTE_DOWNLINK = 3
 } nb_live_flow_action_t;
 
 typedef struct {

@@ -5,6 +5,15 @@
 #include <unistd.h>
 
 int main(void){
+    assert(nb_dns_servers_valid("1.1.1.1,8.8.8.8")==1);
+    assert(nb_dns_servers_valid("1.1.1.1,not-an-ip")==0);
+    nb_dns_t* explicit_dns=nb_dns_create_with_servers(AF_INET,1,"1.1.1.1,8.8.8.8");
+    assert(explicit_dns!=NULL&&nb_dns_context_submit(explicit_dns,9,"192.0.2.1",443)==0);
+    struct pollfd explicit_descriptor={nb_dns_context_result_fd(explicit_dns),POLLIN,0};
+    assert(poll(&explicit_descriptor,1,3000)>0);char explicit_drain[8];
+    assert(read(explicit_descriptor.fd,explicit_drain,sizeof(explicit_drain))>0);
+    nb_dns_result_t explicit_result;assert(nb_dns_context_pop(explicit_dns,&explicit_result)==1&&explicit_result.ok==1);
+    nb_dns_destroy(explicit_dns);
     assert(nb_dns_init(AF_UNSPEC,1)==0);assert(nb_dns_result_fd()>=0);
     assert(nb_dns_submit(7,"localhost",443)==0);
     struct pollfd descriptor={nb_dns_result_fd(),POLLIN,0};assert(poll(&descriptor,1,3000)>0);

@@ -2,7 +2,7 @@
 """P1 租户/路由策略签名、原子下发和失败回滚。"""
 from __future__ import annotations
 import argparse,datetime as dt,hashlib,hmac,ipaddress,json,os,pathlib,re,secrets,shlex,time
-import deploy,line_probe
+import deploy,line_probe,nb_shard_deploy
 
 NAME=re.compile(r"^[A-Za-z0-9_.-]{1,63}$")
 def key()->bytes:
@@ -19,14 +19,44 @@ def verify(v:dict)->None:
     sig=v.get("signature","");unsigned={k:x for k,x in v.items() if k!="signature"}
     if not hmac.compare_digest(sig,hmac.new(key(),canonical(unsigned),hashlib.sha256).hexdigest()):raise ValueError("策略签名无效")
 
+def _fnv_u64(value:int,h:int)->int:
+    for shift in range(0,64,8):
+        h^=(value>>shift)&0xff;h=(h*1099511628211)&0xffffffffffffffff
+    return h
+
+def tenant_fingerprint(policy:dict)->int:
+    h=1469598103934665603
+    for tenant in policy["tenants"]:
+        for byte in str(tenant["name"]).encode("ascii"):
+            h^=byte;h=(h*1099511628211)&0xffffffffffffffff
+        up=int(tenant.get("rate_up_kbps",tenant.get("rate_kbps",0)))*1000//8
+        down=int(tenant.get("rate_down_kbps",tenant.get("rate_kbps",0)))*1000//8
+        if int(policy["schema_version"])==3:
+            burst_up=int(tenant.get("burst_up_bytes",0));burst_down=int(tenant.get("burst_down_bytes",0))
+        else:
+            burst_up=up*int(tenant.get("burst_up_seconds",tenant.get("burst_seconds",1)))
+            burst_down=down*int(tenant.get("burst_down_seconds",tenant.get("burst_seconds",1)))
+        values=(int(tenant.get("max_tcp",0)),int(tenant.get("max_udp",0)),up,down,
+                burst_up,burst_down,int(tenant.get("quota_mb",0))*1024*1024)
+        for value in values:h=_fnv_u64(value,h)
+    return h
+
 def validate(policy:dict)->tuple[str,str]:
-    if policy.get("schema_version") not in (1,2) or not NAME.fullmatch(str(policy.get("fixed_exit",""))):raise ValueError("schema/fixed_exit 非法")
+    schema=int(policy.get("schema_version",0))
+    if schema not in (1,2,3) or not NAME.fullmatch(str(policy.get("fixed_exit",""))):raise ValueError("schema/fixed_exit 非法")
     tenants=policy.get("tenants");routes=policy.get("routes")
     if not isinstance(tenants,list)or not tenants or not isinstance(routes,list)or not routes:raise ValueError("tenants/routes 不能为空")
     tlines=[];seen=set()
     for t in tenants:
         name=str(t.get("name",""));max_tcp=int(t.get("max_tcp",0));max_udp=int(t.get("max_udp",0));quota=int(t.get("quota_mb",0))
-        if "rate_up_kbps" in t or "rate_down_kbps" in t:
+        if schema==3:
+            up=int(t.get("rate_up_kbps",0));down=int(t.get("rate_down_kbps",0))
+            up_burst=int(t.get("burst_up_bytes",0));down_burst=int(t.get("burst_down_bytes",0))
+            valid_rates=(0<=up<=100000000 and 0<=down<=100000000 and
+                0<=up_burst<=1073741824 and 0<=down_burst<=1073741824 and
+                (up==0 or up_burst>0) and (down==0 or down_burst>0))
+            rendered=f"tenant-v3 {name} {max_tcp} {max_udp} {up} {down} {quota} {up_burst} {down_burst}"
+        elif "rate_up_kbps" in t or "rate_down_kbps" in t:
             up=int(t.get("rate_up_kbps",0));down=int(t.get("rate_down_kbps",0));up_burst=int(t.get("burst_up_seconds",1));down_burst=int(t.get("burst_down_seconds",1))
             valid_rates=0<=up<=100000000 and 0<=down<=100000000 and 1<=up_burst<=60 and 1<=down_burst<=60
             rendered=f"tenant {name} {max_tcp} {max_udp} {up} {down} {quota} {up_burst} {down_burst}"
@@ -49,7 +79,53 @@ def prepare(policy_path:pathlib.Path,output:pathlib.Path)->dict:
     policy=json.loads(policy_path.read_text(encoding="utf-8"));tenants,routes=validate(policy);output.mkdir(parents=True,exist_ok=True)
     tenant_bytes=tenants.encode("ascii");route_bytes=routes.encode("ascii")
     (output/"tenant.conf").write_bytes(tenant_bytes);(output/"exit_routes.conf").write_bytes(route_bytes)
-    doc={"schema_version":1,"state":"approved","policy_id":hashlib.sha256(canonical(policy)).hexdigest()[:16],"created_at_utc":dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z"),"fixed_exit":policy["fixed_exit"],"tenant_sha256":hashlib.sha256(tenant_bytes).hexdigest(),"routes_sha256":hashlib.sha256(route_bytes).hexdigest()};sign(doc);(output/"manifest.json").write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");return doc
+    fingerprint=tenant_fingerprint(policy)
+    doc={"schema_version":2,"state":"approved","policy_id":hashlib.sha256(canonical(policy)).hexdigest()[:16],"created_at_utc":dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z"),"fixed_exit":policy["fixed_exit"],"tenant_sha256":hashlib.sha256(tenant_bytes).hexdigest(),"tenant_fingerprint":f"{fingerprint:016x}","routes_sha256":hashlib.sha256(route_bytes).hexdigest()};sign(doc);(output/"manifest.json").write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");return doc
+
+def _remote_control_command(control:str,command:str)->str:
+    script=("import socket;"+f"s=socket.socket(socket.AF_UNIX);s.settimeout(5);s.connect({control!r});"+
+        f"s.sendall(({command!r}+'\\n').encode());data=s.recv(32768);s.close();print(data.decode(),end='')")
+    return "python3 -c "+shlex.quote(script)
+
+def invoke_role(role:str,command:str)->list[dict]:
+    connection=deploy.connect(role);responses=[]
+    try:
+        for worker in range(deploy._effective_workers(role)):
+            control=nb_shard_deploy.line_control_path(deploy.DEPLOY_INSTANCE,role,worker)
+            raw=deploy.checked_run(connection,_remote_control_command(control,command),tmo=15).strip()
+            response=json.loads(raw.splitlines()[-1])
+            if response.get("error"):raise RuntimeError(f"{role}[{worker}] 拒绝限速策略: {response['error']}")
+            responses.append(response)
+    finally:connection.close()
+    return responses
+
+def _remote_read(role:str,path:str)->bytes:
+    connection=deploy.connect(role)
+    try:return deploy.fetch_bytes(connection,path)
+    finally:connection.close()
+
+def _remote_push(role:str,data:bytes,path:str)->None:
+    connection=deploy.connect(role)
+    try:deploy.push_bytes(connection,data,path,0o600)
+    finally:connection.close()
+
+def _publish(role:str,source:str,target:str)->None:
+    connection=deploy.connect(role);temporary=target+".next"
+    try:deploy.checked_run(connection," && ".join((f"test -f {shlex.quote(source)}",
+        f"ln -sfn {shlex.quote(source)} {shlex.quote(temporary)}",
+        f"mv -Tf {shlex.quote(temporary)} {shlex.quote(target)}")),tmo=15)
+    finally:connection.close()
+
+def _verify_role(role:str,fingerprint:str)->None:
+    responses=invoke_role(role,"tenant status")
+    mismatched=[index for index,response in enumerate(responses)
+        if str(response.get("fingerprint","")).lower()!=fingerprint.lower()]
+    if mismatched:raise RuntimeError(f"{role} 限速策略指纹读回不一致 workers={mismatched}")
+
+def _rollback_role(role:str,old:bytes,transaction:int,root:str)->None:
+    rollback=f"{root}/rollback-{role}.conf";target=f"{deploy.INSTANCE_WORK}/tenant.conf"
+    _remote_push(role,old,rollback);invoke_role(role,f"tenant prepare {transaction} {rollback}")
+    _publish(role,rollback,target);invoke_role(role,f"tenant commit {transaction}")
 
 def verify_integrity_after_reload(socks_port:int)->None:
     last_error=None
@@ -70,16 +146,29 @@ def apply(bundle:pathlib.Path,execute:bool,socks_port:int=1080)->None:
     tenant=(bundle/"tenant.conf").read_bytes();routes=(bundle/"exit_routes.conf").read_bytes()
     if hashlib.sha256(tenant).hexdigest()!=doc["tenant_sha256"]or hashlib.sha256(routes).hexdigest()!=doc["routes_sha256"]:raise ValueError("策略文件哈希不匹配")
     if not execute:print(json.dumps({"preflight":"ok","policy_id":doc["policy_id"]},ensure_ascii=False));return
-    work=deploy.INSTANCE_WORK;service=deploy._service_name("entry")
-    c=deploy.connect("entry");root=f"{work}/configs/{doc['policy_id']}";old_t=deploy.fetch_bytes(c,f"{work}/tenant.conf");old_r=deploy.fetch_bytes(c,f"{work}/exit_routes.conf")
+    work=deploy.INSTANCE_WORK;root=f"{work}/configs/{doc['policy_id']}";transaction=int(doc["policy_id"],16)
+    old_t={role:_remote_read(role,f"{work}/tenant.conf") for role in ("exit","entry")}
+    old_r=_remote_read("entry",f"{work}/exit_routes.conf")
+    if routes!=old_r:raise ValueError("路由变更必须走完整原子部署，限速热更新只接受租户策略")
+    prepared=[];published=[]
     try:
-        deploy.push_bytes(c,tenant,f"{root}/tenant.conf",0o600);deploy.push_bytes(c,routes,f"{root}/exit_routes.conf",0o600)
-        deploy.run(c,f"ln -sfn {shlex.quote(root+'/tenant.conf')} {shlex.quote(work+'/tenant.conf.next')}; mv -Tf {shlex.quote(work+'/tenant.conf.next')} {shlex.quote(work+'/tenant.conf')}; ln -sfn {shlex.quote(root+'/exit_routes.conf')} {shlex.quote(work+'/exit_routes.conf.next')}; mv -Tf {shlex.quote(work+'/exit_routes.conf.next')} {shlex.quote(work+'/exit_routes.conf')}; systemctl kill -s HUP {shlex.quote(service + '.service')}")
-        deployment=deploy._remote_current_deployment(c,"entry");deploy._verify_deployment_health(c,"entry",deployment,warmup=4)
+        for role in ("exit","entry"):_remote_push(role,tenant,f"{root}/tenant.conf")
+        for role in ("exit","entry"):
+            invoke_role(role,f"tenant prepare {transaction} {root}/tenant.conf");prepared.append(role)
+        for role in ("exit","entry"):
+            _publish(role,f"{root}/tenant.conf",f"{work}/tenant.conf");published.append(role)
+            invoke_role(role,f"tenant commit {transaction}");_verify_role(role,doc["tenant_fingerprint"])
         os.environ.setdefault("NB_SOCKS_USERNAME","");verify_integrity_after_reload(socks_port)
-    except Exception:
-        deploy.push_bytes(c,old_t,f"{work}/tenant.conf",0o600);deploy.push_bytes(c,old_r,f"{work}/exit_routes.conf",0o600);deploy.run(c,f"systemctl kill -s HUP {shlex.quote(service + '.service')}");raise
-    finally:c.close()
+    except Exception as original:
+        for role in reversed(prepared):
+            try:invoke_role(role,f"tenant abort {transaction}")
+            except Exception:pass
+        rollback_transaction=(transaction+1)&0xffffffffffffffff or 1;errors=[]
+        for role in reversed(published):
+            try:_rollback_role(role,old_t[role],rollback_transaction,root)
+            except Exception as error:errors.append(f"{role}: {error}")
+        if errors:raise RuntimeError(f"限速策略提交失败且回滚不完整: {original}; {'; '.join(errors)}") from original
+        raise
     doc["state"]="active";doc["activated_at_utc"]=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z");sign(doc);(bundle/"manifest.json").write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
 
 def keygen(output:pathlib.Path)->None:

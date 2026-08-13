@@ -499,7 +499,9 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
         if(fec_engine_ensure(p)!=0) return -1;
         {
             char ctrl[420];
-            int cl=nb_fec_start_render(ctrl,sizeof(ctrl),p->fec_session_id,prio,profile.k,profile.r,route);
+            char fec_route[390];const char* wire_route=route;
+            if(p->tenant_name[0]){if(nb_tenant_wire_render(fec_route,sizeof(fec_route),p->tenant_name,route)<0)return -1;wire_route=fec_route;}
+            int cl=nb_fec_start_render(ctrl,sizeof(ctrl),p->fec_session_id,prio,profile.k,profile.r,wire_route);
             if(cl<=0||(size_t)cl>=sizeof(ctrl)||queue_down_prefix(p,(const uint8_t*)ctrl,(size_t)cl)!=0){
                 log4c_error("id=%u queue fec ctrl start fail", p->id); return -1; }
         }
@@ -512,17 +514,20 @@ static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb
     if(G.role==ROLE_ENTRY&&p->logical_endpoint){
         int resume=p->logical_reconnect_pending;
         uint8_t bootstrap[768];
-        int length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),prio,route,
+        int length=nb_lstream_bootstrap_encode(bootstrap,sizeof(bootstrap),prio,p->tenant_name,route,
             resume?NB_LSTREAM_RESUME:NB_LSTREAM_OPEN,p->logical_flow_hi,p->logical_flow_lo,
             resume?p->logical_rx_delivered:0);
         if(length<0||queue_down_prefix(p,bootstrap,(size_t)length)!=0){
             log4c_error("id=%u queue logical route bootstrap fail",p->id);return -1;}
         p->logical_reconnect_pending=0;p->logical_resume_inflight=resume;
     }else{
-        char hdr[390],flow[33];int hl=0;
-        if(p->logical_mode&&nb_lstream_flow_render(flow,p->logical_flow_hi,p->logical_flow_lo)==0)
-            hl=snprintf(hdr,sizeof(hdr),"%d;L=%s;%s\n",prio,flow,route);
-        else hl=snprintf(hdr,sizeof(hdr),"%d;%s\n",prio,route);
+        char hdr[512],flow[33],routed[390];int hl=0;
+        if(nb_tenant_wire_render(routed,sizeof(routed),p->tenant_name,route)<0)return -1;
+        if(p->logical_mode&&nb_lstream_flow_render(flow,p->logical_flow_hi,p->logical_flow_lo)==0){
+            if(p->tenant_name[0])hl=snprintf(hdr,sizeof(hdr),"%d;A=%s;L=%s;%s\n",prio,p->tenant_name,flow,route);
+            else hl=snprintf(hdr,sizeof(hdr),"%d;L=%s;%s\n",prio,flow,route);
+        }
+        else hl=snprintf(hdr,sizeof(hdr),"%d;%s\n",prio,routed);
         if(hl<=0||(size_t)hl>=sizeof(hdr)||queue_down_prefix(p,(const uint8_t*)hdr,(size_t)hl)!=0){
             log4c_error("id=%u queue route to downstream fail", p->id); return -1; }
     }
@@ -594,13 +599,16 @@ static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin){
 
 static proxy_stream_t* udp_middle_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view,
     const char* route,char* rest,size_t rest_cap){
+    char tenant[NB_TENANT_NAME_MAX];const char* routed=route;
+    int tenant_wire=nb_tenant_wire_parse(route,tenant,sizeof(tenant),&routed);if(tenant_wire<0)return NULL;
     char next_host[256];int next_port=0;
-    if(udp_route_consume_h(route,next_host,sizeof(next_host),&next_port,rest,rest_cap)!=0)return NULL;
+    if(udp_route_consume_h(routed,next_host,sizeof(next_host),&next_port,rest,rest_cap)!=0)return NULL;
     next_port=worker_lane_port(next_port);if(next_port<1)return NULL;
     struct sockaddr_storage addr;int is_name=0;
     if(picoquic_get_server_address(next_host,next_port,&addr,&is_name)!=0)return NULL;
     proxy_stream_t* p=ps_alloc();if(p==NULL)return NULL;p->udp_mode=1;p->udp_session_id=view->session_id;
     p->up_cnx=cnx;p->down_pool_id=pool_get_or_create(&addr);
+    if(tenant_wire>0)snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",tenant);
     char target[256];int target_port=0;nb_flow_policy_t pol;
     if(parse_target_from_route(rest,target,sizeof(target),&target_port)==0){
         flow_policy_for_host(target,target_port,&pol);apply_flow_policy(p,&pol);

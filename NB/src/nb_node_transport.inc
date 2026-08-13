@@ -1,11 +1,19 @@
 static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view,const char* route){
-    char host[256];int port=0;if(parse_target_from_route(route,host,sizeof(host),&port)!=0)return NULL;
+    char tenant[NB_TENANT_NAME_MAX];const char* routed=route;
+    int tenant_wire=nb_tenant_wire_parse(route,tenant,sizeof(tenant),&routed);if(tenant_wire<0)return NULL;
+    char host[256];int port=0;if(parse_target_from_route(routed,host,sizeof(host),&port)!=0)return NULL;
     if(!whitelist_allowed(host,port))return NULL;
     proxy_stream_t* p=ps_alloc();if(p==NULL)return NULL;
     p->udp_mode=1;p->udp_session_id=view->session_id;p->up_cnx=cnx;
+    if(g_tenants_enabled){
+        p->tenant_index=tenant_wire>0?nb_tenant_find(&g_tenants,tenant):(g_tenants.count==1?0:-1);
+        if(p->tenant_index<0){ps_set_close_reason(p,"tenant-wire-unknown");ps_free(p);return NULL;}
+        snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",g_tenants.items[p->tenant_index].name);
+        if(tenant_wire==0)log4c_warn("exit UDP accepted legacy tenant-less flow using sole tenant=%s",p->tenant_name);
+    }
     if(udp_reassembly_ensure(p)!=0){ps_set_close_reason(p,"udp-exit-state-allocation");ps_free(p);return NULL;}
     ps_index_refresh(p);
-    snprintf(p->route,sizeof(p->route),"%s",route);snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);
+    snprintf(p->route,sizeof(p->route),"%s",routed);snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);
     p->udp_target_port=port;p->target_port=port;nb_flow_policy_t pol;flow_policy_for_host(host,port,&pol);apply_flow_policy(p,&pol);
     if(dns_submit(p->id,host,port)!=0){ps_set_close_reason(p,"udp-dns-queue-full");ps_free(p);return NULL;}
     p->dns_pending=1;log4c_info("exit udp flow open id=%u usid=%u target=%s:%d",p->id,p->udp_session_id,host,port);return p;
@@ -153,6 +161,33 @@ static int probe_sink_feed(proxy_stream_t* p,const uint8_t* bytes,size_t len){
     return 0;
 }
 
+static int probe_source_request(proxy_stream_t* p,const uint8_t* bytes,size_t len){
+    if(p->probe_header_len+len>NB_PROBE_HEADER_SIZE||p->probe_expected_bytes!=0)return -1;
+    memcpy(p->probe_header+p->probe_header_len,bytes,len);p->probe_header_len+=len;
+    if(p->probe_header_len<NB_PROBE_HEADER_SIZE)return 0;
+    if(nb_probe_source_header_parse(p->probe_header,p->probe_header_len,&p->probe_expected_bytes)!=0){
+        ps_set_close_reason(p,"probe-source-header");return -1;
+    }
+    return 0;
+}
+
+static int probe_source_pump(proxy_stream_t* p){
+    if(!p||p->probe_mode!=4||p->probe_expected_bytes==0||p->probe_bytes>=p->probe_expected_bytes)return 0;
+    uint64_t now=picoquic_current_time();if(p->tenant_throttled_until>now)return 0;
+    p->tenant_throttled_until=0;uint8_t payload[16384];size_t desired=(size_t)(p->probe_expected_bytes-p->probe_bytes);
+    if(desired>sizeof(payload))desired=sizeof(payload);
+    size_t allowed=g_tenants_enabled?nb_tenant_take(&g_tenants,p->tenant_index,desired,now,NB_TENANT_DOWN):desired;
+    if(allowed==0){p->tenant_throttled_until=now+
+        nb_tenant_retry_after_us(&g_tenants,p->tenant_index,1,NB_TENANT_DOWN);return 0;}
+    nb_probe_source_fill(p->probe_bytes,payload,allowed);
+    if(queue_up(p,payload,allowed,p->probe_bytes+allowed==p->probe_expected_bytes)!=0){
+        if(g_tenants_enabled)nb_tenant_refund(&g_tenants,p->tenant_index,allowed,NB_TENANT_DOWN);
+        return -1;
+    }
+    p->probe_hash=nb_probe_hash_update(p->probe_hash,payload,allowed);p->probe_bytes+=allowed;
+    ps_note_payload(p,0,allowed);return 0;
+}
+
 static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int fin){
     proxy_stream_t* p=stream?*stream:NULL;if(p==NULL)return -1;
     size_t off=0;
@@ -164,6 +199,7 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
     if(p->hdr_done&&p->probe_mode){
         if(len>0){
             if(p->probe_mode==1){if(probe_sink_feed(p,bytes,len)!=0)return -1;}
+            else if(p->probe_mode==4){if(probe_source_request(p,bytes,len)!=0)return -1;}
             else if(queue_up(p,bytes,len,0)!=0)return -1;
         }
         if(fin){
@@ -216,6 +252,16 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
         if(prio<=0||prio>255){log4c_error("id=%u invalid priority",p->id);ps_teardown(p);return -1;}
         p->prio=prio;
         picoquic_set_stream_priority(p->up_cnx,p->up_stream_id,(uint8_t)prio);
+        { char tenant[NB_TENANT_NAME_MAX];const char* routed=rt;int tenant_wire=nb_tenant_wire_parse(rt,tenant,sizeof(tenant),&routed);
+          if(tenant_wire<0){ps_teardown_reason(p,"tenant-route-header");return -1;}
+          if(tenant_wire>0){snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",tenant);rt=(char*)routed;}
+          if(G.role==ROLE_EXIT&&g_tenants_enabled){
+              p->tenant_index=tenant_wire>0?nb_tenant_find(&g_tenants,tenant):(g_tenants.count==1?0:-1);
+              if(p->tenant_index<0){ps_teardown_reason(p,"tenant-route-unknown");return -1;}
+              snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",g_tenants.items[p->tenant_index].name);
+              if(tenant_wire==0)log4c_warn("exit TCP accepted legacy tenant-less flow using sole tenant=%s",p->tenant_name);
+          }
+        }
         if(!strncmp(rt,"L=",2)){
             char* logical_end=strchr(rt+2,';');uint64_t flow_hi=0,flow_lo=0;
             if(logical_end==NULL||logical_end-(rt+2)!=32){ps_teardown_reason(p,"logical-route-header");return -1;}
@@ -255,7 +301,9 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
                 log4c_info("exit internal probe start id=%u mode=sink",p->id);
             }else if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_ECHO_HOST)){
                 p->probe_mode=2;p->target_connect_state=2;
-                log4c_info("exit internal probe start id=%u mode=echo",p->id);
+            }else if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_SOURCE_HOST)){
+                p->probe_mode=4;p->probe_hash=NB_PROBE_HASH_INITIAL;p->target_connect_state=2;
+                log4c_info("exit internal probe start id=%u mode=downlink-source",p->id);
             }else if(!whitelist_allowed(thost,tport)){ /* 白名单外 -> 拒绝(reset stream), 出口访问控制 */
                 log4c_debug("exit id=%u BLOCKED %s:%d (not in whitelist)",p->id,thost,tport);
                 ps_teardown(p); return -1; }
@@ -298,6 +346,7 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
             if(logical_receive(p,bytes+off,len-off)!=0){ps_teardown_reason(p,"logical-frame");return -1;}
         }else if(p->probe_mode){
             if(p->probe_mode==1){if(probe_sink_feed(p,bytes+off,len-off)!=0)return -1;}
+            else if(p->probe_mode==4){if(probe_source_request(p,bytes+off,len-off)!=0)return -1;}
             else if(queue_up(p,bytes+off,len-off,0)!=0)return -1;
         }else fwd_down(p,bytes+off,len-off,0);
     }

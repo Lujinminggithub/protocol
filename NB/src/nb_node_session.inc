@@ -221,6 +221,7 @@ static void ps_free(proxy_stream_t* p){
     if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);if(p->tenant_acquired)nb_tenant_release(&g_tenants,p->tenant_index,p->tenant_udp);}
     /* Business-session lifetime is not a route-health signal. Active probes own health updates. */
     if(G.role==ROLE_ENTRY&&p->route_index>=0)nb_routes_finish_session(&G.exit_routes,(size_t)p->route_index);
+    nb_metrics_note_traffic(&g_metrics_state,p->bytes_c2s,p->bytes_s2c);
     nb_metrics_note_close(&g_metrics_state,p->close_reason);
     if(p->udp_mode && !p->udp_association){
         log4c_info("%s udp flow close id=%u usid=%u reason=%s age=%.1fms packets=%llu/%llu bytes=%llu/%llu pressure_drop=%llu milestones_ms=local_c2s:%.1f,c2s_rx:%.1f,c2s_prepare:%.1f,target_ready:%.1f,target_send:%.1f,target_rx:%.1f,s2c_rx:%.1f,s2c_prepare:%.1f,local_s2c:%.1f target=%s:%d route=%s",
@@ -491,7 +492,16 @@ static void fec_ctrl_handle_line(proxy_stream_t* p, const char* line, int from_d
         nb_fec_start_t start;
         if(nb_fec_start_parse(line,g_fec_cfg.k,g_fec_cfg.r,&start)==0){
             sid=start.session_id;int prio=start.priority;
-            snprintf(route,sizeof(route),"%s",start.route);
+            char tenant[NB_TENANT_NAME_MAX];const char* routed=start.route;
+            int tenant_wire=nb_tenant_wire_parse(start.route,tenant,sizeof(tenant),&routed);
+            if(tenant_wire<0){p->need_teardown=1;return;}
+            if(tenant_wire>0)snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",tenant);
+            if(G.role==ROLE_EXIT&&g_tenants_enabled){
+                p->tenant_index=tenant_wire>0?nb_tenant_find(&g_tenants,tenant):(g_tenants.count==1?0:-1);
+                if(p->tenant_index<0){ps_set_close_reason(p,"tenant-fec-unknown");p->need_teardown=1;return;}
+                snprintf(p->tenant_name,sizeof(p->tenant_name),"%s",g_tenants.items[p->tenant_index].name);
+            }
+            snprintf(route,sizeof(route),"%s",routed);
             p->fec_ctrl_only = 1;
             p->fec_sidecar_mode = 1;
             p->fec_session_id = sid;

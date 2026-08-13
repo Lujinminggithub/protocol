@@ -15,6 +15,8 @@ typedef struct {
 typedef struct nb_dns nb_dns_t;
 
 nb_dns_t* nb_dns_create(int address_family,int worker_count);
+nb_dns_t* nb_dns_create_with_servers(int address_family,int worker_count,const char* servers);
+int nb_dns_servers_valid(const char* servers);
 void nb_dns_destroy(nb_dns_t* dns);
 int nb_dns_context_result_fd(nb_dns_t* dns);
 int nb_dns_context_submit(nb_dns_t* dns,uint32_t session_id,const char* host,int port);

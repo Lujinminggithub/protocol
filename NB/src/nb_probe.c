@@ -4,20 +4,38 @@
 #include <string.h>
 
 static const uint8_t NB_PROBE_MAGIC[4]={'N','B','P','1'};
+static const uint8_t NB_PROBE_SOURCE_MAGIC[4]={'N','B','P','2'};
 
-int nb_probe_header_format(uint64_t expected_bytes, uint8_t* output, size_t output_size){
+static int header_format(const uint8_t magic[4],uint64_t expected_bytes,uint8_t* output,size_t output_size){
     if(output==NULL||output_size<NB_PROBE_HEADER_SIZE||expected_bytes==0||expected_bytes>NB_PROBE_MAX_BYTES)return -1;
-    memcpy(output,NB_PROBE_MAGIC,sizeof(NB_PROBE_MAGIC));
-    for(size_t index=0;index<8;index++)output[4+index]=(uint8_t)(expected_bytes>>(56-index*8));
+    memcpy(output,magic,4);for(size_t index=0;index<8;index++)output[4+index]=(uint8_t)(expected_bytes>>(56-index*8));
     return (int)NB_PROBE_HEADER_SIZE;
 }
 
-int nb_probe_header_parse(const uint8_t* input, size_t input_size, uint64_t* expected_bytes){
-    if(input==NULL||input_size!=NB_PROBE_HEADER_SIZE||expected_bytes==NULL||
-        memcmp(input,NB_PROBE_MAGIC,sizeof(NB_PROBE_MAGIC))!=0)return -1;
+static int header_parse(const uint8_t magic[4],const uint8_t* input,size_t input_size,uint64_t* expected_bytes){
+    if(input==NULL||input_size!=NB_PROBE_HEADER_SIZE||expected_bytes==NULL||memcmp(input,magic,4)!=0)return -1;
     uint64_t value=0;for(size_t index=0;index<8;index++)value=(value<<8)|input[4+index];
     if(value==0||value>NB_PROBE_MAX_BYTES)return -1;
     *expected_bytes=value;return 0;
+}
+
+int nb_probe_header_format(uint64_t expected_bytes, uint8_t* output, size_t output_size){
+    return header_format(NB_PROBE_MAGIC,expected_bytes,output,output_size);
+}
+
+int nb_probe_header_parse(const uint8_t* input, size_t input_size, uint64_t* expected_bytes){
+    return header_parse(NB_PROBE_MAGIC,input,input_size,expected_bytes);
+}
+
+int nb_probe_source_header_format(uint64_t expected_bytes,uint8_t* output,size_t output_size){
+    return header_format(NB_PROBE_SOURCE_MAGIC,expected_bytes,output,output_size);
+}
+int nb_probe_source_header_parse(const uint8_t* input,size_t input_size,uint64_t* expected_bytes){
+    return header_parse(NB_PROBE_SOURCE_MAGIC,input,input_size,expected_bytes);
+}
+void nb_probe_source_fill(uint64_t offset,uint8_t* output,size_t length){
+    if(!output)return;
+    for(size_t index=0;index<length;index++)output[index]=(uint8_t)(((offset+index)*13+29)&0xff);
 }
 
 uint64_t nb_probe_hash_update(uint64_t hash, const uint8_t* data, size_t length){

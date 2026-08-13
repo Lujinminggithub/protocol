@@ -55,6 +55,10 @@ typedef struct nb_instance {
     int socks_auth_enabled;
     nb_tenants_t tenants;
     int tenants_enabled;
+    nb_tenants_t tenants_pending;
+    uint64_t tenant_generation;
+    uint64_t tenant_pending_generation;
+    int tenants_pending_valid;
     struct in_addr socks_udp_advertise_addr;
     int socks_udp_advertise_configured;
     uint16_t socks_udp_port_min;

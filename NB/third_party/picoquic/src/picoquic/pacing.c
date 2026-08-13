@@ -78,6 +78,9 @@ int picoquic_is_authorized_by_pacing(picoquic_pacing_t * pacing, uint64_t curren
         uint64_t next_pacing_time;
         int64_t bucket_required;
 
+        /* max_burst_packets caps accumulated credit, but does not imply that
+         * the scheduler emits a whole train per wake. Media connections use
+         * one-packet wake intervals unless packet-train mode is explicitly on. */
         if (packet_train_mode || pacing->bandwidth_pause) {
             bucket_required = pacing->bucket_max;
 

@@ -39,14 +39,14 @@ int main(void){
     CHECK(nb_udp_fec_tx_flush_due(tx,11999,repair,sizeof(repair))==0);
     CHECK(nb_udp_fec_tx_flush_due(tx,12000,repair,sizeof(repair))>0);
     nb_udp_fec_adaptive_t adaptive={0};
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,14999,1,1000000)==0);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.01,1000,1,2000000)==1);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,0,1,31999999)==1);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,0,1,32000000)==0);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,15000,1,33000000)==1);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.01,0,1,40000000)==1);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,0,1,69999999)==1);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,0,0,70000000)==1);
-    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,0,1,70000000)==0);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,50000,1,1000000)==0);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.30,50000,1,2000000)==0);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.31,1000,1,3000000)==1);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,50000,1,32999999)==1);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,50000,1,33000000)==0);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,50000,1,34000000)==0);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.31,0,1,35000000)==1);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,0,0,65000000)==1);
+    CHECK(nb_udp_fec_adaptive_update(&adaptive,0.0,50000,1,65000000)==0);
     nb_udp_fec_tx_destroy(tx);nb_udp_fec_rx_destroy(rx);puts("nb_udp_fec_test: ok");return 0;
 }

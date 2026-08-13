@@ -16,5 +16,8 @@ int nb_probe_ack_format(uint64_t received_bytes, uint64_t hash,
     char* output, size_t output_size);
 int nb_probe_header_format(uint64_t expected_bytes, uint8_t* output, size_t output_size);
 int nb_probe_header_parse(const uint8_t* input, size_t input_size, uint64_t* expected_bytes);
+int nb_probe_source_header_format(uint64_t expected_bytes, uint8_t* output, size_t output_size);
+int nb_probe_source_header_parse(const uint8_t* input, size_t input_size, uint64_t* expected_bytes);
+void nb_probe_source_fill(uint64_t offset,uint8_t* output,size_t length);
 
 #endif

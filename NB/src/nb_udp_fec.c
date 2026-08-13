@@ -6,10 +6,8 @@
 #define NB_UDP_FEC_HEADER 24u
 #define NB_UDP_FEC_DESC 12u
 #define NB_UDP_FEC_CACHE 32u
-#define NB_UDP_FEC_LOSS_ON_PCT 0.0
+#define NB_UDP_FEC_LOSS_ON_PCT 0.30
 #define NB_UDP_FEC_LOSS_OFF_PCT 0.03
-#define NB_UDP_FEC_JITTER_ON_US 15000u
-#define NB_UDP_FEC_JITTER_OFF_US 8000u
 #define NB_UDP_FEC_MIN_ON_US 30000000u
 
 typedef struct {
@@ -196,12 +194,13 @@ int nb_udp_fec_rx_recover(nb_udp_fec_rx_t* state,const uint8_t* repair,size_t re
 int nb_udp_fec_adaptive_update(nb_udp_fec_adaptive_t* state,double loss_pct,
     uint64_t jitter_us,int sample_valid,uint64_t now_us){
     if(state==NULL||loss_pct<0.0)return 0;
+    (void)jitter_us;
     if(!sample_valid)return state->active;
-    int degraded=loss_pct>NB_UDP_FEC_LOSS_ON_PCT||jitter_us>=NB_UDP_FEC_JITTER_ON_US;
+    int degraded=loss_pct>NB_UDP_FEC_LOSS_ON_PCT;
     if(degraded){
         state->active=1;state->changed_at=now_us;
     }else if(state->active&&now_us>=state->changed_at&&now_us-state->changed_at>=NB_UDP_FEC_MIN_ON_US&&
-        loss_pct<=NB_UDP_FEC_LOSS_OFF_PCT&&jitter_us<=NB_UDP_FEC_JITTER_OFF_US){
+        loss_pct<=NB_UDP_FEC_LOSS_OFF_PCT){
         state->active=0;state->changed_at=now_us;
     }
     return state->active;

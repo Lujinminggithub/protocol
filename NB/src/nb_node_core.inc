@@ -41,6 +41,7 @@
 #include "nb_auth.h"
 #include "nb_auth_async.h"
 #include "nb_tenant.h"
+#include "nb_tenant_wire.h"
 #include "nb_control.h"
 #include "nb_routes.h"
 #include "nb_policy.h"
@@ -62,6 +63,7 @@
 #include "nb_udp_io.h"
 #include "nb_udp_lifecycle.h"
 #include "nb_whitelist.h"
+#include "nb_wait.h"
 #include "nb_shard.h"
 #include "log/log4c.h"
 
@@ -70,6 +72,7 @@
 #define NB_PROBE_PORT 9
 #define NB_PROBE_SINK_HOST "nb-probe-sink.internal"
 #define NB_PROBE_ECHO_HOST "nb-probe-echo.internal"
+#define NB_PROBE_SOURCE_HOST "nb-probe-source.internal"
 #define BUFCAP (256*1024)
 #define MAX_CONN NB_MAX_CONNECTIONS
 #define NB_Q2T_MAX (16*1024*1024)   /* 过载保护: 单流 q2t 待写缓冲硬上限 16MB, 超限=对端TCP卡死 */
@@ -479,6 +482,40 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
     if(!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))
         return nb_transport_profile_render_status(&nb_current_instance->transport_profiles,out,cap);
     unsigned long long generation=0,fingerprint=0;char line_id[65],path[768];
+    if(!strcmp(command,"tenant status")||!strcmp(command,"GET /tenant-policy")){
+        char tenants[30000];int length=nb_tenants_render_json(&g_tenants,tenants,sizeof(tenants));
+        if(length<0)return snprintf(out,cap,"{\"error\":\"tenant status unavailable\"}\n");
+        while(length>0&&(tenants[length-1]=='\n'||tenants[length-1]=='\r'))tenants[--length]=0;
+        return snprintf(out,cap,"{\"status\":\"active\",\"generation\":%llu,\"fingerprint\":\"%016llx\",\"role\":\"%s\",\"policy\":%s}\n",
+            (unsigned long long)nb_current_instance->tenant_generation,
+            (unsigned long long)g_tenants.config_fingerprint,role_name(G.role),tenants);
+    }
+    if(sscanf(command,"tenant prepare %llu %767s",&generation,path)==2){
+        if(!g_tenants_enabled)return snprintf(out,cap,"{\"error\":\"tenant policy is not enabled\"}\n");
+        nb_tenants_t next;char error[256]={0};memset(&next,0,sizeof(next));next.shared_fd=-1;
+        if(nb_tenants_load(&next,path,error,sizeof(error))!=0||!nb_tenants_same_identity(&g_tenants,&next))
+            return snprintf(out,cap,"{\"error\":\"%s\"}\n",error[0]?error:"tenant identity/order changed");
+        nb_current_instance->tenants_pending=next;nb_current_instance->tenant_pending_generation=(uint64_t)generation;
+        nb_current_instance->tenants_pending_valid=1;
+        return snprintf(out,cap,"{\"status\":\"prepared\",\"generation\":%llu}\n",generation);
+    }
+    if(sscanf(command,"tenant commit %llu",&generation)==1){
+        char error[256];
+        if(!nb_current_instance->tenants_pending_valid||nb_current_instance->tenant_pending_generation!=(uint64_t)generation)
+            return snprintf(out,cap,"{\"error\":\"tenant generation was not prepared\"}\n");
+        if(nb_tenants_reconfigure(&g_tenants,&nb_current_instance->tenants_pending,error,sizeof(error))!=0)
+            return snprintf(out,cap,"{\"error\":\"%s\"}\n",error);
+        nb_current_instance->tenant_generation=g_tenants.config_fingerprint;nb_current_instance->tenants_pending_valid=0;
+        memset(&nb_current_instance->tenants_pending,0,sizeof(nb_current_instance->tenants_pending));
+        return snprintf(out,cap,"{\"status\":\"committed\",\"generation\":%llu,\"fingerprint\":\"%016llx\"}\n",
+            (unsigned long long)nb_current_instance->tenant_generation,
+            (unsigned long long)g_tenants.config_fingerprint);
+    }
+    if(sscanf(command,"tenant abort %llu",&generation)==1){
+        if(nb_current_instance->tenants_pending_valid&&nb_current_instance->tenant_pending_generation==(uint64_t)generation){
+            nb_current_instance->tenants_pending_valid=0;memset(&nb_current_instance->tenants_pending,0,sizeof(nb_current_instance->tenants_pending));}
+        return snprintf(out,cap,"{\"status\":\"aborted\",\"generation\":%llu}\n",generation);
+    }
     if(sscanf(command,"profile prepare %llu %llx %64s %767s",&generation,&fingerprint,line_id,path)==4){
         char error[256];int rc=nb_transport_profile_prepare(&nb_current_instance->transport_profiles,path,
             (uint64_t)generation,(uint64_t)fingerprint,line_id,role_name(G.role),error,sizeof(error));
@@ -590,14 +627,16 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
  * 规则: host命中(域名或IP) AND port命中; 某类白名单为空 = 该维度不限制。 */
 static int whitelist_allowed(const char* host, int port){
     if(port==NB_PROBE_PORT && host!=NULL &&
-        (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)))return 1;
+        (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
+         !strcasecmp(host,NB_PROBE_SOURCE_HOST)))return 1;
     return nb_whitelist_context_allowed(nb_current_instance->whitelist,host,port);
 }
 
 static void flow_policy_for_host(const char* host, int port, nb_flow_policy_t* out){
     nb_flow_policy_default(out);
     if(port==NB_PROBE_PORT && host!=NULL &&
-        (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST))){
+        (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
+         !strcasecmp(host,NB_PROBE_SOURCE_HOST))){
         out->matched=1;out->flow_class=NB_FLOW_CLASS_MEDIA;out->lane_hint=NB_FLOW_LANE_LATENCY;
         out->fec_hint=NB_FLOW_FEC_OFF;out->prio=NB_PRIO_MEDIA;
         snprintf(out->rule_name,sizeof(out->rule_name),"internal-probe");
@@ -666,6 +705,15 @@ static void ps_demote_bulk(proxy_stream_t* p,const char* rule,double c2s_kbps,do
         role_name(G.role),p->id,c2s_kbps,s2c_kbps,rule,p->route);
 }
 
+static void ps_demote_downlink_bulk(proxy_stream_t* p,double c2s_kbps,double s2c_kbps){
+    if(p==NULL||p->downlink_bulk||p->up_cnx==NULL||p->udp_mode)return;
+    p->downlink_bulk=1;
+    picoquic_set_stream_priority(p->up_cnx,p->up_stream_id,NB_PRIO_BULK);
+    log4c_info("%s flow downlink-demote id=%u rate_kbps=c2s:%.1f,s2c:%.1f "
+        "upstream_prio=%d downstream_prio=%d rule=auto-download-dominant route=%s",
+        role_name(G.role),p->id,c2s_kbps,s2c_kbps,NB_PRIO_BULK,p->prio,p->route);
+}
+
 static void ps_update_runtime_policy(proxy_stream_t* p,uint64_t now){
     if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);p->tenant_accounted_up=p->bytes_c2s;p->tenant_accounted_down=p->bytes_s2c;}
     if(p->udp_mode)return;
@@ -673,8 +721,10 @@ static void ps_update_runtime_policy(proxy_stream_t* p,uint64_t now){
     nb_live_flow_action_t action=nb_live_flow_observe(&p->live_runtime,p->flow_class,
         p->bytes_c2s,p->bytes_s2c,now,&c2s,&s2c);
     if(action==NB_LIVE_FLOW_PROMOTE_MEDIA)ps_promote_media(p,"auto-high-uplink",c2s);
-    else if(action==NB_LIVE_FLOW_DEMOTE_BULK)ps_demote_bulk(p,
-        p->flow_class==NB_FLOW_CLASS_MEDIA?"auto-download-dominant":"auto-high-throughput-ctrl",c2s,s2c);
+    else if(action==NB_LIVE_FLOW_DEMOTE_BULK)
+        ps_demote_bulk(p,"auto-high-throughput-ctrl",c2s,s2c);
+    else if(action==NB_LIVE_FLOW_DEMOTE_DOWNLINK)
+        ps_demote_downlink_bulk(p,c2s,s2c);
 }
 
 static void ps_note_payload(proxy_stream_t* p, int c2s, size_t len){

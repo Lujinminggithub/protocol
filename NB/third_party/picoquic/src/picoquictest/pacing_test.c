@@ -344,5 +344,75 @@ int pacing_repeat_test(void)
             }
         }
     }
+
+    /* Media pacing uses the same one-packet wake interval as regular pacing.
+     * max_burst_packets limits accumulated credit; it must not make a
+     * scheduler that emits one packet per wake wait for two packet times. */
+    if (ret == 0) {
+        picoquic_pacing_t media_pacing = { 0 };
+        uint64_t next_time = UINT64_MAX;
+        picoquic_pacing_init(&media_pacing, 1000);
+        media_pacing.packet_time_nanosec = 800000;
+        media_pacing.packet_time_microsec = 800;
+        media_pacing.bucket_nanosec = 0;
+        media_pacing.bucket_max = 1600000;
+        media_pacing.max_burst_packets = 2;
+        if (picoquic_is_authorized_by_pacing(&media_pacing, 1000, &next_time, 0, NULL) != 0 ||
+            next_time != 1801) {
+            DBG_PRINTF("Media pacing expected a one-packet wake at 1801, got %" PRIu64, next_time);
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        picoquic_pacing_t regular_pacing = { 0 };
+        uint64_t next_time = UINT64_MAX;
+        picoquic_pacing_init(&regular_pacing, 1000);
+        regular_pacing.packet_time_nanosec = 800000;
+        regular_pacing.packet_time_microsec = 800;
+        regular_pacing.bucket_nanosec = 0;
+        regular_pacing.bucket_max = 1600000;
+        if (picoquic_is_authorized_by_pacing(&regular_pacing, 1000, &next_time, 0, NULL) != 0 ||
+            next_time != 1801) {
+            DBG_PRINTF("Regular pacing expected a one-packet wake at 1801, got %" PRIu64, next_time);
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        uint64_t simulated_time = 0;
+        picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, simulated_time, &simulated_time, NULL, NULL, 0);
+        picoquic_cnx_t* cnx = NULL;
+        struct sockaddr_in peer = { 0 };
+        peer.sin_family = AF_INET;
+        peer.sin_port = 1000;
+        if (quic != NULL) {
+            cnx = picoquic_create_cnx(quic, picoquic_null_connection_id,
+                picoquic_null_connection_id, (struct sockaddr*)&peer, simulated_time,
+                0, "test-sni", "test-alpn", 1);
+        }
+        if (cnx == NULL) {
+            ret = -1;
+        }
+        else {
+            const uint64_t media_seed = 393216;
+            picoquic_per_ack_state_t seed = { 0 };
+            picoquic_set_congestion_algorithm(cnx, picoquic_bbr_algorithm);
+            picoquic_set_media_mode(cnx, 1);
+            cnx->path[0]->cwin = PICOQUIC_CWIN_INITIAL;
+            seed.nb_bytes_acknowledged = media_seed;
+            cnx->congestion_alg->alg_notify(cnx, cnx->path[0],
+                picoquic_congestion_notification_seed_cwin, &seed, simulated_time);
+            if (cnx->path[0]->cwin < media_seed) {
+                DBG_PRINTF("Media BBR seed floor expected %" PRIu64 ", got %" PRIu64,
+                    media_seed, cnx->path[0]->cwin);
+                ret = -1;
+            }
+        }
+        if (quic != NULL) {
+            picoquic_free(quic);
+        }
+    }
     return ret;
 }

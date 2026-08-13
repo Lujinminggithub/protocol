@@ -5,6 +5,16 @@
 
 #include "nb_policy.h"
 
+static void add_saturated(uint64_t* total,uint64_t value){
+    *total=UINT64_MAX-*total<value?UINT64_MAX:*total+value;
+}
+
+void nb_metrics_note_traffic(nb_metrics_state_t* state,uint64_t bytes_c2s,uint64_t bytes_s2c){
+    if(state==NULL)return;
+    add_saturated(&state->bytes_c2s,bytes_c2s);
+    add_saturated(&state->bytes_s2c,bytes_s2c);
+}
+
 void nb_metrics_note_close(nb_metrics_state_t* state,const char* reason){
     if(state==NULL)return;
     state->close_total++;
@@ -46,7 +56,8 @@ void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot,const nb_metrics_s
     memset(snapshot,0,sizeof(*snapshot));
     snapshot->sessions=sessions;snapshot->sessions_peak=sessions_peak;
     snapshot->pools=pools;snapshot->exit_routes=exit_routes;
-    if(state)snapshot->lifetime=*state;
+    if(state){snapshot->lifetime=*state;snapshot->bytes_c2s=state->bytes_c2s;
+        snapshot->bytes_s2c=state->bytes_s2c;}
 }
 
 void nb_metrics_snapshot_add_stream(nb_metrics_snapshot_t* s,int flow_class,int udp_mode,

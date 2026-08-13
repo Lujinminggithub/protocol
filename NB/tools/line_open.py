@@ -7,6 +7,7 @@ import copy
 import datetime as dt
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import pathlib
@@ -98,7 +99,16 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
         "cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1400,
         "udp_gso": False, "reorder_gap": 128, "reorder_delay_us": 450000})
     result["transport"].setdefault("exit", {
-        "cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1400, "udp_gso": False})
+        "cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1400, "udp_gso": False,
+        "dns_servers": ["1.1.1.1", "8.8.8.8"]})
+    result["transport"]["exit"].setdefault("dns_servers", ["1.1.1.1", "8.8.8.8"])
+    dns_servers = result["transport"]["exit"]["dns_servers"]
+    if not isinstance(dns_servers, list) or not 1 <= len(dns_servers) <= 3:
+        raise ValueError("transport.exit.dns_servers must contain 1..3 IPv4 addresses")
+    try:
+        result["transport"]["exit"]["dns_servers"] = [str(ipaddress.IPv4Address(item)) for item in dns_servers]
+    except (ipaddress.AddressValueError, TypeError) as error:
+        raise ValueError("transport.exit.dns_servers must contain IPv4 addresses") from error
     if not result.get("exits"):
         result["exits"] = [{"name": f"{normalized['exit']['name']}-primary",
                             "host": normalized["exit"]["host"],
@@ -119,7 +129,7 @@ def baseline_profile(hosts: dict, line_id: str, middle_port: int = 4443,
     transport = hosts["transport"]
     def selected(role: str) -> dict:
         keys = ("cc", "cwin_max_bytes", "bbr_options", "mtu_max",
-                "reorder_gap", "reorder_delay_us")
+                "reorder_gap", "reorder_delay_us", "dns_servers")
         return {key: transport[role][key] for key in keys if key in transport[role]}
     return {
         "schema_version": 1, "line_id": line_id, "status": "bootstrap-baseline",

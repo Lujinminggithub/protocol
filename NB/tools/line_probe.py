@@ -35,6 +35,7 @@ PING_LOSS_RE = re.compile(r"([0-9.]+)% packet loss")
 PING_RTT_RE = re.compile(r"=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+)\s*ms")
 PROBE_SINK_HOST = "nb-probe-sink.internal"
 PROBE_ECHO_HOST = "nb-probe-echo.internal"
+PROBE_SOURCE_HOST = "nb-probe-source.internal"
 PROBE_PORT = 9
 IPV4_UDP_OVERHEAD = 28
 MTU_PROBE_MIN = 1280
@@ -119,6 +120,32 @@ if mode == "integrity":
     if received != len(expected) or received_hash != expected_hash:
         raise RuntimeError("integrity mismatch: sent=%d received=%d" % (len(expected), received))
     result = {"bytes": size, "elapsed_s": elapsed, "integrity": "ok", "origin": "entry-local"}
+elif mode == "downlink":
+    target_mbps = request["target_mbps"]
+    duration_s = request["duration_s"]
+    target_bytes = int(target_mbps * 1000000.0 / 8.0 * duration_s)
+    sock = connect_socks("nb-probe-source.internal")
+    sock.sendall(struct.pack("!4sQ", b"NBP2", target_bytes))
+    started = time.monotonic()
+    received = 0
+    value = 14695981039346656037
+    while received < target_bytes:
+        data = sock.recv(min(64 * 1024, target_bytes - received))
+        if not data:
+            break
+        expected = bytes((((received + index) * 13 + 29) & 0xff) for index in range(len(data)))
+        if data != expected:
+            raise RuntimeError("downlink integrity mismatch at offset=%d" % received)
+        for byte in data:
+            value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+        received += len(data)
+    elapsed = time.monotonic() - started
+    sock.close()
+    if received != target_bytes:
+        raise RuntimeError("downlink count mismatch: expected=%d received=%d" % (target_bytes, received))
+    result = {"bytes": received, "elapsed_s": elapsed,
+        "planned_duration_s": duration_s, "achieved_mbps": received * 8.0 / max(elapsed, 0.001) / 1000000.0,
+        "integrity": "count-ok", "hash": "%016x" % value, "origin": "entry-local"}
 elif mode == "load":
     target_mbps = request["target_mbps"]
     duration_s = request["duration_s"]
@@ -183,6 +210,14 @@ def percentile(values: list[float], p: float) -> float:
     return ordered[at]
 
 
+def winsorized_percentile(values: list[float], p: float) -> float:
+    """Ignore one isolated high window once there is enough probe coverage."""
+    ordered = sorted(values)
+    if len(ordered) >= 6:
+        ordered[-1] = ordered[-2]
+    return percentile(ordered, p)
+
+
 def parse_ping(text: str) -> dict:
     loss = PING_LOSS_RE.search(text)
     rtt = PING_RTT_RE.search(text)
@@ -229,6 +264,9 @@ def summarize_linkq(samples: list[dict]) -> dict:
         "effective_loss_p95_pct": percentile([x["loss"] for x in valid], 0.95),
         "reorder_gap_max": max((x["reorder_gap"] for x in valid), default=0),
         "reorder_delay_max_ms": max((x["reorder_ms"] for x in valid), default=0.0),
+        "reorder_percentile_windows": len(valid),
+        "reorder_gap_p95": winsorized_percentile([x["reorder_gap"] for x in valid], 0.95),
+        "reorder_delay_p95_ms": winsorized_percentile([x["reorder_ms"] for x in valid], 0.95),
         "blocked_windows": sum(x["block"] for x in valid),
         "quic_udp_payload_mtu_min": min(observed_mtu, default=0),
         "quic_udp_payload_mtu_max": max(observed_mtu, default=0),
@@ -269,16 +307,13 @@ def recommend(summary: dict, current: dict, target_mbps: float,
     if current.get("cc") == "cubic":
         cwin = max(cwin, current_cwin)
 
-    observed_gap = summary["reorder_gap_max"]
-    observed_delay = summary["reorder_delay_max_ms"]
-    gap = max(3, int(math.ceil(observed_gap * 1.25)))
-    delay_ms = max(2.0 * rtt, observed_delay * 1.25 + max(10.0, 0.25 * rtt))
-    # A short clean probe can justify adding protection, but cannot prove that an
-    # existing reordering allowance is safe to remove.
-    gap = max(gap, int(current.get("reorder_gap", 0) or 0))
-    delay_ms = max(delay_ms, int(current.get("reorder_delay_us", 0) or 0) / 1000.0)
-    gap = min(1024, gap)
-    delay_us = min(1_000_000, int(math.ceil(delay_ms) * 1000))
+    observed_gap = summary.get("reorder_gap_p95", summary["reorder_gap_max"])
+    observed_delay = summary.get("reorder_delay_p95_ms", summary["reorder_delay_max_ms"])
+    gap = min(64, max(8, int(math.ceil(observed_gap)) + 8))
+    delay_cap_ms = 80.0 if rtt <= 30.0 else 120.0
+    delay_ms = min(delay_cap_ms, max(20.0,
+        observed_delay + 3.0 * summary["jitter_p95_ms"]))
+    delay_us = int(math.ceil(delay_ms) * 1000)
 
     loss = summary["effective_loss_p95_pct"]
     jitter = summary["jitter_p95_ms"]
@@ -315,24 +350,31 @@ def recommend(summary: dict, current: dict, target_mbps: float,
 
 
 def evaluate_admission(active_probe: dict | None, target_mbps: float,
+                       downstream_target_mbps: float | None = None,
                        min_throughput_ratio: float = 0.90) -> dict:
     reasons = []
     active_probe = active_probe or {}
     integrity = active_probe.get("integrity") or {}
-    load = active_probe.get("load") or {}
-    achieved = float(load.get("achieved_mbps", 0) or 0)
+    uplink = active_probe.get("uplink") or active_probe.get("load") or {}
+    downlink = active_probe.get("downlink") or uplink
+    achieved_up = float(uplink.get("achieved_mbps", 0) or 0)
+    achieved_down = float(downlink.get("achieved_mbps", 0) or 0)
     if integrity.get("integrity") != "ok":
         reasons.append("payload-integrity")
-    if load.get("integrity") != "count-ok":
-        reasons.append("load-integrity")
-    if achieved < target_mbps * min_throughput_ratio:
-        reasons.append("insufficient-throughput")
+    if uplink.get("integrity") != "count-ok":reasons.append("uplink-integrity")
+    if downlink.get("integrity") != "count-ok":reasons.append("downlink-integrity")
+    down_target=downstream_target_mbps if downstream_target_mbps is not None else target_mbps
+    if achieved_up < target_mbps * min_throughput_ratio:reasons.append("insufficient-uplink")
+    if achieved_down < down_target * min_throughput_ratio:reasons.append("insufficient-downlink")
     return {
         "status": "admitted" if not reasons else "rejected",
         "reasons": reasons,
-        "target_mbps": target_mbps,
-        "achieved_mbps": achieved,
-        "throughput_ratio": achieved / target_mbps if target_mbps > 0 else 0.0,
+        "target_mbps": min(target_mbps,down_target),
+        "target_upstream_mbps":target_mbps,"target_downstream_mbps":down_target,
+        "achieved_mbps": min(achieved_up,achieved_down),
+        "achieved_upstream_mbps": achieved_up,"achieved_downstream_mbps": achieved_down,
+        "throughput_ratio": min(achieved_up/target_mbps if target_mbps>0 else 0,
+            achieved_down/down_target if down_target>0 else 0),
         "minimum_throughput_ratio": min_throughput_ratio,
     }
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -454,6 +496,24 @@ def run_load_probe(entry_host: str, socks_port: int, target_mbps: float, duratio
         "achieved_mbps": sent * 8.0 / max(elapsed, 0.001) / 1_000_000.0,
         "integrity": "cancelled" if stop_event and stop_event.is_set() else "count-ok",
         "origin": "controller"}
+
+
+def run_downlink_probe(entry_host: str,socks_port: int,target_mbps: float,duration_s: int,
+                       io_timeout: float = 30) -> dict:
+    target_bytes=int(target_mbps*1_000_000/8.0*duration_s)
+    sock=socks_connect(entry_host,socks_port,PROBE_SOURCE_HOST,max(io_timeout,duration_s+15))
+    sock.sendall(struct.pack("!4sQ",b"NBP2",target_bytes));started=time.monotonic();received=0
+    while received<target_bytes:
+        data=sock.recv(min(64*1024,target_bytes-received))
+        if not data:break
+        expected=bytes((((received+index)*13+29)&0xff) for index in range(len(data)))
+        if data!=expected:raise RuntimeError(f"下行探针完整性失败 offset={received}")
+        received+=len(data)
+    elapsed=time.monotonic()-started;sock.close()
+    if received!=target_bytes:raise RuntimeError(f"下行探针计数失败 expected={target_bytes} received={received}")
+    return {"bytes":received,"elapsed_s":elapsed,
+        "achieved_mbps":received*8.0/max(elapsed,0.001)/1_000_000.0,
+        "integrity":"count-ok","origin":"controller"}
 
 
 def parse_entry_probe_line(raw_line: str) -> dict | None:
@@ -680,6 +740,8 @@ def main() -> None:
     parser.add_argument("--headroom-ratio", type=float, default=1.25,
         help="套餐容量资格测试余量，默认 1.25")
     parser.add_argument("--active", action="store_true", help="通过真实三跳 QUIC 产生受控负载")
+    parser.add_argument("--upstream-mbps",type=float,help="业务上行平均限速验证目标")
+    parser.add_argument("--downstream-mbps",type=float,help="业务下行平均限速验证目标")
     parser.add_argument("--duration", type=int, default=90, help="主动负载持续秒数")
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--via-entry-ssh", action="store_true",
@@ -696,6 +758,8 @@ def main() -> None:
     package_mbps = args.package_mbps
     target_mbps = (package_mbps * args.headroom_ratio if package_mbps is not None
                    else (args.target_mbps if args.target_mbps is not None else 10.0))
+    shaping_up=args.upstream_mbps if args.upstream_mbps is not None else (package_mbps or target_mbps)
+    shaping_down=args.downstream_mbps if args.downstream_mbps is not None else (package_mbps or target_mbps)
     if package_mbps is not None and (package_mbps < 1.0 or package_mbps > 1000):
         raise SystemExit("--package-mbps 必须在 1..1000")
     if args.ping_samples < 10 or args.ping_samples > 300:
@@ -726,19 +790,23 @@ def main() -> None:
         try:
             if args.probe_origin == "entry-local":
                 integrity = run_entry_local_probe("integrity", args.socks_port)
-                load = run_entry_local_probe("load", args.socks_port,
-                    target_mbps=target_mbps, duration_s=args.duration)
+                uplink = run_entry_local_probe("load", args.socks_port,
+                    target_mbps=shaping_up, duration_s=args.duration)
+                downlink = run_entry_local_probe("downlink", args.socks_port,
+                    target_mbps=shaping_down, duration_s=args.duration)
             else:
                 integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
-                load = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
-                    target_mbps, args.duration)
+                uplink = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
+                    shaping_up, args.duration)
+                downlink = run_downlink_probe(deploy._role_host("entry")["host"], args.socks_port,
+                    shaping_down, args.duration)
         finally:
             sample_stop.set()
             for thread in sample_threads:
                 thread.join(25)
         time.sleep(12)
         active_logs = {role: log_since(role, offsets[role]) for role in offsets}
-        active_result = {"integrity": integrity, "load": load}
+        active_result = {"integrity": integrity, "uplink": uplink, "downlink": downlink}
 
     entry_segment = collect_segment("entry", middle_target, args.ping_samples, target_mbps)
     middle_segment = collect_segment("middle", exit_host["host"], args.ping_samples, target_mbps)
@@ -764,13 +832,14 @@ def main() -> None:
         "metric_collection_errors": active_metric_errors,
         "service_package": {
             "committed_mbps": package_mbps,
+            "upstream_mbps":shaping_up,"downstream_mbps":shaping_down,
             "qualification_mbps": target_mbps,
             "headroom_ratio": args.headroom_ratio if package_mbps is not None else None,
         },
-        "admission": evaluate_admission(active_result, target_mbps) if args.active else {
+        "admission": evaluate_admission(active_result, shaping_up, shaping_down) if args.active else {
             "status": "not-evaluated",
             "reasons": ["active-quic-required"],
-            "target_mbps": target_mbps,
+            "target_mbps": min(shaping_up,shaping_down),
         },
         "segments": {
             "entry_middle": entry_segment,

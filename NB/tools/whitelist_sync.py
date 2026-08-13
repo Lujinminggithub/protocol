@@ -21,6 +21,13 @@ MAX_SRS = 64 * 1024 * 1024
 SUPPORTED_FIELDS = {"domain", "domain_suffix", "domain_keyword", "ip_cidr", "port"}
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 CONNECTIVITY_TEST_RULES = {"domain_exact odr.itunes.apple.com"}
+REQUIRED_PUBLIC_DNS_RULES = {
+    "ip 1.1.1.1/32",
+    "ip 8.8.8.8/32",
+    "ip 9.9.9.9/32",
+    "ip 114.114.114.114/32",
+}
+POLICY_MARKER = "# nb-whitelist-policy: public-dns-v1"
 
 
 def fetch(url: str, limit: int) -> tuple[bytes, str]:
@@ -118,12 +125,25 @@ def convert(source: dict) -> list[str]:
             if not isinstance(port, int) or not 1 <= port <= 65535:
                 raise ValueError("invalid whitelist port")
             output.add("port " + str(port))
+    output.update(REQUIRED_PUBLIC_DNS_RULES)
+    if any(item.startswith("port ") for item in output):
+        output.add("port 53")
     if not any(item.startswith(("domain_", "ip ")) for item in output):
         raise ValueError("SRS produced no NB address rules")
     for prefix in ("domain_exact ", "domain_suffix ", "domain_keyword ", "ip ", "port "):
         if sum(item.startswith(prefix) for item in output) > 8192:
             raise ValueError("SRS exceeds the NB whitelist capacity")
     return sorted(output)
+
+
+def output_has_current_policy(path: pathlib.Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return any(line.rstrip("\r\n") == POLICY_MARKER for line in handle)
+    except (OSError, UnicodeError):
+        return False
 
 
 def decompile(binary: str, payload: bytes, directory: pathlib.Path) -> dict:
@@ -156,7 +176,8 @@ def main() -> None:
     if not source_url:
         raise SystemExit("whitelist source environment variable is unavailable")
     digest_path = args.state_dir / "whitelist.md5"
-    current_digest = digest_path.read_text(encoding="ascii").strip().lower() if digest_path.is_file() and args.output.is_file() else ""
+    current_digest = (digest_path.read_text(encoding="ascii").strip().lower()
+                      if digest_path.is_file() and output_has_current_policy(args.output) else "")
     payload, digest = resolve_source(source_url, args.mode, current_digest)
     if payload is None or current_digest == digest:
         print("WHITELIST_SYNC_CHANGED=0")
@@ -165,7 +186,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(dir=args.state_dir) as temporary:
         source = decompile(args.sing_box, payload, pathlib.Path(temporary))
     rules = convert(source)
-    content = "# generated from verified sing-box SRS\n" + "\n".join(rules) + "\n"
+    content = POLICY_MARKER + "\n# generated from verified sing-box SRS\n" + "\n".join(rules) + "\n"
     atomic_write(args.output, content)
     atomic_write(digest_path, digest + "\n")
     print(f"WHITELIST_SYNC_CHANGED=1 rules={len(rules)}")

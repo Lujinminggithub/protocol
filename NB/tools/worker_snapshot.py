@@ -62,7 +62,8 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
         "fec_observe": number(fec, "observe") != 0,
         "fec_active": number(fec, "active") != 0,
         "payload": {"health": health, "metrics": metrics, "collection_error": error},
-        "_bytes_total": number(byte_counts, "c2s") + number(byte_counts, "s2c"),
+        "_bytes_c2s": number(byte_counts, "c2s"),
+        "_bytes_s2c": number(byte_counts, "s2c"),
         "_rxq_overflow_total": number(udp_errors, "rxq_overflow"),
     }
 
@@ -77,16 +78,20 @@ def apply_throughput(samples: list[dict], state_file: pathlib.Path | None) -> No
             previous = {}
     current = {}
     for item in samples:
-        total = float(item.pop("_bytes_total", 0))
+        c2s = float(item.pop("_bytes_c2s", 0))
+        s2c = float(item.pop("_bytes_s2c", 0))
         rxq_total = float(item.pop("_rxq_overflow_total", 0))
         prior = previous.get(item["node_id"], {})
         try:
             before = dt.datetime.fromisoformat(str(prior["observed_at"]).replace("Z", "+00:00"))
             after = dt.datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
             elapsed = (after - before).total_seconds()
-            delta = total - float(prior["bytes_total"])
-            if 0 < elapsed <= 300 and delta >= 0:
-                item["throughput_mbps"] = delta * 8 / elapsed / 1_000_000
+            up_delta = c2s - float(prior["bytes_c2s"])
+            down_delta = s2c - float(prior["bytes_s2c"])
+            if 0 < elapsed <= 300 and up_delta >= 0 and down_delta >= 0:
+                item["upstream_mbps"] = up_delta * 8 / elapsed / 1_000_000
+                item["downstream_mbps"] = down_delta * 8 / elapsed / 1_000_000
+                item["throughput_mbps"] = item["upstream_mbps"] + item["downstream_mbps"]
         except (KeyError, TypeError, ValueError):
             pass
         previous_rxq = float(prior.get("rxq_overflow_total", 0) or 0)
@@ -95,7 +100,9 @@ def apply_throughput(samples: list[dict], state_file: pathlib.Path | None) -> No
             if item["health"] == "ok":
                 item["health"] = "degraded"
             item["payload"]["rxq_overflow_delta"] = rxq_delta
-        current[item["node_id"]] = {"observed_at": item["observed_at"], "bytes_total": total,
+        item.setdefault("upstream_mbps", 0.0);item.setdefault("downstream_mbps", 0.0)
+        current[item["node_id"]] = {"observed_at": item["observed_at"], "bytes_c2s": c2s,
+                                    "bytes_s2c": s2c,
                                     "rxq_overflow_total": rxq_total}
     if state_file:
         state_file.parent.mkdir(parents=True, exist_ok=True)

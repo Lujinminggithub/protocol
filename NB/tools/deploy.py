@@ -7,6 +7,7 @@ PICOQUIC_PATCH_FILES = tuple(ROOT / path for path in (
     "third_party/picoquic/src/picoquic/bbr.c",
     "third_party/picoquic/src/picoquic/cubic.c",
     "third_party/picoquic/src/picoquic/loss_recovery.c",
+    "third_party/picoquic/src/picoquic/pacing.c",
 ))
 PICOQUIC_SOURCE_DIGEST = "\n".join(
     f"{path.relative_to(ROOT).as_posix()} {nb_release.sha256_file(path)}"
@@ -51,6 +52,8 @@ BUILD_FILES = {
     "src/nb_policy.h": SRC / "nb_policy.h",
     "src/nb_live.c": SRC / "nb_live.c",
     "src/nb_live.h": SRC / "nb_live.h",
+    "src/nb_wait.c": SRC / "nb_wait.c",
+    "src/nb_wait.h": SRC / "nb_wait.h",
     "src/nb_probe.c": SRC / "nb_probe.c",
     "src/nb_probe.h": SRC / "nb_probe.h",
     "src/nb_lstream.c": SRC / "nb_lstream.c",
@@ -138,6 +141,7 @@ BUILD_FILES = {
     "tools/test_udp_lifecycle.c": ROOT / "tools" / "test_udp_lifecycle.c",
     "tools/test_policy.c": ROOT / "tools" / "test_policy.c",
     "tools/test_live.c": ROOT / "tools" / "test_live.c",
+    "tools/test_wait.c": ROOT / "tools" / "test_wait.c",
     "tools/test_probe.c": ROOT / "tools" / "test_probe.c",
     "tools/test_metrics.c": ROOT / "tools" / "test_metrics.c",
     "tools/test_session_index.c": ROOT / "tools" / "test_session_index.c",
@@ -160,6 +164,7 @@ BUILD_FILES = {
     "third_party/picoquic/src/picoquic/bbr.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "bbr.c",
     "third_party/picoquic/src/picoquic/cubic.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "cubic.c",
     "third_party/picoquic/src/picoquic/loss_recovery.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "loss_recovery.c",
+    "third_party/picoquic/src/picoquic/pacing.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "pacing.c",
 }
 for _fragment in sorted(SRC.glob("nb_node_*.inc")):
     BUILD_FILES[_fragment.relative_to(ROOT).as_posix()] = _fragment

@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 typedef struct {
+    uint64_t bytes_c2s;
+    uint64_t bytes_s2c;
     uint64_t close_total;
     uint64_t close_normal;
     uint64_t close_timeout;
@@ -93,6 +95,8 @@ typedef struct {
 } nb_metrics_fec_t;
 
 void nb_metrics_note_close(nb_metrics_state_t* state, const char* reason);
+void nb_metrics_note_traffic(nb_metrics_state_t* state, uint64_t bytes_c2s,
+    uint64_t bytes_s2c);
 void nb_metrics_note_loop(nb_metrics_state_t* state, uint64_t busy_us, uint64_t wake_late_us);
 void nb_metrics_note_udp_error(nb_metrics_state_t* state, int transmit);
 void nb_metrics_note_udp_rxq_overflow(nb_metrics_state_t* state, uint64_t dropped);

@@ -25,7 +25,8 @@ int main(void){
     assert(plan.cwin_bytes==262144);
 
     assert(nb_transport_seed_should_refresh(1,0,202757,281000)==1);
-    assert(nb_transport_seed_should_refresh(1,1,202757,281000)==0);
+    assert(nb_transport_seed_should_refresh(1,1,202757,281000)==1);
+    assert(nb_transport_seed_should_refresh(1,1,202757,210000)==0);
     assert(nb_transport_seed_should_refresh(0,0,202757,281000)==0);
     assert(nb_transport_seed_should_refresh(1,0,202757,0)==0);
     assert(nb_transport_seed_should_refresh(1,0,281000,281000)==0);

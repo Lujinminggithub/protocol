@@ -1,4 +1,5 @@
 #include "nb_lstream.h"
+#include "nb_tenant_wire.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,12 +23,16 @@ int nb_lstream_frame_encode(uint8_t* out,size_t cap,uint8_t type,uint64_t flow_h
     if(payload_length)memcpy(out+NB_LSTREAM_HEADER,payload,payload_length);
     return (int)(NB_LSTREAM_HEADER+payload_length);
 }
-int nb_lstream_bootstrap_encode(uint8_t* out,size_t cap,int priority,const char* route,
+int nb_lstream_bootstrap_encode(uint8_t* out,size_t cap,int priority,const char* tenant,const char* route,
     uint8_t type,uint64_t flow_hi,uint64_t flow_lo,uint64_t offset){
     if(out==NULL||route==NULL||priority<=0||priority>255||
         (type!=NB_LSTREAM_OPEN&&type!=NB_LSTREAM_RESUME)||strchr(route,'\n')||strchr(route,'\r'))return -1;
     char flow[33];if(nb_lstream_flow_render(flow,flow_hi,flow_lo)!=0)return -1;
-    int header=snprintf((char*)out,cap,"%d;L=%s;%s\n",priority,flow,route);
+    int header;
+    if(tenant&&tenant[0]){
+        if(!nb_tenant_wire_name_valid(tenant))return -1;
+        header=snprintf((char*)out,cap,"%d;A=%s;L=%s;%s\n",priority,tenant,flow,route);
+    }else header=snprintf((char*)out,cap,"%d;L=%s;%s\n",priority,flow,route);
     if(header<=0||(size_t)header>=cap)return -1;
     int frame=nb_lstream_frame_encode(out+(size_t)header,cap-(size_t)header,type,
         flow_hi,flow_lo,offset,NULL,0);

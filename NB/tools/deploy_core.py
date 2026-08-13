@@ -659,6 +659,7 @@ def _push_security(c, role):
     push_bytes(c, (SECURITY_DIR / f"{role}.key").read_bytes(), paths["key"], mode=0o600)
     if role == "entry":
         push_bytes(c, (SECURITY_DIR / "socks.users").read_bytes(), paths["users"], mode=0o600)
+    if role in ("entry", "exit"):
         existing = run(c, f"test -f {shlex.quote(paths['tenants'])} && echo PRESENT || true").strip()
         if "PRESENT" not in existing:
             push_bytes(c, (SECURITY_DIR / "tenant.conf").read_bytes(), paths["tenants"], mode=0o600)
@@ -778,7 +779,7 @@ def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_i
             raise ValueError("exit 启动需要 whitelist 路径")
         outip=_exit_bind_ip()
         source=f" -o {outip}" if outip else ""
-        return f"{base} -p {EXIT_PORT} -W {wl_remote}{source}"
+        return f"{base} -p {EXIT_PORT} -Q {sec['tenants']} -W {wl_remote}{source}"
     raise ValueError(f"unknown role: {role}")
 
 
@@ -814,6 +815,17 @@ def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None,bina
     if not isinstance(udp_gso,bool):
         raise ValueError(f"transport.{role}.udp_gso 必须为 true 或 false")
     udp_gso_env=f"Environment=NB_UDP_GSO={'on' if udp_gso else 'off'}\n"
+    dns_servers=[]
+    dns_env=""
+    if role=="exit":
+        configured_dns=transport.get("dns_servers",["1.1.1.1","8.8.8.8"])
+        if not isinstance(configured_dns,list) or not 1<=len(configured_dns)<=3:
+            raise ValueError("transport.exit.dns_servers 必须包含 1 到 3 个 IPv4 地址")
+        try:
+            dns_servers=[str(ipaddress.IPv4Address(value)) for value in configured_dns]
+        except (ipaddress.AddressValueError,TypeError) as exc:
+            raise ValueError("transport.exit.dns_servers 必须是 IPv4 地址") from exc
+        dns_env=f"Environment=NB_DNS_SERVERS={','.join(dns_servers)}\n"
     release_env = f"Environment=NB_RELEASE_ID={release_id}\n" if release_id else ""
     line_id, line_schema = _line_profile_identity()
     profile_env = (f"Environment=NB_LINE_PROFILE_ID={line_id}\n"
@@ -857,6 +869,7 @@ def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None,bina
             "NB_TRANSPORT_PROFILE_FILE":f"{INSTANCE_WORK}/transport-profiles/{role}-active.conf"}
         if cwin_max_bytes:environment["NB_CWIN_MAX_BYTES"]=str(cwin_max_bytes)
         if mtu_max:environment["NB_MTU_MAX"]=str(mtu_max)
+        if role=="exit":environment["NB_DNS_SERVERS"]=",".join(dns_servers)
         if role=="entry":
             if udp_advertise_ip:environment["NB_SOCKS_UDP_ADVERTISE_IP"]=udp_advertise_ip
             if udp_port_min:
@@ -880,7 +893,7 @@ Environment=NB_FEC_V15=on
 Environment=NB_WORKER_LANE_PORTS=on
 Environment=NB_CC={cc}
 Environment=NB_BBR_OPTIONS={bbr_options}
-{cwin_env}{mtu_env}{udp_gso_env}{release_env}{profile_env}{instance_env}{udp_advertise_env}{reorder_env}ExecStart={exec_start}
+{cwin_env}{mtu_env}{udp_gso_env}{release_env}{profile_env}{instance_env}{udp_advertise_env}{reorder_env}{dns_env}ExecStart={exec_start}
 Restart=on-failure
 RestartSec=2
 KillMode=control-group

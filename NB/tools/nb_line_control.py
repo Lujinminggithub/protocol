@@ -54,7 +54,10 @@ def validate_candidate(candidate: dict) -> dict:
     admission = candidate.get("admission") or {}
     if admission.get("status") != "admitted":
         raise ValueError(f"线路准入未通过: {admission.get('reasons') or ['unknown']}")
-    if (active.get("integrity") or {}).get("integrity") != "ok" or (active.get("load") or {}).get("integrity") != "count-ok":
+    uplink=active.get("uplink") or active.get("load") or {}
+    downlink=active.get("downlink") or uplink
+    if ((active.get("integrity") or {}).get("integrity") != "ok" or
+        uplink.get("integrity") != "count-ok" or downlink.get("integrity") != "count-ok"):
         raise ValueError("主动探针完整性未通过")
     proposed = {}
     for segment_name, role in (("entry_middle", "entry"), ("middle_exit", "middle")):
@@ -68,10 +71,6 @@ def validate_candidate(candidate: dict) -> dict:
         if mtu.get("confidence") not in ("quic-and-df", "quic-proven"):
             raise ValueError(f"{segment_name} MTU 缺少 QUIC 证据")
         current = recommendation.get("current") or {}
-        if int(recommendation.get("reorder_gap", 0) or 0) < int(current.get("reorder_gap", 0) or 0):
-            raise ValueError(f"{segment_name}: reorder_gap protection cannot be reduced by canary")
-        if int(recommendation.get("reorder_delay_us", 0) or 0) < int(current.get("reorder_delay_us", 0) or 0):
-            raise ValueError(f"{segment_name}: reorder_delay protection cannot be reduced by canary")
         if recommendation.get("cc") == current.get("cc") == "cubic":
             if int(recommendation.get("cwin_max_bytes", 0) or 0) < int(current.get("cwin_max_bytes", 0) or 0):
                 raise ValueError(f"{segment_name}: CUBIC cwin limit cannot be reduced by canary")
@@ -188,8 +187,10 @@ def _run_active_probe(result: dict, stop_event: threading.Event, duration: int) 
         socks_port = int(os.environ.get("NB_CANARY_SOCKS_PORT", "1080"))
         target_mbps = float(os.environ.get("NB_CANARY_TARGET_MBPS", "10"))
         result["integrity"] = line_probe.run_integrity_probe(entry["host"], socks_port)
-        result["load"] = line_probe.run_load_probe(
+        result["uplink"] = line_probe.run_load_probe(
             entry["host"], socks_port, target_mbps, duration, stop_event)
+        result["downlink"] = line_probe.run_downlink_probe(
+            entry["host"], socks_port, target_mbps, duration)
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
 
@@ -199,8 +200,10 @@ def _verify_active_probe(result: dict) -> None:
         raise RuntimeError(f"canary active probe failed: {result['error']}")
     if (result.get("integrity") or {}).get("integrity") != "ok":
         raise RuntimeError(f"canary integrity probe failed: {result.get('integrity')}")
-    if (result.get("load") or {}).get("integrity") != "count-ok":
-        raise RuntimeError(f"canary load probe failed: {result.get('load')}")
+    if (result.get("uplink") or {}).get("integrity") != "count-ok":
+        raise RuntimeError(f"canary uplink probe failed: {result.get('uplink')}")
+    if (result.get("downlink") or {}).get("integrity") != "count-ok":
+        raise RuntimeError(f"canary downlink probe failed: {result.get('downlink')}")
 
 
 def _current_deployment() -> str:

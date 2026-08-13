@@ -49,10 +49,13 @@ class WorkerSnapshotTest(unittest.TestCase):
             second = worker_snapshot.snapshot("line-1", "entry", "2026-07-29T00:00:10Z", record)
             worker_snapshot.apply_throughput([second], state_file)
             self.assertAlmostEqual(second["throughput_mbps"], 1.6)
+            self.assertAlmostEqual(second["upstream_mbps"], 0.8)
+            self.assertAlmostEqual(second["downstream_mbps"], 0.8)
             self.assertEqual(second["health"], "degraded")
             self.assertEqual(second["payload"]["rxq_overflow_delta"], 7)
             persisted = json.loads(state_file.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["nb-entry-0"]["bytes_total"], 2_001_000)
+            self.assertEqual(persisted["nb-entry-0"]["bytes_c2s"], 1_000_600)
+            self.assertEqual(persisted["nb-entry-0"]["bytes_s2c"], 1_000_400)
             self.assertEqual(persisted["nb-entry-0"]["rxq_overflow_total"], 7)
 
 

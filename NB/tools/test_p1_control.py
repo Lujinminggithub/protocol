@@ -10,10 +10,49 @@ def main():
             doc=nb_p1_control.prepare(policy,bundle);loaded=json.loads((bundle/"manifest.json").read_text(encoding="utf-8"));nb_p1_control.verify(loaded);assert doc["state"]=="approved"
             assert b"\r\n" not in (bundle/"tenant.conf").read_bytes() and b"\r\n" not in (bundle/"exit_routes.conf").read_bytes()
             assert (bundle/"tenant.conf").read_text(encoding="ascii").strip().endswith(" 1")
-            dual={"schema_version":2,"fixed_exit":"kz","tenants":[{"name":"live","max_tcp":2,"max_udp":3,"rate_up_kbps":5000,"rate_down_kbps":8000,"quota_mb":0,"burst_up_seconds":10,"burst_down_seconds":12}],"routes":[{"name":"r","host":"127.0.0.1","fixed_exit":"kz"}]}
+            dual={"schema_version":3,"fixed_exit":"kz","tenants":[{"name":"live","max_tcp":2,"max_udp":3,"rate_up_kbps":5000,"rate_down_kbps":8000,"quota_mb":0,"burst_up_bytes":262144,"burst_down_bytes":524288}],"routes":[{"name":"r","host":"127.0.0.1","fixed_exit":"kz"}]}
             tenants,_=nb_p1_control.validate(dual)
-            assert tenants.strip()=="tenant live 2 3 5000 8000 0 10 12"
+            assert tenants.strip()=="tenant-v3 live 2 3 5000 8000 0 262144 524288"
+            dual_path=root/"dual.json";dual_path.write_text(json.dumps(dual),encoding="utf-8")
+            dual_bundle=root/"dual-bundle";dual_doc=nb_p1_control.prepare(dual_path,dual_bundle)
+            assert dual_doc["tenant_fingerprint"]=="3894f0915d74aaef"
             nb_p1_control.apply(bundle,False)
+            calls=[]
+            original={name:getattr(nb_p1_control,name) for name in
+                ("_remote_read","_remote_push","invoke_role","_publish","verify_integrity_after_reload")}
+            try:
+                nb_p1_control._remote_read=lambda role,path:(
+                    (dual_bundle/"tenant.conf").read_bytes() if path.endswith("tenant.conf") else
+                    (dual_bundle/"exit_routes.conf").read_bytes())
+                nb_p1_control._remote_push=lambda role,data,path:calls.append(("push",role,path))
+                def invoke(role,command):
+                    calls.append(("invoke",role,command))
+                    if command.startswith("tenant status"):
+                        return [{"fingerprint":dual_doc["tenant_fingerprint"]}]
+                    return [{"status":"ok"}]
+                nb_p1_control.invoke_role=invoke
+                nb_p1_control._publish=lambda role,source,target:calls.append(("publish",role,target))
+                nb_p1_control.verify_integrity_after_reload=lambda port:calls.append(("probe",port))
+                nb_p1_control.apply(dual_bundle,True,1085)
+                commits=[call[1] for call in calls if call[0]=="invoke" and call[2].startswith("tenant commit")]
+                assert commits==["exit","entry"]
+                calls.clear();failed={"done":False}
+                def fail_entry_commit(role,command):
+                    calls.append(("invoke",role,command))
+                    if role=="entry" and command.startswith("tenant commit") and not failed["done"]:
+                        failed["done"]=True;raise RuntimeError("injected entry commit failure")
+                    if command.startswith("tenant status"):
+                        return [{"fingerprint":dual_doc["tenant_fingerprint"]}]
+                    return [{"status":"ok"}]
+                nb_p1_control.invoke_role=fail_entry_commit
+                try:nb_p1_control.apply(dual_bundle,True,1085)
+                except RuntimeError as error:assert "injected entry commit failure" in str(error)
+                else:raise AssertionError("injected transaction failure was ignored")
+                rollback_prepares=[call[1] for call in calls if call[0]=="invoke" and
+                    call[2].startswith("tenant prepare") and "rollback-" in call[2]]
+                assert rollback_prepares==["entry","exit"]
+            finally:
+                for name,value in original.items():setattr(nb_p1_control,name,value)
             bad=json.loads(policy.read_text());bad["routes"][0]["fixed_exit"]="other"
             try:nb_p1_control.validate(bad)
             except ValueError:pass
