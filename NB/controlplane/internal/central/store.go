@@ -405,12 +405,19 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
-	 SELECT line_id,node_id,observed_at,id FROM (
-	  SELECT line_id,node_id,observed_at,id,
-	   ROW_NUMBER() OVER (PARTITION BY line_id,node_id ORDER BY observed_at DESC,id DESC) AS rn
-	  FROM snapshots
-	 ) WHERE rn=1`)
+	var hasSnapshots, hasLatest int
+	if err = s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM snapshots LIMIT 1),
+	 EXISTS(SELECT 1 FROM latest_snapshots LIMIT 1)`).Scan(&hasSnapshots, &hasLatest); err != nil {
+		return err
+	}
+	if hasSnapshots == 1 && hasLatest == 0 {
+		_, err = s.db.ExecContext(ctx, `INSERT INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
+		 SELECT line_id,node_id,observed_at,id FROM (
+		  SELECT line_id,node_id,observed_at,id,
+		   ROW_NUMBER() OVER (PARTITION BY line_id,node_id ORDER BY observed_at DESC,id DESC) AS rn
+		  FROM snapshots
+		 ) WHERE rn=1`)
+	}
 	return err
 }
 
