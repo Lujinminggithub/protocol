@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>NB 中央运营控制台</title>
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -30,7 +31,7 @@
         <div class="metrics" id="metrics"></div>
         <section class="topology-band">
           <div class="section-head"><div><h2>线路拓扑</h2><p>按实际设备连接关系展示</p></div><select id="topologyLine" aria-label="选择线路"></select></div>
-          <div id="overviewTopology" class="topology-canvas"></div>
+          <div id="overviewTopology" class="topology-stage" aria-label="线路三维拓扑"></div>
         </section>
         <div class="split-grid">
           <section class="band"><div class="section-head"><div><h2>线路运行状态</h2><p>按最新节点快照聚合</p></div></div><div class="table-wrap"><table><thead><tr><th>线路</th><th>健康</th><th>当前 / 配额</th><th>会话</th><th>队列最大等待</th><th>有效丢包</th><th>部署</th></tr></thead><tbody id="overviewLines"></tbody></table></div></section>
@@ -39,6 +40,10 @@
       </section>
 
       <section class="view" id="devicesView">
+        <section class="device-topology-band">
+          <div class="section-head"><div><h2>设备连接关系</h2><p>拖动旋转、滚轮缩放，点击设备查看详情</p></div><div class="topology-filters"><select id="deviceTopologyLine" aria-label="按线路筛选"></select><select id="deviceTopologyRegion" aria-label="按区域筛选"><option value="">全部区域</option></select><select id="deviceTopologyRole" aria-label="按角色筛选"><option value="">全部角色</option><option value="entry">Entry</option><option value="relay">Relay</option><option value="exit">Exit</option></select><select id="deviceTopologyHealth" aria-label="按健康筛选"><option value="">全部健康</option><option value="ok">健康</option><option value="degraded">异常</option><option value="down">离线</option><option value="unknown">待采集</option></select></div></div>
+          <div id="deviceTopology" class="topology-stage large" aria-label="设备三维拓扑"></div>
+        </section>
         <div class="toolbar"><input id="deviceSearch" type="search" placeholder="搜索设备、地址、区域或运营商"><select id="deviceStatus"><option value="">全部状态</option><option value="ready">可用</option><option value="maintenance">维护</option><option value="offline">离线</option><option value="retired">退役</option></select><span class="toolbar-note">SSH 密码保存在控制面主机的受限凭据文件中，不进入数据库</span></div>
         <div class="table-wrap"><table><thead><tr><th>设备</th><th>状态</th><th>SSH 地址</th><th>区域 / 运营商</th><th>系统</th><th>最近健康</th><th>操作</th></tr></thead><tbody id="devicesTable"></tbody></table></div>
       </section>
@@ -85,5 +90,8 @@
   <div class="modal-backdrop hidden" id="operationModal"><form class="modal" id="operationForm"><div class="modal-head"><div><h2 id="operationTitle">创建任务</h2><p id="operationTarget"></p></div><button type="button" class="icon-button close-operation">×</button></div><input type="hidden" name="line_id"><input type="hidden" name="kind"><label>发起人<input name="requested_by" value="operator" pattern="[A-Za-z0-9_.-]+" required></label><label>目标 deployment<input name="deployment" placeholder="回滚时填写"></label><label>备注<textarea name="note" rows="3"></textarea></label><div class="form-error" id="operationError"></div><div class="modal-actions"><button type="button" class="secondary close-operation">取消</button><button class="primary" type="submit">提交任务</button></div></form></div>
 
   <div class="modal-backdrop hidden" id="detailModal"><div class="modal xwide"><div class="modal-head"><div><h2 id="detailTitle">详情</h2><p id="detailSubtitle"></p></div><button type="button" class="icon-button close-detail">×</button></div><div id="detailBody"></div></div></div>
-  <div class="toast" id="toast"></div><script src="/app.js" defer></script>
+  <div class="toast" id="toast"></div>
+  <script src="/vendor/echarts-6.1.0.min.js" defer></script>
+  <script src="/vendor/3d-force-graph-1.80.0.min.js" defer></script>
+  <script src="/app.js" type="module"></script>
 </body></html>

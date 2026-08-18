@@ -36,6 +36,23 @@ func main() {
 		AgentToken: os.Getenv("NB_WEB_AGENT_TOKEN"), DeviceSecretsFile: secretsFile})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		if pruneErr := database.PruneTraffic(ctx, time.Now().UTC()); pruneErr != nil && ctx.Err() == nil {
+			log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
+		}
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case stamp := <-ticker.C:
+				if pruneErr := database.PruneTraffic(ctx, stamp.UTC()); pruneErr != nil && ctx.Err() == nil {
+					log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
+				}
+			}
+		}
+	}()
 	server := &http.Server{Addr: env("NB_WEB_LISTEN", "127.0.0.1:9091"), Handler: service.Handler(),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {

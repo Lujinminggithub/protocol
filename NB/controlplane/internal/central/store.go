@@ -193,6 +193,17 @@ CREATE TABLE IF NOT EXISTS latest_snapshots (
  snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
  PRIMARY KEY(line_id,node_id)
 );
+CREATE TABLE IF NOT EXISTS traffic_rollups (
+ line_id TEXT NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+ node_id TEXT NOT NULL, role TEXT NOT NULL, worker_id TEXT NOT NULL,
+ resolution_s INTEGER NOT NULL CHECK(resolution_s IN (60,300)),
+ bucket_at TEXT NOT NULL, sample_count INTEGER NOT NULL,
+ upstream_sum REAL NOT NULL, downstream_sum REAL NOT NULL,
+ sessions_max INTEGER NOT NULL, queue_age_max_us REAL NOT NULL,
+ effective_loss_max_pct REAL NOT NULL, health_rank INTEGER NOT NULL,
+ deployment TEXT NOT NULL, profile TEXT NOT NULL, last_observed_at TEXT NOT NULL,
+ PRIMARY KEY(line_id,node_id,worker_id,resolution_s,bucket_at)
+);
 CREATE TRIGGER IF NOT EXISTS snapshots_update_latest AFTER INSERT ON snapshots BEGIN
  INSERT INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
  VALUES(NEW.line_id,NEW.node_id,NEW.observed_at,NEW.id)
@@ -269,6 +280,7 @@ CREATE TABLE IF NOT EXISTS transport_generations (
 );
 CREATE INDEX IF NOT EXISTS snapshots_latest ON snapshots(line_id,node_id,worker_id,observed_at DESC);
 CREATE INDEX IF NOT EXISTS snapshots_latest_node ON snapshots(line_id,node_id,observed_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS traffic_rollups_range ON traffic_rollups(line_id,resolution_s,bucket_at);
 CREATE INDEX IF NOT EXISTS incidents_line ON incidents(line_id,status,observed_at DESC);
 CREATE INDEX IF NOT EXISTS operations_ready ON operations(line_id,status,created_at);
 CREATE INDEX IF NOT EXISTS raw_events_path ON raw_events(path,received_at);
@@ -396,7 +408,10 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	   ROW_NUMBER() OVER (PARTITION BY line_id,node_id ORDER BY observed_at DESC,id DESC) AS rn
 	  FROM snapshots
 	 ) WHERE rn=1`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.backfillTrafficRollups(ctx)
 }
 
 func (s *Store) DeleteLine(ctx context.Context, id, requestedBy, reason string) error {
@@ -510,7 +525,12 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO snapshots
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO snapshots
 	 (line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
 	 upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at)
 	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.LineID, item.NodeID, item.Role, item.WorkerID, item.ObservedAt,
@@ -520,7 +540,22 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 		return false, err
 	}
 	count, err := result.RowsAffected()
-	return count > 0, err
+	if err != nil || count == 0 {
+		return false, err
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, item.ObservedAt)
+	if err != nil {
+		return false, err
+	}
+	for _, resolution := range []time.Duration{time.Minute, 5 * time.Minute} {
+		if err = upsertTrafficRollup(ctx, tx, item, observedAt.Truncate(resolution), int(resolution/time.Second)); err != nil {
+			return false, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) RecordIncident(ctx context.Context, item Incident) (bool, error) {

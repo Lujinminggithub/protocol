@@ -1,6 +1,10 @@
+import {TrafficCharts} from "./traffic-charts.js";
+import {DeviceTopology} from "./device-topology.js";
+
 const state = {
   token: sessionStorage.getItem("nbAdminToken") || "",
-  dashboard: null, devices: [], lines: [], details: {}, operations: [], incidents: [], executors: [], view: "overview", openOperationID: "",
+  dashboard: null, devices: [], lines: [], details: {}, topology: {devices:[],links:[]}, operations: [], incidents: [], executors: [], view: "overview", openOperationID: "",
+  trafficCharts: null, overviewTopology: null, deviceTopology: null,
   pendingDeviceHostKey: null
 };
 
@@ -95,11 +99,20 @@ function topology(detail, compact = false) {
 function renderOverviewTopology() {
   const select = $("#topologyLine");
   const previous = select.value;
-  select.innerHTML = state.lines.map((line) => `<option value="${escapeHTML(line.id)}">${escapeHTML(line.name)}</option>`).join("");
-  if (state.lines.some((line) => line.id === previous)) select.value = previous;
-  const id = select.value || state.lines[0]?.id;
-  $("#overviewTopology").innerHTML = id ? topology(state.details[id]) : `<div class="topology-empty">尚未登记线路</div>`;
-  $$('[data-device-detail]').forEach((button) => button.addEventListener("click", () => showDeviceDetail(button.dataset.deviceDetail)));
+  select.innerHTML = `<option value="">全部线路</option>${state.lines.map((line) => `<option value="${escapeHTML(line.id)}">${escapeHTML(line.name)}</option>`).join("")}`;
+  if (state.lines.some((line) => line.id === previous) || previous === "") select.value = previous;
+  if (!state.overviewTopology) state.overviewTopology = new DeviceTopology($("#overviewTopology"), {onDevice:showDeviceDetail,onLine:showLineDetail});
+  state.overviewTopology.render(state.topology,{lineID:select.value});
+}
+
+function renderDeviceTopology() {
+  const lineSelect=$("#deviceTopologyLine"),regionSelect=$("#deviceTopologyRegion"),previousLine=lineSelect.value,previousRegion=regionSelect.value;
+  lineSelect.innerHTML=`<option value="">全部线路</option>${state.lines.map((line)=>`<option value="${escapeHTML(line.id)}">${escapeHTML(line.name)}</option>`).join("")}`;
+  if(state.lines.some((line)=>line.id===previousLine))lineSelect.value=previousLine;
+  const regions=[...new Set(state.devices.map((device)=>device.region).filter(Boolean))].sort();regionSelect.innerHTML=`<option value="">全部区域</option>${regions.map((region)=>`<option value="${escapeHTML(region)}">${escapeHTML(region)}</option>`).join("")}`;
+  if(regions.includes(previousRegion))regionSelect.value=previousRegion;
+  if(!state.deviceTopology)state.deviceTopology=new DeviceTopology($("#deviceTopology"),{onDevice:showDeviceDetail,onLine:showLineDetail});
+  state.deviceTopology.render(state.topology,{lineID:lineSelect.value,region:regionSelect.value,role:$("#deviceTopologyRole").value,health:$("#deviceTopologyHealth").value});
 }
 
 function overviewRow(line) {
@@ -185,11 +198,11 @@ function renderIncidents() { $("#incidentsTable").innerHTML = state.incidents.le
 
 async function loadAll() {
   try {
-    const [dashboard,devices,lines,operations,incidents,executors] = await Promise.all([api("/api/v1/dashboard"),api("/api/v1/devices"),api("/api/v1/lines"),api("/api/v1/operations?limit=100"),api("/api/v1/incidents?limit=100"),api("/api/v1/executors")]);
-    state.dashboard=dashboard; state.devices=devices.devices||[]; state.lines=lines.lines||[]; state.operations=operations.operations||[]; state.incidents=incidents.incidents||[]; state.executors=executors.executors||[];
+    const [dashboard,devices,lines,topologyData,operations,incidents,executors] = await Promise.all([api("/api/v1/dashboard"),api("/api/v1/devices"),api("/api/v1/lines"),api("/api/v1/topology"),api("/api/v1/operations?limit=100"),api("/api/v1/incidents?limit=100"),api("/api/v1/executors")]);
+    state.dashboard=dashboard; state.devices=devices.devices||[]; state.lines=lines.lines||[]; state.topology=topologyData||{devices:[],links:[]}; state.operations=operations.operations||[]; state.incidents=incidents.incidents||[]; state.executors=executors.executors||[];
     const details = await Promise.all(state.lines.map((line) => api(`/api/v1/lines/${encodeURIComponent(line.id)}/detail`).catch(() => ({line}))));
     state.details = Object.fromEntries(details.map((detail) => [detail.line.id,detail]));
-    renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview();
+    renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview(); renderDeviceTopology();
     $("#updatedAt").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`; setConnected(true); $("#authModal").classList.add("hidden");
   } catch (error) { setConnected(false); if (error.status === 401) { state.token=""; sessionStorage.removeItem("nbAdminToken"); $("#authModal").classList.remove("hidden"); } else toast(error.message); throw error; }
 }
@@ -200,7 +213,7 @@ function switchView(name) { state.view=name; $$(".nav-item").forEach((item) => i
 function openOperation(lineID,kind) { const line=state.lines.find((x)=>x.id===lineID),form=$("#operationForm"); form.reset(); form.elements.line_id.value=lineID; form.elements.kind.value=kind; form.elements.requested_by.value="operator"; $("#operationTitle").textContent=kindText[kind]||"创建任务"; $("#operationTarget").textContent=line?`${line.name} · ${line.id}`:lineID; $("#operationError").textContent=""; $("#operationModal").classList.remove("hidden"); }
 function bindDetails() { $$('[data-line-detail]').forEach((b) => b.onclick=()=>showLineDetail(b.dataset.lineDetail)); $$('[data-operation-detail]').forEach((b) => b.onclick=()=>showOperationDetail(b.dataset.operationDetail)); }
 function showDeviceDetail(id) { const item=state.devices.find((x)=>x.id===id); if(!item)return; state.openOperationID=""; $("#detailTitle").textContent=item.name; $("#detailSubtitle").textContent=item.id; $("#detailBody").innerHTML=`<div class="detail-grid"><dl><dt>SSH</dt><dd class="mono">${escapeHTML(item.ssh_user)}@${escapeHTML(item.host)}:${item.ssh_port}</dd><dt>内网地址</dt><dd>${escapeHTML(item.private_ip||"--")}</dd><dt>区域 / 运营商</dt><dd>${escapeHTML(item.region||"--")} / ${escapeHTML(item.provider||"--")}</dd></dl><dl><dt>状态</dt><dd>${badge(item.status)} ${badge(item.last_health||"unknown")}</dd><dt>系统</dt><dd>${escapeHTML(item.os||"--")} · ${escapeHTML(item.arch||"--")}</dd><dt>最近在线</dt><dd>${formatTime(item.last_seen_at)}</dd></dl></div>`; $("#detailModal").classList.remove("hidden"); }
-function showLineDetail(id) { const detail=state.details[id]; if(!detail)return; state.openOperationID=""; const spec=detail.spec||{},upstream=spec.upstream_mbps||spec.bandwidth_mbps||detail.line.capacity_mbps,downstream=spec.downstream_mbps||spec.bandwidth_mbps||detail.line.capacity_mbps,dns=(spec.dns_servers||["1.1.1.1","8.8.8.8"]).join(", "); $("#detailTitle").textContent=detail.line.name; $("#detailSubtitle").textContent=`${detail.line.id} · ${statusText[detail.line.status]||detail.line.status}`; $("#detailBody").innerHTML=`<div class="detail-section"><h3>设备拓扑</h3><div class="topology-canvas">${topology(detail)}</div></div><div class="detail-grid"><dl><dt>资源组 / 实例</dt><dd>${escapeHTML(spec.resource_group||"--")} / ${escapeHTML(spec.instance_id||"--")}</dd><dt>平均速率</dt><dd>上行 ${number(upstream)} / 下行 ${number(downstream)} Mbps</dd><dt>出口 IP</dt><dd>${escapeHTML(spec.exit_bind_ip||"默认路由")}</dd><dt>出口 DNS</dt><dd>${escapeHTML(dns)}</dd><dt>端口规划</dt><dd>SOCKS ${spec.socks_port||"--"} · Relay ${spec.relay_port||"--"} · Exit ${spec.exit_port||"--"}</dd></dl><dl><dt>UDP 池</dt><dd>${spec.udp_port_min||"--"} - ${spec.udp_port_max||"--"}</dd><dt>构建 / 跳板</dt><dd>${escapeHTML(spec.build_mode||"--")} / ${escapeHTML(spec.jump_policy||"--")}</dd><dt>Deployment</dt><dd class="mono">${escapeHTML(detail.line.active_deployment||"--")}</dd></dl></div>${clientConfigSection(detail.client_operation)}<div class="detail-section"><h3>节点快照</h3>${snapshotTable(detail.snapshots||[])}</div>`; $("#detailModal").classList.remove("hidden"); $$('[data-device-detail]').forEach((b)=>b.onclick=()=>showDeviceDetail(b.dataset.deviceDetail)); hydrateClientConfig($("#detailBody .client-delivery")); }
+function showLineDetail(id) { const detail=state.details[id]; if(!detail)return; if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;} state.openOperationID=""; const spec=detail.spec||{},upstream=spec.upstream_mbps||spec.bandwidth_mbps||detail.line.capacity_mbps,downstream=spec.downstream_mbps||spec.bandwidth_mbps||detail.line.capacity_mbps,dns=(spec.dns_servers||["1.1.1.1","8.8.8.8"]).join(", "); $("#detailTitle").textContent=detail.line.name; $("#detailSubtitle").textContent=`${detail.line.id} · ${statusText[detail.line.status]||detail.line.status}`; $("#detailBody").innerHTML=`<div class="detail-section"><h3>设备拓扑</h3><div class="topology-canvas">${topology(detail)}</div></div><div class="detail-grid"><dl><dt>资源组 / 实例</dt><dd>${escapeHTML(spec.resource_group||"--")} / ${escapeHTML(spec.instance_id||"--")}</dd><dt>平均速率</dt><dd>上行 ${number(upstream)} / 下行 ${number(downstream)} Mbps</dd><dt>出口 IP</dt><dd>${escapeHTML(spec.exit_bind_ip||"默认路由")}</dd><dt>出口 DNS</dt><dd>${escapeHTML(dns)}</dd><dt>端口规划</dt><dd>SOCKS ${spec.socks_port||"--"} · Relay ${spec.relay_port||"--"} · Exit ${spec.exit_port||"--"}</dd></dl><dl><dt>UDP 池</dt><dd>${spec.udp_port_min||"--"} - ${spec.udp_port_max||"--"}</dd><dt>构建 / 跳板</dt><dd>${escapeHTML(spec.build_mode||"--")} / ${escapeHTML(spec.jump_policy||"--")}</dd><dt>Deployment</dt><dd class="mono">${escapeHTML(detail.line.active_deployment||"--")}</dd></dl></div>${clientConfigSection(detail.client_operation)}<div class="detail-section traffic-section"><h3>实时与历史流量</h3><div id="lineTrafficCharts" class="traffic-charts"></div></div><div class="detail-section"><h3>节点快照</h3>${snapshotTable(detail.snapshots||[])}</div>`; $("#detailModal").classList.remove("hidden"); $$('[data-device-detail]').forEach((b)=>b.onclick=()=>showDeviceDetail(b.dataset.deviceDetail)); hydrateClientConfig($("#detailBody .client-delivery")); requestAnimationFrame(()=>{state.trafficCharts=new TrafficCharts($("#lineTrafficCharts"),{lineID:id,token:state.token});state.trafficCharts.mount();}); }
 function snapshotTable(items) { if(!items.length)return `<div class="topology-empty">等待 worker 采集运行快照</div>`; return `<div class="table-wrap"><table class="detail-table"><thead><tr><th>节点</th><th>角色</th><th>健康</th><th>上行</th><th>下行</th><th>会话</th><th>队列最大等待</th><th>有效丢包</th></tr></thead><tbody>${items.map((x)=>{const health=healthState(x.health);return `<tr><td><span class="snapshot-node"><span class="computer-icon small ${escapeHTML(health)}" aria-hidden="true"></span>${escapeHTML(x.node_id)}</span></td><td>${escapeHTML(x.role)}</td><td>${badge(health)}</td><td>${number(x.upstream_mbps,2)} Mbps</td><td>${number(x.downstream_mbps,2)} Mbps</td><td>${number(x.sessions)}</td><td>${formatDurationUS(x.queue_age_p95_us)}</td><td>${number(x.effective_loss_pct,3)}%</td></tr>`;}).join("")}</tbody></table></div>`; }
 function clientConfigSection(operation) {
   const clientURL=operation?.result?.client_url;
@@ -289,8 +302,9 @@ $("#operationForm").addEventListener("submit",async(event)=>{event.preventDefaul
 $$('.nav-item').forEach((item)=>item.addEventListener("click",()=>switchView(item.dataset.view)));
 $("#contextAction").addEventListener("click",()=>{if(state.view==="devices"){const form=$("#deviceForm");form.reset();delete form.dataset.originalHost;delete form.dataset.originalPort;delete form.dataset.hostKeyStatus;clearDeviceHostKeyConfirmation();form.elements.id.readOnly=false;form.elements.password.required=true;$("#devicePasswordLabel").textContent="SSH 密码";$("#devicePasswordHint").textContent="首次登记必须输入，保存后不会回显";$("#scanDeviceHostKey").textContent="扫描主机密钥";$("#deviceError").textContent="";$("#deviceModal").classList.remove("hidden");}else{$("#lineError").textContent="";$("#lineModal").classList.remove("hidden");}});
 $("#refreshButton").addEventListener("click",()=>loadAll().catch(()=>{}));
-$$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";$("#detailModal").classList.add("hidden");}));
+$$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
 $("#deviceSearch").addEventListener("input",filterDevices);$("#deviceStatus").addEventListener("change",filterDevices);$("#lineSearch").addEventListener("input",filterLines);$("#lineStatus").addEventListener("change",filterLines);$("#topologyLine").addEventListener("change",renderOverviewTopology);
+for(const selector of ["#deviceTopologyLine","#deviceTopologyRegion","#deviceTopologyRole","#deviceTopologyHealth"])$(selector).addEventListener("change",renderDeviceTopology);
 $("#operationLine").addEventListener("change",async()=>{const id=$("#operationLine").value,data=await api(`/api/v1/operations?limit=100${id?`&line_id=${encodeURIComponent(id)}`:""}`);state.operations=data.operations||[];renderOperations();});$("#reloadOperations").addEventListener("click",()=>$("#operationLine").dispatchEvent(new Event("change")));
 if(state.token)loadAll().catch(()=>{});else $("#authModal").classList.remove("hidden");
 setInterval(()=>{if(state.token&&document.visibilityState==="visible")loadAll().catch(()=>{});},10000);

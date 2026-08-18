@@ -65,6 +65,154 @@ func startTestSSHServer(t *testing.T) (string, int, ssh.PublicKey) {
 	return "127.0.0.1", address.Port, signer.PublicKey()
 }
 
+func TestTrafficHistoryAPIRequiresAuthAndValidRange(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "line-traffic", Name: "traffic", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC().Add(-time.Minute)
+	if _, err = database.RecordSnapshot(t.Context(), central.Snapshot{LineID: "line-traffic", NodeID: "entry-0",
+		Role: "entry", WorkerID: "0", ObservedAt: observed.Format(time.RFC3339Nano), Health: "ok",
+		UpstreamMbps: 2.5, DownstreamMbps: 3.5}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	from, to := observed.Add(-time.Minute).Format(time.RFC3339), observed.Add(time.Minute).Format(time.RFC3339)
+	response, body := call(t, server.Client(), http.MethodGet,
+		server.URL+"/api/v1/lines/line-traffic/traffic?from="+from+"&to="+to, "", "", nil)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet,
+		server.URL+"/api/v1/lines/line-traffic/traffic?from=2025-01-01T00:00:00Z&to=2026-08-18T00:00:00Z", "admin", "", nil)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized range status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet,
+		server.URL+"/api/v1/lines/line-traffic/traffic?from="+from+"&to="+to, "admin", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"resolution_s":15`)) ||
+		!bytes.Contains(body, []byte(`"upstream_mbps":2.5`)) {
+		t.Fatalf("history status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestSnapshotStreamPublishesInsertedSnapshot(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "line-stream", Name: "stream", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/v1/lines/line-stream/traffic/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer admin")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("stream status=%d content-type=%q", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	payload := central.Snapshot{LineID: "line-stream", NodeID: "entry-0", Role: "entry", WorkerID: "0",
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "ok", UpstreamMbps: 4.25, DownstreamMbps: 1.5}
+	response2, body := call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/snapshots", "agent", "", payload)
+	if response2.StatusCode != http.StatusOK {
+		t.Fatalf("snapshot status=%d body=%s", response2.StatusCode, body)
+	}
+	streamBody, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(streamBody, []byte("event: snapshot")) || !bytes.Contains(streamBody, []byte(`"upstream_mbps":4.25`)) {
+		t.Fatalf("stream body=%q", streamBody)
+	}
+}
+
+func TestTopologyAPIRequiresAdminAuthorization(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	response, body := call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/topology", "", "", nil)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/topology", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"devices":[]`)) ||
+		!bytes.Contains(body, []byte(`"links":[]`)) {
+		t.Fatalf("topology status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestVisualizationAssetsAreEmbeddedLocally(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	for path, minimumSize := range map[string]int{
+		"/vendor/echarts-6.1.0.min.js":         500000,
+		"/vendor/three-0.185.1.module.min.js":  300000,
+		"/vendor/three.core.min.js":            350000,
+		"/vendor/3d-force-graph-1.80.0.min.js": 1000000,
+		"/traffic-charts.js":                   3000,
+		"/device-topology.js":                  3000,
+	} {
+		response, err := server.Client().Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if response.StatusCode != http.StatusOK || len(body) < minimumSize {
+			t.Fatalf("asset %s status=%d size=%d", path, response.StatusCode, len(body))
+		}
+	}
+	response, err := server.Client().Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"echarts-6.1.0.min.js", "3d-force-graph-1.80.0.min.js", `type="module"`, `id="deviceTopology"`} {
+		if !bytes.Contains(body, []byte(required)) {
+			t.Fatalf("index is missing %q", required)
+		}
+	}
+	policy := response.Header.Get("Content-Security-Policy")
+	if !strings.Contains(policy, "script-src 'self'") || strings.Contains(policy, "script-src 'self' 'unsafe-inline'") ||
+		!strings.Contains(policy, "style-src 'self' 'unsafe-inline'") {
+		t.Fatalf("unexpected visualization CSP: %q", policy)
+	}
+}
+
 func confirmedDeviceFields(t *testing.T, app *App, host string, port int, supplied ...ssh.PublicKey) map[string]any {
 	t.Helper()
 	var publicKey ssh.PublicKey

@@ -488,3 +488,185 @@ func TestDashboardUsesMaterializedLatestSnapshots(t *testing.T) {
 		t.Fatalf("query plan does not use materialized latest snapshots: %s", plan.String())
 	}
 }
+
+func TestTrafficHistoryAggregatesWorkersWithoutAddingHops(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-traffic", Name: "traffic", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
+	for _, item := range []Snapshot{
+		{LineID: "line-traffic", NodeID: "entry-0", Role: "entry", WorkerID: "0", ObservedAt: base.Add(2 * time.Second).Format(time.RFC3339Nano), Health: "ok", UpstreamMbps: 2, DownstreamMbps: 3, Sessions: 2},
+		{LineID: "line-traffic", NodeID: "entry-1", Role: "entry", WorkerID: "1", ObservedAt: base.Add(4 * time.Second).Format(time.RFC3339Nano), Health: "ok", UpstreamMbps: 1, DownstreamMbps: 1.5, Sessions: 1},
+		{LineID: "line-traffic", NodeID: "middle-0", Role: "middle", WorkerID: "0", ObservedAt: base.Add(3 * time.Second).Format(time.RFC3339Nano), Health: "degraded", UpstreamMbps: 8, DownstreamMbps: 9, Sessions: 2},
+		{LineID: "line-traffic", NodeID: "exit-0", Role: "exit", WorkerID: "0", ObservedAt: base.Add(5 * time.Second).Format(time.RFC3339Nano), Health: "ok", UpstreamMbps: 7, DownstreamMbps: 8, Sessions: 2},
+	} {
+		if inserted, recordErr := store.RecordSnapshot(t.Context(), item); recordErr != nil || !inserted {
+			t.Fatalf("RecordSnapshot inserted=%v err=%v", inserted, recordErr)
+		}
+	}
+	history, err := store.TrafficHistory(t.Context(), "line-traffic", base, base.Add(time.Minute), 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.ResolutionSeconds != 60 {
+		t.Fatalf("resolution=%d", history.ResolutionSeconds)
+	}
+	entry := history.Role("entry")
+	if len(entry.Points) != 1 || entry.Points[0].UpstreamMbps != 3 || entry.Points[0].DownstreamMbps != 4.5 {
+		t.Fatalf("entry boundary was not summed by worker only: %+v", entry)
+	}
+	if got := history.Role("middle").Points[0].Health; got != "degraded" {
+		t.Fatalf("middle health=%q", got)
+	}
+	if len(history.Workers) != 4 {
+		t.Fatalf("workers=%d want 4", len(history.Workers))
+	}
+}
+
+func TestTrafficResolutionAndRetention(t *testing.T) {
+	if got := TrafficResolution(2 * time.Hour); got != 15 {
+		t.Fatalf("2h resolution=%d", got)
+	}
+	if got := TrafficResolution(24 * time.Hour); got != 60 {
+		t.Fatalf("24h resolution=%d", got)
+	}
+	if got := TrafficResolution(30 * 24 * time.Hour); got != 300 {
+		t.Fatalf("30d resolution=%d", got)
+	}
+
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-retention", Name: "retention", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	nowAt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	old := Snapshot{LineID: "line-retention", NodeID: "entry-0", Role: "entry", WorkerID: "0",
+		ObservedAt: nowAt.Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano), Health: "ok", UpstreamMbps: 1}
+	if _, err = store.RecordSnapshot(t.Context(), old); err != nil {
+		t.Fatal(err)
+	}
+	newest := old
+	newest.ObservedAt = nowAt.Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err = store.RecordSnapshot(t.Context(), newest); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PruneTraffic(t.Context(), nowAt); err != nil {
+		t.Fatal(err)
+	}
+	var raw int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE line_id='line-retention'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != 1 {
+		t.Fatalf("raw snapshots=%d want latest only", raw)
+	}
+	var rollups int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM traffic_rollups WHERE line_id='line-retention'`).Scan(&rollups); err != nil {
+		t.Fatal(err)
+	}
+	if rollups == 0 {
+		t.Fatal("recent rollups were removed")
+	}
+}
+
+func TestBackfillTrafficRollupsIsIdempotent(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-backfill", Name: "backfill", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
+	for offset, upstream := range []float64{2, 4} {
+		item := Snapshot{LineID: "line-backfill", NodeID: "entry-0", Role: "entry", WorkerID: "0",
+			ObservedAt: base.Add(time.Duration(offset*15) * time.Second).Format(time.RFC3339Nano), Health: "ok",
+			Deployment: "deployment-1", Profile: "profile-1", UpstreamMbps: upstream, DownstreamMbps: 1}
+		if inserted, recordErr := store.RecordSnapshot(t.Context(), item); recordErr != nil || !inserted {
+			t.Fatalf("RecordSnapshot inserted=%v err=%v", inserted, recordErr)
+		}
+	}
+	if _, err = store.db.Exec(`DELETE FROM traffic_rollups WHERE line_id='line-backfill'`); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.backfillTrafficRollups(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.backfillTrafficRollups(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var samples int64
+	var upstream float64
+	if err = store.db.QueryRow(`SELECT sample_count,upstream_sum FROM traffic_rollups
+	 WHERE line_id='line-backfill' AND resolution_s=60`).Scan(&samples, &upstream); err != nil {
+		t.Fatal(err)
+	}
+	if samples != 2 || upstream != 6 {
+		t.Fatalf("samples=%d upstream=%v, want 2 and 6", samples, upstream)
+	}
+}
+
+func TestTopologyDeduplicatesSharedDevicesAndKeepsLineEdges(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, device := range []Device{
+		{ID: "gz", Name: "GZ", Status: "ready", Host: "192.0.2.1", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)},
+		{ID: "hk", Name: "HK", Status: "ready", Host: "192.0.2.2", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)},
+		{ID: "us", Name: "US", Status: "ready", Host: "192.0.2.3", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)},
+		{ID: "kz", Name: "KZ", Status: "ready", Host: "192.0.2.4", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)},
+	} {
+		if _, err = store.UpsertDevice(t.Context(), device); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index, exit := range []string{"us", "kz"} {
+		lineID := "line-" + exit
+		if _, err = store.UpsertLine(t.Context(), Line{ID: lineID, Name: lineID, Status: "active",
+			EntryRegion: "GZ", ExitRegion: exit, Provider: "test", CapacityMbps: 10}); err != nil {
+			t.Fatal(err)
+		}
+		spec := LineSpec{LineID: lineID, ResourceGroup: "shared", InstanceID: lineID + "_1", BandwidthMbps: 10,
+			UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1080 + index, RelayPort: 4440 + index*10,
+			ExitPort: 4450 + index, UDPPortMin: 20000 + index*1024, UDPPortMax: 21023 + index*1024,
+			Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto",
+			JumpPolicy: "auto", Nodes: []LineNode{
+				{DeviceID: "gz", Role: "entry", NextHopDevice: "hk", JumpCandidates: json.RawMessage(`[]`), Config: json.RawMessage(`{}`)},
+				{DeviceID: "hk", Role: "relay", NextHopDevice: exit, JumpCandidates: json.RawMessage(`["gz"]`), Config: json.RawMessage(`{}`)},
+				{DeviceID: exit, Role: "exit", JumpCandidates: json.RawMessage(`["hk"]`), Config: json.RawMessage(`{}`)},
+			}}
+		if _, err = store.SaveLineSpec(t.Context(), spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	topology, err := store.Topology(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topology.Devices) != 4 || len(topology.Links) != 4 {
+		t.Fatalf("devices=%d links=%d topology=%+v", len(topology.Devices), len(topology.Links), topology)
+	}
+	var shared int
+	for _, link := range topology.Links {
+		if link.Source == "gz" && link.Target == "hk" {
+			shared++
+		}
+	}
+	if shared != 2 {
+		t.Fatalf("shared GZ-HK line edges=%d want 2", shared)
+	}
+}

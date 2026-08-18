@@ -75,11 +75,12 @@ type App struct {
 	deviceSecrets        deviceSecretStore
 	hostKeyTokenKey      [32]byte
 	verifySSHCredentials func(context.Context, string, int, string, string, ssh.PublicKey) error
+	snapshotHub          *snapshotHub
 }
 
 func New(store *central.Store, cfg Config) *App {
 	app := &App{store: store, cfg: cfg, deviceSecrets: deviceSecretStore{path: cfg.DeviceSecretsFile},
-		verifySSHCredentials: verifySSHPassword}
+		verifySSHCredentials: verifySSHPassword, snapshotHub: newSnapshotHub()}
 	if _, err := rand.Read(app.hostKeyTokenKey[:]); err != nil {
 		panic("failed to initialize SSH host-key confirmation tokens")
 	}
@@ -91,12 +92,15 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", a.health)
 	mux.HandleFunc("GET /readyz", a.ready)
 	mux.HandleFunc("GET /api/v1/dashboard", a.admin(a.dashboard))
+	mux.HandleFunc("GET /api/v1/topology", a.admin(a.topology))
 	mux.HandleFunc("GET /api/v1/lines", a.admin(a.lines))
 	mux.HandleFunc("POST /api/v1/lines", a.admin(a.upsertLine))
 	mux.HandleFunc("GET /api/v1/lines/{id}", a.admin(a.line))
 	mux.HandleFunc("PATCH /api/v1/lines/{id}", a.admin(a.patchLine))
 	mux.HandleFunc("DELETE /api/v1/lines/{id}", a.admin(a.deleteLine))
 	mux.HandleFunc("GET /api/v1/lines/{id}/detail", a.admin(a.lineDetail))
+	mux.HandleFunc("GET /api/v1/lines/{id}/traffic", a.admin(a.trafficHistory))
+	mux.HandleFunc("GET /api/v1/lines/{id}/traffic/stream", a.admin(a.trafficStream))
 	mux.HandleFunc("GET /api/v1/lines/{id}/spec", a.admin(a.lineSpec))
 	mux.HandleFunc("PUT /api/v1/lines/{id}/spec", a.admin(a.saveLineSpec))
 	mux.HandleFunc("GET /api/v1/devices", a.admin(a.devices))
@@ -144,7 +148,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -220,6 +224,15 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, view)
+}
+
+func (a *App) topology(w http.ResponseWriter, r *http.Request) {
+	result, err := a.store.Topology(r.Context())
+	if err != nil {
+		problem(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (a *App) lines(w http.ResponseWriter, r *http.Request) {
@@ -636,6 +649,9 @@ func (a *App) snapshot(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		problem(w, 500, err.Error())
 		return
+	}
+	if inserted {
+		a.snapshotHub.publish(item)
 	}
 	writeJSON(w, 200, map[string]bool{"inserted": inserted})
 }
