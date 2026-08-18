@@ -82,6 +82,25 @@ def prepare(policy_path:pathlib.Path,output:pathlib.Path)->dict:
     fingerprint=tenant_fingerprint(policy)
     doc={"schema_version":2,"state":"approved","policy_id":hashlib.sha256(canonical(policy)).hexdigest()[:16],"created_at_utc":dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00","Z"),"fixed_exit":policy["fixed_exit"],"tenant_sha256":hashlib.sha256(tenant_bytes).hexdigest(),"tenant_fingerprint":f"{fingerprint:016x}","routes_sha256":hashlib.sha256(route_bytes).hexdigest()};sign(doc);(output/"manifest.json").write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");return doc
 
+def _route_records(data:bytes)->tuple[tuple[str,str,int,int],...]:
+    records=[];seen=set()
+    for line_number,raw in enumerate(data.decode("ascii").splitlines(),1):
+        line=raw.strip()
+        if not line or line.startswith("#"):continue
+        fields=line.split()
+        if len(fields)!=5 or fields[0]!="route":
+            raise ValueError(f"invalid exit route at line {line_number}")
+        _,name,target,weight_text,capacity_text=fields
+        if name in seen or not NAME.fullmatch(name) or not target.startswith("H:"):
+            raise ValueError(f"invalid exit route at line {line_number}")
+        try:weight=int(weight_text);capacity=int(capacity_text)
+        except ValueError as error:raise ValueError(f"invalid exit route at line {line_number}") from error
+        if not 1<=weight<=1000 or not 0<=capacity<=100000:
+            raise ValueError(f"invalid exit route at line {line_number}")
+        seen.add(name);records.append((name,target,weight,capacity))
+    if not records:raise ValueError("exit route table is empty")
+    return tuple(records)
+
 def _remote_control_command(control:str,command:str)->str:
     script=("import socket;"+f"s=socket.socket(socket.AF_UNIX);s.settimeout(5);s.connect({control!r});"+
         f"s.sendall(({command!r}+'\\n').encode());data=s.recv(32768);s.close();print(data.decode(),end='')")
@@ -149,7 +168,7 @@ def apply(bundle:pathlib.Path,execute:bool,socks_port:int=1080)->None:
     work=deploy.INSTANCE_WORK;root=f"{work}/configs/{doc['policy_id']}";transaction=int(doc["policy_id"],16)
     old_t={role:_remote_read(role,f"{work}/tenant.conf") for role in ("exit","entry")}
     old_r=_remote_read("entry",f"{work}/exit_routes.conf")
-    if routes!=old_r:raise ValueError("路由变更必须走完整原子部署，限速热更新只接受租户策略")
+    if _route_records(routes)!=_route_records(old_r):raise ValueError("路由变更必须走完整原子部署，限速热更新只接受租户策略")
     prepared=[];published=[]
     try:
         for role in ("exit","entry"):_remote_push(role,tenant,f"{root}/tenant.conf")

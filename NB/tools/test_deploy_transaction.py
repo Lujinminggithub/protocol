@@ -15,6 +15,22 @@ class FakeClient:
 
 
 def main() -> None:
+    with tempfile.TemporaryDirectory(prefix="nb-build-inputs-") as inputs_tmp:
+        present = pathlib.Path(inputs_tmp) / "present.c"
+        missing = pathlib.Path(inputs_tmp) / "missing.c"
+        present.write_text("ok", encoding="ascii")
+        assert deploy.missing_build_inputs({"src/present.c": present}) == []
+        assert deploy.missing_build_inputs({
+            "src/present.c": present,
+            "src/missing.c": missing,
+        }) == ["src/missing.c"]
+        cmake = pathlib.Path(inputs_tmp) / "CMakeLists.txt"
+        cmake.write_text("add_executable(test src/present.c src/missing.c)\n", encoding="ascii")
+        assert deploy.undeclared_cmake_inputs({"src/present.c": present}, cmake) == ["src/missing.c"]
+    assert deploy.undeclared_cmake_inputs() == []
+    assert all(path.relative_to(deploy.ROOT).as_posix() in deploy.BUILD_FILES
+               for path in deploy.SRC.iterdir() if path.is_file() and path.suffix in {".c", ".h"})
+
     with tempfile.TemporaryDirectory(prefix="nb-security-push-") as security_tmp:
         security = pathlib.Path(security_tmp)
         for name in ("ca.pem", "socks.users", "tenant.conf", "entry.pem", "entry.key",

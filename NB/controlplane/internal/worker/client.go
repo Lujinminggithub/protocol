@@ -25,6 +25,7 @@ type ClientConfig struct {
 	OperationTimeout time.Duration
 	MaintenanceEvery time.Duration
 	SnapshotEvery    time.Duration
+	SnapshotTimeout  time.Duration
 }
 
 type operationRunner interface {
@@ -32,11 +33,11 @@ type operationRunner interface {
 }
 
 type Client struct {
-	registry Registry
-	runner   operationRunner
-	cfg      ClientConfig
-	http     *http.Client
-	snapshot sync.Mutex
+	registry  Registry
+	runner    operationRunner
+	cfg       ClientConfig
+	http      *http.Client
+	snapshots sync.Map
 }
 
 type persistedResult struct {
@@ -80,6 +81,9 @@ func NewClient(registry Registry, runner operationRunner, cfg ClientConfig) (*Cl
 	}
 	if cfg.SnapshotEvery <= 0 {
 		cfg.SnapshotEvery = 15 * time.Second
+	}
+	if cfg.SnapshotTimeout <= 0 {
+		cfg.SnapshotTimeout = 30 * time.Second
 	}
 	return &Client{registry: registry, runner: runner, cfg: cfg,
 		http: &http.Client{Timeout: 20 * time.Second}}, nil
@@ -232,10 +236,6 @@ func (c *Client) snapshotLines(ctx context.Context) []LineSpec {
 }
 
 func (c *Client) collectSnapshots(ctx context.Context) {
-	if !c.snapshot.TryLock() {
-		return
-	}
-	defer c.snapshot.Unlock()
 	collector, ok := c.runner.(interface {
 		CollectSnapshots(context.Context, LineSpec) ([]Snapshot, error)
 	})
@@ -252,10 +252,16 @@ func (c *Client) collectSnapshots(ctx context.Context) {
 	var group sync.WaitGroup
 	for _, line := range lines {
 		line := line
+		if _, loaded := c.snapshots.LoadOrStore(line.LineID, struct{}{}); loaded {
+			continue
+		}
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			snapshots, err := collector.CollectSnapshots(ctx, line)
+			defer c.snapshots.Delete(line.LineID)
+			lineContext, cancel := context.WithTimeout(ctx, c.cfg.SnapshotTimeout)
+			defer cancel()
+			snapshots, err := collector.CollectSnapshots(lineContext, line)
 			results <- collected{lineID: line.LineID, snapshots: snapshots, err: err}
 		}()
 	}
@@ -327,7 +333,7 @@ func (c *Client) poll(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) runHeartbeat(ctx context.Context, failures chan<- error) {
+func (c *Client) runHeartbeat(ctx context.Context) {
 	ticker := time.NewTicker(c.cfg.HeartbeatEvery)
 	defer ticker.Stop()
 	for {
@@ -336,11 +342,8 @@ func (c *Client) runHeartbeat(ctx context.Context, failures chan<- error) {
 			return
 		case <-ticker.C:
 			if err := c.heartbeat(ctx); err != nil {
-				select {
-				case failures <- err:
-				default:
-				}
-				return
+				fmt.Fprintf(os.Stderr, "nb-web-worker heartbeat failed: %v; retrying\n", err)
+				continue
 			}
 			if err := c.syncInventory(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
@@ -360,8 +363,7 @@ func (c *Client) Run(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
 	}
 	go c.collectSnapshots(ctx)
-	heartbeatFailures := make(chan error, 1)
-	go c.runHeartbeat(ctx, heartbeatFailures)
+	go c.runHeartbeat(ctx)
 	poll := time.NewTicker(c.cfg.PollEvery)
 	maintenance := time.NewTicker(c.cfg.MaintenanceEvery)
 	snapshots := time.NewTicker(c.cfg.SnapshotEvery)
@@ -372,8 +374,6 @@ func (c *Client) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case err := <-heartbeatFailures:
-			return err
 		case <-poll.C:
 			if err := c.poll(ctx); err != nil {
 				return err

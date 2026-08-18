@@ -564,14 +564,11 @@ func (s *Store) OperationEvents(ctx context.Context, operationID string) ([]Oper
 }
 
 func (s *Store) LatestSnapshots(ctx context.Context, lineID string) ([]Snapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `WITH ranked AS (
-	 SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,
-	 queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at,
-	 ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY observed_at DESC,id DESC) AS rn
-	 FROM snapshots WHERE line_id=?
-	) SELECT line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,
-	 queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at FROM ranked WHERE rn=1
-	 ORDER BY CASE role WHEN 'entry' THEN 1 WHEN 'middle' THEN 2 WHEN 'relay' THEN 2 ELSE 3 END,node_id`, lineID)
+	rows, err := s.db.QueryContext(ctx, `SELECT s.line_id,s.node_id,s.role,s.worker_id,s.observed_at,s.health,s.deployment,s.profile,
+	 s.sessions,s.throughput_mbps,s.upstream_mbps,s.downstream_mbps,s.queue_age_p95_us,s.effective_loss_pct,
+	 s.fec_observe,s.fec_active,s.payload,s.received_at
+	 FROM latest_snapshots latest JOIN snapshots s ON s.id=latest.snapshot_id WHERE latest.line_id=?
+	 ORDER BY CASE s.role WHEN 'entry' THEN 1 WHEN 'middle' THEN 2 WHEN 'relay' THEN 2 ELSE 3 END,s.node_id`, lineID)
 	if err != nil {
 		return nil, err
 	}

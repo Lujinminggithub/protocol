@@ -119,6 +119,12 @@ def main() -> None:
         request = json.loads(connection.stdin.value)
         assert request["socks_port"] == 1085 and request["duration_s"] == 5
         assert remote["origin"] == "entry-local" and connection.closed
+        connection = FakeConnection()
+        line_probe.deploy.connect = lambda role: connection
+        remote = run_entry_local_probe("downlink", 1085, target_mbps=1, duration_s=5)
+        request = json.loads(connection.stdin.value)
+        assert request["mode"] == "downlink" and request["target_mbps"] == 1
+        assert remote["origin"] == "entry-local" and connection.closed
     finally:
         line_probe.deploy.connect = original_connect
         if old_username is None:

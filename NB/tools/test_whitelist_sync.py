@@ -37,6 +37,16 @@ def main() -> None:
     assert "domain_keyword bytecdn" in scalar_rules
     assert "ip 192.0.2.8/29" in scalar_rules
     assert "port 8443" in scalar_rules
+    unicode_hyphen_rules = whitelist_sync.convert({
+        "version": 1,
+        "rules": [{"domain_suffix": ["tiktok\u2011minis.com"]}],
+    })
+    assert "domain_suffix tiktok-minis.com" in unicode_hyphen_rules
+    try:
+        whitelist_sync.convert({"version": 1, "rules": [{"domain_suffix": ["tiktok/minis.com"]}]})
+        raise AssertionError("unsafe domain punctuation was accepted")
+    except ValueError as error:
+        assert "cannot be represented" in str(error)
     try:
         whitelist_sync.convert({"version": 1, "rules": [{"domain_regex": [".*"]}]})
         raise AssertionError("unsupported SRS rule was accepted")

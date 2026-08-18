@@ -187,6 +187,20 @@ CREATE TABLE IF NOT EXISTS snapshots (
  fec_observe INTEGER NOT NULL, fec_active INTEGER NOT NULL, payload BLOB NOT NULL,
  received_at TEXT NOT NULL, UNIQUE(line_id,node_id,worker_id,observed_at)
 );
+CREATE TABLE IF NOT EXISTS latest_snapshots (
+ line_id TEXT NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+ node_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+ snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+ PRIMARY KEY(line_id,node_id)
+);
+CREATE TRIGGER IF NOT EXISTS snapshots_update_latest AFTER INSERT ON snapshots BEGIN
+ INSERT INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
+ VALUES(NEW.line_id,NEW.node_id,NEW.observed_at,NEW.id)
+ ON CONFLICT(line_id,node_id) DO UPDATE SET
+  observed_at=excluded.observed_at,snapshot_id=excluded.snapshot_id
+ WHERE excluded.observed_at>latest_snapshots.observed_at OR
+  (excluded.observed_at=latest_snapshots.observed_at AND excluded.snapshot_id>latest_snapshots.snapshot_id);
+END;
 CREATE TABLE IF NOT EXISTS incidents (
  id TEXT PRIMARY KEY, line_id TEXT NOT NULL REFERENCES lines(id), severity TEXT NOT NULL,
  status TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL,
@@ -373,6 +387,15 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	// Remove those placeholders so they cannot degrade an otherwise healthy line.
 	_, err = s.db.ExecContext(ctx, `DELETE FROM snapshots
  WHERE worker_id='collector' AND health='down' AND node_id LIKE '%-collector'`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
+	 SELECT line_id,node_id,observed_at,id FROM (
+	  SELECT line_id,node_id,observed_at,id,
+	   ROW_NUMBER() OVER (PARTITION BY line_id,node_id ORDER BY observed_at DESC,id DESC) AS rn
+	  FROM snapshots
+	 ) WHERE rn=1`)
 	return err
 }
 
@@ -847,12 +870,9 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 	view := Dashboard{Lines: make([]LineView, 0, len(lines))}
 	for _, line := range lines {
 		item := LineView{Line: line, Health: "unknown"}
-		rows, queryErr := s.db.QueryContext(ctx, `WITH ranked AS (
-	 SELECT role,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,
-	 fec_observe,fec_active,observed_at,ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY observed_at DESC,id DESC) AS rn
-	 FROM snapshots WHERE line_id=?
-	) SELECT role,health,deployment,profile,sessions,throughput_mbps,upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,
-	 fec_observe,fec_active,observed_at FROM ranked WHERE rn=1`, line.ID)
+		rows, queryErr := s.db.QueryContext(ctx, `SELECT s.role,s.health,s.deployment,s.profile,s.sessions,s.throughput_mbps,
+	 s.upstream_mbps,s.downstream_mbps,s.queue_age_p95_us,s.effective_loss_pct,s.fec_observe,s.fec_active,s.observed_at
+	 FROM latest_snapshots latest JOIN snapshots s ON s.id=latest.snapshot_id WHERE latest.line_id=?`, line.ID)
 		if queryErr != nil {
 			return Dashboard{}, queryErr
 		}

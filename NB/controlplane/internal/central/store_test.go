@@ -424,3 +424,67 @@ func TestDashboardHandlesSnapshotHistory(t *testing.T) {
 		t.Fatalf("unexpected dashboard summary: %+v", view)
 	}
 }
+
+func TestDashboardUsesMaterializedLatestSnapshots(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	stamp := now()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-1", Name: "test", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10,
+		ActiveDeployment: "deployment-1", Profile: "profile-1"}); err != nil {
+		t.Fatal(err)
+	}
+	newest := Snapshot{LineID: "line-1", NodeID: "entry-0", Role: "entry", WorkerID: "worker-1",
+		ObservedAt: stamp, Health: "ok", Deployment: "deployment-1", Profile: "profile-1",
+		Sessions: 7, ThroughputMbps: 4, UpstreamMbps: 3, DownstreamMbps: 1}
+	if inserted, recordErr := store.RecordSnapshot(t.Context(), newest); recordErr != nil || !inserted {
+		t.Fatalf("record newest inserted=%v err=%v", inserted, recordErr)
+	}
+	older := newest
+	older.ObservedAt = "2020-01-01T00:00:00Z"
+	older.Health = "down"
+	older.Sessions = 99
+	if inserted, recordErr := store.RecordSnapshot(t.Context(), older); recordErr != nil || !inserted {
+		t.Fatalf("record older inserted=%v err=%v", inserted, recordErr)
+	}
+
+	var latestCount, historyCount int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM latest_snapshots`).Scan(&latestCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if latestCount != 1 || historyCount != 2 {
+		t.Fatalf("latest=%d history=%d", latestCount, historyCount)
+	}
+	view, err := store.Dashboard(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := view.Lines[0]; got.Health != "healthy" || got.Sessions != 7 || got.UpstreamMbps != 3 || got.DownstreamMbps != 1 {
+		t.Fatalf("dashboard did not retain newest snapshot: %+v", got)
+	}
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN SELECT s.role FROM latest_snapshots latest
+	 JOIN snapshots s ON s.id=latest.snapshot_id WHERE latest.line_id=?`, "line-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err = rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+	}
+	if !strings.Contains(plan.String(), "latest_snapshots") {
+		t.Fatalf("query plan does not use materialized latest snapshots: %s", plan.String())
+	}
+}

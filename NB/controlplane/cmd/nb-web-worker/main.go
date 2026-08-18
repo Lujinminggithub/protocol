@@ -45,6 +45,7 @@ func main() {
 		OperationTimeout: duration("NB_WEB_WORKER_OPERATION_TIMEOUT_SECONDS", 45*time.Minute),
 		MaintenanceEvery: duration("NB_WEB_WORKER_MAINTENANCE_SECONDS", 5*time.Minute),
 		SnapshotEvery:    duration("NB_WEB_WORKER_SNAPSHOT_SECONDS", 15*time.Second),
+		SnapshotTimeout:  duration("NB_WEB_WORKER_SNAPSHOT_TIMEOUT_SECONDS", 30*time.Second),
 	})
 	if err != nil {
 		log.Fatal(err)

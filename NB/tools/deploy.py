@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """NB deployment build, rollout, and command orchestration."""
 
+import re
+
 from deploy_core import *  # noqa: F403 - deploy_core publishes the CLI integration surface.
 
 PICOQUIC_PATCH_FILES = tuple(ROOT / path for path in (
@@ -166,6 +168,21 @@ BUILD_FILES = {
     "third_party/picoquic/src/picoquic/loss_recovery.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "loss_recovery.c",
     "third_party/picoquic/src/picoquic/pacing.c": ROOT / "third_party" / "picoquic" / "src" / "picoquic" / "pacing.c",
 }
+
+
+def cmake_declared_inputs(cmake_path=None):
+    """Return repository source files named directly by CMake targets."""
+    source = ROOT / "CMakeLists.txt" if cmake_path is None else pathlib.Path(cmake_path)
+    text = source.read_text(encoding="utf-8")
+    pattern = re.compile(r"(?<![A-Za-z0-9_])((?:src|tools)/[A-Za-z0-9_./-]+\.(?:c|h|py|sh))")
+    return sorted(set(pattern.findall(text)))
+
+
+for _cmake_input in cmake_declared_inputs():
+    BUILD_FILES.setdefault(_cmake_input, ROOT.joinpath(*pathlib.PurePosixPath(_cmake_input).parts))
+for _source_input in sorted(SRC.iterdir()):
+    if _source_input.is_file() and _source_input.suffix in {".c", ".h"}:
+        BUILD_FILES.setdefault(_source_input.relative_to(ROOT).as_posix(), _source_input)
 for _fragment in sorted(SRC.glob("nb_node_*.inc")):
     BUILD_FILES[_fragment.relative_to(ROOT).as_posix()] = _fragment
 for _fragment in sorted((SRC / "log").glob("log4c_*.inc")):
@@ -203,6 +220,17 @@ RUNTIME_CONFIGURATION_INPUTS = {
 }
 
 
+def missing_build_inputs(files=None):
+    """Return archive names whose source files are absent from this snapshot."""
+    selected = BUILD_FILES if files is None else files
+    return sorted(arcname for arcname, path in selected.items() if not path.is_file())
+
+
+def undeclared_cmake_inputs(files=None, cmake_path=None):
+    selected = BUILD_FILES if files is None else files
+    return sorted(set(cmake_declared_inputs(cmake_path)) - set(selected))
+
+
 def act_recon(roles):
     for r in roles:
         c = connect(r); h = _role_host(r)
@@ -219,7 +247,16 @@ def act_build(roles):
     """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
     if BUILD_HOST != "entry":
         raise RuntimeError("production builds must run on the entry role")
+    missing = missing_build_inputs()
+    if missing:
+        preview = ", ".join(missing[:12])
+        suffix = f"（另有 {len(missing) - 12} 个）" if len(missing) > 12 else ""
+        raise RuntimeError(f"控制面构建源码快照不完整，缺少: {preview}{suffix}")
+    undeclared = undeclared_cmake_inputs()
+    if undeclared:
+        raise RuntimeError("远程构建输入未覆盖 CMake 依赖: " + ", ".join(undeclared))
     tests = ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
+             "test_deploy_transfer.py",
              "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
              "test_line_provision.py", "test_line_open.py", "test_supervisor.py",
              "test_shard_deploy.py"]

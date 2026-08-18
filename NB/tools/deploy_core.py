@@ -431,7 +431,8 @@ def _stage_release(c, role, manifest, binary=None):
 def _copy_release_between_nodes(source_c, source_role, target_c, target_role, manifest):
     return deploy_transfer.copy_release(
         source_c, source_role, target_c, target_role, manifest,
-        instance_work=INSTANCE_WORK, role_host=_role_host, run=run, push_bytes=push_bytes)
+        instance_work=INSTANCE_WORK, role_host=_role_host, run=run,
+        checked_run=checked_run, push_bytes=push_bytes)
 
 
 def _activate_release(c, release_id):

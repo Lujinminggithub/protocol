@@ -20,6 +20,7 @@ MAX_METADATA = 8192
 MAX_SRS = 64 * 1024 * 1024
 SUPPORTED_FIELDS = {"domain", "domain_suffix", "domain_keyword", "ip_cidr", "port"}
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+DNS_HYPHEN_TRANSLATION = str.maketrans({"\u2010": "-", "\u2011": "-"})
 CONNECTIVITY_TEST_RULES = {"domain_exact odr.itunes.apple.com"}
 REQUIRED_PUBLIC_DNS_RULES = {
     "ip 1.1.1.1/32",
@@ -81,7 +82,11 @@ def values(rule: dict, field: str) -> list:
 def normalize_domain(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("invalid SRS domain")
-    domain = value.lower().lstrip(".").rstrip(".")
+    domain = value.translate(DNS_HYPHEN_TRANSLATION).lower().lstrip(".").rstrip(".")
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise ValueError("SRS domain cannot be represented by NB") from error
     labels = domain.split(".")
     if not domain or len(domain) > 127 or any(not DOMAIN_LABEL_RE.fullmatch(label) for label in labels):
         raise ValueError("SRS domain cannot be represented by NB")

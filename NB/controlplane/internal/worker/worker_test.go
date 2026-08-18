@@ -381,6 +381,21 @@ func TestCommandFailureSummaryReportsReleaseValidationCause(t *testing.T) {
 	}
 }
 
+func TestCommandFailureSummaryPrefersLaterMissingBuildInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.log")
+	content := "RuntimeError: local source differs from the binary build inputs\n" +
+		"Traceback (most recent call last):\n" +
+		"FileNotFoundError: /opt/nb-controlplane/repo/src/nb_wait.c\n" +
+		"subprocess.CalledProcessError: command returned non-zero exit status 1\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	summary := commandFailureSummary(os.ErrInvalid, path)
+	if summary != "FileNotFoundError: /opt/nb-controlplane/repo/src/nb_wait.c" {
+		t.Fatalf("wrong root cause selected: %s", summary)
+	}
+}
+
 func TestClientURLReadsQualifiedPrivateArtifact(t *testing.T) {
 	registry := testRegistry(t, nil)
 	line := registry.Lines[0]
@@ -565,6 +580,22 @@ func (runner *fakeDynamicSnapshotRunner) resolveSnapshotLine(plan dynamicPlan) (
 	return LineSpec{LineID: plan.LineID}, nil
 }
 
+type blockingSnapshotRunner struct {
+	fakeRunner
+	started chan struct{}
+	once    sync.Once
+}
+
+func (runner *blockingSnapshotRunner) CollectSnapshots(ctx context.Context, line LineSpec) ([]Snapshot, error) {
+	if line.LineID == "line-blocked" {
+		runner.once.Do(func() { close(runner.started) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []Snapshot{{LineID: line.LineID, NodeID: "entry-1", Role: "entry", WorkerID: "0",
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "ok"}}, nil
+}
+
 func TestClientCollectsAndDeliversSnapshots(t *testing.T) {
 	registry := testRegistry(t, nil)
 	var delivered atomic.Int64
@@ -640,6 +671,42 @@ func TestClientCollectsDynamicLineSnapshots(t *testing.T) {
 		if _, ok := lines.Load(lineID); !ok {
 			t.Fatalf("snapshot missing for %s", lineID)
 		}
+	}
+}
+
+func TestBlockedLineDoesNotSuppressLaterSnapshotCycles(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines[0].LineID = "line-blocked"
+	var delivered atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/agent/v1/snapshots" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var snapshot Snapshot
+		if json.NewDecoder(request.Body).Decode(&snapshot) == nil && snapshot.LineID == "line-healthy" {
+			delivered.Store(true)
+		}
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	}))
+	defer server.Close()
+	runner := &blockingSnapshotRunner{started: make(chan struct{})}
+	client, err := NewClient(registry, runner, ClientConfig{BaseURL: server.URL, Token: "agent-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go client.collectSnapshots(ctx)
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("blocked collector did not start")
+	}
+	client.registry.Lines = append(client.registry.Lines, LineSpec{LineID: "line-healthy"})
+	client.collectSnapshots(context.Background())
+	if !delivered.Load() {
+		t.Fatal("healthy line was suppressed by an unrelated blocked collector")
 	}
 }
 
@@ -726,6 +793,52 @@ func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
 	}
 	if _, err = os.Stat(filepath.Join(registry.StateDir, "op-1", "result.json")); err != nil {
 		t.Fatal("operation result was not persisted")
+	}
+}
+
+func TestClientHeartbeatsRecoverDuringLongOperation(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate"})
+	var heartbeat, completed atomic.Int64
+	var claimed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/agent/v1/executors/heartbeat":
+			attempt := heartbeat.Add(1)
+			if attempt == 2 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"temporary database busy"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":"ready"}`))
+		case "/agent/v1/operations":
+			if claimed.CompareAndSwap(false, true) {
+				_, _ = w.Write([]byte(`{"operations":[{"id":"op-long","line_id":"line-1","kind":"line.validate","request":{}}]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"operations":[]}`))
+			}
+		case "/agent/v1/operations/op-long/result":
+			completed.Add(1)
+			_, _ = w.Write([]byte(`{"status":"accepted"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(registry, &fakeRunner{delay: 90 * time.Millisecond}, ClientConfig{
+		BaseURL: server.URL, Token: "agent-secret", PollEvery: 5 * time.Millisecond,
+		HeartbeatEvery: 10 * time.Millisecond, OperationTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 140*time.Millisecond)
+	defer cancel()
+	if err = client.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if heartbeat.Load() < 5 || completed.Load() != 1 {
+		t.Fatalf("heartbeat did not recover during operation: heartbeat=%d completed=%d", heartbeat.Load(), completed.Load())
 	}
 }
 

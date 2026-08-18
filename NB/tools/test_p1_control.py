@@ -16,6 +16,11 @@ def main():
             dual_path=root/"dual.json";dual_path.write_text(json.dumps(dual),encoding="utf-8")
             dual_bundle=root/"dual-bundle";dual_doc=nb_p1_control.prepare(dual_path,dual_bundle)
             assert dual_doc["tenant_fingerprint"]=="3894f0915d74aaef"
+            route_bytes=(dual_bundle/"exit_routes.conf").read_bytes()
+            deployed_routes=b"# route <name> <H:host:port> <weight> <capacity; 0=unlimited>\n"+route_bytes
+            assert nb_p1_control._route_records(route_bytes)==nb_p1_control._route_records(deployed_routes)
+            changed_routes=deployed_routes.replace(b"H:127.0.0.1:4443",b"H:127.0.0.1:4444")
+            assert nb_p1_control._route_records(route_bytes)!=nb_p1_control._route_records(changed_routes)
             nb_p1_control.apply(bundle,False)
             calls=[]
             original={name:getattr(nb_p1_control,name) for name in
@@ -23,7 +28,7 @@ def main():
             try:
                 nb_p1_control._remote_read=lambda role,path:(
                     (dual_bundle/"tenant.conf").read_bytes() if path.endswith("tenant.conf") else
-                    (dual_bundle/"exit_routes.conf").read_bytes())
+                    deployed_routes)
                 nb_p1_control._remote_push=lambda role,data,path:calls.append(("push",role,path))
                 def invoke(role,command):
                     calls.append(("invoke",role,command))

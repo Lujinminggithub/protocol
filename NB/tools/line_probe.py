@@ -544,8 +544,8 @@ def run_entry_local_probe(mode: str, socks_port: int, *, size: int = 256 * 1024,
                           target_mbps: float = 0.0, duration_s: int = 0,
                           io_timeout: float = 30.0) -> dict:
     """Generate qualification traffic on Entry so controller uplink is excluded."""
-    if mode not in {"integrity", "load"}:
-        raise ValueError("entry-local probe mode must be integrity or load")
+    if mode not in {"integrity", "load", "downlink"}:
+        raise ValueError("entry-local probe mode must be integrity, load or downlink")
     username = os.environ.get("NB_SOCKS_USERNAME", "")
     password = os.environ.get("NB_SOCKS_PASSWORD", "")
     if not username or not password or len(username.encode()) > 255 or len(password.encode()) > 255:
