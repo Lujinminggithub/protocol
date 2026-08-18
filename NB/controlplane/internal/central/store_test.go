@@ -601,11 +601,13 @@ func TestBackfillTrafficRollupsIsIdempotent(t *testing.T) {
 	if _, err = store.db.Exec(`DELETE FROM traffic_rollups WHERE line_id='line-backfill'`); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.backfillTrafficRollups(t.Context()); err != nil {
-		t.Fatal(err)
+	completed, err := store.BackfillTrafficHistory(t.Context())
+	if err != nil || !completed {
+		t.Fatalf("first backfill completed=%v err=%v", completed, err)
 	}
-	if err = store.backfillTrafficRollups(t.Context()); err != nil {
-		t.Fatal(err)
+	completed, err = store.BackfillTrafficHistory(t.Context())
+	if err != nil || completed {
+		t.Fatalf("second backfill completed=%v err=%v", completed, err)
 	}
 	var samples int64
 	var upstream float64

@@ -37,19 +37,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
-		if pruneErr := database.PruneTraffic(ctx, time.Now().UTC()); pruneErr != nil && ctx.Err() == nil {
-			log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
-		}
+		backfillComplete := false
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
+			if !backfillComplete {
+				log.Printf("component=nb-web traffic_backfill=start")
+				changed, backfillErr := database.BackfillTrafficHistory(ctx)
+				if backfillErr != nil {
+					if ctx.Err() == nil {
+						log.Printf("component=nb-web traffic_backfill_error=%q", backfillErr)
+					}
+				} else {
+					backfillComplete = true
+					log.Printf("component=nb-web traffic_backfill=complete changed=%t", changed)
+				}
+			}
+			if backfillComplete {
+				if pruneErr := database.PruneTraffic(ctx, time.Now().UTC()); pruneErr != nil && ctx.Err() == nil {
+					log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return
-			case stamp := <-ticker.C:
-				if pruneErr := database.PruneTraffic(ctx, stamp.UTC()); pruneErr != nil && ctx.Err() == nil {
-					log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
-				}
+			case <-ticker.C:
 			}
 		}
 	}()

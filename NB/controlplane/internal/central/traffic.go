@@ -115,6 +115,28 @@ FROM aggregate JOIN ranked ON ranked.line_id=aggregate.line_id AND ranked.node_i
 	return nil
 }
 
+// BackfillTrafficHistory performs the one-time historical rollup outside the
+// startup migration path. A large production snapshot table must not delay the
+// web listener or trigger a systemd restart loop.
+func (s *Store) BackfillTrafficHistory(ctx context.Context) (bool, error) {
+	const job = "traffic_rollups_v1"
+	var completed string
+	err := s.db.QueryRowContext(ctx, `SELECT completed_at FROM maintenance_jobs WHERE name=?`, job).Scan(&completed)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("read traffic backfill state: %w", err)
+	}
+	if err = s.backfillTrafficRollups(ctx); err != nil {
+		return false, err
+	}
+	if _, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO maintenance_jobs(name,completed_at) VALUES(?,?)`, job, now()); err != nil {
+		return false, fmt.Errorf("record traffic backfill completion: %w", err)
+	}
+	return true, nil
+}
+
 func healthFromRank(rank int) string {
 	switch rank {
 	case 2:

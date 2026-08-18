@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS traffic_rollups (
  deployment TEXT NOT NULL, profile TEXT NOT NULL, last_observed_at TEXT NOT NULL,
  PRIMARY KEY(line_id,node_id,worker_id,resolution_s,bucket_at)
 );
+CREATE TABLE IF NOT EXISTS maintenance_jobs (
+ name TEXT PRIMARY KEY, completed_at TEXT NOT NULL
+);
 CREATE TRIGGER IF NOT EXISTS snapshots_update_latest AFTER INSERT ON snapshots BEGIN
  INSERT INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
  VALUES(NEW.line_id,NEW.node_id,NEW.observed_at,NEW.id)
@@ -408,10 +411,7 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	   ROW_NUMBER() OVER (PARTITION BY line_id,node_id ORDER BY observed_at DESC,id DESC) AS rn
 	  FROM snapshots
 	 ) WHERE rn=1`)
-	if err != nil {
-		return err
-	}
-	return s.backfillTrafficRollups(ctx)
+	return err
 }
 
 func (s *Store) DeleteLine(ctx context.Context, id, requestedBy, reason string) error {
