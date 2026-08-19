@@ -43,9 +43,11 @@ h2 { font-size: 16px; font-weight: 700; }
 .topbar p, .section-head p { color: var(--muted); margin-top: 5px; font-size: 12px; }
 .top-actions { display: flex; align-items: center; gap: 9px; }
 .updated { color: var(--muted); font-size: 12px; white-space: nowrap; }
-.primary, .secondary, .icon-button, .action-button { min-height: 36px; border-radius: 5px; border: 1px solid transparent; padding: 0 14px; }
+.primary, .secondary, .danger, .icon-button, .action-button { min-height: 36px; border-radius: 5px; border: 1px solid transparent; padding: 0 14px; }
 .primary { background: var(--accent); color: white; }
 .primary:hover { background: var(--accent-dark); }
+.danger { background: var(--red); color: white; }
+.danger:hover { background: #922f2f; }
 .secondary { background: white; color: var(--text); border-color: var(--line); }
 .icon-button { width: 36px; padding: 0; background: white; border-color: var(--line); font-size: 18px; }
 .action-button { min-height: 30px; padding: 0 10px; background: white; border-color: var(--line); font-size: 12px; }
@@ -153,6 +155,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .full { width: 100%; margin-top: 16px; }
 .form-error { min-height: 18px; margin-top: 10px; color: var(--red); font-size: 12px; }
+.danger-notice { margin-bottom: 16px; padding: 12px 14px; border: 1px solid #e2bbb7; background: #fff5f4; color: #7f302b; }
+.danger-notice strong { display: block; margin-bottom: 4px; }
+.danger-notice p { margin: 0; color: #7f302b; font-size: 13px; line-height: 1.55; }
+.acknowledge { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; }
+.acknowledge input { width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--red); }
+.acknowledge span { font-size: 13px; line-height: 1.5; }
 .host-key-confirmation { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); display: grid; gap: 12px; }
 .host-key-confirmation.hidden { display: none; }
 .host-key-confirmation > div { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }

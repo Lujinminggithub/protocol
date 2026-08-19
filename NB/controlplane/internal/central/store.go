@@ -430,65 +430,6 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 	return err
 }
 
-func (s *Store) DeleteLine(ctx context.Context, id, requestedBy, reason string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var line Line
-	err = tx.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
- active_deployment,profile,secret_ref,created_at,updated_at FROM lines WHERE id=?`, id).Scan(
-		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
-		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt)
-	if err != nil {
-		return err
-	}
-	var active, specs, snapshots, incidents, operations int
-	for query, target := range map[string]*int{
-		`SELECT COUNT(*) FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running')`: &active,
-		`SELECT COUNT(*) FROM line_specs WHERE line_id=?`:                                                 &specs,
-		`SELECT COUNT(*) FROM snapshots WHERE line_id=?`:                                                  &snapshots,
-		`SELECT COUNT(*) FROM incidents WHERE line_id=?`:                                                  &incidents,
-		`SELECT COUNT(*) FROM operations WHERE line_id=?`:                                                 &operations,
-	} {
-		if err = tx.QueryRowContext(ctx, query, id).Scan(target); err != nil {
-			return err
-		}
-	}
-	if active > 0 {
-		return errors.New("line has active operations")
-	}
-	if specs > 0 && line.Status != "draft" && line.Status != "disabled" && line.Status != "archived" {
-		return errors.New("configured line must be disabled before deletion")
-	}
-	audit, err := json.Marshal(map[string]any{
-		"line": map[string]any{"id": line.ID, "name": line.Name, "status": line.Status,
-			"entry_region": line.EntryRegion, "exit_region": line.ExitRegion, "provider": line.Provider,
-			"capacity_mbps": line.CapacityMbps, "active_deployment": line.ActiveDeployment, "profile": line.Profile},
-		"counts": map[string]int{"specs": specs, "snapshots": snapshots, "incidents": incidents, "operations": operations},
-	})
-	if err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO line_deletion_audit
- (line_id,line_name,requested_by,reason,snapshot,deleted_at) VALUES(?,?,?,?,?,?)`,
-		line.ID, line.Name, requestedBy, reason, audit, now()); err != nil {
-		return err
-	}
-	for _, query := range []string{
-		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
-		`DELETE FROM operations WHERE line_id=?`, `DELETE FROM snapshots WHERE line_id=?`,
-		`DELETE FROM incidents WHERE line_id=?`, `DELETE FROM line_specs WHERE line_id=?`,
-		`DELETE FROM lines WHERE id=?`,
-	} {
-		if _, err = tx.ExecContext(ctx, query, id); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
 	stamp := now()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO lines

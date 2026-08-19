@@ -1,6 +1,7 @@
 import {TrafficCharts} from "./traffic-charts.js";
 import {DeviceTopology} from "./device-topology.js";
 import {TrafficWorkspace} from "./traffic-workspace.js";
+import {lineDeletionAction} from "./line-actions.js";
 
 const state = {
   token: sessionStorage.getItem("nbAdminToken") || "",
@@ -171,8 +172,13 @@ function lineRow(line) {
   const route = nodes.map((n) => n.device?.name || n.device_id).join(" → ") || `${line.entry_region} → ${line.exit_region}`;
   const definitions = line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.validate","验证",""] ,["line.tune","协议调优",""] ,["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
   const actions = definitions.map(([kind,label,style]) => { const a = operationAvailability(line.id,kind); return `<button class="action-button ${style}" ${a.enabled ? `data-action="${kind}" data-line="${escapeHTML(line.id)}"` : `disabled title="${escapeHTML(a.reason)}"`}>${label}</button>`; }).join("");
-  const canDelete = !nodes.length || ["draft","disabled","archived"].includes(line.status);
-  const deleteAction = canDelete ? `<button class="action-button danger-action" data-delete-line="${escapeHTML(line.id)}">删除</button>` : "";
+  const hasActiveOperation=state.operations.some((item)=>item.line_id===line.id&&["queued","dispatched","running"].includes(item.status));
+  const hasFailedDisable=state.operations.some((item)=>item.line_id===line.id&&item.kind==="line.disable"&&item.status==="failed");
+  const hasNodeProblem=nodes.some((node)=>["unreachable","down","degraded","unhealthy","offline"].includes(node.device?.last_health));
+  const deletion=lineDeletionAction(line.status,nodes.length>0,hasActiveOperation,hasNodeProblem||hasFailedDisable);
+  const deleteAction=deletion.mode==="normal"?`<button class="action-button danger-action" data-delete-line="${escapeHTML(line.id)}">${deletion.label}</button>`:
+    deletion.mode==="force"?`<button class="action-button danger-action" data-force-delete-line="${escapeHTML(line.id)}">${deletion.label}</button>`:
+    `<button class="action-button danger-action" disabled title="${escapeHTML(deletion.reason)}">${deletion.label}</button>`;
   const upstream=detail?.spec?.upstream_mbps||detail?.spec?.bandwidth_mbps||line.capacity_mbps,downstream=detail?.spec?.downstream_mbps||detail?.spec?.bandwidth_mbps||line.capacity_mbps;
   return `<tr data-line-search="${escapeHTML(`${line.id} ${line.name} ${route}`.toLowerCase())}" data-line-status="${escapeHTML(line.status)}"><td><button class="text-button" data-line-detail="${escapeHTML(line.id)}"><strong>${escapeHTML(line.name)}</strong><small>${escapeHTML(line.id)}</small></button></td><td>${badge(line.status)}</td><td><div class="route-summary">${escapeHTML(route)}</div></td><td>↑ ${number(upstream)} / ↓ ${number(downstream)} Mbps</td><td>${detail?.spec?.socks_port || "--"}</td><td><span class="mono">${escapeHTML(line.profile || "--")}</span></td><td><div class="actions">${actions}${deleteAction}</div></td></tr>`;
 }
@@ -186,11 +192,21 @@ async function deleteLine(id) {
   } catch (error) { toast(error.message); }
 }
 
+function openForceDeleteLine(id) {
+  const form=$("#forceDeleteLineForm"),line=state.lines.find((item)=>item.id===id);
+  form.reset();form.elements.line_id.value=id;
+  $("#forceDeleteLineTarget").textContent=line?`${line.name} · ${id}`:id;
+  $("#forceDeleteLineHint").textContent=`请输入完整线路 ID：${id}`;
+  $("#forceDeleteLineError").textContent="";
+  $("#forceDeleteLineModal").classList.remove("hidden");
+}
+
 function renderLines() {
   $("#linesTable").innerHTML = state.lines.length ? state.lines.map(lineRow).join("") : `<tr><td class="empty" colspan="7">尚未登记线路</td></tr>`;
   filterLines();
   $$('[data-action]').forEach((button) => button.addEventListener("click", () => openOperation(button.dataset.line, button.dataset.action)));
   $$('[data-delete-line]').forEach((button) => button.addEventListener("click", () => deleteLine(button.dataset.deleteLine)));
+  $$('[data-force-delete-line]').forEach((button) => button.addEventListener("click", () => openForceDeleteLine(button.dataset.forceDeleteLine)));
   $("#operationLine").innerHTML = `<option value="">全部线路</option>${state.lines.map((line) => `<option value="${escapeHTML(line.id)}">${escapeHTML(line.name)}</option>`).join("")}`;
   bindDetails();
 }
@@ -311,11 +327,19 @@ $("#confirmDeviceHostKey").addEventListener("click",async()=>{
 for(const name of ["host","ssh_port"]){$("#deviceForm").elements[name].addEventListener("input",clearDeviceHostKeyConfirmation);}
 $("#lineForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,submit=form.querySelector("[type=submit]"),v=Object.fromEntries(new FormData(form));if(submit.disabled)return;submit.disabled=true;const numeric=["upstream_mbps","downstream_mbps","socks_port"];numeric.forEach((key)=>v[key]=Number(v[key]||0));v.bandwidth_mbps=Math.max(v.upstream_mbps,v.downstream_mbps);const line={id:v.id,name:v.name,status:"draft",entry_region:v.entry_region,exit_region:v.exit_region,provider:"mixed",capacity_mbps:v.bandwidth_mbps,active_deployment:"",profile:"",secret_ref:""};const dns=(v.dns_servers||"1.1.1.1,8.8.8.8").split(/[\s,]+/).map(x=>x.trim()).filter(Boolean);const spec={line_id:v.id,resource_group:v.resource_group,instance_id:v.instance_id,bandwidth_mbps:v.bandwidth_mbps,upstream_mbps:v.upstream_mbps,downstream_mbps:v.downstream_mbps,socks_port:v.socks_port,relay_port:0,exit_port:0,exit_bind_ip:(v.exit_bind_ip||"").trim(),dns_servers:dns,udp_port_min:0,udp_port_max:0,whitelist:v.whitelist.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),build_mode:v.build_mode,artifact_ref:v.artifact_ref,source_ref:v.source_ref,srs_ref:v.srs_ref,jump_policy:v.jump_policy,nodes:[{device_id:v.entry_device,role:"entry",ordinal:0,next_hop_device_id:v.relay_device,jump_candidates:[],config:{}},{device_id:v.relay_device,role:"relay",ordinal:0,next_hop_device_id:v.exit_device,jump_candidates:[v.entry_device],config:{}},{device_id:v.exit_device,role:"exit",ordinal:0,next_hop_device_id:"",jump_candidates:[v.relay_device,v.entry_device],config:{}}]};let lineCreated=false,specSaved=false;try{await api("/api/v1/lines",{method:"POST",body:JSON.stringify(line)});lineCreated=true;await api(`/api/v1/lines/${encodeURIComponent(v.id)}/spec`,{method:"PUT",body:JSON.stringify(spec)});specSaved=true;await api("/api/v1/operations",{method:"POST",headers:{"Idempotency-Key":`web-${crypto.randomUUID()}`},body:JSON.stringify({line_id:v.id,kind:"line.open",requested_by:"operator",request:{note:"created from topology editor"}})});$("#lineModal").classList.add("hidden");form.reset();await loadAll();switchView("operations");toast("线路已登记，双向平均速率和出口 DNS 已配置，开线任务已排队");}catch(error){if(lineCreated&&!specSaved){await api(`/api/v1/lines/${encodeURIComponent(v.id)}`,{method:"DELETE",body:JSON.stringify({requested_by:"operator",reason:"rollback incomplete web line creation"})}).catch(()=>{});}$("#lineError").textContent=error.message;await loadAll().catch(()=>{});}finally{submit.disabled=false;}});
 $("#operationForm").addEventListener("submit",async(event)=>{event.preventDefault();const v=Object.fromEntries(new FormData(event.currentTarget));try{await api("/api/v1/operations",{method:"POST",headers:{"Idempotency-Key":`web-${crypto.randomUUID()}`},body:JSON.stringify({line_id:v.line_id,kind:v.kind,requested_by:v.requested_by,request:{deployment:v.deployment,note:v.note}})});$("#operationModal").classList.add("hidden");await loadAll();switchView("operations");toast("任务已进入队列");}catch(error){$("#operationError").textContent=error.message;}});
+$("#forceDeleteLineForm").addEventListener("submit",async(event)=>{
+  event.preventDefault();const form=event.currentTarget,v=Object.fromEntries(new FormData(form)),button=form.querySelector("[type=submit]");
+  $("#forceDeleteLineError").textContent="";button.disabled=true;
+  try{
+    await api(`/api/v1/lines/${encodeURIComponent(v.line_id)}`,{method:"DELETE",body:JSON.stringify({requested_by:"operator",reason:v.reason.trim(),force:true,confirmation:v.confirmation.trim(),acknowledge_orphans:v.acknowledge_orphans==="on"})});
+    $("#forceDeleteLineModal").classList.add("hidden");await loadAll();toast("线路已强制删除，审计记录已保留");
+  }catch(error){$("#forceDeleteLineError").textContent=error.message;}finally{button.disabled=false;}
+});
 
 $$('.nav-item').forEach((item)=>item.addEventListener("click",()=>switchView(item.dataset.view)));
 $("#contextAction").addEventListener("click",()=>{if(state.view==="devices"){const form=$("#deviceForm");form.reset();delete form.dataset.originalHost;delete form.dataset.originalPort;delete form.dataset.hostKeyStatus;clearDeviceHostKeyConfirmation();form.elements.id.readOnly=false;form.elements.password.required=true;$("#devicePasswordLabel").textContent="SSH 密码";$("#devicePasswordHint").textContent="首次登记必须输入，保存后不会回显";$("#scanDeviceHostKey").textContent="扫描主机密钥";$("#deviceError").textContent="";$("#deviceModal").classList.remove("hidden");}else{$("#lineError").textContent="";$("#lineModal").classList.remove("hidden");}});
 $("#refreshButton").addEventListener("click",()=>loadAll().catch(()=>{}));
-$$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
+$$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-force-delete-line').forEach((x)=>x.addEventListener("click",()=>$("#forceDeleteLineModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
 $("#deviceSearch").addEventListener("input",filterDevices);$("#deviceStatus").addEventListener("change",filterDevices);$("#lineSearch").addEventListener("input",filterLines);$("#lineStatus").addEventListener("change",filterLines);$("#topologyLine").addEventListener("change",renderOverviewTopology);
 for(const selector of ["#deviceTopologyLine","#deviceTopologyRegion","#deviceTopologyRole","#deviceTopologyHealth"])$(selector).addEventListener("change",renderDeviceTopology);
 const resetTopologyButton=document.createElement("button");

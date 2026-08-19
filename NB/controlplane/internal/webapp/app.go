@@ -352,29 +352,6 @@ func (a *App) line(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, line)
 }
 
-func (a *App) deleteLine(w http.ResponseWriter, r *http.Request) {
-	var request struct {
-		RequestedBy string `json:"requested_by"`
-		Reason      string `json:"reason"`
-	}
-	if !decode(w, r, &request) {
-		return
-	}
-	if !safeID.MatchString(request.RequestedBy) || strings.TrimSpace(request.Reason) == "" || len(request.Reason) > 300 {
-		problem(w, 400, "requested_by and deletion reason are required")
-		return
-	}
-	if err := a.store.DeleteLine(r.Context(), r.PathValue("id"), request.RequestedBy, request.Reason); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			problem(w, 404, "line not found")
-		} else {
-			problem(w, 409, err.Error())
-		}
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func (a *App) patchLine(w http.ResponseWriter, r *http.Request) {
 	line, err := a.store.Line(r.Context(), r.PathValue("id"))
 	if err != nil {

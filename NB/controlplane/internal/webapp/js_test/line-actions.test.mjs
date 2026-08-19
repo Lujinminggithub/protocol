@@ -1,0 +1,12 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {lineDeletionAction} from "../assets/line-actions.js";
+
+test("line deletion action distinguishes normal, force, and blocked deletion", () => {
+  assert.deepEqual(lineDeletionAction("disabled", true, false, false), {mode:"normal", label:"删除"});
+  assert.deepEqual(lineDeletionAction("active", true, false, true), {mode:"force", label:"强制删除"});
+  assert.deepEqual(lineDeletionAction("maintenance", true, false, true), {mode:"force", label:"强制删除"});
+  assert.deepEqual(lineDeletionAction("active", true, true, true), {mode:"blocked", label:"任务执行中", reason:"线路仍有排队中或执行中的任务"});
+  assert.deepEqual(lineDeletionAction("active", false, false, false), {mode:"normal", label:"删除"});
+  assert.deepEqual(lineDeletionAction("active", true, false, false), {mode:"blocked", label:"请先停用", reason:"线路节点正常，请先执行停用"});
+});
