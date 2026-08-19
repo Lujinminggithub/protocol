@@ -7,11 +7,6 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_tickets off;
 
-    # Render this value from the operator workstation's current public IP.
-    allow 127.0.0.1;
-    allow __OPERATOR_PUBLIC_IP__;
-    deny all;
-
     client_max_body_size 2m;
     location / {
         proxy_pass http://127.0.0.1:19091;
