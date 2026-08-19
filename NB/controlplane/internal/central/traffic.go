@@ -352,7 +352,6 @@ func (s *Store) TrafficHistory(ctx context.Context, lineID string, from, to time
 	if err != nil {
 		return TrafficHistoryResult{}, err
 	}
-	defer operationRows.Close()
 	for operationRows.Next() {
 		var marker TrafficMarker
 		var status string
@@ -364,8 +363,50 @@ func (s *Store) TrafficHistory(ctx context.Context, lineID string, from, to time
 		result.Markers = append(result.Markers, marker)
 	}
 	if err = operationRows.Err(); err != nil {
+		_ = operationRows.Close()
 		return TrafficHistoryResult{}, err
 	}
+	_ = operationRows.Close()
+	eventRows, err := s.db.QueryContext(ctx, `SELECT MIN(events.created_at),events.stage,events.status
+ FROM operation_events events JOIN operations operation ON operation.id=events.operation_id
+ WHERE operation.line_id=? AND events.created_at>=? AND events.created_at<?
+ GROUP BY events.operation_id,events.stage,events.status ORDER BY MIN(events.created_at)`, lineID,
+		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return TrafficHistoryResult{}, err
+	}
+	for eventRows.Next() {
+		var observedAt, stage, status string
+		if err = eventRows.Scan(&observedAt, &stage, &status); err != nil {
+			_ = eventRows.Close()
+			return TrafficHistoryResult{}, err
+		}
+		result.Markers = append(result.Markers, TrafficMarker{ObservedAt: observedAt, Kind: "operation_event", Label: stage + " · " + status})
+	}
+	if err = eventRows.Err(); err != nil {
+		_ = eventRows.Close()
+		return TrafficHistoryResult{}, err
+	}
+	_ = eventRows.Close()
+	incidentRows, err := s.db.QueryContext(ctx, `SELECT observed_at,kind,severity,status FROM incidents
+ WHERE line_id=? AND observed_at>=? AND observed_at<? ORDER BY observed_at`, lineID,
+		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return TrafficHistoryResult{}, err
+	}
+	for incidentRows.Next() {
+		var observedAt, kind, severity, status string
+		if err = incidentRows.Scan(&observedAt, &kind, &severity, &status); err != nil {
+			_ = incidentRows.Close()
+			return TrafficHistoryResult{}, err
+		}
+		result.Markers = append(result.Markers, TrafficMarker{ObservedAt: observedAt, Kind: "incident", Label: kind + " · " + severity + " · " + status})
+	}
+	if err = incidentRows.Err(); err != nil {
+		_ = incidentRows.Close()
+		return TrafficHistoryResult{}, err
+	}
+	_ = incidentRows.Close()
 	sort.Slice(result.Markers, func(i, j int) bool { return result.Markers[i].ObservedAt < result.Markers[j].ObservedAt })
 	return result, nil
 }

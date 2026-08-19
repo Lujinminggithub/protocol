@@ -529,6 +529,57 @@ func TestTrafficHistoryAggregatesWorkersWithoutAddingHops(t *testing.T) {
 	}
 }
 
+func TestTrafficHistoryIncludesSafeOperationalMarkers(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-markers", Name: "markers", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 19, 1, 0, 0, 0, time.UTC)
+	if _, err = store.db.Exec(`INSERT INTO operations(id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?)`, "op-marker", "line-markers", "line.validate", "succeeded", "operator", "marker-key",
+		[]byte(`{"secret":"must-not-leak"}`), []byte(`{"stdout":"must-not-leak"}`),
+		base.Add(10*time.Second).Format(time.RFC3339Nano), base.Add(30*time.Second).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`INSERT INTO operation_events(operation_id,sequence,stage,status,message,parameters,created_at)
+ VALUES(?,?,?,?,?,?,?)`, "op-marker", 1, "probe", "running", "private command output", []byte(`{"password":"secret"}`),
+		base.Add(20*time.Second).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.RecordIncident(t.Context(), Incident{ID: "incident-marker", LineID: "line-markers", Severity: "warning",
+		Status: "open", Kind: "packet-loss", Message: "sensitive remote output", ObservedAt: base.Add(40 * time.Second).Format(time.RFC3339Nano),
+		Payload: json.RawMessage(`{"credential":"secret"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	history, err := store.TrafficHistory(t.Context(), "line-markers", base, base.Add(time.Minute), 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Markers) != 3 {
+		t.Fatalf("markers=%+v want operation, event, incident", history.Markers)
+	}
+	encoded, err := json.Marshal(history.Markers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, required := range []string{`"kind":"operation"`, `"kind":"operation_event"`, `"kind":"incident"`, "probe", "packet-loss"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("markers missing %q: %s", required, text)
+		}
+	}
+	for _, forbidden := range []string{"must-not-leak", "private command output", "password", "credential"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("markers leaked %q: %s", forbidden, text)
+		}
+	}
+}
+
 func TestTrafficResolutionAndRetention(t *testing.T) {
 	if got := TrafficResolution(2 * time.Hour); got != 15 {
 		t.Fatalf("2h resolution=%d", got)
@@ -670,5 +721,54 @@ func TestTopologyDeduplicatesSharedDevicesAndKeepsLineEdges(t *testing.T) {
 	}
 	if shared != 2 {
 		t.Fatalf("shared GZ-HK line edges=%d want 2", shared)
+	}
+}
+
+func TestTopologyLayoutPersistsAndResets(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertDevice(t.Context(), Device{ID: "entry-1", Name: "Entry", Status: "ready",
+		Host: "192.0.2.10", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	want := TopologyLayout{DeviceID: "entry-1", X: -120.5, Y: 8, Z: 3, UpdatedBy: "operator"}
+	if err = store.SaveTopologyLayouts(t.Context(), []TopologyLayout{want}); err != nil {
+		t.Fatal(err)
+	}
+	topology, err := store.Topology(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topology.Devices) != 1 || topology.Devices[0].Layout == nil {
+		t.Fatalf("layout missing from topology: %+v", topology)
+	}
+	got := topology.Devices[0].Layout
+	if got.X != want.X || got.Y != want.Y || got.Z != want.Z || got.UpdatedBy != want.UpdatedBy || got.UpdatedAt == "" {
+		t.Fatalf("layout=%+v want=%+v", got, want)
+	}
+	if err = store.ResetTopologyLayouts(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	topology, err = store.Topology(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topology.Devices[0].Layout != nil {
+		t.Fatalf("layout survived reset: %+v", topology.Devices[0].Layout)
+	}
+}
+
+func TestTopologyLayoutRejectsUnknownDevice(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	err = store.SaveTopologyLayouts(t.Context(), []TopologyLayout{{DeviceID: "missing", X: 1, UpdatedBy: "operator"}})
+	if err == nil {
+		t.Fatal("unknown device layout was accepted")
 	}
 }

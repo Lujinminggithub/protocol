@@ -1,5 +1,6 @@
 import {TrafficCharts} from "./traffic-charts.js";
 import {DeviceTopology} from "./device-topology.js";
+import {TrafficWorkspace} from "./traffic-workspace.js";
 
 const state = {
   token: sessionStorage.getItem("nbAdminToken") || "",
@@ -42,6 +43,10 @@ async function api(path, options = {}) {
 
 function badge(value) { return `<span class="badge ${escapeHTML(value)}">${escapeHTML(statusText[value] || value || "未知")}</span>`; }
 function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove("show"), 2800); }
+async function saveTopologyLayouts(layouts) {
+  try { await api("/api/v1/topology/layout",{method:"PUT",body:JSON.stringify({updated_by:"operator",layouts})}); }
+  catch(error) { toast(`拓扑布局保存失败：${error.message}`); throw error; }
+}
 function setConnected(ok) { $("#apiDot").classList.toggle("online", ok); $("#apiStatus").textContent = ok ? "中央服务在线" : "未连接"; }
 function metric(label, value, note) { return `<div class="metric"><span class="metric-label">${label}</span><strong class="metric-value">${value}</strong><span class="metric-note">${note}</span></div>`; }
 
@@ -101,7 +106,7 @@ function renderOverviewTopology() {
   const previous = select.value;
   select.innerHTML = `<option value="">全部线路</option>${state.lines.map((line) => `<option value="${escapeHTML(line.id)}">${escapeHTML(line.name)}</option>`).join("")}`;
   if (state.lines.some((line) => line.id === previous) || previous === "") select.value = previous;
-  if (!state.overviewTopology) state.overviewTopology = new DeviceTopology($("#overviewTopology"), {onDevice:showDeviceDetail,onLine:showLineDetail});
+  if (!state.overviewTopology) state.overviewTopology = new DeviceTopology($("#overviewTopology"), {onDevice:showDeviceDetail,onLine:showLineDetail,onSaveLayout:saveTopologyLayouts});
   state.overviewTopology.render(state.topology,{lineID:select.value});
 }
 
@@ -111,7 +116,7 @@ function renderDeviceTopology() {
   if(state.lines.some((line)=>line.id===previousLine))lineSelect.value=previousLine;
   const regions=[...new Set(state.devices.map((device)=>device.region).filter(Boolean))].sort();regionSelect.innerHTML=`<option value="">全部区域</option>${regions.map((region)=>`<option value="${escapeHTML(region)}">${escapeHTML(region)}</option>`).join("")}`;
   if(regions.includes(previousRegion))regionSelect.value=previousRegion;
-  if(!state.deviceTopology)state.deviceTopology=new DeviceTopology($("#deviceTopology"),{onDevice:showDeviceDetail,onLine:showLineDetail});
+  if(!state.deviceTopology)state.deviceTopology=new DeviceTopology($("#deviceTopology"),{onDevice:showDeviceDetail,onLine:showLineDetail,onSaveLayout:saveTopologyLayouts});
   state.deviceTopology.render(state.topology,{lineID:lineSelect.value,region:regionSelect.value,role:$("#deviceTopologyRole").value,health:$("#deviceTopologyHealth").value});
 }
 
@@ -305,6 +310,24 @@ $("#refreshButton").addEventListener("click",()=>loadAll().catch(()=>{}));
 $$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
 $("#deviceSearch").addEventListener("input",filterDevices);$("#deviceStatus").addEventListener("change",filterDevices);$("#lineSearch").addEventListener("input",filterLines);$("#lineStatus").addEventListener("change",filterLines);$("#topologyLine").addEventListener("change",renderOverviewTopology);
 for(const selector of ["#deviceTopologyLine","#deviceTopologyRegion","#deviceTopologyRole","#deviceTopologyHealth"])$(selector).addEventListener("change",renderDeviceTopology);
+const resetTopologyButton=document.createElement("button");
+resetTopologyButton.type="button";resetTopologyButton.className="secondary topology-reset";resetTopologyButton.textContent="重置布局";
+resetTopologyButton.addEventListener("click",async()=>{
+  try{
+    await api("/api/v1/topology/layout",{method:"DELETE"});state.topology=await api("/api/v1/topology");
+    state.deviceTopology?.reset(state.topology,{lineID:$("#deviceTopologyLine").value,region:$("#deviceTopologyRegion").value,role:$("#deviceTopologyRole").value,health:$("#deviceTopologyHealth").value});
+    state.overviewTopology?.reset(state.topology,{lineID:$("#topologyLine").value});toast("拓扑布局已重置");
+  }catch(error){toast(`重置布局失败：${error.message}`);}
+});
+$(".topology-filters").append(resetTopologyButton);
+let trafficWorkspace=null;
+document.addEventListener("nb:open-traffic",(event)=>{
+  const lineID=event.detail?.lineID,detail=state.details[lineID];if(!lineID)return;
+  if(!trafficWorkspace)trafficWorkspace=new TrafficWorkspace($("#trafficWorkspace"),{token:state.token});
+  trafficWorkspace.token=state.token;
+  $("#detailModal").classList.add("hidden");
+  trafficWorkspace.open({id:lineID,name:detail?.line?.name||lineID});
+});
 $("#operationLine").addEventListener("change",async()=>{const id=$("#operationLine").value,data=await api(`/api/v1/operations?limit=100${id?`&line_id=${encodeURIComponent(id)}`:""}`);state.operations=data.operations||[];renderOperations();});$("#reloadOperations").addEventListener("click",()=>$("#operationLine").dispatchEvent(new Event("change")));
 if(state.token)loadAll().catch(()=>{});else $("#authModal").classList.remove("hidden");
 setInterval(()=>{if(state.token&&document.visibilityState==="visible")loadAll().catch(()=>{});},10000);

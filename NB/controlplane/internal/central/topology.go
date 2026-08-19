@@ -7,17 +7,27 @@ import (
 )
 
 type TopologyDevice struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Health     string `json:"health"`
-	Host       string `json:"host"`
-	PrivateIP  string `json:"private_ip"`
-	Region     string `json:"region"`
-	Provider   string `json:"provider"`
-	OS         string `json:"os"`
-	Arch       string `json:"arch"`
-	LastSeenAt string `json:"last_seen_at"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
+	Health     string          `json:"health"`
+	Host       string          `json:"host"`
+	PrivateIP  string          `json:"private_ip"`
+	Region     string          `json:"region"`
+	Provider   string          `json:"provider"`
+	OS         string          `json:"os"`
+	Arch       string          `json:"arch"`
+	LastSeenAt string          `json:"last_seen_at"`
+	Layout     *TopologyLayout `json:"layout,omitempty"`
+}
+
+type TopologyLayout struct {
+	DeviceID  string  `json:"device_id"`
+	X         float64 `json:"x"`
+	Y         float64 `json:"y"`
+	Z         float64 `json:"z"`
+	UpdatedBy string  `json:"updated_by"`
+	UpdatedAt string  `json:"updated_at"`
 }
 
 type TopologyLink struct {
@@ -62,6 +72,10 @@ func snapshotRoleHealth(items []Snapshot, role string) (string, float64, float64
 
 func (s *Store) Topology(ctx context.Context) (TopologyResult, error) {
 	result := TopologyResult{Devices: []TopologyDevice{}, Links: []TopologyLink{}}
+	layouts, err := s.topologyLayouts(ctx)
+	if err != nil {
+		return result, err
+	}
 	devices, err := s.Devices(ctx)
 	if err != nil {
 		return result, err
@@ -69,7 +83,8 @@ func (s *Store) Topology(ctx context.Context) (TopologyResult, error) {
 	for _, item := range devices {
 		result.Devices = append(result.Devices, TopologyDevice{ID: item.ID, Name: item.Name, Status: item.Status,
 			Health: item.LastHealth, Host: item.Host, PrivateIP: item.PrivateIP, Region: item.Region,
-			Provider: item.Provider, OS: item.OS, Arch: item.Arch, LastSeenAt: item.LastSeenAt})
+			Provider: item.Provider, OS: item.OS, Arch: item.Arch, LastSeenAt: item.LastSeenAt,
+			Layout: layouts[item.ID]})
 	}
 	lines, err := s.Lines(ctx)
 	if err != nil {
@@ -98,4 +113,44 @@ func (s *Store) Topology(ctx context.Context) (TopologyResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func (s *Store) topologyLayouts(ctx context.Context) (map[string]*TopologyLayout, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT device_id,x,y,z,updated_by,updated_at FROM topology_layouts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]*TopologyLayout)
+	for rows.Next() {
+		item := &TopologyLayout{}
+		if err = rows.Scan(&item.DeviceID, &item.X, &item.Y, &item.Z, &item.UpdatedBy, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result[item.DeviceID] = item
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) SaveTopologyLayouts(ctx context.Context, items []TopologyLayout) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	updatedAt := now()
+	for _, item := range items {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO topology_layouts(device_id,x,y,z,updated_by,updated_at)
+ VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET
+ x=excluded.x,y=excluded.y,z=excluded.z,updated_by=excluded.updated_by,updated_at=excluded.updated_at`,
+			item.DeviceID, item.X, item.Y, item.Z, item.UpdatedBy, updatedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ResetTopologyLayouts(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM topology_layouts`)
+	return err
 }

@@ -241,6 +241,11 @@ CREATE TABLE IF NOT EXISTS devices (
  last_health TEXT NOT NULL DEFAULT 'unknown', last_seen_at TEXT NOT NULL DEFAULT '',
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS topology_layouts (
+ device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+ x REAL NOT NULL, y REAL NOT NULL, z REAL NOT NULL,
+ updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS line_specs (
  line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
  resource_group TEXT NOT NULL, instance_id TEXT NOT NULL,

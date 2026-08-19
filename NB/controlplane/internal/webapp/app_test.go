@@ -163,6 +163,46 @@ func TestTopologyAPIRequiresAdminAuthorization(t *testing.T) {
 	}
 }
 
+func TestTopologyLayoutAPIValidatesPersistsAndResets(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err = database.UpsertDevice(t.Context(), central.Device{ID: "entry-1", Name: "Entry", Status: "ready",
+		Host: "192.0.2.10", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	request := map[string]any{"updated_by": "operator", "layouts": []map[string]any{{
+		"device_id": "entry-1", "x": -140.0, "y": 12.0, "z": 4.0,
+	}}}
+	response, body := call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/topology/layout", "admin", "", request)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"x":-140`)) {
+		t.Fatalf("save layout status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/topology", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"layout":{"device_id":"entry-1"`)) {
+		t.Fatalf("topology layout status=%d body=%s", response.StatusCode, body)
+	}
+	invalid := map[string]any{"updated_by": "operator", "layouts": []map[string]any{{
+		"device_id": "entry-1", "x": 10001.0, "y": 0.0, "z": 0.0,
+	}}}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/topology/layout", "admin", "", invalid)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid layout status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodDelete, server.URL+"/api/v1/topology/layout", "admin", "", nil)
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("reset layout status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/topology", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || bytes.Contains(body, []byte(`"layout"`)) {
+		t.Fatalf("layout remained after reset status=%d body=%s", response.StatusCode, body)
+	}
+}
+
 func TestVisualizationAssetsAreEmbeddedLocally(t *testing.T) {
 	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -178,6 +218,9 @@ func TestVisualizationAssetsAreEmbeddedLocally(t *testing.T) {
 		"/vendor/3d-force-graph-1.80.0.min.js": 1000000,
 		"/traffic-charts.js":                   3000,
 		"/device-topology.js":                  3000,
+		"/traffic-workspace.js":                3000,
+		"/traffic-time.js":                     800,
+		"/topology-layout.js":                  1000,
 	} {
 		response, err := server.Client().Get(server.URL + path)
 		if err != nil {
@@ -201,7 +244,7 @@ func TestVisualizationAssetsAreEmbeddedLocally(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"echarts-6.1.0.min.js", "3d-force-graph-1.80.0.min.js", `type="module"`, `id="deviceTopology"`} {
+	for _, required := range []string{"echarts-6.1.0.min.js", "3d-force-graph-1.80.0.min.js", `type="module"`, `id="deviceTopology"`, `id="trafficWorkspace"`, `data-traffic-from`, `data-traffic-events`} {
 		if !bytes.Contains(body, []byte(required)) {
 			t.Fatalf("index is missing %q", required)
 		}

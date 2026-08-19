@@ -65,6 +65,30 @@
     </main>
   </div>
 
+  <section class="traffic-workspace hidden" id="trafficWorkspace" aria-label="线路流量分析">
+    <header class="traffic-workspace-head">
+      <div><button class="icon-button" type="button" data-traffic-close aria-label="关闭流量分析" title="返回">←</button></div>
+      <div class="traffic-workspace-title"><h2 data-traffic-title>流量分析</h2><p data-traffic-subtitle></p></div>
+      <span class="traffic-live-status" data-traffic-status><i></i>准备加载</span>
+    </header>
+    <div class="traffic-range-bar">
+      <div class="segmented" role="group" aria-label="快捷时间范围">
+        <button type="button" data-traffic-preset="30m">30m</button><button type="button" data-traffic-preset="2h">2h</button>
+        <button type="button" data-traffic-preset="6h">6h</button><button type="button" data-traffic-preset="24h">24h</button>
+        <button type="button" data-traffic-preset="7d">7d</button><button type="button" data-traffic-preset="30d">30d</button>
+      </div>
+      <label>开始<input type="datetime-local" data-traffic-from></label>
+      <label>结束<input type="datetime-local" data-traffic-to></label>
+      <button class="secondary" type="button" data-traffic-apply>查询</button>
+      <button class="secondary hidden" type="button" data-traffic-live>返回实时</button>
+      <span class="traffic-range-error" data-traffic-range-error role="alert"></span>
+    </div>
+    <div class="traffic-workspace-body">
+      <main class="traffic-analysis-main"><div class="traffic-charts" data-traffic-charts></div></main>
+      <aside class="traffic-event-rail"><div class="section-head"><div><h2>证据时间轴</h2><p>点击事件定位前后 15 分钟</p></div></div><div data-traffic-events></div></aside>
+    </div>
+  </section>
+
   <div class="modal-backdrop" id="authModal"><form class="modal auth-modal" id="authForm"><div class="modal-head"><div><h2>连接运营控制台</h2><p>输入当前 nb-web 进程使用的管理员令牌</p></div></div><label>管理员令牌<input id="tokenInput" type="password" autocomplete="current-password" required></label><div class="form-error auth-error" id="authError" role="alert" aria-live="polite"></div><button class="primary full" id="authSubmit" type="submit">连接</button></form></div>
 
   <div class="modal-backdrop hidden" id="deviceModal"><form class="modal wide" id="deviceForm"><div class="modal-head"><div><h2>录入服务器设备</h2><p>登记管理地址、区域和 SSH 登录凭据</p></div><button type="button" class="icon-button close-device">×</button></div><div class="form-grid three">

@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -93,6 +94,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", a.ready)
 	mux.HandleFunc("GET /api/v1/dashboard", a.admin(a.dashboard))
 	mux.HandleFunc("GET /api/v1/topology", a.admin(a.topology))
+	mux.HandleFunc("PUT /api/v1/topology/layout", a.admin(a.saveTopologyLayout))
+	mux.HandleFunc("DELETE /api/v1/topology/layout", a.admin(a.resetTopologyLayout))
 	mux.HandleFunc("GET /api/v1/lines", a.admin(a.lines))
 	mux.HandleFunc("POST /api/v1/lines", a.admin(a.upsertLine))
 	mux.HandleFunc("GET /api/v1/lines/{id}", a.admin(a.line))
@@ -233,6 +236,53 @@ func (a *App) topology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *App) saveTopologyLayout(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		UpdatedBy string                   `json:"updated_by"`
+		Layouts   []central.TopologyLayout `json:"layouts"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	if !safeID.MatchString(request.UpdatedBy) || len(request.Layouts) == 0 || len(request.Layouts) > 1000 {
+		problem(w, http.StatusBadRequest, "布局提交人和设备坐标不能为空")
+		return
+	}
+	seen := make(map[string]bool, len(request.Layouts))
+	for index := range request.Layouts {
+		item := &request.Layouts[index]
+		item.UpdatedBy = request.UpdatedBy
+		if !safeID.MatchString(item.DeviceID) || seen[item.DeviceID] {
+			problem(w, http.StatusBadRequest, "设备布局包含无效或重复的设备 ID")
+			return
+		}
+		seen[item.DeviceID] = true
+		for _, coordinate := range []float64{item.X, item.Y, item.Z} {
+			if math.IsNaN(coordinate) || math.IsInf(coordinate, 0) || math.Abs(coordinate) > 10000 {
+				problem(w, http.StatusBadRequest, "设备布局坐标无效")
+				return
+			}
+		}
+		if _, err := a.store.Device(r.Context(), item.DeviceID); err != nil {
+			problem(w, http.StatusBadRequest, "设备布局引用了不存在的设备")
+			return
+		}
+	}
+	if err := a.store.SaveTopologyLayouts(r.Context(), request.Layouts); err != nil {
+		problem(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"layouts": request.Layouts})
+}
+
+func (a *App) resetTopologyLayout(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.ResetTopologyLayouts(r.Context()); err != nil {
+		problem(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) lines(w http.ResponseWriter, r *http.Request) {
