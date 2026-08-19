@@ -1,6 +1,6 @@
 export function healthTone(value) {
   const health=value==="healthy"?"ok":(value||"unknown");
-  if(["down","offline","unhealthy"].includes(health))return "critical";
+  if(["down","offline","unhealthy","unreachable"].includes(health))return "critical";
   if(["degraded","unknown"].includes(health))return "warning";
   return "normal";
 }

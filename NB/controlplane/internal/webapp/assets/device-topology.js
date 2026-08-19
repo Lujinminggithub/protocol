@@ -82,13 +82,16 @@ export class DeviceTopology{
   }
   initialize(){
     this.root.innerHTML="";
-    this.linkColor=(link)=>["down","degraded"].includes(link.health)?"#c4473d":link.line_id===this.selectedLine?"#087f8c":"#83a6aa";
+    this.linkColor=(link)=>["down","degraded","offline","unhealthy","unreachable"].includes(link.health)?"#c4473d":link.line_id===this.selectedLine?"#087f8c":"#83a6aa";
     this.linkWidth=(link)=>link.line_id===this.selectedLine?1:.28;
-    this.graph=globalThis.ForceGraph3D()(this.root).backgroundColor("#f8fafb").showNavInfo(false).nodeThreeObject(computerModel)
+    this.graph=globalThis.ForceGraph3D()(this.root).backgroundColor("#e7eef0").showNavInfo(false).nodeThreeObject(computerModel)
       .nodeLabel((node)=>`${node.name||node.id} · ${node.region||"--"} · ${deviceHealth(node)}`)
       .linkColor(this.linkColor).linkWidth(this.linkWidth).linkOpacity(.68)
       .onNodeClick((node)=>this.onDevice?.(node.id)).onLinkClick((link)=>this.focusLine(link.line_id))
       .onNodeDragEnd((node)=>this.persistNode(node));
+    const grid=new THREE.GridHelper(720,36,0x91aeb3,0xc5d4d7);
+    grid.rotation.x=Math.PI/2;grid.position.z=-42;grid.material.transparent=true;grid.material.opacity=.34;
+    this.graph.scene().add(grid);
     this.graph.d3Force("charge").strength(-105);this.graph.d3Force("link").distance(70);
     this.resizeObserver=new ResizeObserver(()=>this.graph?.width(this.root.clientWidth).height(this.root.clientHeight));this.resizeObserver.observe(this.root);
   }

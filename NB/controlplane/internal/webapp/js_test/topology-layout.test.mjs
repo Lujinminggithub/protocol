@@ -24,4 +24,5 @@ test("health tone maps warning and critical states",()=>{
   assert.equal(healthTone("healthy"),"normal");
   assert.equal(healthTone("degraded"),"warning");
   assert.equal(healthTone("offline"),"critical");
+  assert.equal(healthTone("unreachable"),"critical");
 });

@@ -41,11 +41,11 @@
 
       <section class="view" id="devicesView">
         <section class="device-topology-band">
-          <div class="section-head"><div><h2>设备连接关系</h2><p>拖动旋转、滚轮缩放，点击设备查看详情</p></div><div class="topology-filters"><select id="deviceTopologyLine" aria-label="按线路筛选"></select><select id="deviceTopologyRegion" aria-label="按区域筛选"><option value="">全部区域</option></select><select id="deviceTopologyRole" aria-label="按角色筛选"><option value="">全部角色</option><option value="entry">Entry</option><option value="relay">Relay</option><option value="exit">Exit</option></select><select id="deviceTopologyHealth" aria-label="按健康筛选"><option value="">全部健康</option><option value="ok">健康</option><option value="degraded">异常</option><option value="down">离线</option><option value="unknown">待采集</option></select></div></div>
+          <div class="section-head"><div><h2>设备连接关系</h2><p>拖动旋转、滚轮缩放，点击设备查看详情</p></div><div class="topology-filters"><select id="deviceTopologyLine" aria-label="按线路筛选"></select><select id="deviceTopologyRegion" aria-label="按区域筛选"><option value="">全部区域</option></select><select id="deviceTopologyRole" aria-label="按角色筛选"><option value="">全部角色</option><option value="entry">Entry</option><option value="relay">Relay</option><option value="exit">Exit</option></select><select id="deviceTopologyHealth" aria-label="按连通状态筛选"><option value="">全部连通状态</option><option value="ok">健康</option><option value="degraded">异常</option><option value="unreachable">不可达</option><option value="down">离线</option><option value="unknown">待采集</option></select></div></div>
           <div id="deviceTopology" class="topology-stage large" aria-label="设备三维拓扑"></div>
         </section>
-        <div class="toolbar"><input id="deviceSearch" type="search" placeholder="搜索设备、地址、区域或运营商"><select id="deviceStatus"><option value="">全部状态</option><option value="ready">可用</option><option value="maintenance">维护</option><option value="offline">离线</option><option value="retired">退役</option></select><span class="toolbar-note">SSH 密码保存在控制面主机的受限凭据文件中，不进入数据库</span></div>
-        <div class="table-wrap"><table><thead><tr><th>设备</th><th>状态</th><th>SSH 地址</th><th>区域 / 运营商</th><th>系统</th><th>最近健康</th><th>操作</th></tr></thead><tbody id="devicesTable"></tbody></table></div>
+        <div class="toolbar"><input id="deviceSearch" type="search" placeholder="搜索设备、地址、区域或运营商"><select id="deviceStatus"><option value="">全部管理状态</option><option value="ready">已启用</option><option value="maintenance">维护</option><option value="offline">停用</option><option value="retired">退役</option></select><span class="toolbar-note">SSH 密码保存在控制面主机的受限凭据文件中，不进入数据库</span></div>
+        <div class="table-wrap"><table><thead><tr><th>设备</th><th>管理状态</th><th>SSH 地址</th><th>区域 / 运营商</th><th>系统</th><th>连通状态</th><th>操作</th></tr></thead><tbody id="devicesTable"></tbody></table></div>
       </section>
 
       <section class="view" id="linesView">
@@ -54,8 +54,8 @@
       </section>
 
       <section class="view" id="operationsView">
-        <div class="toolbar"><select id="operationLine"><option value="">全部线路</option></select><button class="secondary" id="reloadOperations">刷新任务</button><span class="toolbar-note">点击任务查看构建、上传、分发、启动和验证步骤</span></div>
-        <div class="table-wrap"><table><thead><tr><th>任务</th><th>线路</th><th>类型</th><th>状态</th><th>发起人</th><th>开始时间</th><th>更新时间</th></tr></thead><tbody id="operationsTable"></tbody></table></div>
+        <div class="toolbar"><select id="operationLine"><option value="">全部线路</option></select><button class="secondary" id="reloadOperations">刷新任务</button><button class="secondary" id="deleteSelectedOperations" disabled>清理所选</button><span class="toolbar-note">执行中和排队中的任务不可清理；成功结果与执行证据会保留</span></div>
+        <div class="table-wrap"><table><thead><tr><th class="selection-cell"><input class="selection-checkbox" id="operationSelectAll" type="checkbox" aria-label="选择全部可清理任务"></th><th>任务</th><th>线路</th><th>类型</th><th>状态</th><th>发起人</th><th>开始时间</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="operationsTable"></tbody></table></div>
       </section>
 
       <section class="view" id="incidentsView">
@@ -92,7 +92,7 @@
   <div class="modal-backdrop" id="authModal"><form class="modal auth-modal" id="authForm"><div class="modal-head"><div><h2>连接运营控制台</h2><p>输入当前 nb-web 进程使用的管理员令牌</p></div></div><label>管理员令牌<input id="tokenInput" type="password" autocomplete="current-password" required></label><div class="form-error auth-error" id="authError" role="alert" aria-live="polite"></div><button class="primary full" id="authSubmit" type="submit">连接</button></form></div>
 
   <div class="modal-backdrop hidden" id="deviceModal"><form class="modal wide" id="deviceForm"><div class="modal-head"><div><h2>录入服务器设备</h2><p>登记管理地址、区域和 SSH 登录凭据</p></div><button type="button" class="icon-button close-device">×</button></div><div class="form-grid three">
-    <label>设备 ID<input name="id" placeholder="gz-83" pattern="[A-Za-z0-9_.-]+" required></label><label>显示名称<input name="name" placeholder="广州 Entry 01" required></label><label>状态<select name="status"><option value="ready">可用</option><option value="provisioning">初始化</option><option value="maintenance">维护</option><option value="offline">离线</option></select></label>
+    <label>设备 ID<input name="id" placeholder="gz-83" pattern="[A-Za-z0-9_.-]+" required></label><label>显示名称<input name="name" placeholder="广州 Entry 01" required></label><label>管理状态<select name="status"><option value="ready">已启用</option><option value="provisioning">初始化</option><option value="maintenance">维护</option><option value="offline">停用</option></select></label>
     <label>公网地址<input name="host" placeholder="203.0.113.10" required></label><label>SSH 端口<input name="ssh_port" type="number" min="1" max="65535" value="22" required></label><label>SSH 用户<input name="ssh_user" value="root" required></label>
     <label>内网地址<input name="private_ip" placeholder="172.16.0.10"></label><label>区域<input name="region" placeholder="CN-GZ"></label><label>运营商<input name="provider" placeholder="UCloud"></label>
     <label>操作系统<input name="os" placeholder="Ubuntu 24.04"></label><label>架构<input name="arch" placeholder="amd64"></label><label><span id="devicePasswordLabel">SSH 密码</span><input name="password" type="password" autocomplete="new-password" required><small id="devicePasswordHint" class="field-hint">首次登记必须输入，保存后不会回显</small></label>

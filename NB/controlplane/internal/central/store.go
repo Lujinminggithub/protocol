@@ -225,6 +225,10 @@ CREATE TABLE IF NOT EXISTS operations (
  status TEXT NOT NULL, requested_by TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
  request BLOB NOT NULL, result BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS operation_cleanups (
+ operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE CASCADE,
+ cleaned_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS executors (
  worker_id TEXT PRIMARY KEY, status TEXT NOT NULL, version TEXT NOT NULL,
  capabilities BLOB NOT NULL, observed_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -656,10 +660,11 @@ func (s *Store) AllocateTransportGeneration(ctx context.Context, lineID string) 
 }
 
 func (s *Store) Operations(ctx context.Context, lineID string, limit int) ([]Operation, error) {
-	query := `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at FROM operations`
+	query := `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at FROM operations
+	 WHERE NOT EXISTS (SELECT 1 FROM operation_cleanups cleanup WHERE cleanup.operation_id=operations.id)`
 	args := []any{}
 	if lineID != "" {
-		query += ` WHERE line_id=?`
+		query += ` AND line_id=?`
 		args = append(args, lineID)
 	}
 	query += ` ORDER BY created_at DESC LIMIT ?`

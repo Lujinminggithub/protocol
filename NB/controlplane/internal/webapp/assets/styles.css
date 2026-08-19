@@ -82,10 +82,10 @@ tbody tr:hover { background: #fbfcfd; }
 .line-name { font-weight: 650; }.line-id, .subtext { color: var(--muted); font-size: 11px; margin-top: 3px; }
 .badge { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; border-radius: 4px; padding: 0 8px; font-size: 11px; font-weight: 650; }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.badge.healthy, .badge.active, .badge.succeeded { color: var(--green); background: var(--green-soft); }
+.badge.healthy, .badge.active, .badge.succeeded, .badge.ready { color: var(--green); background: var(--green-soft); }
 .badge.degraded, .badge.warning, .badge.validating, .badge.queued, .badge.dispatched { color: var(--amber); background: var(--amber-soft); }
 .badge.unknown, .badge.draft, .badge.maintenance, .badge.disabled { color: #67747b; background: #edf1f2; }
-.badge.critical, .badge.failed, .badge.down { color: var(--red); background: var(--red-soft); }
+.badge.critical, .badge.failed, .badge.down, .badge.unreachable, .badge.offline, .badge.unhealthy { color: var(--red); background: var(--red-soft); }
 .badge.rolled_back { color: var(--blue); background: var(--blue-soft); }
 .capacity { min-width: 116px; }.capacity-bar { height: 5px; margin-top: 7px; background: #e8edef; overflow: hidden; }.capacity-bar span { display: block; height: 100%; background: var(--accent); }
 .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; }
@@ -97,7 +97,7 @@ tbody tr:hover { background: #fbfcfd; }
 .route-summary { min-width: 180px; max-width: 340px; white-space: normal; }
 .device-name { display: flex; align-items: center; gap: 9px; }.device-name strong,.device-name small { display: block; }.device-name small { color: var(--muted); margin-top: 3px; }
 .health-dot,.node-health { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: #89959a; }
-.health-dot.healthy,.node-health.healthy { background: var(--green); }.health-dot.degraded,.health-dot.down,.node-health.degraded,.node-health.down { background: var(--red); }.health-dot.unknown,.node-health.unknown { background: var(--amber); }
+.health-dot.healthy,.health-dot.ok,.node-health.healthy,.node-health.ok { background: var(--green); }.health-dot.degraded,.health-dot.down,.health-dot.offline,.health-dot.unhealthy,.health-dot.unreachable,.node-health.degraded,.node-health.down,.node-health.offline,.node-health.unhealthy,.node-health.unreachable { background: var(--red); }.health-dot.unknown,.node-health.unknown { background: var(--amber); }
 .toolbar { min-height: 56px; display: flex; align-items: center; gap: 9px; background: white; border: 1px solid var(--line); border-bottom: 0; padding: 9px 12px; }
 .toolbar-note { margin-left: auto; color: var(--muted); font-size: 11px; }
 .toolbar input { width: min(330px, 50vw); }
@@ -121,9 +121,10 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .role-grid { display: flex; align-items: end; gap: 12px; }.role-grid label { flex: 1; }.route-arrow { padding-bottom: 10px; color: var(--accent); font-size: 20px; }
 .topology-band { margin-top: 22px; }
 .topology-band .section-head { margin-top: 0; }.topology-band select { width: min(320px,45vw); }
-.topology-stage { position: relative; width: 100%; height: 420px; min-height: 320px; overflow: hidden; background: #f8fafb; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.topology-stage { position: relative; width: 100%; height: 420px; min-height: 320px; overflow: hidden; background: #e7eef0; border-top: 1px solid #cbd8db; border-bottom: 1px solid #cbd8db; }
 .topology-stage.large { height: 520px; }.topology-stage canvas { display: block; }.device-topology-band { margin-bottom: 24px; }
 .topology-filters { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }.topology-filters select { width: auto; min-width: 130px; }
+.selection-cell { width: 42px; text-align: center; }.selection-checkbox { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); vertical-align: middle; }
 .topology-fallback { min-height: 320px; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 24px; padding: 24px; }
 .topology-fallback button { width: 150px; min-height: 130px; border: 0; background: transparent; display: grid; place-items: center; align-content: center; gap: 6px; color: var(--muted); }.topology-fallback button:hover { background: #eef5f5; }.topology-fallback strong,.topology-fallback small { display: block; }
 .topology-canvas { min-height: 180px; padding: 22px; border: 1px solid var(--line); background: var(--surface); overflow-x: auto; }

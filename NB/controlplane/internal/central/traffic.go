@@ -69,7 +69,7 @@ func TrafficResolution(span time.Duration) int {
 
 func healthRank(health string) int {
 	switch health {
-	case "down", "offline", "unhealthy":
+	case "down", "offline", "unhealthy", "unreachable":
 		return 2
 	case "degraded":
 		return 1
@@ -94,7 +94,7 @@ func (s *Store) backfillTrafficRollups(ctx context.Context) error {
   SUM(upstream_mbps) AS upstream_sum,SUM(downstream_mbps) AS downstream_sum,
   MAX(sessions) AS sessions_max,MAX(queue_age_p95_us) AS queue_age_max_us,
   MAX(effective_loss_pct) AS effective_loss_max_pct,
-  MAX(CASE WHEN health IN ('down','offline','unhealthy') THEN 2 WHEN health='degraded' THEN 1 ELSE 0 END) AS health_rank,
+  MAX(CASE WHEN health IN ('down','offline','unhealthy','unreachable') THEN 2 WHEN health='degraded' THEN 1 ELSE 0 END) AS health_rank,
   MAX(observed_at) AS last_observed_at
  FROM source GROUP BY line_id,node_id,role,worker_id,bucket_at
 )

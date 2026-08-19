@@ -244,7 +244,7 @@ func TestVisualizationAssetsAreEmbeddedLocally(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"echarts-6.1.0.min.js", "3d-force-graph-1.80.0.min.js", `type="module"`, `id="deviceTopology"`, `id="trafficWorkspace"`, `data-traffic-from`, `data-traffic-events`} {
+	for _, required := range []string{"echarts-6.1.0.min.js", "3d-force-graph-1.80.0.min.js", `type="module"`, `id="deviceTopology"`, `id="trafficWorkspace"`, `data-traffic-from`, `data-traffic-events`, `id="operationSelectAll"`, `id="deleteSelectedOperations"`} {
 		if !bytes.Contains(body, []byte(required)) {
 			t.Fatalf("index is missing %q", required)
 		}

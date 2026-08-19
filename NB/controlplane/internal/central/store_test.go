@@ -100,6 +100,98 @@ func TestCreateOperationRejectsAnotherActiveOperationOnLine(t *testing.T) {
 	}
 }
 
+func TestDeleteOperationsOnlyRemovesTerminalTasksAtomically(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-clean", Name: "clean", Status: "draft",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	terminal := Operation{ID: "op-terminal", LineID: "line-clean", Kind: "line.validate", RequestedBy: "operator",
+		IdempotencyKey: "terminal-1", Request: json.RawMessage(`{}`)}
+	terminal, _, err = store.CreateOperation(t.Context(), terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CancelOperation(t.Context(), terminal.ID, "test terminal task"); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordOperationEvent(t.Context(), OperationEvent{OperationID: terminal.ID, Sequence: 1,
+		Stage: "prepare", Status: "cancelled", Message: "test", Parameters: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	active := Operation{ID: "op-active", LineID: "line-clean", Kind: "line.validate", RequestedBy: "operator",
+		IdempotencyKey: "active-1", Request: json.RawMessage(`{}`)}
+	active, _, err = store.CreateOperation(t.Context(), active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DeleteOperations(t.Context(), []string{terminal.ID, active.ID}); err == nil {
+		t.Fatal("batch containing an active task must be rejected")
+	}
+	if _, err = store.Operation(t.Context(), terminal.ID); err != nil {
+		t.Fatalf("atomic rejection hid terminal task: %v", err)
+	}
+	if err = store.CancelOperation(t.Context(), active.ID, "test cleanup"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := store.DeleteOperations(t.Context(), []string{terminal.ID, active.ID})
+	if err != nil || deleted != 2 {
+		t.Fatalf("delete terminal tasks count=%d err=%v", deleted, err)
+	}
+	if _, err = store.Operation(t.Context(), terminal.ID); err != nil {
+		t.Fatalf("cleanup removed durable task evidence: %v", err)
+	}
+	visible, err := store.Operations(t.Context(), "line-clean", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("cleaned tasks remain visible: %+v", visible)
+	}
+	var events int
+	if err = store.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM operation_events WHERE operation_id=?`, terminal.ID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("cleanup removed operation evidence: %d", events)
+	}
+}
+
+func TestOperationCleanupMigratesLegacyDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "central.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE operations (
+ id TEXT PRIMARY KEY, line_id TEXT NOT NULL, kind TEXT NOT NULL,
+ status TEXT NOT NULL, requested_by TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+ request BLOB NOT NULL, result BLOB, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var tables int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operation_cleanups'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 1 {
+		t.Fatalf("legacy database missing operation_cleanups table: %d", tables)
+	}
+}
+
 func TestAllocateLineSpecAssignsUniqueEntryPortAndSaveRechecksConflict(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -642,8 +734,12 @@ func TestBackfillTrafficRollupsIsIdempotent(t *testing.T) {
 	}
 	base := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
 	for offset, upstream := range []float64{2, 4} {
+		health := "ok"
+		if offset == 1 {
+			health = "unreachable"
+		}
 		item := Snapshot{LineID: "line-backfill", NodeID: "entry-0", Role: "entry", WorkerID: "0",
-			ObservedAt: base.Add(time.Duration(offset*15) * time.Second).Format(time.RFC3339Nano), Health: "ok",
+			ObservedAt: base.Add(time.Duration(offset*15) * time.Second).Format(time.RFC3339Nano), Health: health,
 			Deployment: "deployment-1", Profile: "profile-1", UpstreamMbps: upstream, DownstreamMbps: 1}
 		if inserted, recordErr := store.RecordSnapshot(t.Context(), item); recordErr != nil || !inserted {
 			t.Fatalf("RecordSnapshot inserted=%v err=%v", inserted, recordErr)
@@ -660,14 +756,14 @@ func TestBackfillTrafficRollupsIsIdempotent(t *testing.T) {
 	if err != nil || completed {
 		t.Fatalf("second backfill completed=%v err=%v", completed, err)
 	}
-	var samples int64
+	var samples, healthRank int64
 	var upstream float64
-	if err = store.db.QueryRow(`SELECT sample_count,upstream_sum FROM traffic_rollups
-	 WHERE line_id='line-backfill' AND resolution_s=60`).Scan(&samples, &upstream); err != nil {
+	if err = store.db.QueryRow(`SELECT sample_count,upstream_sum,health_rank FROM traffic_rollups
+	 WHERE line_id='line-backfill' AND resolution_s=60`).Scan(&samples, &upstream, &healthRank); err != nil {
 		t.Fatal(err)
 	}
-	if samples != 2 || upstream != 6 {
-		t.Fatalf("samples=%d upstream=%v, want 2 and 6", samples, upstream)
+	if samples != 2 || upstream != 6 || healthRank != 2 {
+		t.Fatalf("samples=%d upstream=%v health_rank=%d, want 2, 6 and 2", samples, upstream, healthRank)
 	}
 }
 
