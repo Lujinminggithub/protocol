@@ -41,8 +41,10 @@ type Client struct {
 }
 
 type persistedResult struct {
-	Status string          `json:"status"`
-	Result json.RawMessage `json:"result"`
+	LineID       string          `json:"line_id"`
+	Status       string          `json:"status"`
+	Result       json.RawMessage `json:"result"`
+	Acknowledged bool            `json:"acknowledged,omitempty"`
 }
 
 type eventEmitter func(context.Context, OperationEvent) error
@@ -160,6 +162,80 @@ func (c *Client) claim(ctx context.Context, lineID string) ([]Operation, error) 
 func (c *Client) complete(ctx context.Context, operation Operation, status string, result any) error {
 	payload := map[string]any{"line_id": operation.LineID, "status": status, "result": result}
 	return c.request(ctx, http.MethodPost, "/agent/v1/operations/"+url.PathEscape(operation.ID)+"/result", payload, nil)
+}
+
+func retryableCompletionError(err error) bool {
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"database is locked", "sqlite_busy", "http 500", "http 502", "http 503", "http 504", "timeout", "temporarily unavailable"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) completeWithRetry(ctx context.Context, operation Operation, status string, result any) error {
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if attempt > 0 {
+			delay := 250 * time.Millisecond * time.Duration(1<<(attempt-1))
+			if delay > 8*time.Second {
+				delay = 8 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		lastErr = c.complete(ctx, operation, status, result)
+		if lastErr == nil || !retryableCompletionError(lastErr) {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+func acknowledgePersistedResult(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var persisted persistedResult
+	if err = json.Unmarshal(data, &persisted); err != nil {
+		return err
+	}
+	persisted.Acknowledged = true
+	encoded, err := json.Marshal(persisted)
+	if err != nil {
+		return err
+	}
+	return writePrivateFile(path, encoded)
+}
+
+func (c *Client) retryPersistedResults(ctx context.Context) error {
+	paths, err := filepath.Glob(filepath.Join(c.registry.StateDir, "*", "result.json"))
+	if err != nil {
+		return err
+	}
+	for _, resultPath := range paths {
+		data, readErr := os.ReadFile(resultPath)
+		if readErr != nil {
+			continue
+		}
+		var persisted persistedResult
+		if json.Unmarshal(data, &persisted) != nil || persisted.Acknowledged || persisted.LineID == "" || persisted.Status == "" {
+			continue
+		}
+		operation := Operation{ID: filepath.Base(filepath.Dir(resultPath)), LineID: persisted.LineID}
+		if err = c.completeWithRetry(ctx, operation, persisted.Status, persisted.Result); err != nil {
+			return fmt.Errorf("persisted result %s: %w", operation.ID, err)
+		}
+		if err = acknowledgePersistedResult(resultPath); err != nil {
+			return fmt.Errorf("acknowledge persisted result %s: %w", operation.ID, err)
+		}
+	}
+	return nil
 }
 
 func (c *Client) syncClientConfigs(ctx context.Context) error {
@@ -283,6 +359,9 @@ func (c *Client) collectSnapshots(ctx context.Context) {
 }
 
 func (c *Client) poll(ctx context.Context) error {
+	if err := c.retryPersistedResults(ctx); err != nil {
+		return err
+	}
 	lines := append([]LineSpec(nil), c.registry.Lines...)
 	if c.registry.Dynamic.Enabled {
 		lines = append(lines, LineSpec{LineID: "*"})
@@ -295,8 +374,11 @@ func (c *Client) poll(ctx context.Context) error {
 		for _, operation := range operations {
 			resultPath := filepath.Join(c.registry.StateDir, operation.ID, "result.json")
 			var persisted persistedResult
-			if data, readErr := os.ReadFile(resultPath); readErr == nil && json.Unmarshal(data, &persisted) == nil {
-				if err = c.complete(ctx, operation, persisted.Status, persisted.Result); err != nil {
+			if data, readErr := os.ReadFile(resultPath); readErr == nil && json.Unmarshal(data, &persisted) == nil && !persisted.Acknowledged {
+				if err = c.completeWithRetry(ctx, operation, persisted.Status, persisted.Result); err != nil {
+					return err
+				}
+				if err = acknowledgePersistedResult(resultPath); err != nil {
 					return err
 				}
 				continue
@@ -320,12 +402,15 @@ func (c *Client) poll(ctx context.Context) error {
 			if marshalErr != nil {
 				return marshalErr
 			}
-			persisted = persistedResult{Status: status, Result: encoded}
+			persisted = persistedResult{LineID: operation.LineID, Status: status, Result: encoded}
 			persistedData, _ := json.Marshal(persisted)
 			if err = writePrivateFile(resultPath, persistedData); err != nil {
 				return err
 			}
-			if err = c.complete(ctx, operation, status, json.RawMessage(encoded)); err != nil {
+			if err = c.completeWithRetry(ctx, operation, status, json.RawMessage(encoded)); err != nil {
+				return err
+			}
+			if err = acknowledgePersistedResult(resultPath); err != nil {
 				return err
 			}
 		}

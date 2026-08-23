@@ -1,6 +1,7 @@
 package central
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -19,6 +20,7 @@ type Store struct {
 	db          *sql.DB
 	operationMu sync.Mutex
 	specMu      sync.Mutex
+	writeMu     sync.Mutex
 }
 
 type scanner interface{ Scan(...any) error }
@@ -148,7 +150,10 @@ func Open(path string) (*Store, error) {
 	// A single connection lets one dashboard query stall every API request.
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(8)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// A production database can be several gigabytes. WAL setup and additive
+	// migrations must have enough time to finish during a controlled restart;
+	// the HTTP listener is not started until this initialization succeeds.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
 		if _, err = db.ExecContext(ctx, pragma); err != nil {
@@ -167,6 +172,11 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error                   { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 func now() string                               { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+func (s *Store) lockWrite() func() {
+	s.writeMu.Lock()
+	return s.writeMu.Unlock
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
@@ -475,6 +485,8 @@ func (s *Store) Lines(ctx context.Context) ([]Line, error) {
 }
 
 func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error) {
+	unlock := s.lockWrite()
+	defer unlock()
 	if item.WorkerID == "collector" && item.Health == "down" && strings.HasSuffix(item.NodeID, "-collector") {
 		return false, nil
 	}
@@ -516,6 +528,8 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 }
 
 func (s *Store) RecordIncident(ctx context.Context, item Incident) (bool, error) {
+	unlock := s.lockWrite()
+	defer unlock()
 	payload := item.Payload
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
@@ -551,6 +565,8 @@ func (s *Store) Incidents(ctx context.Context, limit int) ([]Incident, error) {
 func (s *Store) CreateOperation(ctx context.Context, operation Operation) (Operation, bool, error) {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	unlock := s.lockWrite()
+	defer unlock()
 	var existing Operation
 	err := scanOperation(s.db.QueryRowContext(ctx, `SELECT id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at
 	 FROM operations WHERE idempotency_key=?`, operation.IdempotencyKey), &existing)
@@ -592,6 +608,8 @@ func (s *Store) OperationByIdempotencyKey(ctx context.Context, key string) (Oper
 }
 
 func (s *Store) AllocateTransportGeneration(ctx context.Context, lineID string) (uint64, error) {
+	unlock := s.lockWrite()
+	defer unlock()
 	var generation uint64
 	err := s.db.QueryRowContext(ctx, `INSERT INTO transport_generations(line_id,current_generation,updated_at)
 	 VALUES(?,1,?) ON CONFLICT(line_id) DO UPDATE SET
@@ -678,6 +696,8 @@ func (s *Store) ClaimAnyOperationsExcept(ctx context.Context, limit int, exclude
 }
 
 func (s *Store) claimOperations(ctx context.Context, lineID string, limit int, excluded []string) ([]Operation, error) {
+	unlock := s.lockWrite()
+	defer unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -741,14 +761,22 @@ func (s *Store) claimOperations(ctx context.Context, lineID string, limit int, e
 }
 
 func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string, result json.RawMessage) error {
+	unlock := s.lockWrite()
+	defer unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var kind string
-	if err = tx.QueryRowContext(ctx, `SELECT kind FROM operations WHERE id=? AND line_id=?
- AND status IN ('dispatched','running')`, id, lineID).Scan(&kind); err != nil {
+	var kind, currentStatus string
+	var currentResult []byte
+	if err = tx.QueryRowContext(ctx, `SELECT kind,status,result FROM operations WHERE id=? AND line_id=?`, id, lineID).Scan(&kind, &currentStatus, &currentResult); err != nil {
+		return fmt.Errorf("operation is not active")
+	}
+	if currentStatus != "dispatched" && currentStatus != "running" {
+		if currentStatus == status && bytes.Equal(currentResult, result) {
+			return nil
+		}
 		return fmt.Errorf("operation is not active")
 	}
 	updated, err := tx.ExecContext(ctx, `UPDATE operations SET status=?,result=?,updated_at=?
@@ -794,6 +822,8 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 }
 
 func (s *Store) CancelOperation(ctx context.Context, id, reason string) error {
+	unlock := s.lockWrite()
+	defer unlock()
 	result, _ := json.Marshal(map[string]string{"reason": reason})
 	updated, err := s.db.ExecContext(ctx, `UPDATE operations SET status='cancelled',result=?,updated_at=?
  WHERE id=? AND status IN ('queued','cancelled')`, result, now(), id)
@@ -808,6 +838,8 @@ func (s *Store) CancelOperation(ctx context.Context, id, reason string) error {
 }
 
 func (s *Store) RecordExecutor(ctx context.Context, item Executor) error {
+	unlock := s.lockWrite()
+	defer unlock()
 	capabilities, err := json.Marshal(item.Lines)
 	if err != nil {
 		return err

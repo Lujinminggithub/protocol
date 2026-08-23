@@ -529,6 +529,8 @@ func (s *Store) LineSpecConflict(ctx context.Context, spec LineSpec) (string, er
 }
 
 func (s *Store) RecordOperationEvent(ctx context.Context, event OperationEvent) error {
+	unlock := s.lockWrite()
+	defer unlock()
 	if len(event.Parameters) == 0 {
 		event.Parameters = json.RawMessage(`{}`)
 	}

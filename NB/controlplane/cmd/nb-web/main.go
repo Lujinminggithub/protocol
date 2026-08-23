@@ -38,6 +38,10 @@ func main() {
 	defer stop()
 	go func() {
 		backfillComplete := false
+		// Do not run the first retention sweep during startup. On a production
+		// database with a large snapshots table, the sweep can hold SQLite's
+		// single-writer lock long enough to make executor heartbeats time out.
+		pruneDue := false
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
@@ -54,14 +58,21 @@ func main() {
 				}
 			}
 			if backfillComplete {
-				if pruneErr := database.PruneTraffic(ctx, time.Now().UTC()); pruneErr != nil && ctx.Err() == nil {
-					log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
+				if pruneDue {
+					pruneCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+					pruneErr := database.PruneTraffic(pruneCtx, time.Now().UTC())
+					cancel()
+					if pruneErr != nil && ctx.Err() == nil {
+						log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)
+					}
+					pruneDue = false
 				}
 			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				pruneDue = true
 			}
 		}
 	}()

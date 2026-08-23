@@ -402,6 +402,36 @@ func TestOpenAllowsConcurrentDatabaseWork(t *testing.T) {
 	}
 }
 
+func TestCompleteOperationIsIdempotentAfterResultWasPersisted(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stamp := now()
+	_, err = store.db.Exec(`INSERT INTO lines
+ (id,name,status,entry_region,exit_region,provider,capacity_mbps,created_at,updated_at)
+ VALUES('line-idempotent','test','draft','entry','exit','test',10,?,?)`, stamp, stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := Operation{ID: "op-idempotent", LineID: "line-idempotent", Kind: "line.open",
+		RequestedBy: "test", IdempotencyKey: "idempotent-1", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(context.Background(), operation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ClaimOperations(context.Background(), operation.LineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	result := json.RawMessage(`{"deployment":"d1","profile":"p1"}`)
+	if err = store.CompleteOperation(context.Background(), operation.ID, operation.LineID, "failed", result); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteOperation(context.Background(), operation.ID, operation.LineID, "failed", result); err != nil {
+		t.Fatalf("repeat completion should be idempotent: %v", err)
+	}
+}
+
 func TestOpenCreatesLatestSnapshotIndex(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

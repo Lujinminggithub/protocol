@@ -796,6 +796,48 @@ func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
 	}
 }
 
+func TestClientRetriesCompletionAfterTemporaryCentralBusy(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate"})
+	var completeAttempts atomic.Int64
+	var claimed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/agent/v1/executors/heartbeat":
+			_, _ = w.Write([]byte(`{"status":"ready"}`))
+		case "/agent/v1/operations":
+			if claimed.CompareAndSwap(false, true) {
+				_, _ = w.Write([]byte(`{"operations":[{"id":"op-busy","line_id":"line-1","kind":"line.validate","request":{}}]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"operations":[]}`))
+			}
+		case "/agent/v1/operations/op-busy/result":
+			if completeAttempts.Add(1) < 3 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"database is locked (5) (SQLITE_BUSY)"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":"accepted"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(registry, &fakeRunner{}, ClientConfig{BaseURL: server.URL, Token: "agent-secret",
+		Version: "test", PollEvery: 10 * time.Millisecond, HeartbeatEvery: time.Hour, OperationTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err = client.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := completeAttempts.Load(); got != 3 {
+		t.Fatalf("completion attempts=%d, want 3", got)
+	}
+}
+
 func TestClientHeartbeatsRecoverDuringLongOperation(t *testing.T) {
 	registry := testRegistry(t, []string{"line.validate"})
 	var heartbeat, completed atomic.Int64

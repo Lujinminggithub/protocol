@@ -119,6 +119,8 @@ FROM aggregate JOIN ranked ON ranked.line_id=aggregate.line_id AND ranked.node_i
 // startup migration path. A large production snapshot table must not delay the
 // web listener or trigger a systemd restart loop.
 func (s *Store) BackfillTrafficHistory(ctx context.Context) (bool, error) {
+	unlock := s.lockWrite()
+	defer unlock()
 	const job = "traffic_rollups_v1"
 	var completed string
 	err := s.db.QueryRowContext(ctx, `SELECT completed_at FROM maintenance_jobs WHERE name=?`, job).Scan(&completed)
@@ -453,6 +455,8 @@ func stringsLastSeparator(value string) int {
 }
 
 func (s *Store) PruneTraffic(ctx context.Context, nowAt time.Time) error {
+	unlock := s.lockWrite()
+	defer unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
