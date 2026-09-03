@@ -580,6 +580,34 @@ func TestCompleteOperationIsIdempotentAfterResultWasPersisted(t *testing.T) {
 	}
 }
 
+func TestSuccessfulTuneAdvancesTransportGenerationFloor(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-generation", Name: "test", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 5}); err != nil {
+		t.Fatal(err)
+	}
+	op := Operation{ID: "op-generation", LineID: "line-generation", Kind: "line.tune", RequestedBy: "test",
+		IdempotencyKey: "generation", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(t.Context(), op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ClaimOperations(t.Context(), op.LineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteOperation(t.Context(), op.ID, op.LineID, "succeeded",
+		json.RawMessage(`{"profile":"line-generation:9","transport_generation":9}`)); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := store.AllocateTransportGeneration(t.Context(), op.LineID)
+	if err != nil || generation != 10 {
+		t.Fatalf("generation=%d err=%v want 10", generation, err)
+	}
+}
+
 func TestOpenCreatesLatestSnapshotIndex(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

@@ -481,7 +481,8 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, existingErr.Error())
 		return
 	}
-	if _, err := a.store.Line(r.Context(), req.LineID); err != nil {
+	lineRecord, err := a.store.Line(r.Context(), req.LineID)
+	if err != nil {
 		problem(w, 404, "线路不存在")
 		return
 	}
@@ -495,6 +496,7 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			values = map[string]any{}
 		}
 		values["plan"] = spec
+		values["deployment_id"] = lineRecord.ActiveDeployment
 		if req.Kind == "line.tune" {
 			profile, planErr := a.planTransportProfile(r, req.LineID, spec.BandwidthMbps)
 			if planErr != nil {

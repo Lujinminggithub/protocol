@@ -278,13 +278,19 @@ function tuneResultSection(operation) {
   const status=rollout.status||(operation.status==="succeeded"?"committed":operation.status),prepare=(rollout.prepare_order||["entry","middle","exit"]).map(x=>roleNames[x]||x).join(" → "),commit=(rollout.commit_order||["exit","middle","entry"]).map(x=>roleNames[x]||x).join(" → ");
   return `<div class="detail-section tune-result"><h3>调优结果</h3><div class="detail-grid"><dl><dt>Generation</dt><dd><strong>${number(generation)}</strong></dd><dt>Profile Schema</dt><dd>${number(profile?.schema_version)}</dd><dt>事务状态</dt><dd>${escapeHTML(status)}</dd></dl><dl><dt>Prepare 顺序</dt><dd>${escapeHTML(prepare)}</dd><dt>Commit 顺序</dt><dd>${escapeHTML(commit)}</dd><dt>线路 Profile</dt><dd class="mono">${escapeHTML(result.profile||operation.line_id||"--")}</dd></dl></div>${rows.length?`<div class="table-wrap"><table class="detail-table tune-table"><thead><tr><th>链路端点</th><th>拥塞控制</th><th>目标速率</th><th>CWin</th><th>MTU</th><th>重排容忍</th><th>FEC</th><th>证据</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`:""}${roleRows?`<div class="table-wrap"><table class="detail-table rollout-table"><thead><tr><th>角色</th><th>Prepare</th><th>Commit</th><th>读回</th><th>Fingerprint</th></tr></thead><tbody>${roleRows}</tbody></table></div>`:`<p class="subtext">历史任务未保存逐角色事务摘要；generation 来自任务结果。</p>`}</div>`;
 }
+function failureResultSection(operation){
+  const result=operation.result||{},failure=result.failure;
+  if(operation.status!=="failed"&&!failure)return "";
+  const summary=failure?.summary||result.message||"任务执行失败",stage=failure?.stage||"--",root=failure?.root_cause||summary,excerpt=failure?.log_excerpt||"",logFile=failure?.log_file||result.log_file||"";
+  return `<div class="detail-section failure-result"><h3>失败原因</h3><strong>${escapeHTML(summary)}</strong><dl><dt>失败阶段</dt><dd>${escapeHTML(stageText[stage]||stage)}</dd><dt>根因</dt><dd>${escapeHTML(root)}</dd>${logFile?`<dt>执行日志</dt><dd class="mono">${escapeHTML(logFile)}</dd>`:""}</dl>${excerpt?`<details><summary>查看脱敏技术详情</summary><pre>${escapeHTML(excerpt)}</pre></details>`:""}</div>`;
+}
 async function showOperationDetail(id) {
   try {
     const data=await api(`/api/v1/operations/${encodeURIComponent(id)}`),op=data.operation;
     $("#detailTitle").textContent=kindText[op.kind]||op.kind;
     $("#detailSubtitle").textContent=`${op.id} · ${op.line_id}`;
     const plan=op.request?.plan||{};
-    $("#detailBody").innerHTML=`<div class="detail-grid"><dl><dt>状态</dt><dd>${badge(op.status)}</dd><dt>发起人</dt><dd>${escapeHTML(op.requested_by)}</dd><dt>时间</dt><dd>${formatTime(op.created_at)} · ${formatTime(op.updated_at)}</dd></dl><dl><dt>资源组</dt><dd>${escapeHTML(plan.resource_group||"--")}</dd><dt>实例</dt><dd>${escapeHTML(plan.instance_id||"--")}</dd><dt>构建策略</dt><dd>${escapeHTML(plan.build_mode||"--")}</dd></dl></div>${clientConfigSection(op)}${tuneResultSection(op)}<div class="detail-section"><h3>执行流程</h3><div class="timeline">${operationTimeline(op,data.events||[])}</div></div>`;
+    $("#detailBody").innerHTML=`<div class="detail-grid"><dl><dt>状态</dt><dd>${badge(op.status)}</dd><dt>发起人</dt><dd>${escapeHTML(op.requested_by)}</dd><dt>时间</dt><dd>${formatTime(op.created_at)} · ${formatTime(op.updated_at)}</dd></dl><dl><dt>资源组</dt><dd>${escapeHTML(plan.resource_group||"--")}</dd><dt>实例</dt><dd>${escapeHTML(plan.instance_id||"--")}</dd><dt>构建策略</dt><dd>${escapeHTML(plan.build_mode||"--")}</dd></dl></div>${failureResultSection(op)}${clientConfigSection(op)}${tuneResultSection(op)}<div class="detail-section"><h3>执行流程</h3><div class="timeline">${operationTimeline(op,data.events||[])}</div></div>`;
     state.openOperationID=["queued","dispatched","running"].includes(op.status)?id:"";
     $("#detailModal").classList.remove("hidden");
     hydrateClientConfig($("#detailBody .client-delivery"));

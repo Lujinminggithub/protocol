@@ -213,7 +213,7 @@ func TestRequiredPublicDNSWhitelistRules(t *testing.T) {
 
 func TestSummarizeTransportRolloutOmitsPrivatePaths(t *testing.T) {
 	line := LineSpec{LineID: "line-1", StateDir: t.TempDir()}
-	state := profileRolloutState{LineID: line.LineID, Generation: 7, Status: "committed",
+	state := profileRolloutState{LineID: line.LineID, DeploymentID: "deployment-1", Generation: 7, Status: "committed",
 		Prepared:     map[string]bool{"entry": true, "middle": true, "exit": true},
 		Committed:    map[string]bool{"entry": true, "middle": true, "exit": true},
 		Fingerprints: map[string]string{"entry": "entry-fp", "middle": "middle-fp", "exit": "exit-fp"},
@@ -221,7 +221,7 @@ func TestSummarizeTransportRolloutOmitsPrivatePaths(t *testing.T) {
 	if err := atomicJSON(filepath.Join(line.StateDir, "transport", "rollout.json"), state); err != nil {
 		t.Fatal(err)
 	}
-	summary := summarizeTransportRollout(line, "")
+	summary := summarizeTransportRollout(line, "", "deployment-1")
 	if summary == nil || summary.Generation != 7 || summary.Status != "committed" ||
 		strings.Join(summary.CommitOrder, ",") != "exit,middle,entry" || !summary.Roles["middle"].Readback {
 		t.Fatalf("unexpected rollout summary: %+v", summary)
@@ -229,6 +229,45 @@ func TestSummarizeTransportRolloutOmitsPrivatePaths(t *testing.T) {
 	encoded, err := json.Marshal(summary)
 	if err != nil || bytes.Contains(encoded, []byte("/private/")) || !bytes.Contains(encoded, []byte("entry-fp")) {
 		t.Fatalf("rollout JSON leaks paths or omits fingerprint: %s err=%v", encoded, err)
+	}
+}
+
+func TestStaleRolloutFromAnotherDeploymentDoesNotBlockGeneration(t *testing.T) {
+	previous := profileRolloutState{LineID: "line-1", DeploymentID: "old-deployment", Generation: 8, Status: "committed"}
+	reconciled, stale := reconcileRolloutState("line-1", "new-deployment", previous)
+	if !stale || reconciled.Generation != 0 {
+		t.Fatalf("reconciled=%+v stale=%v", reconciled, stale)
+	}
+	if got := nextTransportGeneration(1, reconciled.Generation); got != 1 {
+		t.Fatalf("generation=%d want 1", got)
+	}
+}
+
+func TestSameDeploymentRolloutRebasesCentralGeneration(t *testing.T) {
+	previous := profileRolloutState{LineID: "line-1", DeploymentID: "deployment-1", Generation: 8, Status: "committed"}
+	reconciled, stale := reconcileRolloutState("line-1", "deployment-1", previous)
+	if stale {
+		t.Fatal("current deployment rollout was marked stale")
+	}
+	if got := nextTransportGeneration(2, reconciled.Generation); got != 9 {
+		t.Fatalf("generation=%d want 9", got)
+	}
+}
+
+func TestFailureDetailIncludesRedactedRootCauseAndExcerpt(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	contents := "Traceback (most recent call last):\n  File \"deploy.py\", line 12\nRuntimeError: password=do-not-leak socket conflict\n"
+	if err := os.WriteFile(logPath, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	detail := operationFailure("profile-rollout", errors.New("exit profile failed"), logPath)
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Stage != "profile-rollout" || !strings.Contains(detail.RootCause, "RuntimeError") ||
+		!strings.Contains(detail.LogExcerpt, "deploy.py") || bytes.Contains(encoded, []byte("do-not-leak")) {
+		t.Fatalf("unexpected failure detail: %s", encoded)
 	}
 }
 

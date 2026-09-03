@@ -392,11 +392,15 @@ func (c *Client) poll(ctx context.Context) error {
 			var payload any = result
 			if runErr != nil {
 				status = "failed"
+				if result.Failure == nil {
+					result.Failure = operationFailure(operation.Kind, runErr, result.LogFile)
+				}
+				result.Message = result.Failure.Summary
 				values := map[string]any{}
 				if encodedResult, encodeErr := json.Marshal(result); encodeErr == nil {
 					_ = json.Unmarshal(encodedResult, &values)
 				}
-				values["message"], values["log_file"] = runErr.Error(), result.LogFile
+				values["message"], values["log_file"], values["failure"] = result.Failure.Summary, result.LogFile, result.Failure
 				payload = values
 			}
 			encoded, marshalErr := json.Marshal(payload)

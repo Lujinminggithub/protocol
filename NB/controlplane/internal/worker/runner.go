@@ -36,6 +36,15 @@ type Result struct {
 	TransportGeneration uint64                    `json:"transport_generation,omitempty"`
 	TransportProfile    *transportprofile.Profile `json:"transport_profile,omitempty"`
 	TransportRollout    *transportRolloutResult   `json:"transport_rollout,omitempty"`
+	Failure             *FailureDetail            `json:"failure,omitempty"`
+}
+
+type FailureDetail struct {
+	Stage      string `json:"stage"`
+	Summary    string `json:"summary"`
+	RootCause  string `json:"root_cause"`
+	LogExcerpt string `json:"log_excerpt,omitempty"`
+	LogFile    string `json:"log_file,omitempty"`
 }
 
 type transportRolloutRoleResult struct {
@@ -55,6 +64,7 @@ type transportRolloutResult struct {
 
 type requestValues struct {
 	Deployment       string                   `json:"deployment"`
+	DeploymentID     string                   `json:"deployment_id"`
 	Note             string                   `json:"note"`
 	Plan             dynamicPlan              `json:"plan"`
 	TransportProfile transportprofile.Profile `json:"transport_profile"`
@@ -71,6 +81,39 @@ type Runner struct{ registry Registry }
 func NewRunner(registry Registry) *Runner { return &Runner{registry: registry} }
 
 var sensitiveErrorValue = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)`)
+var sensitiveURLUserInfo = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@`)
+var privateKeyBlock = regexp.MustCompile(`(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----`)
+
+func redactFailureText(value string) string {
+	value = privateKeyBlock.ReplaceAllString(value, "[REDACTED PRIVATE KEY]")
+	value = sensitiveURLUserInfo.ReplaceAllString(value, "$1[REDACTED]@")
+	return sensitiveErrorValue.ReplaceAllString(value, "$1$2[REDACTED]")
+}
+
+func operationFailure(stage string, err error, logPath string) *FailureDetail {
+	detail := &FailureDetail{Stage: stage, Summary: commandFailureSummary(err, logPath), RootCause: redactFailureText(err.Error()), LogFile: logPath}
+	if data, readErr := os.ReadFile(logPath); readErr == nil {
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) > 60 {
+			lines = lines[len(lines)-60:]
+		}
+		excerpt := redactFailureText(strings.Join(lines, "\n"))
+		if len(excerpt) > 12<<10 {
+			excerpt = excerpt[len(excerpt)-(12<<10):]
+		}
+		detail.LogExcerpt = excerpt
+		for index := len(lines) - 1; index >= 0; index-- {
+			line := strings.TrimSpace(lines[index])
+			for _, marker := range []string{"RuntimeError:", "ValueError:", "TimeoutError:", "FileNotFoundError:", "PermissionError:", "AssertionError:"} {
+				if strings.Contains(line, marker) {
+					detail.RootCause = redactFailureText(line)
+					return detail
+				}
+			}
+		}
+	}
+	return detail
+}
 
 func commandFailureSummary(err error, logPath string) string {
 	summary := err.Error()
@@ -106,11 +149,7 @@ func commandFailureSummary(err error, logPath string) string {
 			}
 		}
 	}
-	if strings.Contains(summary, "PRIVATE KEY") {
-		summary = "sensitive command failure details were redacted"
-	} else {
-		summary = sensitiveErrorValue.ReplaceAllString(summary, "$1$2[REDACTED]")
-	}
+	summary = redactFailureText(summary)
 	runes := []rune(summary)
 	if len(runes) > 240 {
 		summary = string(runes[:240]) + "..."
@@ -345,7 +384,10 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "正在准备任务"})
 	failPreparation := func(err error, result Result) (Result, error) {
-		_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "failed", Message: err.Error()})
+		result.Failure = operationFailure("prepare", err, result.LogFile)
+		result.Message = result.Failure.Summary
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "prepare", Status: "failed",
+			Message: result.Failure.Summary, Parameters: map[string]any{"failure": result.Failure}})
 		return result, err
 	}
 	var request requestValues
@@ -410,22 +452,34 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		progress.Flush()
 		if err != nil {
 			summary := commandFailureSummary(err, logPath)
-			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "failed", Message: summary})
-			return Result{LogFile: logPath}, fmt.Errorf("%s 执行失败：%s", filepath.Base(step.Args[0]), summary)
+			runErr := fmt.Errorf("%s 执行失败：%s", filepath.Base(step.Args[0]), summary)
+			failure := operationFailure(stage, runErr, logPath)
+			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "failed",
+				Message: failure.Summary, Parameters: map[string]any{"failure": failure}})
+			return Result{LogFile: logPath, Message: failure.Summary, Failure: failure}, runErr
 		}
 		_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "succeeded", Message: "步骤执行完成"})
 		sequence++
 	}
 	result := Result{LogFile: logPath, Profile: line.LineID, Message: "任务执行完成"}
 	if operation.Kind == "line.tune" {
-		result.TransportProfile = &request.TransportProfile
-		generation, profilePath, rolloutErr := r.applyPlannedProfile(ctx, line, request.TransportProfile, environment, logFile, &sequence)
+		generation, profilePath, rolloutErr := r.applyPlannedProfile(ctx, line, request.DeploymentID, request.TransportProfile, environment, logFile, &sequence)
 		result.TransportGeneration = generation
+		request.TransportProfile.Generation = generation
+		result.TransportProfile = &request.TransportProfile
 		if profilePath != "" {
 			result.Profile = fmt.Sprintf("%s:%d", line.LineID, generation)
 		}
-		result.TransportRollout = summarizeTransportRollout(line, r.registry.StateDir)
+		result.TransportRollout = summarizeTransportRollout(line, r.registry.StateDir, request.DeploymentID)
 		if rolloutErr != nil {
+			stage := "profile-rollout"
+			if profilePath == "" {
+				stage = "profile-reconcile"
+			}
+			result.Failure = operationFailure(stage, rolloutErr, logPath)
+			result.Message = result.Failure.Summary
+			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: stage, Status: "failed",
+				Message: result.Failure.Summary, Parameters: map[string]any{"failure": result.Failure}})
 			return result, rolloutErr
 		}
 	}

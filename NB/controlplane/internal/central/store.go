@@ -978,8 +978,9 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 	}
 	if status == "succeeded" {
 		var values struct {
-			Deployment string `json:"deployment"`
-			Profile    string `json:"profile"`
+			Deployment          string `json:"deployment"`
+			Profile             string `json:"profile"`
+			TransportGeneration uint64 `json:"transport_generation"`
 		}
 		_ = json.Unmarshal(result, &values)
 		switch kind {
@@ -1000,6 +1001,15 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 			}
 			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET profile=?,updated_at=? WHERE id=?`, values.Profile, now(), lineID); err != nil {
 				return err
+			}
+			if values.TransportGeneration > 0 {
+				query := s.controlSQL(`INSERT INTO transport_generations(line_id,current_generation,updated_at)
+				 VALUES(?,?,?) ON CONFLICT(line_id) DO UPDATE SET current_generation=MAX(transport_generations.current_generation,excluded.current_generation),updated_at=excluded.updated_at`,
+					`INSERT INTO transport_generations(line_id,current_generation,updated_at) VALUES(?,?,?)
+				 ON DUPLICATE KEY UPDATE current_generation=GREATEST(current_generation,VALUES(current_generation)),updated_at=VALUES(updated_at)`)
+				if _, err = tx.ExecContext(ctx, query, lineID, values.TransportGeneration, now()); err != nil {
+					return err
+				}
 			}
 		}
 	}

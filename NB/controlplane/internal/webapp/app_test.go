@@ -778,6 +778,7 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 		!bytes.Contains(body, []byte(`upstream_mbps`)) || !bytes.Contains(body, []byte(`downstream_mbps`)) ||
 		!bytes.Contains(body, []byte(`item.role === "entry"`)) ||
 		!bytes.Contains(body, []byte(`tuneResultSection`)) || !bytes.Contains(body, []byte(`transport_rollout`)) ||
+		!bytes.Contains(body, []byte(`失败原因`)) || !bytes.Contains(body, []byte(`log_excerpt`)) ||
 		bytes.Contains(body, []byte(`event.currentTarget.reset()`)) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
 	}

@@ -16,6 +16,7 @@ import (
 
 type profileRolloutState struct {
 	LineID             string            `json:"line_id"`
+	DeploymentID       string            `json:"deployment_id,omitempty"`
 	Generation         uint64            `json:"generation"`
 	PreviousGeneration uint64            `json:"previous_generation"`
 	Status             string            `json:"status"`
@@ -51,13 +52,31 @@ func loadRollout(path string) profileRolloutState {
 	return state
 }
 
-func summarizeTransportRollout(line LineSpec, registryStateDir string) *transportRolloutResult {
+func reconcileRolloutState(lineID, deploymentID string, previous profileRolloutState) (profileRolloutState, bool) {
+	if previous.Generation == 0 {
+		return previous, false
+	}
+	if previous.LineID != lineID || deploymentID == "" || previous.DeploymentID != deploymentID {
+		return profileRolloutState{}, true
+	}
+	return previous, false
+}
+
+func nextTransportGeneration(requested, floor uint64) uint64 {
+	if requested <= floor {
+		return floor + 1
+	}
+	return requested
+}
+
+func summarizeTransportRollout(line LineSpec, registryStateDir, deploymentID string) *transportRolloutResult {
 	lineState := line.StateDir
 	if lineState == "" {
 		lineState = filepath.Join(registryStateDir, "lines", line.LineID)
 	}
 	state := loadRollout(filepath.Join(lineState, "transport", "rollout.json"))
-	if state.Generation == 0 {
+	state, stale := reconcileRolloutState(line.LineID, deploymentID, state)
+	if stale || state.Generation == 0 {
 		return nil
 	}
 	result := &transportRolloutResult{Status: state.Status, Generation: state.Generation,
@@ -95,7 +114,7 @@ func (r *Runner) profileCommand(ctx context.Context, line LineSpec, environment 
 	return last
 }
 
-func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, profile transportprofile.Profile,
+func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, deploymentID string, profile transportprofile.Profile,
 	environment map[string]string, output io.Writer, sequence *int) (uint64, string, error) {
 	lineState := line.StateDir
 	if lineState == "" {
@@ -103,15 +122,24 @@ func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, profile
 	}
 	rolloutPath := filepath.Join(lineState, "transport", "rollout.json")
 	previous := loadRollout(rolloutPath)
-	generation := profile.Generation
-	if profile.LineID != line.LineID || generation == 0 || generation <= previous.Generation {
+	var stale bool
+	previous, stale = reconcileRolloutState(line.LineID, deploymentID, previous)
+	if stale {
+		stalePath := rolloutPath + ".stale-" + time.Now().UTC().Format("20060102T150405Z")
+		if err := os.Rename(rolloutPath, stalePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, "", fmt.Errorf("quarantine stale rollout state: %w", err)
+		}
+	}
+	generation := nextTransportGeneration(profile.Generation, previous.Generation)
+	if profile.LineID != line.LineID || generation == 0 {
 		return 0, "", errors.New("central transport profile generation is missing, stale, or belongs to another line")
 	}
+	profile.Generation = generation
 	profilePath := filepath.Join(lineState, "transport", fmt.Sprintf("profile-%d.json", generation))
 	if err := atomicJSON(profilePath, profile); err != nil {
 		return 0, "", err
 	}
-	state := profileRolloutState{LineID: line.LineID, Generation: generation,
+	state := profileRolloutState{LineID: line.LineID, DeploymentID: deploymentID, Generation: generation,
 		PreviousGeneration: previous.Generation, Status: "preparing", Prepared: map[string]bool{},
 		Committed: map[string]bool{}, Profiles: map[string]string{}, Fingerprints: map[string]string{}}
 	var err error
