@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,10 +10,40 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"nb-controlplane/internal/transportprofile"
 )
+
+type profileStatusResult struct {
+	Workers []struct {
+		Response struct {
+			ActiveGeneration *uint64 `json:"active_generation"`
+		} `json:"response"`
+	} `json:"workers"`
+}
+
+func parseActiveProfileGeneration(output string) (uint64, error) {
+	const marker = "PROFILE_RESULT="
+	index := strings.LastIndex(output, marker)
+	if index < 0 {
+		return 0, errors.New("profile status did not return PROFILE_RESULT")
+	}
+	line := strings.SplitN(output[index+len(marker):], "\n", 2)[0]
+	var result profileStatusResult
+	if json.Unmarshal([]byte(line), &result) != nil || len(result.Workers) == 0 {
+		return 0, errors.New("profile status result is invalid")
+	}
+	var generation uint64
+	for _, worker := range result.Workers {
+		if worker.Response.ActiveGeneration == nil {
+			return 0, errors.New("profile status is missing a worker generation")
+		}
+		generation = max(generation, *worker.Response.ActiveGeneration)
+	}
+	return generation, nil
+}
 
 type profileRolloutState struct {
 	LineID             string            `json:"line_id"`
@@ -114,6 +145,37 @@ func (r *Runner) profileCommand(ctx context.Context, line LineSpec, environment 
 	return last
 }
 
+func (r *Runner) activeTransportGeneration(ctx context.Context, line LineSpec, environment map[string]string,
+	output io.Writer) (uint64, error) {
+	var floor uint64
+	for _, role := range []string{"entry", "middle", "exit"} {
+		step := commandStep{Name: r.registry.Python, Stage: "profile-status", Args: []string{
+			filepath.Join(r.registry.Root, "tools", "transport_profile_apply.py"), "status",
+			"--role", role, "--line-id", line.LineID, "--generation", "0"}}
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			var captured bytes.Buffer
+			if lastErr = r.execute(ctx, step, environment, io.MultiWriter(output, &captured)); lastErr == nil {
+				var generation uint64
+				generation, lastErr = parseActiveProfileGeneration(captured.String())
+				if lastErr == nil {
+					floor = max(floor, generation)
+					break
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * time.Second):
+			}
+		}
+		if lastErr != nil {
+			return 0, fmt.Errorf("read %s active transport generation: %w", role, lastErr)
+		}
+	}
+	return floor, nil
+}
+
 func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, deploymentID string, profile transportprofile.Profile,
 	environment map[string]string, output io.Writer, sequence *int) (uint64, string, error) {
 	lineState := line.StateDir
@@ -130,7 +192,11 @@ func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, deploym
 			return 0, "", fmt.Errorf("quarantine stale rollout state: %w", err)
 		}
 	}
-	generation := nextTransportGeneration(profile.Generation, previous.Generation)
+	remoteGeneration, err := r.activeTransportGeneration(ctx, line, environment, output)
+	if err != nil {
+		return 0, "", err
+	}
+	generation := nextTransportGeneration(profile.Generation, max(previous.Generation, remoteGeneration))
 	if profile.LineID != line.LineID || generation == 0 {
 		return 0, "", errors.New("central transport profile generation is missing, stale, or belongs to another line")
 	}
@@ -140,9 +206,8 @@ func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, deploym
 		return 0, "", err
 	}
 	state := profileRolloutState{LineID: line.LineID, DeploymentID: deploymentID, Generation: generation,
-		PreviousGeneration: previous.Generation, Status: "preparing", Prepared: map[string]bool{},
+		PreviousGeneration: remoteGeneration, Status: "preparing", Prepared: map[string]bool{},
 		Committed: map[string]bool{}, Profiles: map[string]string{}, Fingerprints: map[string]string{}}
-	var err error
 	fingerprints := map[string]uint64{}
 	for _, role := range []string{"entry", "middle", "exit"} {
 		roleProfile, roleErr := profile.Role(role)

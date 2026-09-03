@@ -254,6 +254,29 @@ func TestSameDeploymentRolloutRebasesCentralGeneration(t *testing.T) {
 	}
 }
 
+func TestRemoteProfileStatusAdvancesGenerationWhenLocalStateWasLost(t *testing.T) {
+	output := `PROFILE_RESULT={"role":"entry","phase":"status","generation":0,"workers":[{"worker":0,"response":{"active_generation":7,"active_fingerprint":"a"}},{"worker":1,"response":{"active_generation":7,"active_fingerprint":"a"}}]}`
+	generation, err := parseActiveProfileGeneration(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nextTransportGeneration(1, generation); got != 8 {
+		t.Fatalf("generation=%d want 8", got)
+	}
+}
+
+func TestRemoteProfileStatusMustContainEveryWorkerGeneration(t *testing.T) {
+	for _, output := range []string{
+		`command completed without profile result`,
+		`PROFILE_RESULT={"workers":[]}`,
+		`PROFILE_RESULT={"workers":[{"worker":0,"response":{}}]}`,
+	} {
+		if _, err := parseActiveProfileGeneration(output); err == nil {
+			t.Fatalf("invalid status accepted: %s", output)
+		}
+	}
+}
+
 func TestFailureDetailIncludesRedactedRootCauseAndExcerpt(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "worker.log")
 	contents := "Traceback (most recent call last):\n  File \"deploy.py\", line 12\nRuntimeError: password=do-not-leak socket conflict\n"
