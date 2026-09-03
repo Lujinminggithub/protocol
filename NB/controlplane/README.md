@@ -7,8 +7,10 @@ health/metrics and sends durable, idempotent events to an existing web service.
 ## Central operations service
 
 `nb-web` is the central multi-line service. It embeds its browser UI in the Go
-binary and keeps device inventory, line
-topology, latest worker snapshots, incidents and typed operations in SQLite.
+binary. Production device inventory, line topology, users, incidents and typed
+operations are stored in MySQL/MariaDB. Bounded traffic history is isolated in
+`nb-telemetry.db`; raw samples are retained for 24 hours and progressively
+rolled up. The telemetry database and its journal are capped below 600 MiB.
 It never stores SSH passwords or node private keys; a line stores only a
 `secret_ref` that points to the local secret owner. When an operator registers a
 device in the Web UI, the initial SSH password is required and is written to the
@@ -39,8 +41,8 @@ diagnostics. Do not run them at the same time as the combined launcher.
 For production, install both `nb-web` and `nb-web-worker` on the Linux operations
 host below `/opt/nb-controlplane`, then install the units from
 `controlplane/linux`. `nb-web` listens internally on `127.0.0.1:19091`; Nginx
-publishes `https://<operations-host>:9091` and restricts it to the operator
-workstation's public IP. The worker continues to use the loopback HTTP endpoint,
+publishes `https://<operations-host>:9091`; administrator login protects the
+management API. The worker continues to use the loopback HTTP endpoint,
 so agent credentials never traverse the public listener:
 
 ```bash
@@ -54,12 +56,15 @@ copied once more after the old processes stop. This preserves operation events,
 snapshots and outbox history without replaying a partially running operation.
 
 Windows runs no control-plane service or SSH tunnel. Open the Linux endpoint
-directly in a browser and enter the admin token. For an IP-only deployment,
+directly in a browser and sign in. For an IP-only deployment,
 install the server's pinned leaf certificate in the Windows current-user trust
 store before opening `https://<operations-host>:9091`.
 
-The central API uses
-`Authorization: Bearer`; all operation mutations additionally require an
+The browser uses an administrator account and a short-lived bearer session.
+The initial account is `admin` with password `admin123!@#`; the first login must
+replace it with a password of at least eight characters containing uppercase,
+lowercase and special characters. The agent API continues to use its separate
+`NB_WEB_AGENT_TOKEN`. All operation mutations additionally require an
 `Idempotency-Key`. Supported operation types are `line.open`, `line.validate`,
 `line.upgrade`, `line.rollback`, and `line.disable`. Agents can only claim typed
 operations and return a terminal result, so the web service cannot execute
@@ -79,10 +84,9 @@ service accepts the existing `/api/nb/v1/node-snapshots` and
 `/agent/v1/incidents`, `GET /agent/v1/operations?line_id=...`, and
 `POST /agent/v1/operations/{id}/result` directly.
 
-SQLite WAL is appropriate for one Windows central process and dozens of lines.
-Before running multiple central replicas, move the central store to a network
-database such as MySQL or PostgreSQL;
-the per-line agent outbox remains SQLite.
+Successful operation detail is retained for 24 hours, failed or rolled-back
+detail for 30 days, and operation summaries remain durable. The per-line agent
+outbox remains SQLite and is not part of the central database.
 
 ### Operation worker
 

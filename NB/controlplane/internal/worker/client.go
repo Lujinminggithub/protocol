@@ -166,7 +166,8 @@ func (c *Client) complete(ctx context.Context, operation Operation, status strin
 
 func retryableCompletionError(err error) bool {
 	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"database is locked", "sqlite_busy", "http 500", "http 502", "http 503", "http 504", "timeout", "temporarily unavailable"} {
+	for _, marker := range []string{"database is locked", "sqlite_busy", "deadlock", "lock wait timeout", "too many connections",
+		"http 500", "http 502", "http 503", "http 504", "timeout", "temporarily unavailable"} {
 		if strings.Contains(message, marker) {
 			return true
 		}

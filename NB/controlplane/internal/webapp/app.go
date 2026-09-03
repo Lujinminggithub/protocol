@@ -80,6 +80,10 @@ type App struct {
 }
 
 func New(store *central.Store, cfg Config) *App {
+	hash, err := defaultAdminPasswordHash()
+	if err != nil || store.EnsureInitialUser(context.Background(), initialAdminUsername, hash) != nil {
+		panic("failed to initialize administrator account")
+	}
 	app := &App{store: store, cfg: cfg, deviceSecrets: deviceSecretStore{path: cfg.DeviceSecretsFile},
 		verifySSHCredentials: verifySSHPassword, snapshotHub: newSnapshotHub()}
 	if _, err := rand.Read(app.hostKeyTokenKey[:]); err != nil {
@@ -92,6 +96,9 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.health)
 	mux.HandleFunc("GET /readyz", a.ready)
+	mux.HandleFunc("POST /api/v1/auth/login", a.login)
+	mux.HandleFunc("GET /api/v1/auth/me", a.currentUser)
+	mux.HandleFunc("POST /api/v1/auth/password", a.changePassword)
 	mux.HandleFunc("GET /api/v1/dashboard", a.admin(a.dashboard))
 	mux.HandleFunc("GET /api/v1/topology", a.admin(a.topology))
 	mux.HandleFunc("PUT /api/v1/topology/layout", a.admin(a.saveTopologyLayout))
@@ -169,8 +176,15 @@ func authorized(provided, expected string) bool {
 func (a *App) admin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(bearer(r), a.cfg.AdminToken) {
-			problem(w, http.StatusUnauthorized, "admin authorization required")
-			return
+			user, _, err := a.authenticateSession(r.Context(), r)
+			if err != nil {
+				problem(w, http.StatusUnauthorized, "登录会话无效或已过期")
+				return
+			}
+			if user.MustChangePassword {
+				problem(w, http.StatusForbidden, "首次登录必须修改管理员密码")
+				return
+			}
 		}
 		next(w, r)
 	}

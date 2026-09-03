@@ -49,6 +49,10 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 	if err := validateLineDeletion(id, request); err != nil {
 		return err
 	}
+	var snapshots int
+	if err := s.telemetryDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM snapshots WHERE line_id=?`, id).Scan(&snapshots); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -56,18 +60,17 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 	defer tx.Rollback()
 	var line Line
 	err = tx.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
- active_deployment,profile,secret_ref,created_at,updated_at FROM lines WHERE id=?`, id).Scan(
+ active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE id=?`, id).Scan(
 		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt)
 	if err != nil {
 		return err
 	}
-	var active, failedStops, specs, snapshots, incidents, operations int
+	var active, failedStops, specs, incidents, operations int
 	for query, target := range map[string]*int{
 		`SELECT COUNT(*) FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running')`: &active,
 		`SELECT COUNT(*) FROM operations WHERE line_id=? AND kind='line.disable' AND status='failed'`:     &failedStops,
 		`SELECT COUNT(*) FROM line_specs WHERE line_id=?`:                                                 &specs,
-		`SELECT COUNT(*) FROM snapshots WHERE line_id=?`:                                                  &snapshots,
 		`SELECT COUNT(*) FROM incidents WHERE line_id=?`:                                                  &incidents,
 		`SELECT COUNT(*) FROM operations WHERE line_id=?`:                                                 &operations,
 	} {
@@ -110,13 +113,27 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
 		`DELETE FROM operations WHERE line_id=?`, `DELETE FROM snapshots WHERE line_id=?`,
 		`DELETE FROM incidents WHERE line_id=?`, `DELETE FROM line_specs WHERE line_id=?`,
-		`DELETE FROM lines WHERE id=?`,
+		`DELETE FROM ` + s.linesTable() + ` WHERE id=?`,
 	} {
 		if _, err = tx.ExecContext(ctx, query, id); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	telemetryTx, err := s.telemetryDB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer telemetryTx.Rollback()
+	for _, query := range []string{`DELETE FROM latest_snapshot_payloads WHERE line_id=?`,
+		`DELETE FROM snapshots WHERE line_id=?`, `DELETE FROM traffic_rollups WHERE line_id=?`} {
+		if _, err = telemetryTx.ExecContext(ctx, query, id); err != nil {
+			return err
+		}
+	}
+	return telemetryTx.Commit()
 }
 
 func hasDeletionBlockingDevice(devices []lineDeletionDevice) bool {

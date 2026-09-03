@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -158,6 +159,100 @@ func TestDeleteOperationsOnlyRemovesTerminalTasksAtomically(t *testing.T) {
 	}
 	if events != 1 {
 		t.Fatalf("cleanup removed operation evidence: %d", events)
+	}
+}
+
+func TestPruneControlHistoryKeepsSummariesAndRecentFailureDetails(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	nowAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	if _, err = store.db.Exec(`INSERT INTO lines
+ (id,name,status,entry_region,exit_region,provider,capacity_mbps,created_at,updated_at)
+ VALUES('line-logs','logs','active','entry','exit','test',10,?,?)`, now(), now()); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []struct{ id, status, at string }{
+		{"op-success", "succeeded", nowAt.Add(-25 * time.Hour).Format(time.RFC3339Nano)},
+		{"op-failed-recent", "failed", nowAt.Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano)},
+		{"op-failed-old", "failed", nowAt.Add(-31 * 24 * time.Hour).Format(time.RFC3339Nano)},
+	} {
+		if _, err = store.db.Exec(`INSERT INTO operations
+ (id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at)
+ VALUES(?, 'line-logs','line.open',?,'test',?,'{}','{}',?,?)`, operation.id, operation.status,
+			operation.id, operation.at, operation.at); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = store.db.Exec(`INSERT INTO operation_events
+ (operation_id,sequence,stage,status,message,parameters,created_at) VALUES(?,1,'provision','done','detail','{}',?)`,
+			operation.id, operation.at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.db.Exec(`INSERT INTO raw_events(path,idempotency_key,payload,received_at)
+	 VALUES('/agent','raw-old','{}',?)`, nowAt.Add(-8*24*time.Hour).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.EnsureInitialUser(t.Context(), "retention-user", []byte("hash")); err != nil {
+		t.Fatal(err)
+	}
+	user, err := store.UserForLogin(t.Context(), "retention-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CreateUserSession(t.Context(), user.UserID, []byte("expired-session"), nowAt.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.PruneControlHistory(t.Context(), nowAt); err != nil {
+		t.Fatal(err)
+	}
+	var operations, events, raw, sessions int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM operations`).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM operation_events`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM raw_events`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM user_sessions`).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 3 || events != 1 || raw != 0 || sessions != 0 {
+		t.Fatalf("operations=%d events=%d raw=%d sessions=%d", operations, events, raw, sessions)
+	}
+}
+
+func TestOperationEventDetailIsSizeBounded(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.db.Exec(`INSERT INTO lines
+ (id,name,status,entry_region,exit_region,provider,capacity_mbps,created_at,updated_at)
+ VALUES('line-event-size','event','active','entry','exit','test',10,?,?)`, now(), now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`INSERT INTO operations
+ (id,line_id,kind,status,requested_by,idempotency_key,request,result,created_at,updated_at)
+ VALUES('op-event-size','line-event-size','line.open','running','test','op-event-size','{}',NULL,?,?)`, now(), now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordOperationEvent(t.Context(), OperationEvent{OperationID: "op-event-size", Sequence: 1,
+		Stage: "provision", Status: "running", Message: strings.Repeat("x", 64<<10),
+		Parameters: json.RawMessage(`{"detail":"` + strings.Repeat("y", 128<<10) + `"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	var messageBytes, parameterBytes int
+	if err = store.db.QueryRow(`SELECT length(message),length(parameters) FROM operation_events WHERE operation_id='op-event-size'`).Scan(&messageBytes, &parameterBytes); err != nil {
+		t.Fatal(err)
+	}
+	if messageBytes > 32<<10 || parameterBytes > 64<<10 {
+		t.Fatalf("message=%d parameters=%d", messageBytes, parameterBytes)
 	}
 }
 
@@ -402,6 +497,59 @@ func TestOpenAllowsConcurrentDatabaseWork(t *testing.T) {
 	}
 }
 
+func TestOpenSeparatesBoundedTelemetryFromControlData(t *testing.T) {
+	directory := t.TempDir()
+	controlPath := filepath.Join(directory, "central.db")
+	store, err := Open(controlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-split", Name: "split", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"diagnostic":"latest-only"}`)
+	item := Snapshot{LineID: "line-split", NodeID: "entry-0", Role: "entry", WorkerID: "0",
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "ok", Payload: payload}
+	if inserted, recordErr := store.RecordSnapshot(t.Context(), item); recordErr != nil || !inserted {
+		t.Fatalf("RecordSnapshot inserted=%v err=%v", inserted, recordErr)
+	}
+	var controlSnapshots int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&controlSnapshots); err != nil {
+		t.Fatal(err)
+	}
+	if controlSnapshots != 0 {
+		t.Fatalf("control database contains %d telemetry rows", controlSnapshots)
+	}
+	var historicalPayload string
+	if err = store.telemetryDB.QueryRow(`SELECT payload FROM snapshots`).Scan(&historicalPayload); err != nil {
+		t.Fatal(err)
+	}
+	if historicalPayload != `{}` {
+		t.Fatalf("historical payload=%q want compact placeholder", historicalPayload)
+	}
+	latest, err := store.LatestSnapshots(t.Context(), "line-split")
+	if err != nil || len(latest) != 1 || string(latest[0].Payload) != string(payload) {
+		t.Fatalf("latest snapshots=%+v err=%v", latest, err)
+	}
+	if _, err = os.Stat(filepath.Join(directory, "central-telemetry.db")); err != nil {
+		t.Fatalf("telemetry database missing: %v", err)
+	}
+	for name, database := range map[string]*sql.DB{"control": store.db, "telemetry": store.telemetryDB} {
+		var pageSize, maxPages int64
+		if err = database.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+			t.Fatal(err)
+		}
+		if err = database.QueryRow(`PRAGMA max_page_count`).Scan(&maxPages); err != nil {
+			t.Fatal(err)
+		}
+		if size := pageSize * maxPages; size > 1<<30 {
+			t.Fatalf("%s database cap=%d exceeds 1 GiB", name, size)
+		}
+	}
+}
+
 func TestCompleteOperationIsIdempotentAfterResultWasPersisted(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -440,7 +588,7 @@ func TestOpenCreatesLatestSnapshotIndex(t *testing.T) {
 	defer store.Close()
 
 	var count int
-	err = store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='snapshots_latest_node'`).Scan(&count)
+	err = store.telemetryDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='snapshots_latest_node'`).Scan(&count)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +673,7 @@ func TestDashboardHandlesSnapshotHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = store.db.Exec(`WITH RECURSIVE a(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM a WHERE i<250),
+	_, err = store.telemetryDB.Exec(`WITH RECURSIVE a(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM a WHERE i<250),
 	 b(j) AS (VALUES(1) UNION ALL SELECT j+1 FROM b WHERE j<100)
 	 INSERT INTO snapshots
 	 (line_id,node_id,role,worker_id,observed_at,health,deployment,profile,sessions,throughput_mbps,
@@ -575,10 +723,10 @@ func TestDashboardUsesMaterializedLatestSnapshots(t *testing.T) {
 	}
 
 	var latestCount, historyCount int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM latest_snapshots`).Scan(&latestCount); err != nil {
+	if err = store.telemetryDB.QueryRow(`SELECT COUNT(*) FROM latest_snapshots`).Scan(&latestCount); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&historyCount); err != nil {
+	if err = store.telemetryDB.QueryRow(`SELECT COUNT(*) FROM snapshots`).Scan(&historyCount); err != nil {
 		t.Fatal(err)
 	}
 	if latestCount != 1 || historyCount != 2 {
@@ -591,7 +739,7 @@ func TestDashboardUsesMaterializedLatestSnapshots(t *testing.T) {
 	if got := view.Lines[0]; got.Health != "healthy" || got.Sessions != 7 || got.UpstreamMbps != 3 || got.DownstreamMbps != 1 {
 		t.Fatalf("dashboard did not retain newest snapshot: %+v", got)
 	}
-	rows, err := store.db.Query(`EXPLAIN QUERY PLAN SELECT s.role FROM latest_snapshots latest
+	rows, err := store.telemetryDB.Query(`EXPLAIN QUERY PLAN SELECT s.role FROM latest_snapshots latest
 	 JOIN snapshots s ON s.id=latest.snapshot_id WHERE latest.line_id=?`, "line-1")
 	if err != nil {
 		t.Fatal(err)
@@ -737,18 +885,54 @@ func TestTrafficResolutionAndRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	var raw int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE line_id='line-retention'`).Scan(&raw); err != nil {
+	if err = store.telemetryDB.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE line_id='line-retention'`).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	if raw != 1 {
 		t.Fatalf("raw snapshots=%d want latest only", raw)
 	}
 	var rollups int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM traffic_rollups WHERE line_id='line-retention'`).Scan(&rollups); err != nil {
+	if err = store.telemetryDB.QueryRow(`SELECT COUNT(*) FROM traffic_rollups WHERE line_id='line-retention'`).Scan(&rollups); err != nil {
 		t.Fatal(err)
 	}
 	if rollups == 0 {
 		t.Fatal("recent rollups were removed")
+	}
+}
+
+func TestPruneTrafficBatchCommitsBoundedProgress(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-batch-retention", Name: "retention", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	nowAt := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	for index := 0; index < 5; index++ {
+		item := Snapshot{LineID: "line-batch-retention", NodeID: "entry-0", Role: "entry", WorkerID: "0",
+			ObservedAt: nowAt.Add(time.Duration(-9*24*time.Hour) + time.Duration(index)*time.Second).Format(time.RFC3339Nano),
+			Health:     "ok", UpstreamMbps: 1}
+		if _, err = store.RecordSnapshot(t.Context(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deleted, err := store.pruneTrafficBatch(t.Context(), nowAt, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted=%d want 2", deleted)
+	}
+	var remaining int
+	if err = store.telemetryDB.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE line_id='line-batch-retention'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 3 {
+		t.Fatalf("remaining=%d want 3", remaining)
 	}
 }
 
@@ -775,7 +959,7 @@ func TestBackfillTrafficRollupsIsIdempotent(t *testing.T) {
 			t.Fatalf("RecordSnapshot inserted=%v err=%v", inserted, recordErr)
 		}
 	}
-	if _, err = store.db.Exec(`DELETE FROM traffic_rollups WHERE line_id='line-backfill'`); err != nil {
+	if _, err = store.telemetryDB.Exec(`DELETE FROM traffic_rollups WHERE line_id='line-backfill'`); err != nil {
 		t.Fatal(err)
 	}
 	completed, err := store.BackfillTrafficHistory(t.Context())
@@ -788,7 +972,7 @@ func TestBackfillTrafficRollupsIsIdempotent(t *testing.T) {
 	}
 	var samples, healthRank int64
 	var upstream float64
-	if err = store.db.QueryRow(`SELECT sample_count,upstream_sum,health_rank FROM traffic_rollups
+	if err = store.telemetryDB.QueryRow(`SELECT sample_count,upstream_sum,health_rank FROM traffic_rollups
 	 WHERE line_id='line-backfill' AND resolution_s=60`).Scan(&samples, &upstream, &healthRank); err != nil {
 		t.Fatal(err)
 	}

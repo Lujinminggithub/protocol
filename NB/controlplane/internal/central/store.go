@@ -7,21 +7,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	_ "modernc.org/sqlite"
 )
 
 var ErrConflict = errors.New("idempotency key was already used for a different operation")
 
 type Store struct {
-	db          *sql.DB
-	operationMu sync.Mutex
-	specMu      sync.Mutex
-	writeMu     sync.Mutex
+	db               *sql.DB
+	telemetryDB      *sql.DB
+	operationMu      sync.Mutex
+	specMu           sync.Mutex
+	writeMu          sync.Mutex
+	telemetryWriteMu sync.Mutex
+	dialect          string
 }
+
+const (
+	controlDatabaseMaxBytes   int64 = 128 << 20
+	telemetryDatabaseMaxBytes int64 = 512 << 20
+	controlJournalMaxBytes    int64 = 16 << 20
+	telemetryJournalMaxBytes  int64 = 64 << 20
+)
 
 type scanner interface{ Scan(...any) error }
 
@@ -137,6 +149,64 @@ type LineView struct {
 }
 
 func Open(path string) (*Store, error) {
+	db, err := openSQLite(path, controlDatabaseMaxBytes, controlJournalMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	telemetryPath := strings.TrimSuffix(path, filepath.Ext(path)) + "-telemetry" + filepath.Ext(path)
+	telemetryDB, err := openSQLite(telemetryPath, telemetryDatabaseMaxBytes, telemetryJournalMaxBytes)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	s := &Store{db: db, telemetryDB: telemetryDB, dialect: "sqlite"}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err = s.migrate(ctx); err == nil {
+		err = s.migrateTelemetry(ctx)
+	}
+	if err != nil {
+		telemetryDB.Close()
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func OpenMySQL(dsn, telemetryPath string) (*Store, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, errors.New("MySQL DSN is required")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(8)
+	db.SetConnMaxLifetime(3 * time.Minute)
+	telemetryDB, err := openSQLite(telemetryPath, telemetryDatabaseMaxBytes, telemetryJournalMaxBytes)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	s := &Store{db: db, telemetryDB: telemetryDB, dialect: "mysql"}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err = db.PingContext(ctx); err == nil {
+		err = s.migrateMySQL(ctx)
+	}
+	if err == nil {
+		err = s.migrateTelemetry(ctx)
+	}
+	if err != nil {
+		telemetryDB.Close()
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func openSQLite(path string, maxBytes, journalMaxBytes int64) (*sql.DB, error) {
 	separator := "?"
 	if strings.Contains(path, "?") {
 		separator = "&"
@@ -155,27 +225,100 @@ func Open(path string) (*Store, error) {
 	// the HTTP listener is not started until this initialization succeeds.
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
+	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA foreign_keys=ON",
+		"PRAGMA busy_timeout=5000", "PRAGMA auto_vacuum=INCREMENTAL", "PRAGMA wal_autocheckpoint=1000",
+		fmt.Sprintf("PRAGMA journal_size_limit=%d", journalMaxBytes)} {
 		if _, err = db.ExecContext(ctx, pragma); err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
-	s := &Store{db: db}
-	if err = s.migrate(ctx); err != nil {
+	var pageSize int64
+	if err = db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return s, nil
+	if _, err = db.ExecContext(ctx, fmt.Sprintf("PRAGMA max_page_count=%d", maxBytes/pageSize)); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
-func (s *Store) Close() error                   { return s.db.Close() }
-func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
-func now() string                               { return time.Now().UTC().Format(time.RFC3339Nano) }
+func (s *Store) Close() error {
+	telemetryErr := s.telemetryDB.Close()
+	controlErr := s.db.Close()
+	if controlErr != nil {
+		return controlErr
+	}
+	return telemetryErr
+}
+
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return err
+	}
+	return s.telemetryDB.PingContext(ctx)
+}
+func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 func (s *Store) lockWrite() func() {
 	s.writeMu.Lock()
 	return s.writeMu.Unlock
+}
+
+func (s *Store) lockTelemetryWrite() func() {
+	s.telemetryWriteMu.Lock()
+	return s.telemetryWriteMu.Unlock
+}
+
+func (s *Store) migrateTelemetry(ctx context.Context) error {
+	_, err := s.telemetryDB.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS snapshots (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, line_id TEXT NOT NULL,
+ node_id TEXT NOT NULL, role TEXT NOT NULL, worker_id TEXT NOT NULL,
+ observed_at TEXT NOT NULL, health TEXT NOT NULL, deployment TEXT NOT NULL,
+ profile TEXT NOT NULL, sessions INTEGER NOT NULL, throughput_mbps REAL NOT NULL,
+ upstream_mbps REAL NOT NULL DEFAULT 0, downstream_mbps REAL NOT NULL DEFAULT 0,
+ queue_age_p95_us REAL NOT NULL, effective_loss_pct REAL NOT NULL,
+ fec_observe INTEGER NOT NULL, fec_active INTEGER NOT NULL, payload BLOB NOT NULL DEFAULT '{}',
+ received_at TEXT NOT NULL, UNIQUE(line_id,node_id,worker_id,observed_at)
+);
+CREATE TABLE IF NOT EXISTS latest_snapshots (
+ line_id TEXT NOT NULL, node_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+ snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+ PRIMARY KEY(line_id,node_id)
+);
+CREATE TABLE IF NOT EXISTS latest_snapshot_payloads (
+ line_id TEXT NOT NULL, node_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+ payload BLOB NOT NULL, PRIMARY KEY(line_id,node_id)
+);
+CREATE TABLE IF NOT EXISTS traffic_rollups (
+ line_id TEXT NOT NULL, node_id TEXT NOT NULL, role TEXT NOT NULL, worker_id TEXT NOT NULL,
+ resolution_s INTEGER NOT NULL CHECK(resolution_s IN (60,300,3600)),
+ bucket_at TEXT NOT NULL, sample_count INTEGER NOT NULL,
+ upstream_sum REAL NOT NULL, downstream_sum REAL NOT NULL,
+ sessions_max INTEGER NOT NULL, queue_age_max_us REAL NOT NULL,
+ effective_loss_max_pct REAL NOT NULL, health_rank INTEGER NOT NULL,
+ deployment TEXT NOT NULL, profile TEXT NOT NULL, last_observed_at TEXT NOT NULL,
+ PRIMARY KEY(line_id,node_id,worker_id,resolution_s,bucket_at)
+);
+CREATE TABLE IF NOT EXISTS maintenance_jobs (name TEXT PRIMARY KEY, completed_at TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS snapshots_update_latest AFTER INSERT ON snapshots BEGIN
+ INSERT INTO latest_snapshots(line_id,node_id,observed_at,snapshot_id)
+ VALUES(NEW.line_id,NEW.node_id,NEW.observed_at,NEW.id)
+ ON CONFLICT(line_id,node_id) DO UPDATE SET
+  observed_at=excluded.observed_at,snapshot_id=excluded.snapshot_id
+ WHERE excluded.observed_at>latest_snapshots.observed_at OR
+  (excluded.observed_at=latest_snapshots.observed_at AND excluded.snapshot_id>latest_snapshots.snapshot_id);
+END;
+CREATE INDEX IF NOT EXISTS snapshots_latest ON snapshots(line_id,node_id,worker_id,observed_at DESC);
+CREATE INDEX IF NOT EXISTS snapshots_latest_node ON snapshots(line_id,node_id,observed_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS snapshots_retention ON snapshots(observed_at,id);
+CREATE INDEX IF NOT EXISTS traffic_rollups_range ON traffic_rollups(line_id,resolution_s,bucket_at);
+CREATE INDEX IF NOT EXISTS traffic_rollups_retention ON traffic_rollups(resolution_s,bucket_at);
+`)
+	return err
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -300,6 +443,15 @@ CREATE TABLE IF NOT EXISTS transport_generations (
  line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
  current_generation INTEGER NOT NULL CHECK(current_generation > 0), updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+ password_hash BLOB NOT NULL, must_change_password INTEGER NOT NULL DEFAULT 1,
+ status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_sessions (
+ token_hash BLOB PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ expires_at TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS snapshots_latest ON snapshots(line_id,node_id,worker_id,observed_at DESC);
 CREATE INDEX IF NOT EXISTS snapshots_latest_node ON snapshots(line_id,node_id,observed_at DESC,id DESC);
 CREATE INDEX IF NOT EXISTS traffic_rollups_range ON traffic_rollups(line_id,resolution_s,bucket_at);
@@ -310,6 +462,7 @@ CREATE INDEX IF NOT EXISTS devices_status ON devices(status,region,name);
 CREATE INDEX IF NOT EXISTS line_nodes_device ON line_nodes(device_id,line_id);
 CREATE INDEX IF NOT EXISTS operation_events_order ON operation_events(operation_id,sequence);
 CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_id,deleted_at DESC);
+CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_at);
 `)
 	if err != nil {
 		return err
@@ -442,12 +595,18 @@ CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_
 
 func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
 	stamp := now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO lines
+	query := s.controlSQL(`INSERT INTO lines
  (id,name,status,entry_region,exit_region,provider,capacity_mbps,active_deployment,profile,secret_ref,created_at,updated_at)
  VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,
  entry_region=excluded.entry_region,exit_region=excluded.exit_region,provider=excluded.provider,
  capacity_mbps=excluded.capacity_mbps,active_deployment=excluded.active_deployment,
- profile=excluded.profile,secret_ref=excluded.secret_ref,updated_at=excluded.updated_at`,
+	 profile=excluded.profile,secret_ref=excluded.secret_ref,updated_at=excluded.updated_at`, `INSERT INTO `+s.linesTable()+`
+ (id,name,status,entry_region,exit_region,provider,capacity_mbps,active_deployment,profile,secret_ref,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),status=VALUES(status),
+ entry_region=VALUES(entry_region),exit_region=VALUES(exit_region),provider=VALUES(provider),
+ capacity_mbps=VALUES(capacity_mbps),active_deployment=VALUES(active_deployment),profile=VALUES(profile),
+ secret_ref=VALUES(secret_ref),updated_at=VALUES(updated_at)`)
+	_, err := s.db.ExecContext(ctx, query,
 		line.ID, line.Name, line.Status, line.EntryRegion, line.ExitRegion, line.Provider,
 		line.CapacityMbps, line.ActiveDeployment, line.Profile, line.SecretRef, stamp, stamp)
 	if err != nil {
@@ -459,7 +618,7 @@ func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
 func (s *Store) Line(ctx context.Context, id string) (Line, error) {
 	var line Line
 	err := s.db.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
- active_deployment,profile,secret_ref,created_at,updated_at FROM lines WHERE id=?`, id).Scan(
+ active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE id=?`, id).Scan(
 		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt)
 	return line, err
@@ -467,7 +626,7 @@ func (s *Store) Line(ctx context.Context, id string) (Line, error) {
 
 func (s *Store) Lines(ctx context.Context) ([]Line, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
- active_deployment,profile,secret_ref,created_at,updated_at FROM lines WHERE status<>'archived' ORDER BY name`)
+ active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE status<>'archived' ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +644,10 @@ func (s *Store) Lines(ctx context.Context) ([]Line, error) {
 }
 
 func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error) {
-	unlock := s.lockWrite()
+	if _, err := s.Line(ctx, item.LineID); err != nil {
+		return false, err
+	}
+	unlock := s.lockTelemetryWrite()
 	defer unlock()
 	if item.WorkerID == "collector" && item.Health == "down" && strings.HasSuffix(item.NodeID, "-collector") {
 		return false, nil
@@ -494,7 +656,7 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.telemetryDB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -504,7 +666,7 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 	 upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct,fec_observe,fec_active,payload,received_at)
 	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.LineID, item.NodeID, item.Role, item.WorkerID, item.ObservedAt,
 		item.Health, item.Deployment, item.Profile, item.Sessions, item.ThroughputMbps, item.UpstreamMbps, item.DownstreamMbps, item.QueueAgeP95US,
-		item.EffectiveLoss, item.FECObserve, item.FECActive, []byte(payload), now())
+		item.EffectiveLoss, item.FECObserve, item.FECActive, []byte(`{}`), now())
 	if err != nil {
 		return false, err
 	}
@@ -516,10 +678,15 @@ func (s *Store) RecordSnapshot(ctx context.Context, item Snapshot) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	for _, resolution := range []time.Duration{time.Minute, 5 * time.Minute} {
+	for _, resolution := range []time.Duration{time.Minute, 5 * time.Minute, time.Hour} {
 		if err = upsertTrafficRollup(ctx, tx, item, observedAt.Truncate(resolution), int(resolution/time.Second)); err != nil {
 			return false, err
 		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO latest_snapshot_payloads(line_id,node_id,observed_at,payload)
+	 VALUES(?,?,?,?) ON CONFLICT(line_id,node_id) DO UPDATE SET observed_at=excluded.observed_at,payload=excluded.payload
+	 WHERE excluded.observed_at>=latest_snapshot_payloads.observed_at`, item.LineID, item.NodeID, item.ObservedAt, []byte(payload)); err != nil {
+		return false, err
 	}
 	if err = tx.Commit(); err != nil {
 		return false, err
@@ -534,8 +701,10 @@ func (s *Store) RecordIncident(ctx context.Context, item Incident) (bool, error)
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO incidents
- (id,line_id,severity,status,kind,message,observed_at,payload) VALUES(?,?,?,?,?,?,?,?)`,
+	query := s.controlSQL(`INSERT OR IGNORE INTO incidents
+	 (id,line_id,severity,status,kind,message,observed_at,payload) VALUES(?,?,?,?,?,?,?,?)`, `INSERT IGNORE INTO incidents
+	 (id,line_id,severity,status,kind,message,observed_at,payload) VALUES(?,?,?,?,?,?,?,?)`)
+	result, err := s.db.ExecContext(ctx, query,
 		item.ID, item.LineID, item.Severity, item.Status, item.Kind, item.Message, item.ObservedAt, []byte(payload))
 	if err != nil {
 		return false, err
@@ -610,6 +779,22 @@ func (s *Store) OperationByIdempotencyKey(ctx context.Context, key string) (Oper
 func (s *Store) AllocateTransportGeneration(ctx context.Context, lineID string) (uint64, error) {
 	unlock := s.lockWrite()
 	defer unlock()
+	if s.dialect == "mysql" {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, err
+		}
+		defer tx.Rollback()
+		if _, err = tx.ExecContext(ctx, `INSERT INTO transport_generations(line_id,current_generation,updated_at)
+		 VALUES(?,1,?) ON DUPLICATE KEY UPDATE current_generation=current_generation+1,updated_at=VALUES(updated_at)`, lineID, now()); err != nil {
+			return 0, err
+		}
+		var generation uint64
+		if err = tx.QueryRowContext(ctx, `SELECT current_generation FROM transport_generations WHERE line_id=?`, lineID).Scan(&generation); err != nil {
+			return 0, err
+		}
+		return generation, tx.Commit()
+	}
 	var generation uint64
 	err := s.db.QueryRowContext(ctx, `INSERT INTO transport_generations(line_id,current_generation,updated_at)
 	 VALUES(?,1,?) ON CONFLICT(line_id) DO UPDATE SET
@@ -799,21 +984,21 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 		_ = json.Unmarshal(result, &values)
 		switch kind {
 		case "line.open", "line.upgrade", "line.rollback":
-			if _, err = tx.ExecContext(ctx, `UPDATE lines SET status='active',
+			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='active',
  active_deployment=CASE WHEN ?='' THEN active_deployment ELSE ? END,
  profile=CASE WHEN ?='' THEN profile ELSE ? END,updated_at=? WHERE id=?`,
 				values.Deployment, values.Deployment, values.Profile, values.Profile, now(), lineID); err != nil {
 				return err
 			}
 		case "line.disable":
-			if _, err = tx.ExecContext(ctx, `UPDATE lines SET status='disabled',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='disabled',updated_at=? WHERE id=?`, now(), lineID); err != nil {
 				return err
 			}
 		case "line.tune":
 			if values.Profile == "" {
 				return errors.New("successful transport tuning requires a profile result")
 			}
-			if _, err = tx.ExecContext(ctx, `UPDATE lines SET profile=?,updated_at=? WHERE id=?`, values.Profile, now(), lineID); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET profile=?,updated_at=? WHERE id=?`, values.Profile, now(), lineID); err != nil {
 				return err
 			}
 		}
@@ -844,10 +1029,14 @@ func (s *Store) RecordExecutor(ctx context.Context, item Executor) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO executors
+	query := s.controlSQL(`INSERT INTO executors
  (worker_id,status,version,capabilities,observed_at,updated_at) VALUES(?,?,?,?,?,?)
  ON CONFLICT(worker_id) DO UPDATE SET status=excluded.status,version=excluded.version,
- capabilities=excluded.capabilities,observed_at=excluded.observed_at,updated_at=excluded.updated_at`,
+	 capabilities=excluded.capabilities,observed_at=excluded.observed_at,updated_at=excluded.updated_at`, `INSERT INTO executors
+ (worker_id,status,version,capabilities,observed_at,updated_at) VALUES(?,?,?,?,?,?)
+ ON DUPLICATE KEY UPDATE status=VALUES(status),version=VALUES(version),capabilities=VALUES(capabilities),
+ observed_at=VALUES(observed_at),updated_at=VALUES(updated_at)`)
+	_, err = s.db.ExecContext(ctx, query,
 		item.WorkerID, item.Status, item.Version, capabilities, item.ObservedAt, now())
 	return err
 }
@@ -878,8 +1067,10 @@ func (s *Store) Executors(ctx context.Context, onlineWindow time.Duration) ([]Ex
 }
 
 func (s *Store) RecordRawEvent(ctx context.Context, path, key string, payload json.RawMessage) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO raw_events
- (path,idempotency_key,payload,received_at) VALUES(?,?,?,?)`, path, key, []byte(payload), now())
+	query := s.controlSQL(`INSERT OR IGNORE INTO raw_events
+	 (path,idempotency_key,payload,received_at) VALUES(?,?,?,?)`, `INSERT IGNORE INTO raw_events
+	 (path,idempotency_key,payload,received_at) VALUES(?,?,?,?)`)
+	result, err := s.db.ExecContext(ctx, query, path, key, []byte(payload), now())
 	if err != nil {
 		return false, err
 	}
@@ -895,7 +1086,7 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 	view := Dashboard{Lines: make([]LineView, 0, len(lines))}
 	for _, line := range lines {
 		item := LineView{Line: line, Health: "unknown"}
-		rows, queryErr := s.db.QueryContext(ctx, `SELECT s.role,s.health,s.deployment,s.profile,s.sessions,s.throughput_mbps,
+		rows, queryErr := s.telemetryDB.QueryContext(ctx, `SELECT s.role,s.health,s.deployment,s.profile,s.sessions,s.throughput_mbps,
 	 s.upstream_mbps,s.downstream_mbps,s.queue_age_p95_us,s.effective_loss_pct,s.fec_observe,s.fec_active,s.observed_at
 	 FROM latest_snapshots latest JOIN snapshots s ON s.id=latest.snapshot_id WHERE latest.line_id=?`, line.ID)
 		if queryErr != nil {

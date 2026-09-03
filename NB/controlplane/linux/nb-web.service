@@ -1,7 +1,7 @@
 [Unit]
 Description=NB central operations web console
-After=network-online.target
-Wants=network-online.target
+After=network-online.target mariadb.service
+Wants=network-online.target mariadb.service
 
 [Service]
 Type=simple
@@ -9,6 +9,7 @@ User=root
 Group=root
 UMask=0077
 EnvironmentFile=/opt/nb-controlplane/etc/nb-web.env
+EnvironmentFile=/opt/nb-controlplane/etc/nb-web-mysql.env
 Environment=NB_WEB_DEVICE_SECRETS_FILE=/opt/nb-controlplane/data/secrets/device-secrets.json
 ExecStart=/opt/nb-controlplane/bin/nb-web
 Restart=on-failure

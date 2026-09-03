@@ -4,10 +4,10 @@ import {TrafficWorkspace} from "./traffic-workspace.js";
 import {lineDeletionAction} from "./line-actions.js";
 
 const state = {
-  token: sessionStorage.getItem("nbAdminToken") || "",
+  token: sessionStorage.getItem("nbSessionToken") || "",
   dashboard: null, devices: [], lines: [], details: {}, topology: {devices:[],links:[]}, operations: [], incidents: [], executors: [], view: "overview", openOperationID: "",
   trafficCharts: null, overviewTopology: null, deviceTopology: null,
-  pendingDeviceHostKey: null, selectedOperations: new Set()
+  pendingDeviceHostKey: null, selectedOperations: new Set(), mustChangePassword: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -233,7 +233,7 @@ async function loadAll() {
     state.details = Object.fromEntries(details.map((detail) => [detail.line.id,detail]));
     renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview(); renderDeviceTopology();
     $("#updatedAt").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`; setConnected(true); $("#authModal").classList.add("hidden");
-  } catch (error) { setConnected(false); if (error.status === 401) { state.token=""; sessionStorage.removeItem("nbAdminToken"); $("#authModal").classList.remove("hidden"); } else toast(error.message); throw error; }
+  } catch (error) { setConnected(false); if (error.status === 401) { state.token=""; sessionStorage.removeItem("nbSessionToken"); $("#authModal").classList.remove("hidden"); } else toast(error.message); throw error; }
 }
 
 const viewMeta = {overview:["运营总览","线路拓扑、节点健康与执行任务"],devices:["设备管理","服务器库存、管理端口和健康状态"],lines:["线路管理","设备角色、容量、端口与部署状态"],operations:["操作任务","构建、上传、分发、启动和验证进度"],incidents:["告警中心","线路和设备异常汇总"]};
@@ -294,13 +294,14 @@ async function showOperationDetail(id) {
 
 $("#authForm").addEventListener("submit",async(event)=>{
   event.preventDefault();
-  const token=$("#tokenInput").value.trim(),button=$("#authSubmit"),errorBox=$("#authError");
-  if(!token){errorBox.textContent="请输入管理员令牌";return;}
-  state.token=token; errorBox.textContent=""; button.disabled=true; button.textContent="连接中...";
-  try{await loadAll();sessionStorage.setItem("nbAdminToken",state.token);}
-  catch(error){errorBox.textContent=error.status===401?"管理员令牌不正确，或与当前 nb-web 进程使用的令牌不一致。请使用启动该进程时设置的 NB_WEB_ADMIN_TOKEN。":`连接失败：${error.message}`;}
-  finally{button.disabled=false;button.textContent="连接";}
+  const username=$("#usernameInput").value.trim(),password=$("#passwordInput").value,button=$("#authSubmit"),errorBox=$("#authError");
+  if(!username||!password){errorBox.textContent="请输入用户名和密码";return;}
+  errorBox.textContent="";button.disabled=true;button.textContent="登录中...";
+  try{const result=await api("/api/v1/auth/login",{method:"POST",body:JSON.stringify({username,password})});state.token=result.token;state.mustChangePassword=!!result.must_change_password;sessionStorage.setItem("nbSessionToken",state.token);$("#authModal").classList.add("hidden");if(state.mustChangePassword){$("#currentPasswordInput").value=password;$("#passwordChangeModal").classList.remove("hidden");}else await loadAll();}
+  catch(error){state.token="";sessionStorage.removeItem("nbSessionToken");errorBox.textContent=error.status===401?"用户名或密码错误":`登录失败：${error.message}`;}
+  finally{button.disabled=false;button.textContent="登录";}
 });
+$("#passwordChangeForm").addEventListener("submit",async(event)=>{event.preventDefault();const current=$("#currentPasswordInput").value,next=$("#newPasswordInput").value,confirm=$("#confirmPasswordInput").value,button=$("#passwordChangeSubmit"),errorBox=$("#passwordChangeError");errorBox.textContent="";if(next!==confirm){errorBox.textContent="两次输入的新密码不一致";return;}button.disabled=true;try{await api("/api/v1/auth/password",{method:"POST",body:JSON.stringify({current_password:current,new_password:next})});state.mustChangePassword=false;$("#passwordChangeModal").classList.add("hidden");$("#passwordChangeForm").reset();await loadAll();}catch(error){errorBox.textContent=error.message;}finally{button.disabled=false;}});
 $("#deviceForm").addEventListener("submit",async(event)=>{
   event.preventDefault();
   const form=event.currentTarget,v=Object.fromEntries(new FormData(form));v.ssh_port=Number(v.ssh_port);v.labels={};
@@ -363,6 +364,7 @@ document.addEventListener("nb:open-traffic",(event)=>{
 $("#operationLine").addEventListener("change",async()=>{const id=$("#operationLine").value,data=await api(`/api/v1/operations?limit=100${id?`&line_id=${encodeURIComponent(id)}`:""}`);state.operations=data.operations||[];renderOperations();});$("#reloadOperations").addEventListener("click",()=>$("#operationLine").dispatchEvent(new Event("change")));
 $("#operationSelectAll").addEventListener("change",(event)=>{for(const box of $$('[data-operation-select]:not(:disabled)')){box.checked=event.currentTarget.checked;event.currentTarget.checked?state.selectedOperations.add(box.dataset.operationSelect):state.selectedOperations.delete(box.dataset.operationSelect);}syncOperationSelection();});
 $("#deleteSelectedOperations").addEventListener("click",()=>cleanupOperations([...state.selectedOperations]));
-if(state.token)loadAll().catch(()=>{});else $("#authModal").classList.remove("hidden");
-setInterval(()=>{if(state.token&&document.visibilityState==="visible")loadAll().catch(()=>{});},10000);
-setInterval(()=>{if(state.token&&state.openOperationID&&!$("#detailModal").classList.contains("hidden")&&document.visibilityState==="visible")showOperationDetail(state.openOperationID).catch(()=>{});},2000);
+async function restoreSession(){if(!state.token){$("#authModal").classList.remove("hidden");return;}try{const user=await api("/api/v1/auth/me");$("#authModal").classList.add("hidden");state.mustChangePassword=!!user.must_change_password;if(state.mustChangePassword){$("#passwordChangeModal").classList.remove("hidden");return;}await loadAll();}catch{state.token="";state.mustChangePassword=false;sessionStorage.removeItem("nbSessionToken");$("#authModal").classList.remove("hidden");}}
+restoreSession();
+setInterval(()=>{if(state.token&&!state.mustChangePassword&&document.visibilityState==="visible")loadAll().catch(()=>{});},10000);
+setInterval(()=>{if(state.token&&!state.mustChangePassword&&state.openOperationID&&!$("#detailModal").classList.contains("hidden")&&document.visibilityState==="visible")showOperationDetail(state.openOperationID).catch(()=>{});},2000);

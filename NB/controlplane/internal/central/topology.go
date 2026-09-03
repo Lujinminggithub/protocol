@@ -140,9 +140,12 @@ func (s *Store) SaveTopologyLayouts(ctx context.Context, items []TopologyLayout)
 	defer tx.Rollback()
 	updatedAt := now()
 	for _, item := range items {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO topology_layouts(device_id,x,y,z,updated_by,updated_at)
+		query := s.controlSQL(`INSERT INTO topology_layouts(device_id,x,y,z,updated_by,updated_at)
  VALUES(?,?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET
- x=excluded.x,y=excluded.y,z=excluded.z,updated_by=excluded.updated_by,updated_at=excluded.updated_at`,
+	 x=excluded.x,y=excluded.y,z=excluded.z,updated_by=excluded.updated_by,updated_at=excluded.updated_at`,
+			`INSERT INTO topology_layouts(device_id,x,y,z,updated_by,updated_at) VALUES(?,?,?,?,?,?)
+ ON DUPLICATE KEY UPDATE x=VALUES(x),y=VALUES(y),z=VALUES(z),updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)`)
+		if _, err = tx.ExecContext(ctx, query,
 			item.DeviceID, item.X, item.Y, item.Z, item.UpdatedBy, updatedAt); err != nil {
 			return err
 		}

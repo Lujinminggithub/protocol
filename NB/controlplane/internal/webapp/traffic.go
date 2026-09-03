@@ -28,8 +28,8 @@ func trafficResolution(value string, span time.Duration) (int, error) {
 		return central.TrafficResolution(span), nil
 	}
 	resolution, err := strconv.Atoi(value)
-	if err != nil || (resolution != 15 && resolution != 60 && resolution != 300) {
-		return 0, errors.New("resolution 仅支持 auto、15、60 或 300")
+	if err != nil || (resolution != 15 && resolution != 60 && resolution != 300 && resolution != 3600) {
+		return 0, errors.New("resolution 仅支持 auto、15、60、300 或 3600")
 	}
 	return resolution, nil
 }

@@ -26,7 +26,13 @@ func main() {
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		log.Fatal(err)
 	}
-	database, err := central.Open(filepath.Join(stateDir, "nb-web.db"))
+	var database *central.Store
+	var err error
+	if mysqlDSN := os.Getenv("NB_WEB_MYSQL_DSN"); mysqlDSN != "" {
+		database, err = central.OpenMySQL(mysqlDSN, filepath.Join(stateDir, "nb-telemetry.db"))
+	} else {
+		database, err = central.Open(filepath.Join(stateDir, "nb-web.db"))
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,11 +44,8 @@ func main() {
 	defer stop()
 	go func() {
 		backfillComplete := false
-		// Do not run the first retention sweep during startup. On a production
-		// database with a large snapshots table, the sweep can hold SQLite's
-		// single-writer lock long enough to make executor heartbeats time out.
-		pruneDue := false
-		ticker := time.NewTicker(time.Hour)
+		pruneDue := true
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
 			if !backfillComplete {
@@ -59,8 +62,12 @@ func main() {
 			}
 			if backfillComplete {
 				if pruneDue {
-					pruneCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-					pruneErr := database.PruneTraffic(pruneCtx, time.Now().UTC())
+					pruneCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					nowAt := time.Now().UTC()
+					pruneErr := database.PruneTraffic(pruneCtx, nowAt)
+					if pruneErr == nil {
+						pruneErr = database.PruneControlHistory(pruneCtx, nowAt)
+					}
 					cancel()
 					if pruneErr != nil && ctx.Err() == nil {
 						log.Printf("component=nb-web traffic_retention_error=%q", pruneErr)

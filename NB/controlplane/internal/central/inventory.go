@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type Device struct {
@@ -123,14 +124,21 @@ func (s *Store) UpsertDevice(ctx context.Context, item Device) (Device, error) {
 		item.SSHHostKeyStatus = "pending"
 	}
 	stamp := now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	query := s.controlSQL(`INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,host=excluded.host,
 	 ssh_port=excluded.ssh_port,ssh_user=excluded.ssh_user,ssh_host_key=excluded.ssh_host_key,
 	 ssh_host_key_type=excluded.ssh_host_key_type,ssh_host_key_sha256=excluded.ssh_host_key_sha256,
 	 ssh_host_key_status=excluded.ssh_host_key_status,ssh_host_key_confirmed_at=excluded.ssh_host_key_confirmed_at,
 	 private_ip=excluded.private_ip,
 	 region=excluded.region,provider=excluded.provider,os=excluded.os,arch=excluded.arch,
-	 secret_ref=excluded.secret_ref,labels=excluded.labels,updated_at=excluded.updated_at`,
+	 secret_ref=excluded.secret_ref,labels=excluded.labels,updated_at=excluded.updated_at`, `INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ ON DUPLICATE KEY UPDATE name=VALUES(name),status=VALUES(status),host=VALUES(host),ssh_port=VALUES(ssh_port),
+ ssh_user=VALUES(ssh_user),ssh_host_key=VALUES(ssh_host_key),ssh_host_key_type=VALUES(ssh_host_key_type),
+ ssh_host_key_sha256=VALUES(ssh_host_key_sha256),ssh_host_key_status=VALUES(ssh_host_key_status),
+ ssh_host_key_confirmed_at=VALUES(ssh_host_key_confirmed_at),private_ip=VALUES(private_ip),region=VALUES(region),
+ provider=VALUES(provider),os=VALUES(os),arch=VALUES(arch),secret_ref=VALUES(secret_ref),labels=VALUES(labels),
+ updated_at=VALUES(updated_at)`)
+	_, err := s.db.ExecContext(ctx, query,
 		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser,
 		item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256, item.SSHHostKeyStatus, item.SSHHostKeyConfirmedAt, item.PrivateIP,
 		item.Region, item.Provider, item.OS, item.Arch, item.SecretRef,
@@ -147,7 +155,9 @@ func (s *Store) EnsureDevice(ctx context.Context, item Device) (Device, bool, er
 		item.SSHHostKeyStatus = "pending"
 	}
 	stamp := now()
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	query := s.controlSQL(`INSERT OR IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	result, err := s.db.ExecContext(ctx, query,
 		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser,
 		item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256, item.SSHHostKeyStatus, item.SSHHostKeyConfirmedAt, item.PrivateIP,
 		item.Region, item.Provider, item.OS, item.Arch, item.SecretRef,
@@ -223,7 +233,7 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 		return LineSpec{}, errors.New(conflict)
 	}
 	stamp := now()
-	_, err = tx.ExecContext(ctx, `INSERT INTO line_specs
+	query := s.controlSQL(`INSERT INTO line_specs
 	 (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
 	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
 	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
@@ -233,7 +243,17 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
  udp_port_min=excluded.udp_port_min,udp_port_max=excluded.udp_port_max,
 	 relay_port=excluded.relay_port,exit_port=excluded.exit_port,exit_bind_ip=excluded.exit_bind_ip,dns_servers=excluded.dns_servers,whitelist=excluded.whitelist,
  build_mode=excluded.build_mode,artifact_ref=excluded.artifact_ref,source_ref=excluded.source_ref,
- srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at`,
+	 srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at`, `INSERT INTO line_specs
+ (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
+ relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE resource_group=VALUES(resource_group),
+ instance_id=VALUES(instance_id),bandwidth_mbps=VALUES(bandwidth_mbps),upstream_mbps=VALUES(upstream_mbps),
+ downstream_mbps=VALUES(downstream_mbps),socks_port=VALUES(socks_port),udp_port_min=VALUES(udp_port_min),
+ udp_port_max=VALUES(udp_port_max),relay_port=VALUES(relay_port),exit_port=VALUES(exit_port),
+ exit_bind_ip=VALUES(exit_bind_ip),dns_servers=VALUES(dns_servers),whitelist=VALUES(whitelist),build_mode=VALUES(build_mode),
+ artifact_ref=VALUES(artifact_ref),source_ref=VALUES(source_ref),srs_ref=VALUES(srs_ref),
+ jump_policy=VALUES(jump_policy),updated_at=VALUES(updated_at)`)
+	_, err = tx.ExecContext(ctx, query,
 		spec.LineID, spec.ResourceGroup, spec.InstanceID, spec.BandwidthMbps, spec.UpstreamMbps, spec.DownstreamMbps, spec.SocksPort,
 		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort, spec.ExitBindIP, normalizedJSON(spec.DNSServers, `["1.1.1.1","8.8.8.8"]`),
 		normalizedJSON(spec.Whitelist, `[]`), spec.BuildMode, spec.ArtifactRef, spec.SourceRef,
@@ -306,7 +326,7 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 // ActiveLineSpecs returns only deployed lines. Agents use this to rebuild
 // ephemeral worker state after a controller migration or restart.
 func (s *Store) ActiveLineSpecs(ctx context.Context) ([]LineSpec, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM lines WHERE status IN ('active','maintenance') ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM `+s.linesTable()+` WHERE status IN ('active','maintenance') ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -534,8 +554,18 @@ func (s *Store) RecordOperationEvent(ctx context.Context, event OperationEvent) 
 	if len(event.Parameters) == 0 {
 		event.Parameters = json.RawMessage(`{}`)
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO operation_events
- (operation_id,sequence,stage,status,message,parameters,created_at) VALUES(?,?,?,?,?,?,?)`,
+	if len(event.Message) > 32<<10 {
+		event.Message = strings.ToValidUTF8(event.Message[:32<<10], "")
+	}
+	if len(event.Parameters) > 64<<10 {
+		event.Parameters = json.RawMessage(`{"truncated":true}`)
+	}
+	query := s.controlSQL(`INSERT OR REPLACE INTO operation_events
+	 (operation_id,sequence,stage,status,message,parameters,created_at) VALUES(?,?,?,?,?,?,?)`, `INSERT INTO operation_events
+	 (operation_id,sequence,stage,status,message,parameters,created_at) VALUES(?,?,?,?,?,?,?)
+	 ON DUPLICATE KEY UPDATE stage=VALUES(stage),status=VALUES(status),message=VALUES(message),
+	 parameters=VALUES(parameters),created_at=VALUES(created_at)`)
+	_, err := s.db.ExecContext(ctx, query,
 		event.OperationID, event.Sequence, event.Stage, event.Status, event.Message,
 		normalizedJSON(event.Parameters, `{}`), now())
 	if err == nil {
@@ -566,10 +596,12 @@ func (s *Store) OperationEvents(ctx context.Context, operationID string) ([]Oper
 }
 
 func (s *Store) LatestSnapshots(ctx context.Context, lineID string) ([]Snapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT s.line_id,s.node_id,s.role,s.worker_id,s.observed_at,s.health,s.deployment,s.profile,
+	rows, err := s.telemetryDB.QueryContext(ctx, `SELECT s.line_id,s.node_id,s.role,s.worker_id,s.observed_at,s.health,s.deployment,s.profile,
 	 s.sessions,s.throughput_mbps,s.upstream_mbps,s.downstream_mbps,s.queue_age_p95_us,s.effective_loss_pct,
-	 s.fec_observe,s.fec_active,s.payload,s.received_at
-	 FROM latest_snapshots latest JOIN snapshots s ON s.id=latest.snapshot_id WHERE latest.line_id=?
+	 s.fec_observe,s.fec_active,COALESCE(payloads.payload,s.payload),s.received_at
+	 FROM latest_snapshots latest JOIN snapshots s ON s.id=latest.snapshot_id
+	 LEFT JOIN latest_snapshot_payloads payloads ON payloads.line_id=s.line_id AND payloads.node_id=s.node_id
+	  AND payloads.observed_at=s.observed_at WHERE latest.line_id=?
 	 ORDER BY CASE s.role WHEN 'entry' THEN 1 WHEN 'middle' THEN 2 WHEN 'relay' THEN 2 ELSE 3 END,s.node_id`, lineID)
 	if err != nil {
 		return nil, err

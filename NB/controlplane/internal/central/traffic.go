@@ -11,6 +11,14 @@ import (
 
 const maxTrafficRange = 365 * 24 * time.Hour
 
+const (
+	rawTrafficRetention        = 24 * time.Hour
+	minuteTrafficRetention     = 7 * 24 * time.Hour
+	fiveMinuteTrafficRetention = 90 * 24 * time.Hour
+	hourTrafficRetention       = 365 * 24 * time.Hour
+	trafficPruneBatchSize      = 2000
+)
+
 type TrafficPoint struct {
 	ObservedAt     string  `json:"observed_at"`
 	UpstreamMbps   float64 `json:"upstream_mbps"`
@@ -62,8 +70,10 @@ func TrafficResolution(span time.Duration) int {
 		return 15
 	case span <= 7*24*time.Hour:
 		return 60
-	default:
+	case span <= 90*24*time.Hour:
 		return 300
+	default:
+		return 3600
 	}
 }
 
@@ -79,8 +89,8 @@ func healthRank(health string) int {
 }
 
 func (s *Store) backfillTrafficRollups(ctx context.Context) error {
-	for _, resolution := range []int{60, 300} {
-		_, err := s.db.ExecContext(ctx, `WITH source AS (
+	for _, resolution := range []int{60, 300, 3600} {
+		_, err := s.telemetryDB.ExecContext(ctx, `WITH source AS (
  SELECT line_id,node_id,role,worker_id,
   strftime('%Y-%m-%dT%H:%M:%SZ',(CAST(strftime('%s',observed_at) AS INTEGER)/?)*?,'unixepoch') AS bucket_at,
   observed_at,upstream_mbps,downstream_mbps,sessions,queue_age_p95_us,effective_loss_pct,health,deployment,profile
@@ -119,11 +129,11 @@ FROM aggregate JOIN ranked ON ranked.line_id=aggregate.line_id AND ranked.node_i
 // startup migration path. A large production snapshot table must not delay the
 // web listener or trigger a systemd restart loop.
 func (s *Store) BackfillTrafficHistory(ctx context.Context) (bool, error) {
-	unlock := s.lockWrite()
+	unlock := s.lockTelemetryWrite()
 	defer unlock()
-	const job = "traffic_rollups_v1"
+	const job = "traffic_rollups_v2"
 	var completed string
-	err := s.db.QueryRowContext(ctx, `SELECT completed_at FROM maintenance_jobs WHERE name=?`, job).Scan(&completed)
+	err := s.telemetryDB.QueryRowContext(ctx, `SELECT completed_at FROM maintenance_jobs WHERE name=?`, job).Scan(&completed)
 	if err == nil {
 		return false, nil
 	}
@@ -133,7 +143,7 @@ func (s *Store) BackfillTrafficHistory(ctx context.Context) (bool, error) {
 	if err = s.backfillTrafficRollups(ctx); err != nil {
 		return false, err
 	}
-	if _, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO maintenance_jobs(name,completed_at) VALUES(?,?)`, job, now()); err != nil {
+	if _, err = s.telemetryDB.ExecContext(ctx, `INSERT OR IGNORE INTO maintenance_jobs(name,completed_at) VALUES(?,?)`, job, now()); err != nil {
 		return false, fmt.Errorf("record traffic backfill completion: %w", err)
 	}
 	return true, nil
@@ -218,7 +228,7 @@ func (s *Store) TrafficHistory(ctx context.Context, lineID string, from, to time
 	if resolution == 0 {
 		resolution = TrafficResolution(to.Sub(from))
 	}
-	if resolution != 15 && resolution != 60 && resolution != 300 {
+	if resolution != 15 && resolution != 60 && resolution != 300 && resolution != 3600 {
 		return TrafficHistoryResult{}, errors.New("invalid traffic history resolution")
 	}
 	if _, err := s.Line(ctx, lineID); err != nil {
@@ -226,7 +236,7 @@ func (s *Store) TrafficHistory(ctx context.Context, lineID string, from, to time
 	}
 	workers := map[string]*workerBucket{}
 	if resolution == 15 {
-		rows, err := s.db.QueryContext(ctx, `SELECT node_id,role,worker_id,observed_at,health,deployment,profile,
+		rows, err := s.telemetryDB.QueryContext(ctx, `SELECT node_id,role,worker_id,observed_at,health,deployment,profile,
  sessions,upstream_mbps,downstream_mbps,queue_age_p95_us,effective_loss_pct
  FROM snapshots WHERE line_id=? AND observed_at>=? AND observed_at<? ORDER BY observed_at`,
 			lineID, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano))
@@ -259,7 +269,7 @@ func (s *Store) TrafficHistory(ctx context.Context, lineID string, from, to time
 			return TrafficHistoryResult{}, err
 		}
 	} else {
-		rows, err := s.db.QueryContext(ctx, `SELECT node_id,role,worker_id,bucket_at,sample_count,upstream_sum,
+		rows, err := s.telemetryDB.QueryContext(ctx, `SELECT node_id,role,worker_id,bucket_at,sample_count,upstream_sum,
  downstream_sum,sessions_max,queue_age_max_us,effective_loss_max_pct,health_rank,deployment,profile,last_observed_at
  FROM traffic_rollups WHERE line_id=? AND resolution_s=? AND bucket_at>=? AND bucket_at<? ORDER BY bucket_at`,
 			lineID, resolution, from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339))
@@ -454,26 +464,70 @@ func stringsLastSeparator(value string) int {
 	return -1
 }
 
-func (s *Store) PruneTraffic(ctx context.Context, nowAt time.Time) error {
-	unlock := s.lockWrite()
+func (s *Store) pruneTrafficBatch(ctx context.Context, nowAt time.Time, limit int) (int64, error) {
+	if limit < 1 {
+		return 0, errors.New("traffic prune batch size must be positive")
+	}
+	unlock := s.lockTelemetryWrite()
 	defer unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.telemetryDB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	queries := []struct {
 		query string
 		args  []any
 	}{
-		{`DELETE FROM snapshots WHERE observed_at<? AND id NOT IN (SELECT snapshot_id FROM latest_snapshots)`, []any{nowAt.Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)}},
-		{`DELETE FROM traffic_rollups WHERE resolution_s=60 AND bucket_at<?`, []any{nowAt.Add(-90 * 24 * time.Hour).UTC().Format(time.RFC3339)}},
-		{`DELETE FROM traffic_rollups WHERE resolution_s=300 AND bucket_at<?`, []any{nowAt.Add(-365 * 24 * time.Hour).UTC().Format(time.RFC3339)}},
+		{`DELETE FROM snapshots WHERE id IN (SELECT id FROM snapshots WHERE observed_at<?
+          AND id NOT IN (SELECT snapshot_id FROM latest_snapshots) ORDER BY observed_at LIMIT ?)`,
+			[]any{nowAt.Add(-rawTrafficRetention).UTC().Format(time.RFC3339Nano), limit}},
+		{`DELETE FROM traffic_rollups WHERE rowid IN (SELECT rowid FROM traffic_rollups
+          WHERE resolution_s=60 AND bucket_at<? ORDER BY bucket_at LIMIT ?)`,
+			[]any{nowAt.Add(-minuteTrafficRetention).UTC().Format(time.RFC3339), limit}},
+		{`DELETE FROM traffic_rollups WHERE rowid IN (SELECT rowid FROM traffic_rollups
+          WHERE resolution_s=300 AND bucket_at<? ORDER BY bucket_at LIMIT ?)`,
+			[]any{nowAt.Add(-fiveMinuteTrafficRetention).UTC().Format(time.RFC3339), limit}},
+		{`DELETE FROM traffic_rollups WHERE rowid IN (SELECT rowid FROM traffic_rollups
+          WHERE resolution_s=3600 AND bucket_at<? ORDER BY bucket_at LIMIT ?)`,
+			[]any{nowAt.Add(-hourTrafficRetention).UTC().Format(time.RFC3339), limit}},
 	}
+	var deleted int64
+	remaining := int64(limit)
 	for _, item := range queries {
-		if _, err = tx.ExecContext(ctx, item.query, item.args...); err != nil {
-			return fmt.Errorf("prune traffic history: %w", err)
+		if remaining == 0 {
+			break
+		}
+		item.args[len(item.args)-1] = remaining
+		var result sql.Result
+		if result, err = tx.ExecContext(ctx, item.query, item.args...); err != nil {
+			return 0, fmt.Errorf("prune traffic history: %w", err)
+		}
+		if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
+			deleted += affected
+			remaining -= affected
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+func (s *Store) PruneTraffic(ctx context.Context, nowAt time.Time) error {
+	for {
+		deleted, err := s.pruneTrafficBatch(ctx, nowAt, trafficPruneBatchSize)
+		if err != nil {
+			return err
+		}
+		if deleted == 0 {
+			_, _ = s.telemetryDB.ExecContext(ctx, `PRAGMA incremental_vacuum(1024)`)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
