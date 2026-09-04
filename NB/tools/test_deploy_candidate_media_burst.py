@@ -22,6 +22,19 @@ def load_module():
 BASELINE = b"tenant-v3 nbmobile 256 64 5000 5000 0 625000 625000\n"
 
 
+def pressure_sample(value: int = 7) -> dict:
+    workers = {}
+    for role in ("entry", "middle", "exit"):
+        for worker in ("0", "1"):
+            key = f"{role}:{worker}"
+            workers[key] = {
+                "role": role, "worker": worker, "release_id": "candidate-release",
+                "transport_generation": 2, "boot_id": f"boot-{key}",
+                "queue_pressure_dropped": value,
+            }
+    return {"workers": workers}
+
+
 class FakeRollout:
     def __init__(self, module, failure: str | None = None, exit_original: bytes | None = None) -> None:
         self.module = module
@@ -82,11 +95,11 @@ class FakeRollout:
         if request["kind"] == "sustained_probe":
             return {"average_kbps": 5001 if self.failure == "sustained" else 5000, "duration_s": 90}
         return {"planned_bps": 12000000, "planned_duration_ms": 500,
-                "sent_bytes": 750000, "elapsed_ms": 500}
+                "sent_bytes": 750000, "received_bytes": 742500, "elapsed_ms": 500}
 
     def collector(self):
         self.collects += 1
-        return {"queue_pressure_dropped": 8 if self.failure == "pressure" and self.collects == 2 else 7}
+        return pressure_sample(8 if self.failure == "pressure" and self.collects == 2 else 7)
 
     def install(self) -> None:
         self.originals = {name: getattr(self.module, name) for name in
@@ -190,10 +203,10 @@ class MediaBurstTests(unittest.TestCase):
             requests.append(request)
             if request["kind"] == "media_burst":
                 return {"planned_bps": 12000000, "planned_duration_ms": 500,
-                        "sent_bytes": 750000, "elapsed_ms": 500}
+                        "sent_bytes": 750000, "received_bytes": 742500, "elapsed_ms": 500}
             return {"average_kbps": 5000.0, "duration_s": 90}
 
-        samples = iter(({"queue_pressure_dropped": 4}, {"queue_pressure_dropped": 4}))
+        samples = iter((pressure_sample(4), pressure_sample(4)))
         result = self.module.run_synthetic_validation(runner, lambda: next(samples))
 
         self.assertEqual(result["queue_pressure_delta"], 0)
@@ -201,22 +214,26 @@ class MediaBurstTests(unittest.TestCase):
 
     def test_synthetic_validation_rejects_fail_open_evidence(self) -> None:
         valid_burst = {"planned_bps": 12000000, "planned_duration_ms": 500,
-                       "sent_bytes": 750000, "elapsed_ms": 500}
+                       "sent_bytes": 750000, "received_bytes": 742500, "elapsed_ms": 500}
         valid_sustained = {"average_kbps": 5000.0, "duration_s": 90}
         cases = {
-            "noop": ({}, valid_sustained, lambda: {"queue_pressure_dropped": 4}),
+            "noop": ({}, valid_sustained, lambda: pressure_sample(4)),
             "wrong_bytes": ({**valid_burst, "sent_bytes": 749999}, valid_sustained,
-                            lambda: {"queue_pressure_dropped": 4}),
+                            lambda: pressure_sample(4)),
+            "lost_echo": ({**valid_burst, "received_bytes": 742499}, valid_sustained,
+                          lambda: pressure_sample(4)),
             "wrong_planned_duration": ({**valid_burst, "planned_duration_ms": 499}, valid_sustained,
-                                       lambda: {"queue_pressure_dropped": 4}),
+                                       lambda: pressure_sample(4)),
             "wrong_elapsed": ({**valid_burst, "elapsed_ms": 499}, valid_sustained,
-                              lambda: {"queue_pressure_dropped": 4}),
+                              lambda: pressure_sample(4)),
             "wrong_plan": ({**valid_burst, "planned_bps": 11999999}, valid_sustained,
-                           lambda: {"queue_pressure_dropped": 4}),
+                           lambda: pressure_sample(4)),
             "float_over_limit": (valid_burst, {**valid_sustained, "average_kbps": 5000.9},
-                                   lambda: {"queue_pressure_dropped": 4}),
+                                   lambda: pressure_sample(4)),
+            "too_low": (valid_burst, {**valid_sustained, "average_kbps": 4499},
+                        lambda: pressure_sample(4)),
             "short_sustained": (valid_burst, {**valid_sustained, "duration_s": 89},
-                                lambda: {"queue_pressure_dropped": 4}),
+                                lambda: pressure_sample(4)),
             "missing_pressure": (valid_burst, valid_sustained, lambda: {}),
         }
         for name, (burst, sustained, collector) in cases.items():
@@ -227,47 +244,19 @@ class MediaBurstTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.module.run_synthetic_validation(runner, collector)
 
-    def test_default_collector_rejects_invalid_worker_pressure_values(self) -> None:
-        invalid_workers = {
-            "missing_udp_errors": [{}],
-            "missing_pressure": [{"udp_errors": {}}],
-            "string": [{"udp_errors": {"queue_pressure_dropped": "7"}}],
-            "boolean": [{"udp_errors": {"queue_pressure_dropped": True}}],
-            "float": [{"udp_errors": {"queue_pressure_dropped": 7.0}}],
-            "negative": [{"udp_errors": {"queue_pressure_dropped": -1}}],
+    def test_queue_pressure_rejects_worker_identity_drift_counter_reset_or_missing_role(self) -> None:
+        before = pressure_sample(7)
+        cases = {
+            "restart": lambda after: after["workers"]["exit:1"].__setitem__("boot_id", "restarted"),
+            "counter_reset": lambda after: after["workers"]["middle:0"].__setitem__("queue_pressure_dropped", 6),
+            "missing_role": lambda after: after["workers"].pop("entry:0"),
         }
-        for name, entry_sample in invalid_workers.items():
+        for name, mutate in cases.items():
             with self.subTest(name=name):
-                self.assert_default_collector_rejects(entry_sample)
-
-    def test_default_collector_sums_two_valid_worker_values(self) -> None:
-        result = self.call_default_collector([
-            [{"udp_errors": {"queue_pressure_dropped": 3}}],
-            [{"udp_errors": {"queue_pressure_dropped": 4}}],
-        ])
-
-        self.assertEqual(result, {"queue_pressure_dropped": 7})
-
-    def assert_default_collector_rejects(self, entry_sample) -> None:
-        with self.assertRaises(RuntimeError):
-            self.call_default_collector([entry_sample])
-
-    def call_default_collector(self, samples):
-        outputs = iter(samples)
-        original_connect = self.module.deploy.connect
-        original_checked_run = self.module.deploy.checked_run
-
-        class Connection:
-            def close(self):
-                pass
-
-        try:
-            self.module.deploy.connect = lambda role: Connection()
-            self.module.deploy.checked_run = lambda connection, command, tmo: __import__("json").dumps(next(outputs))
-            return self.module.default_collector()
-        finally:
-            self.module.deploy.connect = original_connect
-            self.module.deploy.checked_run = original_checked_run
+                after = pressure_sample(7)
+                mutate(after)
+                with self.assertRaises(RuntimeError):
+                    self.module.compare_queue_pressure(before, after)
 
     def test_every_transaction_or_gate_failure_restores_old_files_and_fingerprints(self) -> None:
         for failure in ("prepare", "publish", "commit", "readback", "pressure", "burst", "sustained"):

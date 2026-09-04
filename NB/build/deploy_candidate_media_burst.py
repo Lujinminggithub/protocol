@@ -20,9 +20,12 @@ TOOLS = ROOT / "tools"
 INSTANCE = "gz2-hk2-kz-00002_1"
 TENANT_PATH = f"/etc/NB/instances/{INSTANCE}/tenant.conf"
 ROLES = ("entry", "exit")
+TELEMETRY_ROLES = ("entry", "middle", "exit")
 TARGET_RECORD = "tenant-v3 nbmobile 256 64 5000 5000 0 2500000 625000"
 EXPECTED_OLD_RECORD = "tenant-v3 nbmobile 256 64 5000 5000 0 625000 625000"
 SUSTAINED_RATE_KBPS = 5000
+SUSTAINED_MIN_KBPS = 4500
+BURST_MIN_RECEIVED_BYTES = 742500
 
 
 configured_instance = os.environ.setdefault("NB_DEPLOY_INSTANCE", INSTANCE)
@@ -121,17 +124,21 @@ def stage_directory(role: str, directory: str) -> None:
         connection.close()
 
 
-def default_collector() -> dict[str, int]:
-    """汇总 Entry 与 Exit 全部控制端点的媒体队列丢弃计数。"""
-    total = 0
-    for role in ROLES:
+def default_collector() -> dict[str, dict[str, dict[str, Any]]]:
+    """采集六个固定 worker 的身份和队列丢弃计数，不把身份压缩为总数。"""
+    records: dict[str, dict[str, Any]] = {}
+    for role in TELEMETRY_ROLES:
         code = (
             "import glob,json,socket;items=[];"
             f"paths=glob.glob('/run/nb-{INSTANCE}-{role}-*.ctl');"
             "\nfor path in paths:\n"
-            " s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(path);s.sendall(b'metrics\\n');"
-            " value=json.loads(s.recv(262144));s.close();"
-            " items.append({'worker':path.rsplit('-',1)[-1].split('.',1)[0],'udp_errors':value.get('udp_errors')})\n"
+            " def query(command):\n"
+            "  s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(path);s.sendall((command+'\\n').encode());"
+            "  value=json.loads(s.recv(262144));s.close();return value\n"
+            " health=query('health');metrics=query('metrics');"
+            " items.append({'worker':str(health.get('worker',path.rsplit('-',1)[-1].split('.',1)[0])),"
+            "'release_id':health.get('release_id'),'transport_generation':health.get('transport_generation'),"
+            "'boot_id':health.get('boot_id'),'udp_errors':metrics.get('udp_errors')})\n"
             "print(json.dumps(items,separators=(',',':')))"
         )
         connection = deploy.connect(role)
@@ -141,8 +148,8 @@ def default_collector() -> dict[str, int]:
                 workers = json.loads(output.strip().splitlines()[-1])
             except (IndexError, json.JSONDecodeError) as error:
                 raise RuntimeError(f"{role} 控制端采样格式非法") from error
-            if not isinstance(workers, list) or not workers:
-                raise RuntimeError(f"{role} 没有可采样的控制端点")
+            if not isinstance(workers, list) or len(workers) != 2:
+                raise RuntimeError(f"{role} 必须恰好有两个可采样控制端点")
             for index, worker in enumerate(workers):
                 if not isinstance(worker, dict):
                     raise RuntimeError(f"{role}[{index}] 控制端采样格式非法")
@@ -152,10 +159,24 @@ def default_collector() -> dict[str, int]:
                 value = errors.get("queue_pressure_dropped")
                 if type(value) is not int or value < 0:
                     raise RuntimeError(f"{role}[{index}] queue_pressure_dropped 非法")
-                total += value
+                worker_id = worker.get("worker")
+                if str(worker_id) not in ("0", "1"):
+                    raise RuntimeError(f"{role}[{index}] worker 身份非法")
+                key = f"{role}:{worker_id}"
+                if key in records:
+                    raise RuntimeError(f"{key} 控制端采样重复")
+                release_id = worker.get("release_id")
+                boot_id = worker.get("boot_id")
+                generation = worker.get("transport_generation")
+                if (not isinstance(release_id, str) or not release_id or not isinstance(boot_id, str) or
+                        not boot_id or type(generation) is not int or generation < 0):
+                    raise RuntimeError(f"{key} 控制端身份字段非法")
+                records[key] = {"role": role, "worker": str(worker_id), "release_id": release_id,
+                                "transport_generation": generation, "boot_id": boot_id,
+                                "queue_pressure_dropped": value}
         finally:
             connection.close()
-    return {"queue_pressure_dropped": total}
+    return {"workers": records}
 
 
 def default_runner(request: dict[str, Any]) -> dict[str, Any]:
@@ -186,21 +207,59 @@ def required_integer(evidence: dict[str, Any], field: str, label: str) -> int:
     return value
 
 
-def queue_pressure_sample(collector: Callable[[], dict[str, Any]]) -> int:
-    """只接受明确返回的队列丢弃计数，拒绝默认零值。"""
+def queue_pressure_sample(collector: Callable[[], dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """只接受具有固定身份的六 worker 队列计数快照。"""
     evidence = collector()
     if not isinstance(evidence, dict):
         raise RuntimeError("队列计数采样格式非法")
-    value = required_integer(evidence, "queue_pressure_dropped", "队列计数采样")
-    if value < 0:
-        raise RuntimeError("队列计数采样不能为负数")
-    return value
+    workers = evidence.get("workers")
+    if not isinstance(workers, dict):
+        raise RuntimeError("队列计数采样缺少 workers")
+    expected = {f"{role}:{worker}" for role in TELEMETRY_ROLES for worker in ("0", "1")}
+    if set(workers) != expected:
+        raise RuntimeError("队列计数采样必须覆盖 Entry/Middle/Exit 各两个 worker")
+    snapshot: dict[str, dict[str, Any]] = {}
+    for key in sorted(expected):
+        worker = workers.get(key)
+        if not isinstance(worker, dict):
+            raise RuntimeError(f"{key} 队列计数采样格式非法")
+        role, worker_id = key.split(":", 1)
+        if worker.get("role") != role or str(worker.get("worker")) != worker_id:
+            raise RuntimeError(f"{key} 队列计数采样身份键不一致")
+        release = worker.get("release_id")
+        boot = worker.get("boot_id")
+        generation = worker.get("transport_generation")
+        pressure = worker.get("queue_pressure_dropped")
+        if (not isinstance(release, str) or not release or not isinstance(boot, str) or not boot or
+                type(generation) is not int or generation < 0 or type(pressure) is not int or pressure < 0):
+            raise RuntimeError(f"{key} 队列计数采样字段非法")
+        snapshot[key] = {"role": role, "worker": worker_id, "release_id": release,
+                         "transport_generation": generation, "boot_id": boot,
+                         "queue_pressure_dropped": pressure}
+    return snapshot
+
+
+def compare_queue_pressure(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """拒绝任何 worker 重启、版本漂移、计数回退或队列丢弃增量。"""
+    before_workers = queue_pressure_sample(lambda: before)
+    after_workers = queue_pressure_sample(lambda: after)
+    for key in sorted(before_workers):
+        old = before_workers[key]
+        new = after_workers[key]
+        for field in ("release_id", "transport_generation", "boot_id"):
+            if new[field] != old[field]:
+                raise RuntimeError(f"{key} 采样身份漂移: {field}")
+        if new["queue_pressure_dropped"] < old["queue_pressure_dropped"]:
+            raise RuntimeError(f"{key} queue_pressure_dropped 计数回退，疑似重启")
+        if new["queue_pressure_dropped"] != old["queue_pressure_dropped"]:
+            raise RuntimeError(f"{key} queue_pressure_dropped 增量非零")
+    return {"before": before_workers, "after": after_workers, "delta": 0}
 
 
 def run_synthetic_validation(runner: Callable[[dict[str, Any]], dict[str, Any]],
                              collector: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """验证短时突发不增加丢弃计数，且持续流量不超过服务速率。"""
-    before = queue_pressure_sample(collector)
+    before = {"workers": queue_pressure_sample(collector)}
     burst = runner({"kind": "media_burst", "rate_mbps": 12, "duration_ms": 500})
     if not isinstance(burst, dict):
         raise RuntimeError("媒体突发探针结果格式非法")
@@ -210,12 +269,13 @@ def run_synthetic_validation(runner: Callable[[dict[str, Any]], dict[str, Any]],
         raise RuntimeError("媒体突发探针计划时长不正确")
     if required_integer(burst, "sent_bytes", "媒体突发探针") < 750000:
         raise RuntimeError("媒体突发探针发送字节不足")
-    if required_integer(burst, "elapsed_ms", "媒体突发探针") < 500:
-        raise RuntimeError("媒体突发探针实际时长不足")
-    after = queue_pressure_sample(collector)
-    dropped = after - before
-    if dropped != 0:
-        raise RuntimeError("媒体突发产生队列丢弃")
+    if required_integer(burst, "received_bytes", "媒体突发探针") < BURST_MIN_RECEIVED_BYTES:
+        raise RuntimeError("媒体突发探针回显字节不足")
+    elapsed_ms = required_integer(burst, "elapsed_ms", "媒体突发探针")
+    if not 500 <= elapsed_ms <= 1000:
+        raise RuntimeError("媒体突发探针发送窗口必须为 500-1000ms")
+    after = {"workers": queue_pressure_sample(collector)}
+    pressure = compare_queue_pressure(before, after)
     sustained = runner({"kind": "sustained_probe", "duration_s": 90,
                         "maximum_kbps": SUSTAINED_RATE_KBPS})
     if not isinstance(sustained, dict):
@@ -228,10 +288,10 @@ def run_synthetic_validation(runner: Callable[[dict[str, Any]], dict[str, Any]],
     if (isinstance(duration_s, bool) or not isinstance(duration_s, numbers.Real) or
             not math.isfinite(float(duration_s)) or duration_s < 90):
         raise RuntimeError("持续探针实际时长不足")
-    if average_kbps > SUSTAINED_RATE_KBPS:
-        raise RuntimeError("持续探针超过 5Mbps 服务约束")
-    return {"queue_pressure_before": before, "queue_pressure_after": after,
-            "queue_pressure_delta": dropped, "configured_rate_kbps": SUSTAINED_RATE_KBPS,
+    if not SUSTAINED_MIN_KBPS <= average_kbps <= SUSTAINED_RATE_KBPS:
+        raise RuntimeError("持续探针吞吐必须处于 4500-5000Kbps")
+    return {"queue_pressure_before": pressure["before"], "queue_pressure_after": pressure["after"],
+            "queue_pressure_delta": pressure["delta"], "configured_rate_kbps": SUSTAINED_RATE_KBPS,
             "average_kbps": float(average_kbps), "duration_s": float(duration_s),
             "burst_sent_bytes": burst["sent_bytes"], "burst_elapsed_ms": burst["elapsed_ms"]}
 
