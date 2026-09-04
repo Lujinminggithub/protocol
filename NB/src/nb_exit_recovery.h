@@ -13,7 +13,9 @@ typedef enum {
     NB_EXIT_RECOVERY_PRIVATE_REJECT,
     NB_EXIT_RECOVERY_CONNECT_OK,
     NB_EXIT_RECOVERY_CONNECT_FAIL,
-    NB_EXIT_RECOVERY_CONNECT_TIMEOUT
+    NB_EXIT_RECOVERY_CONNECT_TIMEOUT,
+    NB_EXIT_RECOVERY_TARGET_ALLOWED,
+    NB_EXIT_RECOVERY_ROLE_REJECT
 } nb_exit_recovery_action_t;
 
 /* Exit 目标解析/建连阶段的可测试状态视图。terminal_claimed 保证失败动作只消费一次。 */

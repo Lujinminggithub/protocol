@@ -58,7 +58,7 @@
 #include "nb_send.h"
 #include "nb_path.h"
 #include "nb_dns.h"
-#include "nb_exit_recovery.h"
+#include "nb_exit_node_facade.h"
 #include "nb_udp.h"
 #include "nb_udp_queue.h"
 #include "nb_udp_io.h"

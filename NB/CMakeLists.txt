@@ -29,6 +29,12 @@ if(BUILD_TESTING)
   target_compile_options(nb_connect_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_connect_test COMMAND nb_connect_test)
 
+  add_executable(nb_exit_recovery_test tools/test_exit_recovery.c src/nb_metrics.c)
+  target_link_libraries(nb_exit_recovery_test PRIVATE nb_connect)
+  target_include_directories(nb_exit_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_exit_recovery_test PRIVATE -O2 -Wall -Wextra -Werror)
+  add_test(NAME nb_exit_recovery_test COMMAND nb_exit_recovery_test)
+
   add_executable(nb_fec_test tools/test_fec.c src/nb_fec.c src/nb_fec_rs.c)
   target_include_directories(nb_fec_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_fec_test PRIVATE -O2 -Wall -Wextra)

@@ -293,6 +293,14 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
         }
 
         if(strncmp(first,"T:",2)==0){
+            nb_exit_recovery_state_t target_state=ps_exit_recovery_state(p);
+            nb_exit_recovery_action_t target_action=nb_exit_node_target_route(&target_state,G.role);
+            ps_exit_recovery_apply(p,&target_state);
+            if(target_action==NB_EXIT_RECOVERY_ROLE_REJECT){
+                log4c_warn("目标动作角色拒绝 id=%u role=%s action=T result=role-invalid",
+                    p->id,role_name(G.role));
+                ps_teardown_reason(p,NB_EXIT_TARGET_ROLE_CLOSE_REASON);return -1;
+            }
             /* exit: 异步解析 target 域名(不阻塞事件循环), 解析完成后在主循环发起非阻塞 connect */
             char thost[256]={0}; int tport=0; char* c=strrchr(first+2,':');
             if(c){size_t host_len=(size_t)(c-(first+2));
