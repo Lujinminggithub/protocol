@@ -41,6 +41,10 @@ int nb_udp_queue_drop_history_contains(const nb_udp_queue_drop_history_t* histor
 int nb_udp_queue_trim_to_limit(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
     nb_udp_queue_drop_observer_t observer,void* observer_context,size_t* removed_bytes,
     uint64_t* dropped_packets);
+#ifdef NB_NODE_QUEUE_TEST
+int nb_udp_queue_trim_to_limit_forced_hash_test(uint8_t* queue,size_t* length,size_t need,
+    size_t queue_limit,size_t* removed_bytes,uint64_t* dropped_packets);
+#endif
 
 int nb_udp_queue_drop_oldest_packet(uint8_t* queue,size_t* length,
     size_t* removed_bytes,uint64_t* dropped_packets);

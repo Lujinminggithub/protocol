@@ -4,12 +4,21 @@
 
 typedef struct {
     nb_udp_queue_drop_history_t* history;
+    const nb_udp_queue_packet_key_t* incoming_key;
     uint64_t now_us;
+    int incoming_key_was_dropped;
 } udp_queue_history_context_t;
+
+static int udp_queue_packet_key_equal(const nb_udp_queue_packet_key_t* left,
+    const nb_udp_queue_packet_key_t* right){
+    return left!=NULL&&right!=NULL&&left->direction==right->direction&&
+        left->session_id==right->session_id&&left->sequence==right->sequence;
+}
 
 static void udp_queue_note_dropped_key(void* opaque,const nb_udp_queue_packet_key_t* key){
     udp_queue_history_context_t* context=opaque;
     nb_udp_queue_drop_history_note(context->history,key,context->now_us);
+    if(udp_queue_packet_key_equal(context->incoming_key,key))context->incoming_key_was_dropped=1;
 }
 
 static size_t udp_queue_limit_for_direction_values(nb_flow_class_t flow_class,int to_down,
@@ -22,10 +31,13 @@ static size_t udp_queue_limit_for_direction_values(nb_flow_class_t flow_class,in
 }
 
 static int udp_queue_make_hard_room(uint8_t* buf,size_t* length,size_t need,size_t queue_limit,
-    nb_udp_queue_drop_history_t* history,uint64_t now_us,size_t* removed_bytes,uint64_t* dropped){
-    udp_queue_history_context_t context={history,now_us};
-    return nb_udp_queue_trim_to_limit(buf,length,need,queue_limit,udp_queue_note_dropped_key,&context,
+    nb_udp_queue_drop_history_t* history,const nb_udp_queue_packet_key_t* incoming_key,uint64_t now_us,
+    int* incoming_key_was_dropped,size_t* removed_bytes,uint64_t* dropped){
+    udp_queue_history_context_t context={history,incoming_key,now_us,0};
+    int rc=nb_udp_queue_trim_to_limit(buf,length,need,queue_limit,udp_queue_note_dropped_key,&context,
         removed_bytes,dropped);
+    if(incoming_key_was_dropped!=NULL)*incoming_key_was_dropped=context.incoming_key_was_dropped;
+    return rc;
 }
 
 static size_t udp_queue_instance_limit(size_t length,size_t queue_limit,uint64_t instance_queue_bytes,
@@ -53,7 +65,7 @@ size_t nb_node_udp_queue_limit_for_test(nb_flow_class_t flow_class,int to_down,
 int nb_node_udp_queue_make_hard_room_for_test(uint8_t* queue,size_t* length,size_t need,
     size_t queue_limit,nb_udp_queue_drop_history_t* history,uint64_t now_us,uint64_t* dropped){
     size_t released=0;
-    return udp_queue_make_hard_room(queue,length,need,queue_limit,history,now_us,&released,dropped);
+    return udp_queue_make_hard_room(queue,length,need,queue_limit,history,NULL,now_us,NULL,&released,dropped);
 }
 
 int nb_node_udp_queue_should_reject_for_test(const nb_udp_queue_drop_history_t* history,
@@ -65,7 +77,18 @@ int nb_node_udp_queue_trim_for_test(uint8_t* queue,size_t* length,size_t need,si
     uint64_t instance_queue_bytes,uint64_t instance_queue_limit,nb_udp_queue_drop_history_t* history,
     uint64_t now_us,size_t* released,uint64_t* dropped){
     return udp_queue_make_hard_room(queue,length,need,udp_queue_instance_limit(*length,queue_limit,
-        instance_queue_bytes,instance_queue_limit),history,now_us,released,dropped);
+        instance_queue_bytes,instance_queue_limit),history,NULL,now_us,NULL,released,dropped);
+}
+
+int nb_node_udp_queue_admit_for_test(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
+    nb_udp_queue_drop_history_t* history,const nb_udp_queue_packet_key_t* incoming_key,
+    uint64_t now_us,uint64_t* pressure_dropped){
+    size_t released=0;uint64_t dropped=0;int incoming_dropped=0;
+    int rc=udp_queue_make_hard_room(queue,length,need,queue_limit,history,incoming_key,now_us,
+        &incoming_dropped,&released,&dropped);
+    if(pressure_dropped!=NULL)*pressure_dropped=dropped+(rc>0&&!incoming_dropped?1:0);
+    if(rc>0&&!incoming_dropped&&incoming_key!=NULL)nb_udp_queue_drop_history_note(history,incoming_key,now_us);
+    return rc;
 }
 #else
 static size_t udp_queue_limit_for_direction(const proxy_stream_t* p,int to_down){
@@ -136,18 +159,20 @@ static void udp_queue_note_pressure(proxy_stream_t* p,const uint8_t* buf,size_t 
 }
 
 static int udp_queue_make_media_room(proxy_stream_t* p,uint8_t* buf,size_t* len,size_t need,
-    size_t queue_limit){
+    size_t queue_limit,const nb_udp_queue_packet_key_t* incoming_key){
     if(p->flow_class!=NB_FLOW_CLASS_MEDIA)return 0;
     size_t hard_removed=0;uint64_t now=picoquic_current_time(),dropped=0;
     size_t effective_limit=udp_queue_instance_limit(*len,queue_limit,nb_current_instance->queue_bytes,
         nb_current_instance->queue_limit_bytes);
-    int hard_room=udp_queue_make_hard_room(buf,len,need,effective_limit,&p->udp_queue_drop_history,now,
-        &hard_removed,&dropped);
+    int incoming_dropped=0;
+    int hard_room=udp_queue_make_hard_room(buf,len,need,effective_limit,&p->udp_queue_drop_history,
+        incoming_key,now,&incoming_dropped,&hard_removed,&dropped);
     if(hard_room<0)return -1;
     instance_queue_release(hard_removed);
     udp_queue_note_pressure(p,buf,*len,queue_limit,dropped);
     if(hard_room>0){
-        udp_queue_note_pressure(p,buf,*len,queue_limit,1);return 1;
+        if(!incoming_dropped)udp_queue_note_pressure(p,buf,*len,queue_limit,1);
+        return 1;
     }
     return 0;
 }
@@ -170,7 +195,7 @@ static int udp_queue_wire(proxy_stream_t* p,int to_down,const uint8_t* data,size
     uint8_t* buf=to_down?p->udp_down_tx:p->udp_up_tx;
     size_t* len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
     size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
-    int room=udp_queue_make_media_room(p,buf,len,NB_UDP_QUEUE_RECORD_HEADER+length,queue_limit);
+    int room=udp_queue_make_media_room(p,buf,len,NB_UDP_QUEUE_RECORD_HEADER+length,queue_limit,packet_key);
     if(room>0&&packet_key!=NULL)nb_udp_queue_drop_history_note(&p->udp_queue_drop_history,
         packet_key,picoquic_current_time());
     if(room==0&&packet_key!=NULL&&udp_queue_packet_was_dropped(&p->udp_queue_drop_history,
@@ -190,7 +215,7 @@ static int udp_queue_optional_wire(proxy_stream_t* p,int to_down,const uint8_t* 
 static int udp_queue_pending_append(proxy_stream_t* p,const uint8_t* data,size_t length){
     size_t queue_limit=udp_queue_limit_for_direction(p,0);
     int room=udp_queue_make_media_room(p,p->udp_pending_tx,&p->udp_pending_tx_len,
-        NB_UDP_QUEUE_RECORD_HEADER+length,queue_limit);
+        NB_UDP_QUEUE_RECORD_HEADER+length,queue_limit,NULL);
     if(room!=0)return room;
     return dgramq_append(&p->udp_pending_tx,&p->udp_pending_tx_len,&p->udp_pending_tx_cap,
         data,length,p->id,queue_limit);
@@ -206,7 +231,7 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
     uint8_t* queue=to_down?p->udp_down_tx:p->udp_up_tx;
     size_t* queue_len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
     size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
-    int room=udp_queue_make_media_room(p,queue,queue_len,need,queue_limit);if(room!=0)return room;
+    int room=udp_queue_make_media_room(p,queue,queue_len,need,queue_limit,NULL);if(room!=0)return room;
     uint32_t sequence=++p->udp_tx_sequence;
     for(uint16_t i=0;i<fragments;i++){
         size_t offset=(size_t)i*NB_UDP_FRAGMENT_PAYLOAD;

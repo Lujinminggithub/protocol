@@ -20,6 +20,9 @@ int nb_node_udp_queue_should_reject_for_test(const nb_udp_queue_drop_history_t* 
 int nb_node_udp_queue_trim_for_test(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
     uint64_t instance_queue_bytes,uint64_t instance_queue_limit,nb_udp_queue_drop_history_t* history,
     uint64_t now_us,size_t* released,uint64_t* dropped);
+int nb_node_udp_queue_admit_for_test(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
+    nb_udp_queue_drop_history_t* history,const nb_udp_queue_packet_key_t* incoming_key,
+    uint64_t now_us,uint64_t* pressure_dropped);
 #endif
 
 static void put16(uint8_t* p,uint16_t value){p[0]=(uint8_t)(value>>8);p[1]=(uint8_t)value;}
@@ -46,6 +49,18 @@ static size_t append_raw_record(uint8_t* queue,size_t offset,uint8_t value,uint6
 int main(void){
     uint8_t queue[256]={0};size_t length=0;
 #ifdef NB_NODE_QUEUE_TEST
+    size_t down_initial_length=0,down_initial_released=0;uint64_t down_initial_dropped=0;
+    nb_udp_queue_drop_history_t down_initial_history={0};
+    CHECK(nb_node_udp_queue_trim_for_test(NULL,&down_initial_length,36,108,0,1024,&down_initial_history,1,
+        &down_initial_released,&down_initial_dropped)==0);
+    size_t up_initial_length=0,up_initial_released=0;uint64_t up_initial_dropped=0;
+    nb_udp_queue_drop_history_t up_initial_history={0};
+    CHECK(nb_node_udp_queue_trim_for_test(NULL,&up_initial_length,36,108,0,1024,&up_initial_history,2,
+        &up_initial_released,&up_initial_dropped)==0);
+    size_t pending_initial_length=0,pending_initial_released=0;uint64_t pending_initial_dropped=0;
+    nb_udp_queue_drop_history_t pending_initial_history={0};
+    CHECK(nb_node_udp_queue_trim_for_test(NULL,&pending_initial_length,36,108,0,1024,
+        &pending_initial_history,3,&pending_initial_released,&pending_initial_dropped)==0);
     CHECK(nb_node_udp_queue_limit_for_test(NB_FLOW_CLASS_MEDIA,1,
         1,5000000,462000,1,1000000,200000)==589824);
     CHECK(nb_node_udp_queue_limit_for_test(NB_FLOW_CLASS_MEDIA,0,
@@ -107,6 +122,14 @@ int main(void){
     nb_udp_queue_packet_key_t late_key={NB_UDP_TYPE_C2S,7,21};
     CHECK(nb_udp_queue_drop_history_contains(&hard_history,&late_key,7001,5000));
     CHECK(nb_node_udp_queue_should_reject_for_test(&hard_history,&late_key,7001));
+    uint8_t incoming_trim[64]={0};size_t incoming_length=0;uint64_t incoming_pressure=0;
+    incoming_length=append_fragment(incoming_trim,incoming_length,23,0,1000);
+    nb_udp_queue_packet_key_t incoming_key={NB_UDP_TYPE_C2S,7,23};
+    nb_udp_queue_drop_history_t incoming_history={0};
+    CHECK(nb_node_udp_queue_admit_for_test(incoming_trim,&incoming_length,36,35,&incoming_history,
+        &incoming_key,7500,&incoming_pressure)==1);
+    CHECK(incoming_length==0&&incoming_pressure==1);
+    CHECK(nb_node_udp_queue_should_reject_for_test(&incoming_history,&incoming_key,7501));
     uint8_t multi_trim[256]={0};size_t multi_trim_length=0;uint64_t multi_dropped=0;
     multi_trim_length=append_fragment(multi_trim,multi_trim_length,31,0,1000);
     multi_trim_length=append_fragment(multi_trim,multi_trim_length,32,0,1001);
@@ -144,6 +167,19 @@ int main(void){
         shrink_initial,1024*1024,&shrink_history,10000,&shrink_released,&shrink_dropped)==0);
     CHECK(shrink_length+36<=256*1024&&shrink_released==shrink_initial-shrink_length);
     CHECK(shrink_dropped==shrink_released/36);free(shrink_trim);
+    uint8_t low_bits[4096]={0};size_t low_bits_length=0,low_bits_removed=0;uint64_t low_bits_dropped=0;
+    for(uint32_t index=0;index<65;index++)
+        low_bits_length=append_fragment(low_bits,low_bits_length,300+index*131072u,0,1000);
+    CHECK(nb_node_udp_queue_trim_for_test(low_bits,&low_bits_length,36,36,low_bits_length,1024*1024,
+        &down_initial_history,11000,&low_bits_removed,&low_bits_dropped)==0);
+    CHECK(low_bits_length==0&&low_bits_removed==65*36&&low_bits_dropped==65);
+    uint8_t forced_collision[4096]={0};size_t forced_length=0,forced_removed=99;uint64_t forced_dropped=99;
+    for(uint32_t sequence=500;sequence<565;sequence++)
+        forced_length=append_fragment(forced_collision,forced_length,sequence,0,1000);
+    size_t forced_original=forced_length;
+    CHECK(nb_udp_queue_trim_to_limit_forced_hash_test(forced_collision,&forced_length,36,0,
+        &forced_removed,&forced_dropped)==-1);
+    CHECK(forced_length==forced_original&&forced_removed==0&&forced_dropped==0);
 #endif
     CHECK(nb_udp_queue_oldest_age_us(queue,9,6000)==0);
     put64(queue+2,7000);

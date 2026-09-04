@@ -69,9 +69,9 @@ static int sequence_after(uint32_t left,uint32_t right){
 }
 
 static uint32_t packet_key_hash(const nb_udp_queue_packet_key_t* key){
-    uint32_t hash=key->session_id*2654435761u;
-    hash^=key->sequence+0x9e3779b9u+(hash<<6)+(hash>>2);
-    return hash^key->direction;
+    uint32_t hash=key->session_id^(key->sequence*0x9e3779b9u)^key->direction;
+    hash^=hash>>16;hash*=0x7feb352du;hash^=hash>>15;hash*=0x846ca68bu;
+    return hash^(hash>>16);
 }
 
 static nb_udp_queue_drop_window_t* drop_window_for_key(nb_udp_queue_drop_history_t* history,
@@ -133,12 +133,13 @@ int nb_udp_queue_drop_history_contains(const nb_udp_queue_drop_history_t* histor
     return (window->dropped_sequences&(UINT64_C(1)<<distance))!=0;
 }
 
-int nb_udp_queue_trim_to_limit(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
+static int trim_to_limit_with_hash(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
     nb_udp_queue_drop_observer_t observer,void* observer_context,size_t* removed_bytes,
-    uint64_t* dropped_packets){
-    if(queue==NULL||length==NULL||removed_bytes==NULL||dropped_packets==NULL||
-        *length>NB_UDP_QUEUE_MAX_BYTES||need>SIZE_MAX-*length)return -1;
+    uint64_t* dropped_packets,uint32_t (*hash_key)(const nb_udp_queue_packet_key_t*)){
+    if(length==NULL||removed_bytes==NULL||dropped_packets==NULL)return -1;
     *removed_bytes=0;*dropped_packets=0;
+    if(*length==0)return need>queue_limit?1:0;
+    if(queue==NULL||*length>NB_UDP_QUEUE_MAX_BYTES||need>SIZE_MAX-*length)return -1;
     if(*length+need<=queue_limit)return 0;
     trim_record_t* records=calloc(NB_UDP_QUEUE_MAX_RECORDS,sizeof(*records));
     trim_group_t* groups=calloc(NB_UDP_QUEUE_MAX_RECORDS,sizeof(*groups));
@@ -153,13 +154,15 @@ int nb_udp_queue_trim_to_limit(uint8_t* queue,size_t* length,size_t need,size_t 
         uint32_t group=(uint32_t)group_count;
         if(wire_key(&record,&direction,&session_id,&sequence)){
             nb_udp_queue_packet_key_t key={direction,session_id,sequence};
-            size_t slot=packet_key_hash(&key)&(NB_UDP_QUEUE_TRIM_HASH_CAP-1u);
-            while(slots[slot]!=UINT32_MAX){
+            size_t slot=hash_key(&key)&(NB_UDP_QUEUE_TRIM_HASH_CAP-1u);int found=0;
+            for(size_t probe=0;probe<64u;probe++){
+                if(slots[slot]==UINT32_MAX){found=1;break;}
                 group=slots[slot];
                 if(groups[group].valid_key&&groups[group].key.direction==key.direction&&
-                    groups[group].key.session_id==key.session_id&&groups[group].key.sequence==key.sequence)break;
+                    groups[group].key.session_id==key.session_id&&groups[group].key.sequence==key.sequence){found=1;break;}
                 slot=(slot+1u)&(NB_UDP_QUEUE_TRIM_HASH_CAP-1u);
             }
+            if(!found)goto fail;
             if(slots[slot]==UINT32_MAX){
                 if(group_count>=NB_UDP_QUEUE_MAX_RECORDS)goto fail;
                 group=(uint32_t)group_count++;groups[group].key=key;groups[group].valid_key=1;slots[slot]=group;
@@ -190,6 +193,23 @@ int nb_udp_queue_trim_to_limit(uint8_t* queue,size_t* length,size_t need,size_t 
 fail:
     free(records);free(groups);free(slots);return -1;
 }
+
+int nb_udp_queue_trim_to_limit(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
+    nb_udp_queue_drop_observer_t observer,void* observer_context,size_t* removed_bytes,
+    uint64_t* dropped_packets){
+    return trim_to_limit_with_hash(queue,length,need,queue_limit,observer,observer_context,
+        removed_bytes,dropped_packets,packet_key_hash);
+}
+
+#ifdef NB_NODE_QUEUE_TEST
+static uint32_t forced_collision_hash(const nb_udp_queue_packet_key_t* key){(void)key;return 0;}
+
+int nb_udp_queue_trim_to_limit_forced_hash_test(uint8_t* queue,size_t* length,size_t need,
+    size_t queue_limit,size_t* removed_bytes,uint64_t* dropped_packets){
+    return trim_to_limit_with_hash(queue,length,need,queue_limit,NULL,NULL,removed_bytes,
+        dropped_packets,forced_collision_hash);
+}
+#endif
 
 int nb_udp_queue_drop_oldest_packet(uint8_t* queue,size_t* length,
     size_t* removed_bytes,uint64_t* dropped_packets){
