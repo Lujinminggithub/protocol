@@ -13,6 +13,17 @@ int main(void){
     nb_metrics_note_udp_rxq_overflow(&state,7);
     nb_metrics_note_udp_queue_pressure_drop(&state,3);
     nb_metrics_note_traffic(&state,1000,2000);
+    nb_metrics_note_dns(&state,0,0,1200);
+    nb_metrics_note_dns(&state,1,1,3400);
+    nb_metrics_note_target_connect(&state,1,5000000);
+    nb_metrics_note_target_connect(&state,0,7000000);
+    nb_metrics_state_t saturated={
+        .dns_requests=UINT64_MAX,.dns_failures=UINT64_MAX,
+        .dns_private_rejected=UINT64_MAX,.target_connect_timeouts=UINT64_MAX};
+    nb_metrics_note_dns(&saturated,1,1,1);
+    nb_metrics_note_target_connect(&saturated,1,1);
+    assert(saturated.dns_requests==UINT64_MAX&&saturated.dns_failures==UINT64_MAX&&
+        saturated.dns_private_rejected==UINT64_MAX&&saturated.target_connect_timeouts==UINT64_MAX);
     state.pool_retire_total=2;state.pool_retire_suppressed=3;
     state.pool_quarantine_total=4;state.pool_mbb_promotions=2;
     state.pmtu_promotions=4;state.pmtu_fallbacks=1;
@@ -39,5 +50,7 @@ int main(void){
     assert(strstr(json,"\"spurious_total\":4")!=NULL&&strstr(json,"\"cc\":\"bbr\"")!=NULL);
     assert(strstr(json,"\"pool_recovery\":{\"retired\":2,\"suppressed\":3,\"quarantined\":4,\"mbb_promotions\":2}")!=NULL);
     assert(strstr(json,"\"pmtu\":{\"promotions\":4,\"fallbacks\":1}")!=NULL);
+    assert(strstr(json,"\"exit_connectivity\":{\"dns_requests\":2,\"dns_failures\":1,\"dns_private_rejected\":1,\"dns_latency_max_us\":3400,\"target_connect_timeouts\":1,\"target_connect_latency_max_us\":7000000}")!=NULL);
+    puts(json);
     puts("RESULT PASS");return 0;
 }

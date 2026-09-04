@@ -27,6 +27,12 @@ typedef struct {
     uint64_t pool_mbb_promotions;
     uint64_t pmtu_promotions;
     uint64_t pmtu_fallbacks;
+    uint64_t dns_requests;
+    uint64_t dns_failures;
+    uint64_t dns_private_rejected;
+    uint64_t dns_latency_max_us;
+    uint64_t target_connect_timeouts;
+    uint64_t target_connect_latency_max_us;
 } nb_metrics_state_t;
 
 typedef struct {
@@ -101,6 +107,12 @@ void nb_metrics_note_loop(nb_metrics_state_t* state, uint64_t busy_us, uint64_t 
 void nb_metrics_note_udp_error(nb_metrics_state_t* state, int transmit);
 void nb_metrics_note_udp_rxq_overflow(nb_metrics_state_t* state, uint64_t dropped);
 void nb_metrics_note_udp_queue_pressure_drop(nb_metrics_state_t* state,uint64_t dropped);
+/* 记录一次 DNS 查询及其失败、私网拒绝和耗时结果。 */
+void nb_metrics_note_dns(nb_metrics_state_t* state, int failed, int private_rejected,
+    uint64_t latency_us);
+/* 记录一次目标建连结果及耗时。 */
+void nb_metrics_note_target_connect(nb_metrics_state_t* state, int timeout,
+    uint64_t latency_us);
 void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot, const nb_metrics_state_t* state,
     uint64_t sessions, uint64_t sessions_peak, uint64_t pools, uint64_t exit_routes);
 void nb_metrics_snapshot_add_stream(nb_metrics_snapshot_t* snapshot, int flow_class, int udp_mode,

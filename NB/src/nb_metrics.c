@@ -50,6 +50,20 @@ void nb_metrics_note_udp_queue_pressure_drop(nb_metrics_state_t* state,uint64_t 
     else state->udp_queue_pressure_dropped+=dropped;
 }
 
+void nb_metrics_note_dns(nb_metrics_state_t* state,int failed,int private_rejected,uint64_t latency_us){
+    if(state==NULL)return;
+    add_saturated(&state->dns_requests,1);
+    if(failed)add_saturated(&state->dns_failures,1);
+    if(private_rejected)add_saturated(&state->dns_private_rejected,1);
+    if(latency_us>state->dns_latency_max_us)state->dns_latency_max_us=latency_us;
+}
+
+void nb_metrics_note_target_connect(nb_metrics_state_t* state,int timeout,uint64_t latency_us){
+    if(state==NULL)return;
+    if(timeout)add_saturated(&state->target_connect_timeouts,1);
+    if(latency_us>state->target_connect_latency_max_us)state->target_connect_latency_max_us=latency_us;
+}
+
 void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot,const nb_metrics_state_t* state,
     uint64_t sessions,uint64_t sessions_peak,uint64_t pools,uint64_t exit_routes){
     if(snapshot==NULL)return;
@@ -120,6 +134,7 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"instance_resources\":{\"queue_bytes_used\":%llu,\"queue_bytes_limit\":%llu},"
         "\"flow_sessions\":{\"ctrl\":%llu,\"media\":%llu,\"bulk\":%llu,\"unknown\":%llu,\"udp\":%llu},"
         "\"state\":{\"tcp_connecting\":%llu,\"tcp_read_paused\":%llu,\"upstream_fc_blocked\":%llu,\"target_connect_failed\":%llu},"
+        "\"exit_connectivity\":{\"dns_requests\":%llu,\"dns_failures\":%llu,\"dns_private_rejected\":%llu,\"dns_latency_max_us\":%llu,\"target_connect_timeouts\":%llu,\"target_connect_latency_max_us\":%llu},"
         "\"first_byte_wait_max_us\":{\"c2s\":%llu,\"s2c\":%llu},"
         "\"bytes\":{\"c2s\":%llu,\"s2c\":%llu},"
         "\"queue_bytes\":{\"down\":%llu,\"up\":%llu,\"q2t\":%llu},"
@@ -141,7 +156,11 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->queue_bytes_used,(unsigned long long)s->queue_bytes_limit,
         (unsigned long long)s->ctrl_sessions,(unsigned long long)s->media_sessions,(unsigned long long)s->bulk_sessions,(unsigned long long)s->unknown_sessions,(unsigned long long)s->udp_sessions,
         (unsigned long long)s->tcp_connecting,(unsigned long long)s->tcp_read_paused,(unsigned long long)s->upstream_fc_blocked,
-        (unsigned long long)s->target_connect_failed,(unsigned long long)s->first_c2s_wait_max_us,(unsigned long long)s->first_s2c_wait_max_us,
+        (unsigned long long)s->target_connect_failed,
+        (unsigned long long)s->lifetime.dns_requests,(unsigned long long)s->lifetime.dns_failures,
+        (unsigned long long)s->lifetime.dns_private_rejected,(unsigned long long)s->lifetime.dns_latency_max_us,
+        (unsigned long long)s->lifetime.target_connect_timeouts,(unsigned long long)s->lifetime.target_connect_latency_max_us,
+        (unsigned long long)s->first_c2s_wait_max_us,(unsigned long long)s->first_s2c_wait_max_us,
         (unsigned long long)s->bytes_c2s,(unsigned long long)s->bytes_s2c,
         (unsigned long long)s->queue_down_bytes,(unsigned long long)s->queue_up_bytes,(unsigned long long)s->queue_q2t_bytes,
         (unsigned long long)s->queue_down_age_max_us,(unsigned long long)s->queue_up_age_max_us,(unsigned long long)s->queue_q2t_age_max_us,
