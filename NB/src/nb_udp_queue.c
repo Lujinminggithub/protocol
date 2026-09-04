@@ -230,8 +230,7 @@ int nb_udp_queue_drop_oldest_packet(uint8_t* queue,size_t* length,
     }
     size_t write=0;read=0;
     while(read<*length){
-        queue_record_t record;/* The validation pass above makes this read safe. */
-        (void)record_peek(queue+read,*length-read,&record);
+        queue_record_t record;if(record_peek(queue+read,*length-read,&record)!=0)return -1;
         if(!wire_key_matches(&record,direction,session_id,sequence)){
             if(write!=read)memmove(queue+write,queue+read,record.record_length);
             write+=record.record_length;

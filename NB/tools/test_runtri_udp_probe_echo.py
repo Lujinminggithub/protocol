@@ -10,6 +10,30 @@ import runtri_udp_probe_echo as probe
 
 
 class RuntriUdpProbeEchoTest(unittest.TestCase):
+    def test_udp_sessions_queries_metrics(self):
+        class ControlSocket:
+            def __init__(self):
+                self.sent = b""
+                self.responses = [b'{"flow_sessions":{"udp":3}}', b""]
+
+            def connect(self, _path):
+                pass
+
+            def sendall(self, data):
+                self.sent = data
+
+            def recv(self, _size):
+                return self.responses.pop(0)
+
+            def close(self):
+                pass
+
+        control = ControlSocket()
+        with mock.patch.object(probe.socket, "AF_UNIX", 1, create=True), \
+                mock.patch.object(probe.socket, "socket", return_value=control):
+            self.assertEqual(probe.udp_sessions("/tmp/nb-control.sock"), 3)
+        self.assertEqual(control.sent, b"metrics\n")
+
     def test_password_is_read_from_stdin(self):
         self.assertEqual(probe.read_password(io.StringIO("nb-test-password\n")), b"nb-test-password")
         with self.assertRaises(RuntimeError):

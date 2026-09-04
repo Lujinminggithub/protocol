@@ -43,11 +43,11 @@ def recv_address(sock: socket.socket) -> tuple[str, int]:
     return host, struct.unpack("!H", recv_exact(sock, 2))[0]
 
 
-def control_health(path: str) -> dict:
+def control_query(path: str, command: str) -> dict:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         client.connect(path)
-        client.sendall(b"health\n")
+        client.sendall(command.encode("ascii") + b"\n")
         chunks = []
         while True:
             chunk = client.recv(4096)
@@ -60,7 +60,7 @@ def control_health(path: str) -> dict:
 
 
 def udp_sessions(path: str) -> int:
-    return int(control_health(path)["flow_sessions"]["udp"])
+    return int(control_query(path, "metrics")["flow_sessions"]["udp"])
 
 
 def exactly_zero(values: list[int]) -> bool:

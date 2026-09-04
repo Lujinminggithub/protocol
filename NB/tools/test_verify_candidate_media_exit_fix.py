@@ -7,6 +7,7 @@ import math
 import pathlib
 import sys
 import threading
+import types
 import unittest
 from collections import deque
 from unittest import mock
@@ -118,6 +119,26 @@ def valid_evidence() -> dict:
 
 
 class CandidateVerifierTests(unittest.TestCase):
+    def test_native_probe_uses_configured_socks_port(self):
+        calls = []
+        control = mock.Mock()
+        fake_deploy = types.SimpleNamespace(
+            DEFAULT_SOCKS_PORT=1089,
+            _role_host=lambda role: {"host": "192.0.2.10"},
+        )
+        fake_udp_probe = types.SimpleNamespace(
+            udp_associate=lambda host, port: (calls.append((host, port)) or
+                                               (control, ("192.0.2.10", 22000))),
+        )
+        udp = mock.Mock()
+        with mock.patch.dict(sys.modules, {"deploy": fake_deploy, "udp_e2e_probe": fake_udp_probe}), \
+                mock.patch.object(self.module, "_resolve_udp_relay", return_value=("192.0.2.10", 22000)), \
+                mock.patch.object(self.module.socket, "socket", return_value=udp):
+            state = self.module.NativeProbeAdapter().open()
+        self.assertEqual(calls, [("192.0.2.10", 1089)])
+        self.assertIs(state.control, control)
+        udp.bind.assert_called_once_with(("0.0.0.0", 0))
+
     def setUp(self) -> None:
         self.module = load_module()
 

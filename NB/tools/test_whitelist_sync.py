@@ -20,8 +20,11 @@ def main() -> None:
     assert "domain_suffix example.org" in rules
     assert "ip 10.0.0.0/8" in rules
     assert "port 443" in rules
+    for port in (50000, 50001, 50008, 50009, 50020, 50021):
+        assert f"port {port}" in rules
     for address in ("1.1.1.1/32", "8.8.8.8/32", "9.9.9.9/32", "114.114.114.114/32"):
         assert "ip " + address in rules
+    assert "domain_suffix tiktok-row.net" in rules
     assert "port 53" in rules
 
     unrestricted_rules = whitelist_sync.convert({
@@ -29,6 +32,8 @@ def main() -> None:
         "rules": [{"domain": ["unrestricted.example"]}],
     })
     assert "port 53" not in unrestricted_rules
+    assert not any(f"port {port}" in unrestricted_rules
+                   for port in (50000, 50001, 50008, 50009, 50020, 50021))
     scalar_rules = whitelist_sync.convert({
         "version": 3,
         "rules": [{"domain": "scalar.example", "domain_keyword": "bytecdn", "ip_cidr": "192.0.2.8/29", "port": 8443}],
@@ -61,6 +66,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         output = pathlib.Path(directory) / "whitelist.conf"
         output.write_text("# stale policy\n", encoding="utf-8")
+        assert not whitelist_sync.output_has_current_policy(output)
+        output.write_text("# nb-whitelist-policy: public-dns-v1\n", encoding="utf-8")
         assert not whitelist_sync.output_has_current_policy(output)
         output.write_text(whitelist_sync.POLICY_MARKER + "\n", encoding="utf-8")
         assert whitelist_sync.output_has_current_policy(output)

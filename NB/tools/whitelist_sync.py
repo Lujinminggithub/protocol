@@ -28,7 +28,12 @@ REQUIRED_PUBLIC_DNS_RULES = {
     "ip 9.9.9.9/32",
     "ip 114.114.114.114/32",
 }
-POLICY_MARKER = "# nb-whitelist-policy: public-dns-v1"
+REQUIRED_TIKTOK_LIVE_PORT_RULES = {
+    "port 50000", "port 50001", "port 50008",
+    "port 50009", "port 50020", "port 50021",
+}
+REQUIRED_TIKTOK_SIGNAL_RULES = {"domain_suffix tiktok-row.net"}
+POLICY_MARKER = "# nb-whitelist-policy: public-dns-tiktok-live-v2"
 
 
 def fetch(url: str, limit: int) -> tuple[bytes, str]:
@@ -131,7 +136,9 @@ def convert(source: dict) -> list[str]:
                 raise ValueError("invalid whitelist port")
             output.add("port " + str(port))
     output.update(REQUIRED_PUBLIC_DNS_RULES)
+    output.update(REQUIRED_TIKTOK_SIGNAL_RULES)
     if any(item.startswith("port ") for item in output):
+        output.update(REQUIRED_TIKTOK_LIVE_PORT_RULES)
         output.add("port 53")
     if not any(item.startswith(("domain_", "ip ")) for item in output):
         raise ValueError("SRS produced no NB address rules")

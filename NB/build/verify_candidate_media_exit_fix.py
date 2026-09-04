@@ -464,10 +464,12 @@ class NativeProbeAdapter:
             sys.path.insert(0, str(tools))
         import deploy  # pylint: disable=import-outside-toplevel
         import udp_e2e_probe  # pylint: disable=import-outside-toplevel
-        control, relay = udp_e2e_probe.udp_associate(deploy._role_host("entry")["host"], 1080)
+        control, relay = udp_e2e_probe.udp_associate(
+            deploy._role_host("entry")["host"], deploy.DEFAULT_SOCKS_PORT)
         try:
             numeric_relay = _resolve_udp_relay(relay)
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind(("0.0.0.0", 0))
             udp.setblocking(False)
             return _NativeProbeState(control, udp, numeric_relay)
         except Exception:
@@ -505,7 +507,9 @@ class NativeProbeAdapter:
                     time.sleep(0.001)
                     continue
                 except OSError as error:
-                    receiver_errors.append(type(error).__name__)
+                    receiver_errors.append(
+                        f"{type(error).__name__}:errno={error.errno}:"
+                        f"winerror={getattr(error, 'winerror', None)}:{error}")
                     return
                 if peer != state.relay:
                     continue
@@ -556,7 +560,10 @@ class NativeProbeAdapter:
         with receive_lock:
             received_bytes = sum(received.values())
         if receiver.is_alive() or receiver_errors or sent_bytes != target_bytes:
-            raise RuntimeError("原生 UDP 回显探针接收线程或发送证据异常")
+            raise RuntimeError(
+                "原生 UDP 回显探针接收线程或发送证据异常 "
+                f"receiver_alive={receiver.is_alive()} errors={receiver_errors!r} "
+                f"sent_bytes={sent_bytes} target_bytes={target_bytes} received_bytes={received_bytes}")
         if kind == "media_burst":
             if not 0.5 <= send_elapsed_s < 1.0 or received_bytes < BURST_MIN_RECEIVED_BYTES:
                 raise RuntimeError("原生 UDP 突发未在 500-1000ms 内取得 99% 回显")

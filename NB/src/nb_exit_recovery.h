@@ -2,6 +2,7 @@
 #define NB_EXIT_RECOVERY_H
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "nb_connect.h"
