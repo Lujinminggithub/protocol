@@ -6,7 +6,9 @@ import importlib.util
 import math
 import pathlib
 import sys
+import threading
 import unittest
+from collections import deque
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -202,6 +204,48 @@ class CandidateVerifierTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "私网"):
                     self.module.validate_acceptance(evidence)
 
+    def test_parse_timestamp_requires_timezone_aware_utc(self) -> None:
+        for timestamp in ("2026-09-04T12:00:00", "2026-09-04T20:00:00+08:00"):
+            with self.subTest(timestamp=timestamp):
+                with self.assertRaisesRegex(ValueError, "UTC"):
+                    self.module._parse_timestamp(timestamp, "test.timestamp")
+
+    def test_all_acceptance_window_timestamps_require_utc(self) -> None:
+        cases = {
+            "window_started": lambda evidence: evidence["controlplane"]["test_window"].__setitem__(
+                "started_at_utc", "2026-09-04T20:00:00+08:00"),
+            "window_finished": lambda evidence: evidence["controlplane"]["test_window"].__setitem__(
+                "finished_at_utc", "2026-09-04T20:10:00+08:00"),
+            "queue_before": lambda evidence: evidence["queue_pressure_before"]["entry:0"].__setitem__(
+                "sampled_at_utc", "2026-09-04T20:00:10+08:00"),
+            "queue_after_burst": lambda evidence: evidence["queue_pressure_after_burst"]["middle:0"].__setitem__(
+                "sampled_at_utc", "2026-09-04T20:02:00+08:00"),
+            "queue_after_sustained": lambda evidence: evidence["queue_pressure_after_sustained"]["exit:0"].__setitem__(
+                "sampled_at_utc", "2026-09-04T20:05:00+08:00"),
+            "private_before": lambda evidence: evidence["private_dns_probe"]["exit_connectivity_before"].__setitem__(
+                "observed_at", "2026-09-04T20:00:30+08:00"),
+            "private_event": lambda evidence: evidence["private_dns_probe"].__setitem__(
+                "event_at_utc", "2026-09-04T20:01:00+08:00"),
+            "private_after": lambda evidence: evidence["private_dns_probe"]["exit_connectivity_after"].__setitem__(
+                "observed_at", "2026-09-04T20:01:30+08:00"),
+            "phone_click": lambda evidence: evidence["phone_validation"].__setitem__(
+                "click_at", "2026-09-04T20:00:00+08:00"),
+            "phone_enter": lambda evidence: evidence["phone_validation"].__setitem__(
+                "enter_at", "2026-09-04T20:00:02+08:00"),
+            "phone_state": lambda evidence: evidence["phone_validation"]["state_events"][0].__setitem__(
+                "at_utc", "2026-09-04T20:00:03+08:00"),
+            "viewer_started": lambda evidence: evidence["phone_validation"]["viewer_events"][0].__setitem__(
+                "observed_from_utc", "2026-09-04T20:00:06+08:00"),
+            "viewer_finished": lambda evidence: evidence["phone_validation"]["viewer_events"][0].__setitem__(
+                "observed_to_utc", "2026-09-04T20:00:07+08:00"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                evidence = valid_evidence()
+                mutate(evidence)
+                with self.assertRaisesRegex(ValueError, "UTC"):
+                    self.module.validate_acceptance(evidence)
+
     def test_missing_phone_timeline_is_pending_not_passed(self) -> None:
         evidence = valid_evidence()
         evidence.pop("phone_validation")
@@ -267,17 +311,58 @@ class CandidateVerifierTests(unittest.TestCase):
         self.assertIn(b"nb-probe-echo.internal", packet)
         self.assertTrue(packet.endswith((7).to_bytes(8, "big") + b"payload"))
 
-    def test_native_probe_decodes_domain_reply_and_rejects_truncated_or_wrong_target(self) -> None:
+    def test_native_probe_decodes_domain_reply_and_requires_exact_host(self) -> None:
         host = b"nb-probe-echo.internal"
         payload = (7).to_bytes(8, "big") + b"echo"
         reply = b"\x00\x00\x00\x03" + bytes([len(host)]) + host + (9).to_bytes(2, "big") + payload
         sequence, echoed = self.module.decode_native_probe_response(reply)
         self.assertEqual((sequence, echoed), (7, payload))
-        for invalid in (reply[:-(len(payload) - 7)], reply.replace(host, b"wrong.internal", 1),
+
+        invalid_hosts = (
+            b"nb-probe-echo.internal.",
+            b"nb-probe-echo.internal..",
+            b"NB-PROBE-ECHO.INTERNAL",
+            b"wrong-probe.internal",
+        )
+        for invalid_host in invalid_hosts:
+            invalid = (b"\x00\x00\x00\x03" + bytes([len(invalid_host)]) + invalid_host +
+                       (9).to_bytes(2, "big") + payload)
+            with self.subTest(host=invalid_host):
+                with self.assertRaises(ValueError):
+                    self.module.decode_native_probe_response(invalid)
+
+        for invalid in (reply[:-(len(payload) - 7)],
                         reply[:-len(payload)-2] + (10).to_bytes(2, "big") + payload):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     self.module.decode_native_probe_response(invalid)
+
+    def test_native_probe_ignores_echoes_from_any_peer_other_than_exact_relay(self) -> None:
+        class EchoSocket:
+            def __init__(self, peer: tuple[str, int]) -> None:
+                self.peer = peer
+                self.replies: deque[tuple[bytes, tuple[str, int]]] = deque()
+                self.lock = threading.Lock()
+
+            def sendto(self, data: bytes, _relay: tuple[str, int]) -> int:
+                with self.lock:
+                    self.replies.append((data, self.peer))
+                return len(data)
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                with self.lock:
+                    if self.replies:
+                        return self.replies.popleft()
+                raise BlockingIOError
+
+        relay = ("127.0.0.1", 1081)
+        for name, peer in (("wrong_ip", ("127.0.0.2", relay[1])),
+                           ("wrong_port", (relay[0], relay[1] + 1))):
+            with self.subTest(name=name):
+                state = self.module._NativeProbeState(object(), EchoSocket(peer), relay)
+                with self.assertRaisesRegex(RuntimeError, "99%"):
+                    self.module.NativeProbeAdapter._measure(
+                        state, 12_000_000, 0.5, "media_burst")
 
 
 if __name__ == "__main__":

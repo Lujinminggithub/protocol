@@ -174,9 +174,12 @@ def _validate_queue_pressure(evidence: dict[str, Any], workers: list[dict[str, A
 def _parse_timestamp(value: Any, label: str) -> dt.datetime:
     text = _text(value, label)
     try:
-        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError(f"证据 {label} 时间格式非法") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+        raise ValueError(f"证据 {label} 必须是 UTC 时间")
+    return parsed
 
 
 def _test_window(controlplane: dict[str, Any]) -> tuple[dt.datetime, dt.datetime]:
@@ -392,7 +395,7 @@ def decode_native_probe_response(data: bytes) -> tuple[int, bytes]:
         if length == 0 or len(data) < offset + length + 2:
             raise ValueError("原生 probe 域名回包截断")
         try:
-            host = data[offset:offset + length].decode("ascii").rstrip(".").lower()
+            host = data[offset:offset + length].decode("ascii")
         except UnicodeDecodeError as error:
             raise ValueError("原生 probe 域名不是 ASCII") from error
         offset += length
@@ -452,13 +455,15 @@ class NativeProbeAdapter:
         def receive_loop() -> None:
             while not stop.is_set():
                 try:
-                    data, _ = state.udp.recvfrom(65535)
+                    data, peer = state.udp.recvfrom(65535)
                 except BlockingIOError:
                     time.sleep(0.001)
                     continue
                 except OSError as error:
                     receiver_errors.append(type(error).__name__)
                     return
+                if peer != state.relay:
+                    continue
                 try:
                     item, payload = decode_native_probe_response(data)
                     with receive_lock:
