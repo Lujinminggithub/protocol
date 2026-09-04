@@ -30,6 +30,9 @@ def main() -> None:
     assert deploy.undeclared_cmake_inputs() == []
     assert all(path.relative_to(deploy.ROOT).as_posix() in deploy.BUILD_FILES
                for path in deploy.SRC.iterdir() if path.is_file() and path.suffix in {".c", ".h"})
+    runner = "tools/runtri_udp_probe_echo.py"
+    assert deploy.BUILD_FILES[runner] == deploy.ROOT / "tools" / "runtri_udp_probe_echo.py"
+    assert "test -r tools/nb_supervisor.py -a -r scripts/runtri.sh -a -r tools/runtri_udp_probe_echo.py" in deploy.BUILD_CMD
 
     with tempfile.TemporaryDirectory(prefix="nb-security-push-") as security_tmp:
         security = pathlib.Path(security_tmp)

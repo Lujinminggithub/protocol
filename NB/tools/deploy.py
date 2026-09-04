@@ -32,7 +32,7 @@ BUILD_CMD = (
     "ionice -c3 nice -n 10 ctest --test-dir test-build --output-on-failure >>/tmp/nbcmake.log 2>&1 && "
     "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >>/tmp/nbcmake.log 2>&1 && "
     "ionice -c3 nice -n 10 cmake --build build -j2 >>/tmp/nbcmake.log 2>&1 && "
-    "test -r tools/nb_supervisor.py -a -r scripts/runtri.sh && "
+    "test -r tools/nb_supervisor.py -a -r scripts/runtri.sh -a -r tools/runtri_udp_probe_echo.py && "
     f"NB_WORKER_LANE_PORTS=on NB_ENTRY_WORKERS={_effective_workers('entry')} NB_MIDDLE_WORKERS={_effective_workers('middle')} NB_EXIT_WORKERS={_effective_workers('exit')} "
     "NB_KEEP_TMP=1 NB_BIN=" + COMPILE_WORK + "/build/nb_node bash scripts/runtri.sh >>/tmp/nbcmake.log 2>&1; "
     "rc=$?; echo NB_BUILD_GATE_RC=$rc; tail -40 /tmp/nbcmake.log; exit $rc"
@@ -43,6 +43,7 @@ BUILD_FILES = {
     "VERSION": ROOT / "VERSION",
     "scripts/runtri.sh": ROOT / "scripts" / "runtri.sh",
     "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
+    "tools/runtri_udp_probe_echo.py": ROOT / "tools" / "runtri_udp_probe_echo.py",
     "src/nb_node.c": SRC / "nb_node.c",
     "src/nb_node_core.inc": SRC / "nb_node_core.inc",
     "src/nb_node_session.inc": SRC / "nb_node_session.inc",
