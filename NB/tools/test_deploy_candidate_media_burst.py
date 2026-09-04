@@ -227,6 +227,48 @@ class MediaBurstTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.module.run_synthetic_validation(runner, collector)
 
+    def test_default_collector_rejects_invalid_worker_pressure_values(self) -> None:
+        invalid_workers = {
+            "missing_udp_errors": [{}],
+            "missing_pressure": [{"udp_errors": {}}],
+            "string": [{"udp_errors": {"queue_pressure_dropped": "7"}}],
+            "boolean": [{"udp_errors": {"queue_pressure_dropped": True}}],
+            "float": [{"udp_errors": {"queue_pressure_dropped": 7.0}}],
+            "negative": [{"udp_errors": {"queue_pressure_dropped": -1}}],
+        }
+        for name, entry_sample in invalid_workers.items():
+            with self.subTest(name=name):
+                self.assert_default_collector_rejects(entry_sample)
+
+    def test_default_collector_sums_two_valid_worker_values(self) -> None:
+        result = self.call_default_collector([
+            [{"udp_errors": {"queue_pressure_dropped": 3}}],
+            [{"udp_errors": {"queue_pressure_dropped": 4}}],
+        ])
+
+        self.assertEqual(result, {"queue_pressure_dropped": 7})
+
+    def assert_default_collector_rejects(self, entry_sample) -> None:
+        with self.assertRaises(RuntimeError):
+            self.call_default_collector([entry_sample])
+
+    def call_default_collector(self, samples):
+        outputs = iter(samples)
+        original_connect = self.module.deploy.connect
+        original_checked_run = self.module.deploy.checked_run
+
+        class Connection:
+            def close(self):
+                pass
+
+        try:
+            self.module.deploy.connect = lambda role: Connection()
+            self.module.deploy.checked_run = lambda connection, command, tmo: __import__("json").dumps(next(outputs))
+            return self.module.default_collector()
+        finally:
+            self.module.deploy.connect = original_connect
+            self.module.deploy.checked_run = original_checked_run
+
     def test_every_transaction_or_gate_failure_restores_old_files_and_fingerprints(self) -> None:
         for failure in ("prepare", "publish", "commit", "readback", "pressure", "burst", "sustained"):
             with self.subTest(failure=failure):

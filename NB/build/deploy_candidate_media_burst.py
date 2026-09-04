@@ -126,20 +126,33 @@ def default_collector() -> dict[str, int]:
     total = 0
     for role in ROLES:
         code = (
-            "import glob,json,socket;total=0;count=0;"
+            "import glob,json,socket;items=[];"
             f"paths=glob.glob('/run/nb-{INSTANCE}-{role}-*.ctl');"
             "\nfor path in paths:\n"
             " s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(path);s.sendall(b'metrics\\n');"
-            " value=json.loads(s.recv(262144));s.close();count+=1;total+=int((value.get('udp_errors') or {}).get('queue_pressure_dropped',0) or 0)\n"
-            "print(json.dumps({'workers':count,'queue_pressure_dropped':total},separators=(',',':')))"
+            " value=json.loads(s.recv(262144));s.close();"
+            " items.append({'worker':path.rsplit('-',1)[-1].split('.',1)[0],'udp_errors':value.get('udp_errors')})\n"
+            "print(json.dumps(items,separators=(',',':')))"
         )
         connection = deploy.connect(role)
         try:
             output = deploy.checked_run(connection, "python3 -c " + shlex.quote(code), tmo=20)
-            sample = json.loads(output.strip().splitlines()[-1])
-            if int(sample.get("workers", 0)) == 0:
+            try:
+                workers = json.loads(output.strip().splitlines()[-1])
+            except (IndexError, json.JSONDecodeError) as error:
+                raise RuntimeError(f"{role} 控制端采样格式非法") from error
+            if not isinstance(workers, list) or not workers:
                 raise RuntimeError(f"{role} 没有可采样的控制端点")
-            total += int(sample["queue_pressure_dropped"])
+            for index, worker in enumerate(workers):
+                if not isinstance(worker, dict):
+                    raise RuntimeError(f"{role}[{index}] 控制端采样格式非法")
+                errors = worker.get("udp_errors")
+                if not isinstance(errors, dict):
+                    raise RuntimeError(f"{role}[{index}] 缺少 udp_errors")
+                value = errors.get("queue_pressure_dropped")
+                if type(value) is not int or value < 0:
+                    raise RuntimeError(f"{role}[{index}] queue_pressure_dropped 非法")
+                total += value
         finally:
             connection.close()
     return {"queue_pressure_dropped": total}
