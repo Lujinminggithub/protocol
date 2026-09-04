@@ -95,15 +95,6 @@ head -c 300000 /dev/urandom | base64 >"$TMP/www/big.txt"
 (cd "$TMP/www" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >"$TMP/http.log" 2>&1) &
 HTTP_PID=$!
 BACKGROUND_PIDS+=("$HTTP_PID")
-python3 - "$HTTP_PORT" >"$TMP/udp-target.log" 2>&1 <<'PY' &
-import socket,sys,time
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",int(sys.argv[1])))
-data,peer=s.recvfrom(65535);s.sendto(data,peer)
-for _ in range(3):time.sleep(2);s.sendto(b"late-"+data,peer)
-s.close()
-PY
-UDP_TARGET_PID=$!
-BACKGROUND_PIDS+=("$UDP_TARGET_PID")
 python3 - "$ECHO_PORT" >"$TMP/echo-target.log" 2>&1 <<'PY' &
 import socket,sys,threading
 listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -124,13 +115,12 @@ for _ in $(seq 1 50); do
     HTTP_READY=1
     break
   fi
-  kill -0 "$HTTP_PID" "$UDP_TARGET_PID" "$ECHO_TARGET_PID" 2>/dev/null || break
+  kill -0 "$HTTP_PID" "$ECHO_TARGET_PID" 2>/dev/null || break
   sleep .1
 done
 if [ "${HTTP_READY:-0}" != 1 ]; then
   echo "runtri local targets failed to start" >&2
   cat "$TMP/http.log" >&2 || true
-  cat "$TMP/udp-target.log" >&2 || true
   cat "$TMP/echo-target.log" >&2 || true
   exit 1
 fi
@@ -275,39 +265,10 @@ assert bytes(received)==expected,f"half-close echo truncated: {len(received)}/{l
 print("RESULT PASS: 256KB half-close echo integrity")
 PY
 
-python3 - <<'PY'
-import os,socket,struct,time
-def exact(s,n):
-    out=b""
-    while len(out)<n:
-        part=s.recv(n-len(out))
-        if not part:raise RuntimeError("short SOCKS response")
-        out+=part
-    return out
-def address(s):
-    head=exact(s,4);atyp=head[3]
-    if atyp==1:host=socket.inet_ntoa(exact(s,4))
-    elif atyp==3:host=exact(s,exact(s,1)[0]).decode()
-    elif atyp==4:host=socket.inet_ntop(socket.AF_INET6,exact(s,16))
-    else:raise RuntimeError(f"bad ATYP {atyp}")
-    return head,host,struct.unpack("!H",exact(s,2))[0]
-entry=("127.0.0.1",int(os.environ["ENTRY_PORT"]));target_port=int(os.environ["HTTP_PORT"])
-tcp=socket.create_connection(entry,timeout=5);tcp.sendall(b"\x05\x01\x02");assert exact(tcp,2)==b"\x05\x02"
-u=b"nbtest";p=b"nb-test-password";tcp.sendall(b"\x01"+bytes([len(u)])+u+bytes([len(p)])+p);assert exact(tcp,2)==b"\x01\x00"
-tcp.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00");head,host,port=address(tcp);assert head[1]==0
-if host=="0.0.0.0":host="127.0.0.1"
-udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.settimeout(5);payload=b"NB_UDP_LIFECYCLE"
-packet=b"\x00\x00\x00\x01"+socket.inet_aton("127.0.0.1")+struct.pack("!H",target_port)+payload
-udp.sendto(packet,(host,port));reply,_=udp.recvfrom(65535);assert reply.endswith(payload),reply
-tcp.close();udp.close();time.sleep(5)
-print("RESULT PASS: SOCKS UDP lifecycle trigger")
-PY
-grep -q 'middle udp flow close.*reason=udp-peer-close' "$TMP/nb-middle.log"
-grep -q 'exit udp flow close.*reason=udp-peer-close' "$TMP/nb-exit.log"
-if grep -q 'udp datagram reject stage=handler rc=-10' "$TMP/nb-entry.log"; then
-  echo "ERROR: stale S2C UDP datagram reached released entry child" >&2;exit 1
-fi
-echo "RESULT PASS: UDP child close synchronized across entry/middle/exit"
+UDP_ECHO_CONTROLS=()
+for control in "${CONTROLS[@]}"; do UDP_ECHO_CONTROLS+=(--control "$control"); done
+python3 "$ROOT/tools/runtri_udp_probe_echo.py" --entry-port "$ENTRY_PORT" --username nbtest \
+  --password nb-test-password "${UDP_ECHO_CONTROLS[@]}"
 
 for i in $(seq 1 10); do
   curl -fsS -o /dev/null -w "try$i first_byte=%{time_starttransfer}s http=%{http_code}\n" \

@@ -12,9 +12,6 @@ typedef struct {
     int internal_echo_ready;
     int dns_submit;
     int target_socket_open;
-    int to_down;
-    int tenant_render;
-    int fec_source;
     uint8_t type;
     uint32_t sequence;
     const char* route;

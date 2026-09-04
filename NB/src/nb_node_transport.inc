@@ -28,7 +28,7 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
 
 static int udp_exit_enqueue_probe_echo(void* opaque,const nb_udp_probe_echo_plan_t* echo){
     proxy_stream_t* p=opaque;if(p==NULL||echo==NULL)return -1;
-    int queue_rc=udp_queue_packet_with_sequence(p,echo->to_down,echo->type,echo->route,echo->payload,
+    int queue_rc=udp_queue_packet_with_sequence(p,0,echo->type,echo->route,echo->payload,
         echo->payload_length,echo->sequence,1);
     if(queue_rc<0)return -1;
     if(queue_rc>0)return 1;

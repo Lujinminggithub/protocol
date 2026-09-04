@@ -30,7 +30,6 @@ int nb_udp_probe_echo_plan(const char* host,int port,const nb_udp_reassembled_t*
     if(complete->route==NULL||complete->route_length==0||complete->payload==NULL||
         complete->payload_length==0)return -1;
     plan->internal_echo_ready=1;
-    plan->to_down=0;plan->tenant_render=0;plan->fec_source=0;
     plan->type=NB_UDP_TYPE_S2C;plan->sequence=complete->sequence;
     plan->route=complete->route;plan->route_length=complete->route_length;
     plan->payload=complete->payload;plan->payload_length=complete->payload_length;
