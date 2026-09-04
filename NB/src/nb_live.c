@@ -1,5 +1,7 @@
 #include "nb_live.h"
 
+#include <string.h>
+
 #define KIB (1024u)
 #define MIB (1024u * 1024u)
 #define FLOW_SAMPLE_US 1000000ULL
@@ -19,6 +21,15 @@ nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_
         limits.high_bytes=MIB;limits.low_bytes=512*KIB;limits.deadline_us=1000000ULL;
     }
     return limits;
+}
+
+size_t nb_live_udp_queue_limit(nb_flow_class_t flow_class,uint64_t rate,uint64_t reorder_us){
+    if(flow_class!=NB_FLOW_CLASS_MEDIA||rate==0)return 256u*1024u;
+    uint64_t window=reorder_us<200000?200000:reorder_us;
+    uint64_t bytes=(rate/8u)*window/1000000u*2u;
+    if(bytes<256u*1024u)bytes=256u*1024u;
+    if(bytes>1024u*1024u)bytes=1024u*1024u;
+    return (size_t)((bytes+65535u)/65536u*65536u);
 }
 
 nb_live_queue_limits_t nb_live_queue_limits_for_path(nb_flow_class_t flow_class, int udp_mode,
@@ -110,6 +121,27 @@ nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
     if(ck>=256.0)runtime->high_uplink_windows++;
     else runtime->high_uplink_windows=0;
     return runtime->high_uplink_windows>=2?NB_LIVE_FLOW_PROMOTE_MEDIA:NB_LIVE_FLOW_KEEP;
+}
+
+static int rule_preserves_latency(const char* rule_name){
+    static const char* const rules[]={
+        "api*","im-api*","tnc*","mcs*","mon*","common-sign*",
+        "rtc-access*","rtc*","live-netacc*","frontier*","webcast*"
+    };
+    if(rule_name==NULL)return 0;
+    for(size_t i=0;i<sizeof(rules)/sizeof(rules[0]);i++)
+        if(strcmp(rule_name,rules[i])==0)return 1;
+    return 0;
+}
+
+nb_live_flow_action_t nb_live_flow_observe_rule(nb_live_flow_runtime_t* runtime,
+    nb_flow_class_t flow_class,const char* rule_name,uint64_t total_c2s,
+    uint64_t total_s2c,uint64_t now_us,double* c2s_kbps,double* s2c_kbps){
+    nb_live_flow_action_t action=nb_live_flow_observe(runtime,flow_class,total_c2s,
+        total_s2c,now_us,c2s_kbps,s2c_kbps);
+    if((action==NB_LIVE_FLOW_DEMOTE_BULK||action==NB_LIVE_FLOW_DEMOTE_DOWNLINK)&&
+        rule_preserves_latency(rule_name))return NB_LIVE_FLOW_KEEP;
+    return action;
 }
 
 static void sched_refill(nb_live_sched_t* sched,uint64_t now_us){

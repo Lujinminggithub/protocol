@@ -47,6 +47,8 @@ typedef struct {
 } nb_live_sched_t;
 
 nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_mode);
+size_t nb_live_udp_queue_limit(nb_flow_class_t flow_class, uint64_t target_rate_bps,
+    uint64_t reorder_delay_us);
 nb_live_queue_limits_t nb_live_queue_limits_for_path(nb_flow_class_t flow_class, int udp_mode,
     uint64_t reorder_delay_us);
 int nb_live_queue_expiry_enabled(nb_flow_class_t flow_class, int udp_mode);
@@ -56,6 +58,9 @@ uint64_t nb_live_queue_age_us(const nb_live_queue_clock_t* clock, size_t length,
 nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
     nb_flow_class_t flow_class, uint64_t total_c2s, uint64_t total_s2c, uint64_t now_us,
     double* c2s_kbps, double* s2c_kbps);
+nb_live_flow_action_t nb_live_flow_observe_rule(nb_live_flow_runtime_t* runtime,
+    nb_flow_class_t flow_class, const char* rule_name, uint64_t total_c2s,
+    uint64_t total_s2c, uint64_t now_us, double* c2s_kbps, double* s2c_kbps);
 size_t nb_live_sched_grant(nb_live_sched_t* sched, nb_flow_class_t flow_class,
     size_t requested, uint64_t now_us, int media_pending);
 int nb_live_sched_ctrl_ready(nb_live_sched_t* sched, uint64_t now_us);
