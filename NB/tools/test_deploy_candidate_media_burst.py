@@ -19,6 +19,88 @@ def load_module():
     return module
 
 
+BASELINE = b"tenant-v3 nbmobile 256 64 5000 5000 0 625000 625000\n"
+
+
+class FakeRollout:
+    def __init__(self, module, failure: str | None = None, exit_original: bytes | None = None) -> None:
+        self.module = module
+        self.failure = failure
+        self.files = {"entry": BASELINE, "exit": exit_original or BASELINE}
+        self.events: list[tuple[str, str]] = []
+        self.requests: list[dict] = []
+        self.collects = 0
+        self.staged: dict[tuple[str, str], bytes] = {}
+        self.failed = False
+
+    def stage_directory(self, role: str, directory: str) -> None:
+        self.events.append(("stage", role))
+
+    def remote_read(self, role: str) -> bytes:
+        self.events.append(("read", role))
+        return self.files[role]
+
+    def remote_push(self, role: str, data: bytes, path: str) -> None:
+        self.events.append(("push", role))
+        self.staged[(role, path)] = data
+
+    def publish(self, role: str, source: str) -> None:
+        self.events.append(("publish", role))
+        if self.failure == "publish" and role == "entry" and not self.failed:
+            self.failed = True
+            raise RuntimeError("injected publish failure")
+        self.files[role] = self.staged[(role, source)]
+
+    def invoke(self, role: str, command: str):
+        if command.startswith("tenant prepare"):
+            self.events.append(("prepare", role))
+            if self.failure == "prepare" and role == "exit" and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected prepare failure")
+            return [{"status": "ok"}]
+        if command.startswith("tenant commit"):
+            self.events.append(("commit", role))
+            if self.failure == "commit" and role == "exit" and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected commit failure")
+            return [{"status": "ok"}]
+        if command.startswith("tenant abort"):
+            self.events.append(("abort", role))
+            return [{"status": "ok"}]
+        if command == "tenant status":
+            self.events.append(("status", role))
+            if self.failure == "readback" and role == "exit" and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected readback failure")
+            return [{"fingerprint": self.module.tenant_fingerprint(self.files[role])}]
+        raise AssertionError(f"unexpected control command: {command}")
+
+    def runner(self, request: dict):
+        self.requests.append(request)
+        if request["kind"] == "media_burst" and self.failure == "burst":
+            raise RuntimeError("injected burst failure")
+        if request["kind"] == "sustained_probe":
+            return {"average_kbps": 5001 if self.failure == "sustained" else 5000}
+        return {"sent_mbps": 12}
+
+    def collector(self):
+        self.collects += 1
+        return 8 if self.failure == "pressure" and self.collects == 2 else 7
+
+    def install(self) -> None:
+        self.originals = {name: getattr(self.module, name) for name in
+                          ("remote_read", "remote_push", "invoke", "publish", "stage_directory")}
+        self.module.remote_read = self.remote_read
+        self.module.remote_push = self.remote_push
+        self.module.invoke = self.invoke
+        self.module.publish = self.publish
+        self.module.stage_directory = self.stage_directory
+
+    def restore(self) -> None:
+        for name, value in self.originals.items():
+            setattr(self.module, name, value)
+
+
 class MediaBurstTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_module()
@@ -63,6 +145,61 @@ class MediaBurstTests(unittest.TestCase):
         self.assertEqual(result["status"], "preflight")
         self.assertEqual(result["record"], self.module.TARGET_RECORD)
         self.assertEqual(result["instance"], "gz2-hk2-kz-00002_1")
+
+    def test_rejects_mismatched_original_files_before_any_remote_write(self) -> None:
+        fake = FakeRollout(self.module, exit_original=b"tenant-v3 nbmobile 256 64 5000 5000 0 625000 1\n")
+        fake.install()
+        try:
+            with self.assertRaisesRegex(ValueError, "不一致"):
+                self.module.apply(execute=True, runner=fake.runner, collector=fake.collector)
+        finally:
+            fake.restore()
+
+        self.assertEqual(fake.files["entry"], BASELINE)
+        self.assertEqual(fake.files["exit"], b"tenant-v3 nbmobile 256 64 5000 5000 0 625000 1\n")
+        self.assertFalse(any(kind in {"stage", "push", "prepare", "publish", "commit"}
+                             for kind, _role in fake.events))
+
+    def test_prepares_all_roles_before_any_commit_and_runs_synthetic_gates(self) -> None:
+        fake = FakeRollout(self.module)
+        fake.install()
+        try:
+            result = self.module.apply(execute=True, runner=fake.runner, collector=fake.collector)
+        finally:
+            fake.restore()
+
+        self.assertEqual(result["status"], "committed")
+        first_commit = next(index for index, item in enumerate(fake.events) if item[0] == "commit")
+        prepared = [item for item in fake.events[:first_commit] if item[0] == "prepare"]
+        self.assertEqual(prepared, [("prepare", "entry"), ("prepare", "exit")])
+        self.assertEqual(fake.files["entry"], fake.files["exit"])
+        self.assertEqual(fake.files["entry"], self.module.TARGET_RECORD.encode("ascii") + b"\n")
+        self.assertEqual(result["synthetic"]["queue_pressure_delta"], 0)
+        self.assertEqual(result["synthetic"]["configured_rate_kbps"], 5000)
+        self.assertEqual(result["synthetic"]["average_kbps"], 5000)
+        self.assertEqual(fake.requests, [
+            {"kind": "media_burst", "rate_mbps": 12, "duration_ms": 500},
+            {"kind": "sustained_probe", "duration_s": 90, "maximum_kbps": 5000},
+        ])
+
+    def test_every_transaction_or_gate_failure_restores_old_files_and_fingerprints(self) -> None:
+        for failure in ("prepare", "publish", "commit", "readback", "pressure", "burst", "sustained"):
+            with self.subTest(failure=failure):
+                fake = FakeRollout(self.module, failure=failure)
+                fake.install()
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "已恢复"):
+                        self.module.apply(execute=True, runner=fake.runner, collector=fake.collector)
+                finally:
+                    fake.restore()
+
+                self.assertEqual(fake.files["entry"], BASELINE)
+                self.assertEqual(fake.files["exit"], BASELINE)
+                self.assertIn(("abort", "entry"), fake.events)
+                self.assertIn(("abort", "exit"), fake.events)
+                for role in ("entry", "exit"):
+                    self.assertEqual(self.module.tenant_fingerprint(fake.files[role]),
+                                     self.module.tenant_fingerprint(BASELINE))
 
 
 if __name__ == "__main__":
