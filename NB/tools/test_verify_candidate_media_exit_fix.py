@@ -49,6 +49,15 @@ def valid_evidence() -> dict:
                 "boot_id": f"boot-{role}-{worker}",
                 "metrics": metrics,
             })
+    def snapshot(at: str) -> dict:
+        return {
+            f"{item['role']}:{item['worker']}": {
+                "release_id": release, "transport_generation": 2,
+                "boot_id": item["boot_id"], "queue_pressure_dropped": 10,
+                "sampled_at_utc": at,
+            } for item in workers
+        }
+
     return {
         "controlplane": {"deployment": deployment, "generation": 2, "signal_direct": False,
                          "test_window": {"started_at_utc": "2026-09-04T12:00:00Z",
@@ -60,18 +69,9 @@ def valid_evidence() -> dict:
             "exit": {"rate_up_kbps": 5000, "rate_down_kbps": 5000,
                      "burst_up_bytes": 2500000, "burst_down_bytes": 625000},
         },
-        "queue_pressure_before": {
-            f"{item['role']}:{item['worker']}": {
-                "release_id": release, "transport_generation": 2,
-                "boot_id": item["boot_id"], "queue_pressure_dropped": 10,
-            } for item in workers
-        },
-        "queue_pressure_after": {
-            f"{item['role']}:{item['worker']}": {
-                "release_id": release, "transport_generation": 2,
-                "boot_id": item["boot_id"], "queue_pressure_dropped": 10,
-            } for item in workers
-        },
+        "queue_pressure_before": snapshot("2026-09-04T12:00:10Z"),
+        "queue_pressure_after_burst": snapshot("2026-09-04T12:02:00Z"),
+        "queue_pressure_after_sustained": snapshot("2026-09-04T12:05:00Z"),
         "private_dns_probe": {
             "host": "2fio72ng.sg-fn.tiktok-row.net",
             "address": "10.105.212.98",
@@ -81,12 +81,12 @@ def valid_evidence() -> dict:
             "event_at_utc": "2026-09-04T12:01:00Z",
             "exit_connectivity_before": {
                 "worker_key": "exit:0", "release_id": release, "deployment": deployment,
-                "boot_id": "boot-exit-0", "sampled_at_utc": "2026-09-04T12:00:00Z",
+                "boot_id": "boot-exit-0", "observed_at": "2026-09-04T12:00:30Z",
                 "dns_private_rejected": 0, "dns_failures": 0,
             },
             "exit_connectivity_after": {
                 "worker_key": "exit:0", "release_id": release, "deployment": deployment,
-                "boot_id": "boot-exit-0", "sampled_at_utc": "2026-09-04T12:00:01Z",
+                "boot_id": "boot-exit-0", "observed_at": "2026-09-04T12:01:30Z",
                 "dns_private_rejected": 1, "dns_failures": 0,
             },
         },
@@ -147,17 +147,17 @@ class CandidateVerifierTests(unittest.TestCase):
 
     def test_acceptance_requires_zero_queue_pressure_delta_per_worker(self) -> None:
         evidence = valid_evidence()
-        evidence["queue_pressure_after"]["entry:0"]["queue_pressure_dropped"] = 11
+        evidence["queue_pressure_after_burst"]["entry:0"]["queue_pressure_dropped"] = 11
         with self.assertRaisesRegex(ValueError, "queue_pressure_dropped"):
             self.module.validate_acceptance(evidence)
 
         evidence = valid_evidence()
-        evidence["queue_pressure_after"].pop("exit:1")
+        evidence["queue_pressure_after_sustained"].pop("exit:1")
         with self.assertRaisesRegex(ValueError, "queue_pressure"):
             self.module.validate_acceptance(evidence)
 
         evidence = valid_evidence()
-        evidence["queue_pressure_after"]["middle:1"]["boot_id"] = "restarted"
+        evidence["queue_pressure_after_burst"]["middle:1"]["boot_id"] = "restarted"
         with self.assertRaisesRegex(ValueError, "queue_pressure"):
             self.module.validate_acceptance(evidence)
 
@@ -184,13 +184,22 @@ class CandidateVerifierTests(unittest.TestCase):
             "worker": lambda snapshot: snapshot.__setitem__("worker_key", "exit:1"),
             "release": lambda snapshot: snapshot.__setitem__("release_id", "other-release"),
             "boot": lambda snapshot: snapshot.__setitem__("boot_id", "restarted"),
-            "missing_time": lambda snapshot: snapshot.pop("sampled_at_utc"),
+            "missing_time": lambda snapshot: snapshot.pop("observed_at"),
         }
         for name, mutate in cases.items():
             with self.subTest(name=name):
                 evidence = valid_evidence()
                 mutate(evidence["private_dns_probe"]["exit_connectivity_after"])
                 with self.assertRaisesRegex(ValueError, "私网|证据"):
+                    self.module.validate_acceptance(evidence)
+
+    def test_acceptance_rejects_private_probe_observation_outside_event_window(self) -> None:
+        for target, value in (("before", "2020-01-01T00:00:00Z"),
+                              ("after", "2026-09-04T12:00:45Z")):
+            with self.subTest(target=target):
+                evidence = valid_evidence()
+                evidence["private_dns_probe"][f"exit_connectivity_{target}"]["observed_at"] = value
+                with self.assertRaisesRegex(ValueError, "私网"):
                     self.module.validate_acceptance(evidence)
 
     def test_missing_phone_timeline_is_pending_not_passed(self) -> None:
@@ -257,6 +266,18 @@ class CandidateVerifierTests(unittest.TestCase):
 
         self.assertIn(b"nb-probe-echo.internal", packet)
         self.assertTrue(packet.endswith((7).to_bytes(8, "big") + b"payload"))
+
+    def test_native_probe_decodes_domain_reply_and_rejects_truncated_or_wrong_target(self) -> None:
+        host = b"nb-probe-echo.internal"
+        payload = (7).to_bytes(8, "big") + b"echo"
+        reply = b"\x00\x00\x00\x03" + bytes([len(host)]) + host + (9).to_bytes(2, "big") + payload
+        sequence, echoed = self.module.decode_native_probe_response(reply)
+        self.assertEqual((sequence, echoed), (7, payload))
+        for invalid in (reply[:-(len(payload) - 7)], reply.replace(host, b"wrong.internal", 1),
+                        reply[:-len(payload)-2] + (10).to_bytes(2, "big") + payload):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.module.decode_native_probe_response(invalid)
 
 
 if __name__ == "__main__":

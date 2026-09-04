@@ -129,36 +129,45 @@ def _validate_tenant(evidence: dict[str, Any]) -> None:
             raise ValueError(f"证据 tenant.{role} 不是 5000/5000 与 2500000/625000")
 
 
-def _validate_queue_pressure(evidence: dict[str, Any], workers: list[dict[str, Any]]) -> int:
-    before = _mapping(evidence.get("queue_pressure_before"), "queue_pressure_before")
-    after = _mapping(evidence.get("queue_pressure_after"), "queue_pressure_after")
+def _validate_queue_pressure(evidence: dict[str, Any], workers: list[dict[str, Any]],
+                             window: tuple[dt.datetime, dt.datetime]) -> int:
+    stages = {
+        "before": _mapping(evidence.get("queue_pressure_before"), "queue_pressure_before"),
+        "after_burst": _mapping(evidence.get("queue_pressure_after_burst"), "queue_pressure_after_burst"),
+        "after_sustained": _mapping(evidence.get("queue_pressure_after_sustained"), "queue_pressure_after_sustained"),
+    }
     expected_keys = {_worker_key(worker) for worker in workers}
-    if set(before) != expected_keys or set(after) != expected_keys:
-        raise ValueError("证据 queue_pressure 必须覆盖同一组六个 worker")
+    if any(set(snapshot) != expected_keys for snapshot in stages.values()):
+        raise ValueError("证据 queue_pressure 三份快照必须覆盖同一组六个 worker")
     delta = 0
     for key in sorted(expected_keys):
-        old = _mapping(before.get(key), f"queue_pressure_before.{key}")
-        new = _mapping(after.get(key), f"queue_pressure_after.{key}")
+        samples = {stage: _mapping(snapshot.get(key), f"queue_pressure_{stage}.{key}")
+                   for stage, snapshot in stages.items()}
         worker = next(item for item in workers if _worker_key(item) == key)
-        for field in ("release_id", "boot_id"):
-            if (_text(old.get(field), f"queue_pressure_before.{key}.{field}") !=
-                    _text(new.get(field), f"queue_pressure_after.{key}.{field}") or
-                    _text(old.get(field), f"queue_pressure_before.{key}.{field}") !=
-                    _text(worker.get(field), f"worker.{field}")):
-                raise ValueError(f"证据 queue_pressure {key} 身份漂移: {field}")
-        old_generation = _integer(old.get("transport_generation"),
-                                  f"queue_pressure_before.{key}.transport_generation")
-        new_generation = _integer(new.get("transport_generation"),
-                                  f"queue_pressure_after.{key}.transport_generation")
-        if old_generation != new_generation or old_generation != _integer(worker.get("generation"), "worker.generation"):
-            raise ValueError(f"证据 queue_pressure {key} transport generation 漂移")
-        old_pressure = _integer(old.get("queue_pressure_dropped"), f"queue_pressure_before.{key}.queue_pressure_dropped")
-        new_pressure = _integer(new.get("queue_pressure_dropped"), f"queue_pressure_after.{key}.queue_pressure_dropped")
-        if new_pressure < old_pressure:
+        timestamps = []
+        counters = []
+        for stage in ("before", "after_burst", "after_sustained"):
+            sample = samples[stage]
+            for field in ("release_id", "boot_id"):
+                if (_text(sample.get(field), f"queue_pressure_{stage}.{key}.{field}") !=
+                        _text(worker.get(field), f"worker.{field}")):
+                    raise ValueError(f"证据 queue_pressure {key} 身份漂移: {field}")
+            generation = _integer(sample.get("transport_generation"), f"queue_pressure_{stage}.{key}.transport_generation")
+            if generation != _integer(worker.get("generation"), "worker.generation"):
+                raise ValueError(f"证据 queue_pressure {key} transport generation 漂移")
+            observed = _parse_timestamp(sample.get("sampled_at_utc"), f"queue_pressure_{stage}.{key}.sampled_at_utc")
+            if not window[0] <= observed <= window[1]:
+                raise ValueError(f"证据 queue_pressure {key} 采样不在 deployment 测试窗口")
+            timestamps.append(observed)
+            counters.append(_integer(sample.get("queue_pressure_dropped"),
+                                     f"queue_pressure_{stage}.{key}.queue_pressure_dropped"))
+        if timestamps != sorted(timestamps):
+            raise ValueError(f"证据 queue_pressure {key} 采样时间倒退")
+        if not counters[0] <= counters[1] <= counters[2]:
             raise ValueError(f"证据 queue_pressure_dropped 计数回退: {key}")
-        if new_pressure != old_pressure:
-            raise ValueError(f"证据 queue_pressure_dropped 增量非零: {key}")
-        delta += new_pressure - old_pressure
+        if counters[1] != counters[0] or counters[2] != counters[1]:
+            raise ValueError(f"证据 queue_pressure_dropped 两个区间增量非零: {key}")
+        delta += (counters[1] - counters[0]) + (counters[2] - counters[1])
     return delta
 
 
@@ -208,12 +217,11 @@ def _validate_private_probe(evidence: dict[str, Any], workers: list[dict[str, An
             _text(before.get("boot_id"), "private_dns_probe.before.boot_id") !=
             _text(matched.get("boot_id"), "worker.boot_id")):
         raise ValueError("私网证据身份与 Exit worker 不一致")
-    if _parse_timestamp(after.get("sampled_at_utc"), "private_dns_probe.after.sampled_at_utc") < _parse_timestamp(
-            before.get("sampled_at_utc"), "private_dns_probe.before.sampled_at_utc"):
-        raise ValueError("私网证据采样时间窗倒退")
+    before_at = _parse_timestamp(before.get("observed_at"), "private_dns_probe.before.observed_at")
+    after_at = _parse_timestamp(after.get("observed_at"), "private_dns_probe.after.observed_at")
     event_at = _parse_timestamp(probe.get("event_at_utc"), "private_dns_probe.event_at_utc")
-    if not window[0] <= event_at <= window[1]:
-        raise ValueError("私网证据事件不在当前 deployment 测试窗口")
+    if not window[0] <= before_at <= event_at <= after_at <= window[1]:
+        raise ValueError("私网证据观测与事件不在当前 deployment 测试窗口或顺序错误")
     old = _integer(before.get("dns_private_rejected"), "private_dns_probe.before.dns_private_rejected")
     new = _integer(after.get("dns_private_rejected"), "private_dns_probe.after.dns_private_rejected")
     if new <= old:
@@ -309,7 +317,7 @@ def validate_acceptance(evidence: dict[str, Any]) -> dict[str, Any]:
     window = _test_window(controlplane)
     workers, release = _validate_workers(document, deployment)
     _validate_tenant(document)
-    queue_delta = _validate_queue_pressure(document, workers)
+    queue_delta = _validate_queue_pressure(document, workers, window)
     private_probe = _validate_private_probe(document, workers, release, deployment, window)
     synthetic = _validate_synthetic(document)
     phone = _phone_validation(document, window)
@@ -364,6 +372,47 @@ def encode_native_probe_datagram(sequence: int, payload: bytes) -> bytes:
     return b"\x00\x00\x00\x03" + bytes([len(host)]) + host + NATIVE_PROBE_PORT.to_bytes(2, "big") + sequence.to_bytes(8, "big") + payload
 
 
+def decode_native_probe_response(data: bytes) -> tuple[int, bytes]:
+    """Strictly decode SOCKS UDP ATYP 1/3/4 and accept only the native echo target."""
+    if len(data) < 4 or data[:3] != b"\x00\x00\x00":
+        raise ValueError("原生 probe SOCKS UDP 头非法")
+    atyp = data[3]
+    offset = 4
+    if atyp == 1:
+        length = 4
+        if len(data) < offset + length + 2:
+            raise ValueError("原生 probe IPv4 回包截断")
+        host = str(ipaddress.IPv4Address(data[offset:offset + length]))
+        offset += length
+    elif atyp == 3:
+        if len(data) < offset + 1:
+            raise ValueError("原生 probe 域名长度截断")
+        length = data[offset]
+        offset += 1
+        if length == 0 or len(data) < offset + length + 2:
+            raise ValueError("原生 probe 域名回包截断")
+        try:
+            host = data[offset:offset + length].decode("ascii").rstrip(".").lower()
+        except UnicodeDecodeError as error:
+            raise ValueError("原生 probe 域名不是 ASCII") from error
+        offset += length
+    elif atyp == 4:
+        length = 16
+        if len(data) < offset + length + 2:
+            raise ValueError("原生 probe IPv6 回包截断")
+        host = str(ipaddress.IPv6Address(data[offset:offset + length]))
+        offset += length
+    else:
+        raise ValueError("原生 probe SOCKS UDP ATYP 非法")
+    port = int.from_bytes(data[offset:offset + 2], "big")
+    payload = data[offset + 2:]
+    if host != NATIVE_PROBE_HOST or port != NATIVE_PROBE_PORT:
+        raise ValueError("原生 probe 回包目标不匹配")
+    if len(payload) < 8:
+        raise ValueError("原生 probe 回包缺少序号")
+    return int.from_bytes(payload[:8], "big"), payload
+
+
 class NativeProbeAdapter:
     """Runs through the three-hop SOCKS path without changing remote configuration or processes."""
     def open(self) -> _NativeProbeState:
@@ -391,8 +440,6 @@ class NativeProbeAdapter:
     @staticmethod
     def _measure(state: _NativeProbeState, rate_bps: int, duration_s: float, kind: str) -> dict[str, Any]:
         """Count sequenced, de-duplicated echo payloads while paced sends are in progress."""
-        from udp_e2e_probe import decode_datagram  # pylint: disable=import-outside-toplevel
-
         target_bytes = int(rate_bps * duration_s // 8)
         sent_bytes = 0
         sequence = 0
@@ -413,15 +460,13 @@ class NativeProbeAdapter:
                     receiver_errors.append(type(error).__name__)
                     return
                 try:
-                    host, port, payload = decode_datagram(data)
-                    if port != NATIVE_PROBE_PORT or len(payload) < 8:
-                        continue
-                    item = int.from_bytes(payload[:8], "big")
+                    item, payload = decode_native_probe_response(data)
                     with receive_lock:
                         if item in sent_sizes and item not in received and len(payload) == sent_sizes[item]:
                             received[item] = len(payload)
-                except (RuntimeError, ValueError):
-                    continue
+                except ValueError as error:
+                    receiver_errors.append(str(error))
+                    return
 
         receiver = threading.Thread(target=receive_loop, name="nb-media-echo-recv", daemon=True)
         start = time.monotonic()
