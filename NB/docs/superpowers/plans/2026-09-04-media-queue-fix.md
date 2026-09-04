@@ -21,7 +21,7 @@
 
 ---
 
-### 任务 1：动态媒体队列容量
+### Task 1：动态媒体队列容量
 
 **文件：**
 - 修改：`src/nb_live.h`
@@ -66,7 +66,7 @@ size_t nb_live_udp_queue_limit(nb_flow_class_t flow_class,uint64_t rate,uint64_t
 
 预期：退出码 0。
 
-### 任务 2：真实 datagram 队列年龄
+### Task 2：真实 datagram 队列年龄
 
 **文件：**
 - 修改：`src/nb_udp_queue.h`
@@ -95,7 +95,7 @@ size_t nb_live_udp_queue_limit(nb_flow_class_t flow_class,uint64_t rate,uint64_t
 
 运行同上并执行 `build/test_udp_queue_age.exe`，预期打印 `nb_udp_queue_test: ok`。
 
-### 任务 3：节点接入动态容量和队列诊断
+### Task 3：节点接入动态容量和队列诊断
 
 **文件：**
 - 修改：`src/nb_node_udp_queue.inc`
@@ -126,7 +126,7 @@ size_t nb_live_udp_queue_limit(nb_flow_class_t flow_class,uint64_t rate,uint64_t
 
 运行：`python tools/test_shard_deploy.py`、两个 C 测试、`git diff --check`；预期全部退出 0。
 
-### 任务 4：5Mbps 突发热更新与合成验证
+### Task 4：5Mbps 突发热更新与合成验证
 
 **文件：**
 - 新建：`build/deploy_candidate_media_burst.py`

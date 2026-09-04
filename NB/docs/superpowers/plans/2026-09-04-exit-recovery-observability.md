@@ -20,7 +20,7 @@
 
 ---
 
-### 任务 1：DNS 请求上下文和私网地址判定
+### Task 1：DNS 请求上下文和私网地址判定
 
 **文件：**
 - 修改：`src/nb_dns.h`
@@ -49,7 +49,7 @@
 
 执行同一测试，预期打印 `RESULT PASS`。
 
-### 任务 2：TCP 建连截止时间
+### Task 2：TCP 建连截止时间
 
 **文件：**
 - 新建：`src/nb_connect.h`
@@ -80,7 +80,7 @@
 
 运行 CMake 的单项测试，预期退出 0。
 
-### 任务 3：Exit 状态机接入 DNS 与 connect 恢复
+### Task 3：Exit 状态机接入 DNS 与 connect 恢复
 
 **文件：**
 - 修改：`src/nb_node_main.inc`
@@ -111,7 +111,7 @@
 
 运行：`ctest --test-dir test-build -R "nb_(dns|connect|udp_lifecycle)_test" --output-on-failure`。
 
-### 任务 4：metrics 与控制面证据
+### Task 4：metrics 与控制面证据
 
 **文件：**
 - 修改：`src/nb_metrics.h`
@@ -139,7 +139,7 @@
 
 测试程序退出 0，输出可以被 Python `json.loads` 解析。
 
-### 任务 5：合并构建、事务部署和恢复验证
+### Task 5：合并构建、事务部署和恢复验证
 
 **文件：**
 - 使用：`tools/deploy.py`
