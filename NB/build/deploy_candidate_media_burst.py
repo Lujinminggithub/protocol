@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import numbers
 import os
 import pathlib
 import shlex
@@ -119,7 +121,7 @@ def stage_directory(role: str, directory: str) -> None:
         connection.close()
 
 
-def default_collector() -> int:
+def default_collector() -> dict[str, int]:
     """汇总 Entry 与 Exit 全部控制端点的媒体队列丢弃计数。"""
     total = 0
     for role in ROLES:
@@ -140,7 +142,7 @@ def default_collector() -> int:
             total += int(sample["queue_pressure_dropped"])
         finally:
             connection.close()
-    return total
+    return {"queue_pressure_dropped": total}
 
 
 def default_runner(request: dict[str, Any]) -> dict[str, Any]:
@@ -163,26 +165,62 @@ def default_runner(request: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def required_integer(evidence: dict[str, Any], field: str, label: str) -> int:
+    """拒绝缺失、布尔值与非整数的机器证据字段。"""
+    value = evidence.get(field)
+    if type(value) is not int:
+        raise RuntimeError(f"{label}缺少合法 {field}")
+    return value
+
+
+def queue_pressure_sample(collector: Callable[[], dict[str, Any]]) -> int:
+    """只接受明确返回的队列丢弃计数，拒绝默认零值。"""
+    evidence = collector()
+    if not isinstance(evidence, dict):
+        raise RuntimeError("队列计数采样格式非法")
+    value = required_integer(evidence, "queue_pressure_dropped", "队列计数采样")
+    if value < 0:
+        raise RuntimeError("队列计数采样不能为负数")
+    return value
+
+
 def run_synthetic_validation(runner: Callable[[dict[str, Any]], dict[str, Any]],
-                             collector: Callable[[], int]) -> dict[str, Any]:
+                             collector: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """验证短时突发不增加丢弃计数，且持续流量不超过服务速率。"""
-    before = int(collector())
-    runner({"kind": "media_burst", "rate_mbps": 12, "duration_ms": 500})
-    after = int(collector())
+    before = queue_pressure_sample(collector)
+    burst = runner({"kind": "media_burst", "rate_mbps": 12, "duration_ms": 500})
+    if not isinstance(burst, dict):
+        raise RuntimeError("媒体突发探针结果格式非法")
+    if required_integer(burst, "planned_bps", "媒体突发探针") != 12000000:
+        raise RuntimeError("媒体突发探针计划速率不正确")
+    if required_integer(burst, "planned_duration_ms", "媒体突发探针") != 500:
+        raise RuntimeError("媒体突发探针计划时长不正确")
+    if required_integer(burst, "sent_bytes", "媒体突发探针") < 750000:
+        raise RuntimeError("媒体突发探针发送字节不足")
+    if required_integer(burst, "elapsed_ms", "媒体突发探针") < 500:
+        raise RuntimeError("媒体突发探针实际时长不足")
+    after = queue_pressure_sample(collector)
     dropped = after - before
     if dropped != 0:
         raise RuntimeError("媒体突发产生队列丢弃")
     sustained = runner({"kind": "sustained_probe", "duration_s": 90,
                         "maximum_kbps": SUSTAINED_RATE_KBPS})
-    try:
-        average_kbps = int(sustained["average_kbps"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise RuntimeError("持续探针未返回平均吞吐") from error
+    if not isinstance(sustained, dict):
+        raise RuntimeError("持续探针结果格式非法")
+    average_kbps = sustained.get("average_kbps")
+    if (isinstance(average_kbps, bool) or not isinstance(average_kbps, numbers.Real) or
+            not math.isfinite(float(average_kbps))):
+        raise RuntimeError("持续探针未返回合法平均吞吐")
+    duration_s = sustained.get("duration_s")
+    if (isinstance(duration_s, bool) or not isinstance(duration_s, numbers.Real) or
+            not math.isfinite(float(duration_s)) or duration_s < 90):
+        raise RuntimeError("持续探针实际时长不足")
     if average_kbps > SUSTAINED_RATE_KBPS:
         raise RuntimeError("持续探针超过 5Mbps 服务约束")
     return {"queue_pressure_before": before, "queue_pressure_after": after,
             "queue_pressure_delta": dropped, "configured_rate_kbps": SUSTAINED_RATE_KBPS,
-            "average_kbps": average_kbps}
+            "average_kbps": float(average_kbps), "duration_s": float(duration_s),
+            "burst_sent_bytes": burst["sent_bytes"], "burst_elapsed_ms": burst["elapsed_ms"]}
 
 
 def restore_role(role: str, old: bytes, transaction: int, root: str) -> dict[str, Any]:
@@ -197,7 +235,7 @@ def restore_role(role: str, old: bytes, transaction: int, root: str) -> dict[str
 
 
 def apply(execute: bool, runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-          collector: Callable[[], int] | None = None) -> dict[str, Any]:
+          collector: Callable[[], dict[str, Any]] | None = None) -> dict[str, Any]:
     """执行双角色 prepare/commit/readback；未执行模式不产生远端连接。"""
     if deploy.INSTANCE_WORK != f"/etc/NB/instances/{INSTANCE}":
         raise RuntimeError("部署根目录与候选实例不一致")

@@ -80,12 +80,13 @@ class FakeRollout:
         if request["kind"] == "media_burst" and self.failure == "burst":
             raise RuntimeError("injected burst failure")
         if request["kind"] == "sustained_probe":
-            return {"average_kbps": 5001 if self.failure == "sustained" else 5000}
-        return {"sent_mbps": 12}
+            return {"average_kbps": 5001 if self.failure == "sustained" else 5000, "duration_s": 90}
+        return {"planned_bps": 12000000, "planned_duration_ms": 500,
+                "sent_bytes": 750000, "elapsed_ms": 500}
 
     def collector(self):
         self.collects += 1
-        return 8 if self.failure == "pressure" and self.collects == 2 else 7
+        return {"queue_pressure_dropped": 8 if self.failure == "pressure" and self.collects == 2 else 7}
 
     def install(self) -> None:
         self.originals = {name: getattr(self.module, name) for name in
@@ -181,6 +182,50 @@ class MediaBurstTests(unittest.TestCase):
             {"kind": "media_burst", "rate_mbps": 12, "duration_ms": 500},
             {"kind": "sustained_probe", "duration_s": 90, "maximum_kbps": 5000},
         ])
+
+    def test_synthetic_validation_accepts_complete_structured_evidence(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            if request["kind"] == "media_burst":
+                return {"planned_bps": 12000000, "planned_duration_ms": 500,
+                        "sent_bytes": 750000, "elapsed_ms": 500}
+            return {"average_kbps": 5000.0, "duration_s": 90}
+
+        samples = iter(({"queue_pressure_dropped": 4}, {"queue_pressure_dropped": 4}))
+        result = self.module.run_synthetic_validation(runner, lambda: next(samples))
+
+        self.assertEqual(result["queue_pressure_delta"], 0)
+        self.assertEqual(requests[0]["rate_mbps"], 12)
+
+    def test_synthetic_validation_rejects_fail_open_evidence(self) -> None:
+        valid_burst = {"planned_bps": 12000000, "planned_duration_ms": 500,
+                       "sent_bytes": 750000, "elapsed_ms": 500}
+        valid_sustained = {"average_kbps": 5000.0, "duration_s": 90}
+        cases = {
+            "noop": ({}, valid_sustained, lambda: {"queue_pressure_dropped": 4}),
+            "wrong_bytes": ({**valid_burst, "sent_bytes": 749999}, valid_sustained,
+                            lambda: {"queue_pressure_dropped": 4}),
+            "wrong_planned_duration": ({**valid_burst, "planned_duration_ms": 499}, valid_sustained,
+                                       lambda: {"queue_pressure_dropped": 4}),
+            "wrong_elapsed": ({**valid_burst, "elapsed_ms": 499}, valid_sustained,
+                              lambda: {"queue_pressure_dropped": 4}),
+            "wrong_plan": ({**valid_burst, "planned_bps": 11999999}, valid_sustained,
+                           lambda: {"queue_pressure_dropped": 4}),
+            "float_over_limit": (valid_burst, {**valid_sustained, "average_kbps": 5000.9},
+                                   lambda: {"queue_pressure_dropped": 4}),
+            "short_sustained": (valid_burst, {**valid_sustained, "duration_s": 89},
+                                lambda: {"queue_pressure_dropped": 4}),
+            "missing_pressure": (valid_burst, valid_sustained, lambda: {}),
+        }
+        for name, (burst, sustained, collector) in cases.items():
+            with self.subTest(name=name):
+                def runner(request, burst=burst, sustained=sustained):
+                    return burst if request["kind"] == "media_burst" else sustained
+
+                with self.assertRaises(RuntimeError):
+                    self.module.run_synthetic_validation(runner, collector)
 
     def test_every_transaction_or_gate_failure_restores_old_files_and_fingerprints(self) -> None:
         for failure in ("prepare", "publish", "commit", "readback", "pressure", "burst", "sustained"):
