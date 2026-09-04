@@ -95,7 +95,7 @@ if(BUILD_TESTING)
   target_compile_options(nb_udp_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp COMMAND nb_udp_test)
 
-  add_executable(nb_udp_probe_echo_test tools/test_udp_probe_echo.c src/nb_udp_probe_echo.c)
+  add_executable(nb_udp_probe_echo_test tools/test_udp_probe_echo.c src/nb_udp_probe_echo.c src/nb_udp.c src/nb_udp_lifecycle.c)
   target_include_directories(nb_udp_probe_echo_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_udp_probe_echo_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp_probe_echo COMMAND nb_udp_probe_echo_test)

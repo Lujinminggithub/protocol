@@ -26,19 +26,19 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
     log4c_info("exit udp flow open id=%u usid=%u target=%s:%d",p->id,p->udp_session_id,host,port);return p;
 }
 
+static int udp_exit_enqueue_probe_echo(void* opaque,const nb_udp_probe_echo_plan_t* echo){
+    proxy_stream_t* p=opaque;if(p==NULL||echo==NULL)return -1;
+    int queue_rc=udp_queue_packet_with_sequence(p,echo->to_down,echo->type,echo->route,echo->payload,
+        echo->payload_length,echo->sequence,1);
+    if(queue_rc<0)return -1;
+    if(queue_rc>0)return 1;
+    p->udp_packets_c2s+=echo->c2s_packets_delta;p->bytes_c2s+=echo->c2s_bytes_delta;
+    p->udp_packets_s2c+=echo->s2c_packets_delta;p->bytes_s2c+=echo->s2c_bytes_delta;
+    ps_touch(p);return 0;
+}
+
 static int udp_deliver_reassembled(proxy_stream_t* p,const nb_udp_reassembled_t* complete){
     if(G.role==ROLE_EXIT){
-        nb_udp_probe_echo_plan_t echo={0};
-        int echo_rc=nb_udp_probe_echo_plan(p->udp_target_host,p->udp_target_port,complete,&echo);
-        if(echo_rc<0)return -1;
-        if(echo_rc>0){
-            int queue_rc=udp_queue_packet_with_sequence(p,0,echo.type,echo.route,echo.payload,
-                echo.payload_length,echo.sequence,1);
-            if(queue_rc!=0)return queue_rc<0?-1:0;
-            p->udp_packets_c2s+=echo.c2s_packets_delta;p->bytes_c2s+=echo.c2s_bytes_delta;
-            p->udp_packets_s2c+=echo.s2c_packets_delta;p->bytes_s2c+=echo.s2c_bytes_delta;
-            ps_touch(p);return 0;
-        }
         if(p->udp_fd>=0){
             ssize_t n=send(p->udp_fd,complete->payload,complete->payload_length,MSG_NOSIGNAL);
             if(n!=(ssize_t)complete->payload_length)return -1;
@@ -122,6 +122,11 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             nb_udp_reassembled_t complete;
             if(p->udp_reassembly==NULL)return -6;
+            if(nb_udp_probe_echo_target(p->udp_target_host,p->udp_target_port)){
+                int echo_rc=nb_udp_probe_echo_exit_feed(p->udp_target_host,p->udp_target_port,
+                    p->udp_reassembly,view,picoquic_current_time(),udp_exit_enqueue_probe_echo,p);
+                return echo_rc<0?(echo_rc==NB_UDP_PROBE_ECHO_REASSEMBLY_ERROR?-6:-7):0;
+            }
             int rc=nb_udp_reassembly_feed(p->udp_reassembly,view,picoquic_current_time(),&complete);
             return rc<0?-6:(rc==1?(udp_deliver_reassembled(p,&complete)==0?0:-7):0);
         }
