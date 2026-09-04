@@ -1,7 +1,35 @@
-static int dgramq_append(uint8_t** buf,size_t* len,size_t* cap,const uint8_t* d,size_t n,uint32_t ps_id){
+static size_t udp_queue_limit_for_direction_values(nb_flow_class_t flow_class,int to_down,
+    int egress_active,uint64_t egress_rate_bps,uint64_t egress_reorder_us,
+    int ingress_active,uint64_t ingress_rate_bps,uint64_t ingress_reorder_us){
+    int active=to_down?egress_active:ingress_active;
+    uint64_t rate=to_down?egress_rate_bps:ingress_rate_bps;
+    uint64_t reorder=to_down?egress_reorder_us:ingress_reorder_us;
+    return nb_live_udp_queue_limit(flow_class,active?rate:0,active?reorder:0);
+}
+
+#ifdef NB_NODE_QUEUE_TEST
+size_t nb_node_udp_queue_limit_for_test(nb_flow_class_t flow_class,int to_down,
+    int egress_active,uint64_t egress_rate_bps,uint64_t egress_reorder_us,
+    int ingress_active,uint64_t ingress_rate_bps,uint64_t ingress_reorder_us){
+    return udp_queue_limit_for_direction_values(flow_class,to_down,egress_active,egress_rate_bps,
+        egress_reorder_us,ingress_active,ingress_rate_bps,ingress_reorder_us);
+}
+#else
+static size_t udp_queue_limit_for_direction(const proxy_stream_t* p,int to_down){
+    return udp_queue_limit_for_direction_values(p->flow_class,to_down,
+        nb_current_instance->transport_egress.active,
+        nb_current_instance->transport_egress.link.target_rate_bps,
+        nb_current_instance->transport_egress.link.reorder_delay_us,
+        nb_current_instance->transport_ingress.active,
+        nb_current_instance->transport_ingress.link.target_rate_bps,
+        nb_current_instance->transport_ingress.link.reorder_delay_us);
+}
+
+static int dgramq_append(uint8_t** buf,size_t* len,size_t* cap,const uint8_t* d,size_t n,
+    uint32_t ps_id,size_t queue_limit){
     size_t need=10+n;
-    if(*len+need>NB_DGRAM_QUEUE_MAX){
-        log4c_warn("id=%u fec datagram queue over limit %zu+%zu > %d",ps_id,*len,need,NB_DGRAM_QUEUE_MAX);
+    if(*len+need>queue_limit){
+        log4c_warn("id=%u datagram queue over limit %zu+%zu > %zu",ps_id,*len,need,queue_limit);
         return -2;
     }
     if(nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
@@ -39,37 +67,47 @@ static uint64_t dgramq_drop_expired(uint8_t* buf,size_t* len,uint64_t deadline_u
     return dropped;
 }
 
-static void udp_queue_note_pressure(proxy_stream_t* p,uint64_t packets){
+static void udp_queue_note_pressure(proxy_stream_t* p,const uint8_t* buf,size_t length,
+    size_t queue_limit,uint64_t packets){
     if(packets==0)return;
     if(UINT64_MAX-p->udp_queue_pressure_dropped<packets)p->udp_queue_pressure_dropped=UINT64_MAX;
     else p->udp_queue_pressure_dropped+=packets;
     nb_metrics_note_udp_queue_pressure_drop(&g_metrics_state,packets);
+    uint64_t now=picoquic_current_time();
+    if(p->udp_queue_pressure_last_warn_at!=0&&now-p->udp_queue_pressure_last_warn_at<1000000ULL)return;
+    p->udp_queue_pressure_last_warn_at=now;
+    uint64_t oldest_age_us=nb_udp_queue_oldest_age_us(buf,length,now);
+    log4c_info("媒体队列压力 queue-pressure role=%s id=%u target=%s:%d dropped=%llu queue_bytes=%zu queue_limit=%zu oldest_age_ms=%.1f",
+        role_name(G.role),p->id,p->udp_target_host,p->udp_target_port,(unsigned long long)packets,
+        length,queue_limit,oldest_age_us/1000.0);
 }
 
-static int udp_queue_make_media_room(proxy_stream_t* p,uint8_t* buf,size_t* len,size_t need){
+static int udp_queue_make_media_room(proxy_stream_t* p,uint8_t* buf,size_t* len,size_t need,
+    size_t queue_limit){
     if(p->flow_class!=NB_FLOW_CLASS_MEDIA)return 0;
     uint64_t dropped=0;
-    while(*len>0&&(*len+need>NB_DGRAM_QUEUE_MAX||
+    while(*len>0&&(*len+need>queue_limit||
         nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
         need>nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes)){
         size_t removed=0;uint64_t packets=0;
         if(nb_udp_queue_drop_oldest_packet(buf,len,&removed,&packets)!=0)return -1;
         instance_queue_release(removed);dropped+=packets;
     }
-    udp_queue_note_pressure(p,dropped);
-    if(*len+need>NB_DGRAM_QUEUE_MAX||nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
+    udp_queue_note_pressure(p,buf,*len,queue_limit,dropped);
+    if(*len+need>queue_limit||nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
         need>nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes){
-        udp_queue_note_pressure(p,1);return 1;
+        udp_queue_note_pressure(p,buf,*len,queue_limit,1);return 1;
     }
     return 0;
 }
 
-static int udp_queue_wire_raw(proxy_stream_t* p,int to_down,const uint8_t* data,size_t length){
+static int udp_queue_wire_raw(proxy_stream_t* p,int to_down,const uint8_t* data,size_t length,
+    size_t queue_limit){
     uint8_t** buf=to_down?&p->udp_down_tx:&p->udp_up_tx;
     size_t* len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
     size_t* cap=to_down?&p->udp_down_tx_cap:&p->udp_up_tx_cap;
     picoquic_cnx_t* cnx=to_down?p->down_cnx:p->up_cnx;
-    if(cnx==NULL||dgramq_append(buf,len,cap,data,length,p->id)!=0)return -1;
+    if(cnx==NULL||dgramq_append(buf,len,cap,data,length,p->id,queue_limit)!=0)return -1;
     if(to_down&&*len>p->media_down_q_peak)p->media_down_q_peak=*len;
     if(!to_down&&*len>p->media_up_q_peak)p->media_up_q_peak=*len;
     if(picoquic_mark_datagram_ready(cnx,1)!=0)return -1;
@@ -79,16 +117,18 @@ static int udp_queue_wire_raw(proxy_stream_t* p,int to_down,const uint8_t* data,
 static int udp_queue_wire(proxy_stream_t* p,int to_down,const uint8_t* data,size_t length){
     uint8_t* buf=to_down?p->udp_down_tx:p->udp_up_tx;
     size_t* len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
-    int room=udp_queue_make_media_room(p,buf,len,NB_UDP_QUEUE_RECORD_HEADER+length);
-    return room==0?udp_queue_wire_raw(p,to_down,data,length):room;
+    size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
+    int room=udp_queue_make_media_room(p,buf,len,NB_UDP_QUEUE_RECORD_HEADER+length,queue_limit);
+    return room==0?udp_queue_wire_raw(p,to_down,data,length,queue_limit):room;
 }
 
 static int udp_queue_optional_wire(proxy_stream_t* p,int to_down,const uint8_t* data,size_t length){
     size_t len=to_down?p->udp_down_tx_len:p->udp_up_tx_len;
     size_t need=NB_UDP_QUEUE_RECORD_HEADER+length;
-    if(len+need>NB_DGRAM_QUEUE_MAX||nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
+    size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
+    if(len+need>queue_limit||nb_current_instance->queue_bytes>nb_current_instance->queue_limit_bytes||
         need>nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes)return 1;
-    return udp_queue_wire_raw(p,to_down,data,length);
+    return udp_queue_wire_raw(p,to_down,data,length,queue_limit);
 }
 
 static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const char* route,
@@ -100,7 +140,8 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
     size_t need=payload_length+(size_t)fragments*(NB_UDP_QUEUE_RECORD_HEADER+24+route_length);
     uint8_t* queue=to_down?p->udp_down_tx:p->udp_up_tx;
     size_t* queue_len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
-    int room=udp_queue_make_media_room(p,queue,queue_len,need);if(room!=0)return room;
+    size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
+    int room=udp_queue_make_media_room(p,queue,queue_len,need,queue_limit);if(room!=0)return room;
     uint32_t sequence=++p->udp_tx_sequence;
     for(uint16_t i=0;i<fragments;i++){
         size_t offset=(size_t)i*NB_UDP_FRAGMENT_PAYLOAD;
@@ -108,7 +149,7 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
         uint8_t wire[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
         int n=nb_udp_wire_encode(wire,sizeof(wire),type,p->udp_session_id,sequence,i,fragments,
             (uint16_t)payload_length,wire_route,(uint16_t)route_length,payload+offset,(uint16_t)part);
-        if(n<0||udp_queue_wire_raw(p,to_down,wire,(size_t)n)!=0)return -1;
+        if(n<0||udp_queue_wire_raw(p,to_down,wire,(size_t)n,queue_limit)!=0)return -1;
     }
     return 0;
 }
@@ -154,3 +195,4 @@ static int udp_forward_fragment(proxy_stream_t* p,int to_down,const nb_udp_wire_
         view->payload,view->payload_length);
     return n<0?-1:udp_queue_wire(p,to_down,wire,(size_t)n);
 }
+#endif

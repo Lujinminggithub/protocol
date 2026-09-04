@@ -218,6 +218,7 @@ typedef struct proxy_stream {
     uint64_t udp_assoc_malformed;
     uint64_t udp_assoc_policy_drop;
     uint64_t udp_queue_pressure_dropped;
+    uint64_t udp_queue_pressure_last_warn_at;
     uint64_t udp_assoc_first_raw_at;
     uint64_t udp_control_closed_at;
     uint64_t udp_first_local_c2s_at;

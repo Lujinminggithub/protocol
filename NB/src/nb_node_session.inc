@@ -360,7 +360,10 @@ static uint64_t nb_get_u64(const uint8_t* p){uint64_t v=0;for(int i=0;i<8;i++)v=
 
 static int fec_queue_datagram(proxy_stream_t* p, const uint8_t* d, size_t n){
     if(p->fec_dg_cnx == NULL) return -1;
-    if(dgramq_append(&p->fec_dg_tx, &p->fec_dg_tx_len, &p->fec_dg_tx_cap, d, n, p->id) != 0){
+    int to_down=p->fec_dg_cnx==p->down_cnx;
+    size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
+    if(dgramq_append(&p->fec_dg_tx, &p->fec_dg_tx_len, &p->fec_dg_tx_cap, d, n, p->id,
+        queue_limit) != 0){
         p->need_teardown = 1;
         return -1;
     }

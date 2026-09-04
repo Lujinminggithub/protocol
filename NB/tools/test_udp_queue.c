@@ -1,11 +1,18 @@
 #include "nb_udp.h"
 #include "nb_udp_queue.h"
+#include "nb_live.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"check failed line %d: %s\n",__LINE__,#x);return 1;}}while(0)
+
+#ifdef NB_NODE_QUEUE_TEST
+size_t nb_node_udp_queue_limit_for_test(nb_flow_class_t flow_class,int to_down,
+    int egress_active,uint64_t egress_rate_bps,uint64_t egress_reorder_us,
+    int ingress_active,uint64_t ingress_rate_bps,uint64_t ingress_reorder_us);
+#endif
 
 static void put16(uint8_t* p,uint16_t value){p[0]=(uint8_t)(value>>8);p[1]=(uint8_t)value;}
 static void put32(uint8_t* p,uint32_t value){p[0]=(uint8_t)(value>>24);p[1]=(uint8_t)(value>>16);p[2]=(uint8_t)(value>>8);p[3]=(uint8_t)value;}
@@ -23,6 +30,14 @@ static size_t append_fragment(uint8_t* queue,size_t offset,uint32_t sequence,uin
 
 int main(void){
     uint8_t queue[256]={0};size_t length=0;
+#ifdef NB_NODE_QUEUE_TEST
+    CHECK(nb_node_udp_queue_limit_for_test(NB_FLOW_CLASS_MEDIA,1,
+        1,5000000,462000,1,1000000,200000)==589824);
+    CHECK(nb_node_udp_queue_limit_for_test(NB_FLOW_CLASS_MEDIA,0,
+        1,1000000,200000,1,5000000,462000)==589824);
+    CHECK(nb_node_udp_queue_limit_for_test(NB_FLOW_CLASS_MEDIA,1,
+        0,5000000,462000,1,5000000,462000)==262144);
+#endif
     CHECK(nb_udp_queue_oldest_age_us(queue,length,6000)==0);
     length=append_fragment(queue,length,1,0,1000);length=append_fragment(queue,length,1,1,1000);
     length=append_fragment(queue,length,2,0,2000);length=append_fragment(queue,length,2,1,2000);

@@ -594,9 +594,12 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
             size_t down=p->udp_mode?p->udp_down_tx_len:p->down_tx.len;
             size_t up=p->udp_mode?p->udp_up_tx_len:p->up_tx.len;
             size_t q2t=p->udp_mode?p->udp_pending_tx_len:p->q2t.len;
-            uint64_t down_age=p->udp_mode?0:nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now);
-            uint64_t up_age=p->udp_mode?0:nb_live_queue_age_us(&p->queue_clocks->up_tx,p->up_tx.len,now);
-            uint64_t q2t_age=p->udp_mode?0:nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now);
+            uint64_t down_age=p->udp_mode?nb_udp_queue_oldest_age_us(p->udp_down_tx,p->udp_down_tx_len,now):
+                nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now);
+            uint64_t up_age=p->udp_mode?nb_udp_queue_oldest_age_us(p->udp_up_tx,p->udp_up_tx_len,now):
+                nb_live_queue_age_us(&p->queue_clocks->up_tx,p->up_tx.len,now);
+            uint64_t q2t_age=p->udp_mode?nb_udp_queue_oldest_age_us(p->udp_pending_tx,p->udp_pending_tx_len,now):
+                nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now);
             uint64_t c2s_wait=(p->first_c2s_at?p->first_c2s_at:now)-p->created_at;
             uint64_t s2c_wait=(p->first_s2c_at?p->first_s2c_at:now)-p->created_at;
             nb_metrics_snapshot_add_stream(&snapshot,(int)p->flow_class,p->udp_mode,p->tcp_connecting,
@@ -772,9 +775,12 @@ static void ps_log_media_metrics(proxy_stream_t* p,uint64_t now){
     int known_media=ps_is_rtc_webcast(p);
     int high_throughput=c2s_kbps>=256.0||s2c_kbps>=256.0;
     size_t prefix_q=p->down_prefix_len>p->down_prefix_off?p->down_prefix_len-p->down_prefix_off:0;
-    double down_age=nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now)/1000.0;
-    double up_age=nb_live_queue_age_us(&p->queue_clocks->up_tx,p->up_tx.len,now)/1000.0;
-    double q2t_age=nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now)/1000.0;
+    double down_age=(p->udp_mode?nb_udp_queue_oldest_age_us(p->udp_down_tx,p->udp_down_tx_len,now):
+        nb_live_queue_age_us(&p->queue_clocks->down_tx,p->down_tx.len,now))/1000.0;
+    double up_age=(p->udp_mode?nb_udp_queue_oldest_age_us(p->udp_up_tx,p->udp_up_tx_len,now):
+        nb_live_queue_age_us(&p->queue_clocks->up_tx,p->up_tx.len,now))/1000.0;
+    double q2t_age=(p->udp_mode?nb_udp_queue_oldest_age_us(p->udp_pending_tx,p->udp_pending_tx_len,now):
+        nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now))/1000.0;
     if(known_media||high_throughput){
         log4c_info("%s %s flow stat id=%u class=%s rule=%s age=%.1fs window=%.1fs rate_kbps=c2s:%.1f,s2c:%.1f total_kb=c2s:%llu,s2c:%llu queue_now=prefix:%zu,down:%zu,up:%zu,q2t:%zu queue_age_ms=down:%.1f,up:%.1f,q2t:%.1f queue_peak=down:%zu,up:%zu,q2t:%zu tcp_paused=%d route=%s",
             role_name(G.role),known_media?"media":"high-throughput",p->id,nb_flow_class_name(p->flow_class),p->flow_rule,

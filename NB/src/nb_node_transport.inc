@@ -32,7 +32,7 @@ static int udp_deliver_reassembled(proxy_stream_t* p,const nb_udp_reassembled_t*
                     p->udp_target_host,p->udp_target_port);
             }
         }else if(dgramq_append(&p->udp_pending_tx,&p->udp_pending_tx_len,&p->udp_pending_tx_cap,
-            complete->payload,complete->payload_length,p->id)!=0)return -1;
+            complete->payload,complete->payload_length,p->id,udp_queue_limit_for_direction(p,0))!=0)return -1;
         p->udp_packets_c2s++;p->bytes_c2s+=complete->payload_length;ps_touch(p);return 0;
     }
     if(G.role==ROLE_ENTRY){
