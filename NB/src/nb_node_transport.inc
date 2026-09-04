@@ -31,8 +31,7 @@ static int udp_deliver_reassembled(proxy_stream_t* p,const nb_udp_reassembled_t*
                     trace_delta_ms(p->udp_first_target_send_at,p->udp_target_ready_at),complete->payload_length,
                     p->udp_target_host,p->udp_target_port);
             }
-        }else if(dgramq_append(&p->udp_pending_tx,&p->udp_pending_tx_len,&p->udp_pending_tx_cap,
-            complete->payload,complete->payload_length,p->id,udp_queue_limit_for_direction(p,0))!=0)return -1;
+        }else if(udp_queue_pending_append(p,complete->payload,complete->payload_length)!=0)return -1;
         p->udp_packets_c2s++;p->bytes_c2s+=complete->payload_length;ps_touch(p);return 0;
     }
     if(G.role==ROLE_ENTRY){
@@ -78,7 +77,9 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_c2s_rx_at,p->created_at),view->sequence,
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             if(p==NULL)return -3;
-            if(udp_forward_fragment(p,1,view,rest)<0)return -4;
+            int forward_rc=udp_forward_fragment(p,1,view,rest);
+            if(forward_rc<0)return -4;
+            if(forward_rc>0)return 0;
             if(p->flow_class==NB_FLOW_CLASS_MEDIA&&nb_current_instance->transport_egress.active&&
                 nb_current_instance->transport_egress.link.udp_fec_adaptive&&
                 pool_udp_fec_needed(&G.pools[p->down_pool_id],picoquic_current_time())){
@@ -114,7 +115,9 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_s2c_rx_at,p->created_at),view->sequence,
                     view->fragment_index+1,view->fragment_count,view->payload_length,p->udp_target_host,p->udp_target_port);}
             if(p==NULL)return -8;
-            if(udp_forward_fragment(p,0,view,p->route)<0)return -9;
+            int forward_rc=udp_forward_fragment(p,0,view,p->route);
+            if(forward_rc<0)return -9;
+            if(forward_rc>0)return 0;
             p->udp_packets_s2c+=(view->fragment_index==0);p->bytes_s2c+=view->payload_length;ps_touch(p);return 0;
         }
         if(G.role==ROLE_ENTRY){

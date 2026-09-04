@@ -13,6 +13,7 @@
 #include "nb_policy.h"
 #include "nb_ring.h"
 #include "nb_udp.h"
+#include "nb_udp_queue.h"
 #include "nb_udp_fec.h"
 #include "nb_udp_io.h"
 
@@ -219,6 +220,7 @@ typedef struct proxy_stream {
     uint64_t udp_assoc_policy_drop;
     uint64_t udp_queue_pressure_dropped;
     uint64_t udp_queue_pressure_last_warn_at;
+    nb_udp_queue_drop_history_t udp_queue_drop_history;
     uint64_t udp_assoc_first_raw_at;
     uint64_t udp_control_closed_at;
     uint64_t udp_first_local_c2s_at;
