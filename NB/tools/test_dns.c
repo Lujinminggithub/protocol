@@ -16,11 +16,22 @@ static struct sockaddr_in test_ipv4(const char *address){
 
 int main(void){
     struct sockaddr_in private_address=test_ipv4("10.105.212.98");
+    struct sockaddr_in private_172_address=test_ipv4("172.20.1.2");
+    struct sockaddr_in private_192_address=test_ipv4("192.168.10.2");
     struct sockaddr_in public_address=test_ipv4("203.0.113.10");
+    struct sockaddr_in outside_172_low=test_ipv4("172.15.255.255");
+    struct sockaddr_in outside_172_high=test_ipv4("172.32.0.1");
+    struct sockaddr_in outside_192_low=test_ipv4("192.167.255.255");
     assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&private_address)==1);
+    assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&private_172_address)==1);
+    assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&private_192_address)==1);
+    assert(nb_dns_tiktok_private_answer("FOO.SG-FN.TIKTOK-ROW.NET",(const struct sockaddr*)&private_address)==1);
     assert(nb_dns_tiktok_private_answer("rtc-access.tiktokv.com",(const struct sockaddr*)&private_address)==0);
     assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&public_address)==0);
     assert(nb_dns_tiktok_private_answer("10.105.212.98",(const struct sockaddr*)&private_address)==0);
+    assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&outside_172_low)==0);
+    assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&outside_172_high)==0);
+    assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&outside_192_low)==0);
     assert(nb_dns_servers_valid("1.1.1.1,8.8.8.8")==1);
     assert(nb_dns_servers_valid("1.1.1.1,not-an-ip")==0);
     nb_dns_t* explicit_dns=nb_dns_create_with_servers(AF_INET,1,"1.1.1.1,8.8.8.8");
