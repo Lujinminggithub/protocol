@@ -12,6 +12,11 @@ typedef struct {
 
 static uint16_t get16(const uint8_t* p){return (uint16_t)(((uint16_t)p[0]<<8)|p[1]);}
 static uint32_t get32(const uint8_t* p){return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];}
+static uint64_t get64(const uint8_t* p){
+    uint64_t value=0;
+    for(size_t i=0;i<8;i++)value=(value<<8)|p[i];
+    return value;
+}
 
 static int record_peek(const uint8_t* queue,size_t length,queue_record_t* record){
     if(queue==NULL||record==NULL||length<NB_UDP_QUEUE_RECORD_HEADER)return -1;
@@ -28,6 +33,14 @@ static int wire_key(const queue_record_t* record,uint8_t* direction,
         (wire[5]!=NB_UDP_TYPE_C2S&&wire[5]!=NB_UDP_TYPE_S2C)||get16(wire+6)!=24||
         get32(wire+8)==0)return 0;
     *direction=wire[5];*session_id=get32(wire+8);*sequence=get32(wire+12);return 1;
+}
+
+uint64_t nb_udp_queue_oldest_age_us(const uint8_t* queue,size_t length,uint64_t now_us){
+    queue_record_t first;
+    if(record_peek(queue,length,&first)!=0)return 0;
+    uint64_t queued_at=get64(queue+2);
+    if(queued_at>now_us)return 0;
+    return now_us-queued_at;
 }
 
 int nb_udp_queue_drop_oldest_packet(uint8_t* queue,size_t* length,
