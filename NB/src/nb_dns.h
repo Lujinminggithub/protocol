@@ -8,6 +8,9 @@ typedef struct {
     uint32_t ps_id;
     int port;
     int ok;
+    char host[256];
+    uint64_t submitted_at_us;
+    uint64_t completed_at_us;
     struct sockaddr_storage addr;
     socklen_t addrlen;
 } nb_dns_result_t;
@@ -17,6 +20,7 @@ typedef struct nb_dns nb_dns_t;
 nb_dns_t* nb_dns_create(int address_family,int worker_count);
 nb_dns_t* nb_dns_create_with_servers(int address_family,int worker_count,const char* servers);
 int nb_dns_servers_valid(const char* servers);
+int nb_dns_tiktok_private_answer(const char *host, const struct sockaddr *address);
 void nb_dns_destroy(nb_dns_t* dns);
 int nb_dns_context_result_fd(nb_dns_t* dns);
 int nb_dns_context_submit(nb_dns_t* dns,uint32_t session_id,const char* host,int port);

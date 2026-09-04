@@ -10,13 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NB_DNS_QUEUE_CAP 4096
 #define NB_DNS_MAX_WORKERS 32
 #define NB_DNS_MAX_SERVERS 3
 
-typedef struct {uint32_t session_id;int port;char host[256];} nb_dns_request_t;
+typedef struct {uint32_t session_id;int port;char host[256];uint64_t submitted_at_us;} nb_dns_request_t;
 struct nb_dns {
     nb_dns_request_t requests[NB_DNS_QUEUE_CAP];int request_head,request_tail;
     nb_dns_result_t results[NB_DNS_QUEUE_CAP];int result_head,result_tail;
@@ -28,6 +29,32 @@ struct nb_dns {
 
 static _Thread_local nb_dns_t* legacy;
 static int next_slot(int value){return (value+1)%NB_DNS_QUEUE_CAP;}
+
+static uint64_t now_us(void){
+    struct timespec value;
+    if(clock_gettime(CLOCK_MONOTONIC,&value)!=0)return 0;
+    return (uint64_t)value.tv_sec*1000000u+(uint64_t)value.tv_nsec/1000u;
+}
+
+static int ascii_equal_ci(char left,char right){
+    if(left>='A'&&left<='Z')left=(char)(left-'A'+'a');
+    if(right>='A'&&right<='Z')right=(char)(right-'A'+'a');
+    return left==right;
+}
+
+int nb_dns_tiktok_private_answer(const char *host,const struct sockaddr *address){
+    static const char suffix[]=".tiktok-row.net";
+    size_t host_length,suffix_length=strlen(suffix);
+    uint32_t value;
+    if(host==NULL||address==NULL||address->sa_family!=AF_INET)return 0;
+    host_length=strlen(host);
+    if(host_length<=suffix_length||host[host_length-suffix_length-1]=='.')return 0;
+    for(size_t index=0;index<suffix_length;index++)
+        if(!ascii_equal_ci(host[host_length-suffix_length+index],suffix[index]))return 0;
+    memcpy(&value,&((const struct sockaddr_in*)address)->sin_addr,sizeof(value));
+    value=ntohl(value);
+    return (value>>24)==10||((value>>20)==0xAC1)||((value>>16)==0xC0A8);
+}
 
 static int parse_servers(const char* text,struct sockaddr_in* output,int capacity){
     if(text==NULL||text[0]==0)return 0;
@@ -85,6 +112,7 @@ static void* worker(void* context){
         struct addrinfo hints,*addresses=NULL;char port_text[16];memset(&hints,0,sizeof(hints));
         hints.ai_family=dns->address_family;hints.ai_socktype=SOCK_STREAM;snprintf(port_text,sizeof(port_text),"%d",request.port);
         nb_dns_result_t result;memset(&result,0,sizeof(result));result.ps_id=request.session_id;result.port=request.port;
+        memcpy(result.host,request.host,sizeof(result.host));result.submitted_at_us=request.submitted_at_us;
         if(dns->server_count>0){if(explicit_ready)result.ok=explicit_resolve(&resolver,&request,&result);}
         else if(getaddrinfo(request.host,port_text,&hints,&addresses)==0&&addresses){
             if(addresses->ai_addrlen<=sizeof(result.addr)){
@@ -93,6 +121,7 @@ static void* worker(void* context){
             }
             freeaddrinfo(addresses);
         }
+        result.completed_at_us=now_us();
         pthread_mutex_lock(&dns->mutex);int next=next_slot(dns->result_tail);
         if(next!=dns->result_head){dns->results[dns->result_tail]=result;dns->result_tail=next;}
         pthread_mutex_unlock(&dns->mutex);ssize_t written=write(dns->pipe_write,"x",1);(void)written;
@@ -136,7 +165,7 @@ int nb_dns_context_submit(nb_dns_t* dns,uint32_t session_id,const char* host,int
     if(dns==NULL||session_id==0||host==NULL||host[0]==0||strlen(host)>=sizeof(dns->requests[0].host)||port<=0||port>65535)return -1;
     pthread_mutex_lock(&dns->mutex);int next=next_slot(dns->request_tail);
     if(next==dns->request_head){pthread_mutex_unlock(&dns->mutex);return -1;}
-    nb_dns_request_t* request=&dns->requests[dns->request_tail];request->session_id=session_id;request->port=port;
+    nb_dns_request_t* request=&dns->requests[dns->request_tail];request->session_id=session_id;request->port=port;request->submitted_at_us=now_us();
     memcpy(request->host,host,strlen(host)+1);dns->request_tail=next;pthread_cond_signal(&dns->condition);
     pthread_mutex_unlock(&dns->mutex);return 0;
 }
