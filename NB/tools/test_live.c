@@ -8,6 +8,8 @@ int main(void){
     assert(nb_live_udp_queue_limit(NB_FLOW_CLASS_MEDIA,0,462000)==262144);
     assert(nb_live_udp_queue_limit(NB_FLOW_CLASS_MEDIA,100000000,2000000)==1048576);
     assert(nb_live_udp_queue_limit(NB_FLOW_CLASS_CTRL,5000000,462000)==262144);
+    assert(nb_live_udp_queue_limit(NB_FLOW_CLASS_BULK,5000000,462000)==262144);
+    assert(nb_live_udp_queue_limit(NB_FLOW_CLASS_MEDIA,UINT64_MAX,16140901064495857663ULL)==1048576);
     nb_live_queue_limits_t ctrl=nb_live_queue_limits(NB_FLOW_CLASS_CTRL,0);
     nb_live_queue_limits_t media=nb_live_queue_limits(NB_FLOW_CLASS_MEDIA,1);
     nb_live_queue_limits_t bulk=nb_live_queue_limits(NB_FLOW_CLASS_BULK,0);

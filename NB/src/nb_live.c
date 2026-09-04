@@ -26,7 +26,9 @@ nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_
 size_t nb_live_udp_queue_limit(nb_flow_class_t flow_class,uint64_t rate,uint64_t reorder_us){
     if(flow_class!=NB_FLOW_CLASS_MEDIA||rate==0)return 256u*1024u;
     uint64_t window=reorder_us<200000?200000:reorder_us;
-    uint64_t bytes=(rate/8u)*window/1000000u*2u;
+    uint64_t rate_bytes=rate/8u;
+    uint64_t bytes=rate_bytes>UINT64_MAX/window/2u?UINT64_MAX:
+        rate_bytes*window/1000000u*2u;
     if(bytes<256u*1024u)bytes=256u*1024u;
     if(bytes>1024u*1024u)bytes=1024u*1024u;
     return (size_t)((bytes+65535u)/65536u*65536u);
