@@ -1,5 +1,6 @@
 #include "nb_udp_queue.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "nb_udp.h"
@@ -9,6 +10,22 @@ typedef struct {
     size_t wire_length;
     size_t record_length;
 } queue_record_t;
+
+typedef struct {
+    uint32_t group;
+    size_t offset;
+    size_t length;
+} trim_record_t;
+
+typedef struct {
+    nb_udp_queue_packet_key_t key;
+    size_t bytes;
+    int valid_key;
+    int selected;
+} trim_group_t;
+
+/* 2^17 is the smallest power of two above NB_UDP_QUEUE_MAX_RECORDS (95325). */
+#define NB_UDP_QUEUE_TRIM_HASH_CAP 131072u
 
 static uint16_t get16(const uint8_t* p){return (uint16_t)(((uint16_t)p[0]<<8)|p[1]);}
 static uint32_t get32(const uint8_t* p){return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];}
@@ -47,10 +64,31 @@ static int packet_key_valid(const nb_udp_queue_packet_key_t* key){
         key->session_id!=0;
 }
 
-static int packet_key_equal(const nb_udp_queue_packet_key_t* left,
-    const nb_udp_queue_packet_key_t* right){
-    return left->direction==right->direction&&left->session_id==right->session_id&&
-        left->sequence==right->sequence;
+static int sequence_after(uint32_t left,uint32_t right){
+    return (int32_t)(left-right)>0;
+}
+
+static uint32_t packet_key_hash(const nb_udp_queue_packet_key_t* key){
+    uint32_t hash=key->session_id*2654435761u;
+    hash^=key->sequence+0x9e3779b9u+(hash<<6)+(hash>>2);
+    return hash^key->direction;
+}
+
+static nb_udp_queue_drop_window_t* drop_window_for_key(nb_udp_queue_drop_history_t* history,
+    const nb_udp_queue_packet_key_t* key){
+    size_t slot=key->direction==NB_UDP_TYPE_C2S?0:1;
+    nb_udp_queue_drop_window_t* window=&history->windows[slot];
+    if(window->session_id!=key->session_id||window->direction!=key->direction){
+        memset(window,0,sizeof(*window));window->direction=key->direction;window->session_id=key->session_id;
+    }
+    return window;
+}
+
+static const nb_udp_queue_drop_window_t* drop_window_find(const nb_udp_queue_drop_history_t* history,
+    const nb_udp_queue_packet_key_t* key){
+    size_t slot=key->direction==NB_UDP_TYPE_C2S?0:1;
+    const nb_udp_queue_drop_window_t* window=&history->windows[slot];
+    return window->direction==key->direction&&window->session_id==key->session_id?window:NULL;
 }
 
 uint64_t nb_udp_queue_oldest_age_us(const uint8_t* queue,size_t length,uint64_t now_us){
@@ -71,25 +109,86 @@ int nb_udp_queue_oldest_packet_key(const uint8_t* queue,size_t length,
 void nb_udp_queue_drop_history_note(nb_udp_queue_drop_history_t* history,
     const nb_udp_queue_packet_key_t* key,uint64_t now_us){
     if(history==NULL||!packet_key_valid(key))return;
-    for(size_t i=0;i<NB_UDP_QUEUE_DROPPED_HISTORY;i++){
-        if(packet_key_valid(&history->keys[i])&&packet_key_equal(&history->keys[i],key)){
-            history->dropped_at[i]=now_us;return;
-        }
+    (void)now_us;
+    nb_udp_queue_drop_window_t* window=drop_window_for_key(history,key);
+    if(window->dropped_sequences==0){window->highest_sequence=key->sequence;window->dropped_sequences=1;return;}
+    if(sequence_after(key->sequence,window->highest_sequence)){
+        uint32_t advance=key->sequence-window->highest_sequence;
+        window->dropped_sequences=advance>=NB_UDP_QUEUE_DROP_WINDOW_BITS?1:
+            (window->dropped_sequences<<advance)|1;
+        window->highest_sequence=key->sequence;return;
     }
-    size_t slot=history->next%NB_UDP_QUEUE_DROPPED_HISTORY;
-    history->keys[slot]=*key;history->dropped_at[slot]=now_us;
-    history->next=(slot+1)%NB_UDP_QUEUE_DROPPED_HISTORY;
+    uint32_t distance=window->highest_sequence-key->sequence;
+    if(distance<NB_UDP_QUEUE_DROP_WINDOW_BITS)window->dropped_sequences|=UINT64_C(1)<<distance;
 }
 
 int nb_udp_queue_drop_history_contains(const nb_udp_queue_drop_history_t* history,
     const nb_udp_queue_packet_key_t* key,uint64_t now_us,uint64_t max_age_us){
     if(history==NULL||!packet_key_valid(key))return 0;
-    for(size_t i=0;i<NB_UDP_QUEUE_DROPPED_HISTORY;i++){
-        uint64_t dropped_at=history->dropped_at[i];
-        if(packet_key_valid(&history->keys[i])&&packet_key_equal(&history->keys[i],key)&&
-            now_us>=dropped_at&&now_us-dropped_at<=max_age_us)return 1;
+    (void)now_us;(void)max_age_us;
+    const nb_udp_queue_drop_window_t* window=drop_window_find(history,key);
+    if(window==NULL||sequence_after(key->sequence,window->highest_sequence))return 0;
+    uint32_t distance=window->highest_sequence-key->sequence;
+    if(distance>=NB_UDP_QUEUE_DROP_WINDOW_BITS)return 1;
+    return (window->dropped_sequences&(UINT64_C(1)<<distance))!=0;
+}
+
+int nb_udp_queue_trim_to_limit(uint8_t* queue,size_t* length,size_t need,size_t queue_limit,
+    nb_udp_queue_drop_observer_t observer,void* observer_context,size_t* removed_bytes,
+    uint64_t* dropped_packets){
+    if(queue==NULL||length==NULL||removed_bytes==NULL||dropped_packets==NULL||
+        *length>NB_UDP_QUEUE_MAX_BYTES||need>SIZE_MAX-*length)return -1;
+    *removed_bytes=0;*dropped_packets=0;
+    if(*length+need<=queue_limit)return 0;
+    trim_record_t* records=calloc(NB_UDP_QUEUE_MAX_RECORDS,sizeof(*records));
+    trim_group_t* groups=calloc(NB_UDP_QUEUE_MAX_RECORDS,sizeof(*groups));
+    uint32_t* slots=malloc(NB_UDP_QUEUE_TRIM_HASH_CAP*sizeof(*slots));
+    if(records==NULL||groups==NULL||slots==NULL){free(records);free(groups);free(slots);return -1;}
+    for(size_t i=0;i<NB_UDP_QUEUE_TRIM_HASH_CAP;i++)slots[i]=UINT32_MAX;
+    size_t offset=0,record_count=0,group_count=0;
+    while(offset<*length){
+        queue_record_t record;if(record_peek(queue+offset,*length-offset,&record)!=0)goto fail;
+        if(record_count>=NB_UDP_QUEUE_MAX_RECORDS)goto fail;
+        uint8_t direction=0;uint32_t session_id=0,sequence=0;
+        uint32_t group=(uint32_t)group_count;
+        if(wire_key(&record,&direction,&session_id,&sequence)){
+            nb_udp_queue_packet_key_t key={direction,session_id,sequence};
+            size_t slot=packet_key_hash(&key)&(NB_UDP_QUEUE_TRIM_HASH_CAP-1u);
+            while(slots[slot]!=UINT32_MAX){
+                group=slots[slot];
+                if(groups[group].valid_key&&groups[group].key.direction==key.direction&&
+                    groups[group].key.session_id==key.session_id&&groups[group].key.sequence==key.sequence)break;
+                slot=(slot+1u)&(NB_UDP_QUEUE_TRIM_HASH_CAP-1u);
+            }
+            if(slots[slot]==UINT32_MAX){
+                if(group_count>=NB_UDP_QUEUE_MAX_RECORDS)goto fail;
+                group=(uint32_t)group_count++;groups[group].key=key;groups[group].valid_key=1;slots[slot]=group;
+            }
+        }else{
+            if(group_count>=NB_UDP_QUEUE_MAX_RECORDS)goto fail;
+            group=(uint32_t)group_count++;
+        }
+        records[record_count++] = (trim_record_t){group,offset,record.record_length};
+        groups[group].bytes+=record.record_length;offset+=record.record_length;
     }
-    return 0;
+    size_t removed=0;uint64_t packets=0;
+    for(size_t group=0;group<group_count&&*length-removed+need>queue_limit;group++){
+        groups[group].selected=1;removed+=groups[group].bytes;packets++;
+    }
+    size_t write=0;
+    for(size_t record=0;record<record_count;record++){
+        trim_record_t* current=&records[record];
+        if(groups[current->group].selected)continue;
+        if(write!=current->offset)memmove(queue+write,queue+current->offset,current->length);
+        write+=current->length;
+    }
+    for(size_t group=0;group<group_count;group++)if(groups[group].selected&&groups[group].valid_key&&observer!=NULL)
+        observer(observer_context,&groups[group].key);
+    *length=write;*removed_bytes=removed;*dropped_packets=packets;
+    free(records);free(groups);free(slots);
+    return *length+need>queue_limit?1:0;
+fail:
+    free(records);free(groups);free(slots);return -1;
 }
 
 int nb_udp_queue_drop_oldest_packet(uint8_t* queue,size_t* length,
