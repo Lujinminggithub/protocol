@@ -15,8 +15,10 @@ int main(void){
     nb_metrics_note_traffic(&state,1000,2000);
     nb_metrics_note_dns(&state,0,0,1200);
     nb_metrics_note_dns(&state,1,1,3400);
+    nb_metrics_note_dns(&state,0,0,100);
     nb_metrics_note_target_connect(&state,1,5000000);
     nb_metrics_note_target_connect(&state,0,7000000);
+    nb_metrics_note_target_connect(&state,0,100);
     nb_metrics_state_t saturated={
         .dns_requests=UINT64_MAX,.dns_failures=UINT64_MAX,
         .dns_private_rejected=UINT64_MAX,.target_connect_timeouts=UINT64_MAX};
@@ -50,7 +52,13 @@ int main(void){
     assert(strstr(json,"\"spurious_total\":4")!=NULL&&strstr(json,"\"cc\":\"bbr\"")!=NULL);
     assert(strstr(json,"\"pool_recovery\":{\"retired\":2,\"suppressed\":3,\"quarantined\":4,\"mbb_promotions\":2}")!=NULL);
     assert(strstr(json,"\"pmtu\":{\"promotions\":4,\"fallbacks\":1}")!=NULL);
-    assert(strstr(json,"\"exit_connectivity\":{\"dns_requests\":2,\"dns_failures\":1,\"dns_private_rejected\":1,\"dns_latency_max_us\":3400,\"target_connect_timeouts\":1,\"target_connect_latency_max_us\":7000000}")!=NULL);
+    assert(strstr(json,"\"exit_connectivity\":{\"dns_requests\":3,\"dns_failures\":1,\"dns_private_rejected\":1,\"dns_latency_max_us\":3400,\"target_connect_timeouts\":1,\"target_connect_latency_max_us\":7000000}")!=NULL);
+    nb_metrics_state_t empty_state={0};nb_metrics_snapshot_t empty_snapshot;
+    nb_metrics_snapshot_init(&empty_snapshot,&empty_state,0,0,0,0);
+    nb_metrics_fec_t empty_fec={0};char empty_json[4096];
+    int empty_len=nb_metrics_render_json(empty_json,sizeof(empty_json),"exit","0","","",0,&empty_snapshot,&empty_fec);
+    assert(empty_len>0&&(size_t)empty_len<sizeof(empty_json));
+    assert(strstr(empty_json,"\"exit_connectivity\":{\"dns_requests\":0,\"dns_failures\":0,\"dns_private_rejected\":0,\"dns_latency_max_us\":0,\"target_connect_timeouts\":0,\"target_connect_latency_max_us\":0}")!=NULL);
     puts(json);
     puts("RESULT PASS");return 0;
 }
