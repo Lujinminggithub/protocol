@@ -66,14 +66,11 @@
 #include "nb_whitelist.h"
 #include "nb_wait.h"
 #include "nb_shard.h"
+#include "nb_udp_probe_echo.h"
 #include "log/log4c.h"
 
 #define NB_ALPN "nb/1"          /* Newbility(NB) 新传输协议 ALPN */
 #define NB_SNI  "nb.internal"
-#define NB_PROBE_PORT 9
-#define NB_PROBE_SINK_HOST "nb-probe-sink.internal"
-#define NB_PROBE_ECHO_HOST "nb-probe-echo.internal"
-#define NB_PROBE_SOURCE_HOST "nb-probe-source.internal"
 #define BUFCAP (256*1024)
 #define MAX_CONN NB_MAX_CONNECTIONS
 #define NB_Q2T_MAX (16*1024*1024)   /* 过载保护: 单流 q2t 待写缓冲硬上限 16MB, 超限=对端TCP卡死 */
@@ -630,17 +627,13 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
  * 目的: 防止无关流量走三跳线路占带宽 + 降低安全风险。启动加载 + 文件 mtime 热重载。entry 单线程, 无锁。
  * 规则: host命中(域名或IP) AND port命中; 某类白名单为空 = 该维度不限制。 */
 static int whitelist_allowed(const char* host, int port){
-    if(port==NB_PROBE_PORT && host!=NULL &&
-        (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
-         !strcasecmp(host,NB_PROBE_SOURCE_HOST)))return 1;
+    if(nb_probe_internal_target(host,port))return 1;
     return nb_whitelist_context_allowed(nb_current_instance->whitelist,host,port);
 }
 
 static void flow_policy_for_host(const char* host, int port, nb_flow_policy_t* out){
     nb_flow_policy_default(out);
-    if(port==NB_PROBE_PORT && host!=NULL &&
-        (!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
-         !strcasecmp(host,NB_PROBE_SOURCE_HOST))){
+    if(nb_probe_internal_target(host,port)){
         out->matched=1;out->flow_class=NB_FLOW_CLASS_MEDIA;out->lane_hint=NB_FLOW_LANE_LATENCY;
         out->fec_hint=NB_FLOW_FEC_OFF;out->prio=NB_PRIO_MEDIA;
         snprintf(out->rule_name,sizeof(out->rule_name),"internal-probe");

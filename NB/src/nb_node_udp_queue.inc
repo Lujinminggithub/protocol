@@ -221,8 +221,8 @@ static int udp_queue_pending_append(proxy_stream_t* p,const uint8_t* data,size_t
         data,length,p->id,queue_limit);
 }
 
-static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const char* route,
-    const uint8_t* payload,size_t payload_length){
+static int udp_queue_packet_with_sequence(proxy_stream_t* p,int to_down,uint8_t type,const char* route,
+    const uint8_t* payload,size_t payload_length,uint32_t sequence,int preserve_sequence){
     char routed[NB_UDP_ROUTE_MAX];const char* wire_route=route;
     if(to_down&&p->tenant_name[0]){if(nb_tenant_wire_render(routed,sizeof(routed),p->tenant_name,route)<0)return -1;wire_route=routed;}
     uint16_t fragments=nb_udp_fragment_count(payload_length);size_t route_length=wire_route?strlen(wire_route):0;
@@ -232,7 +232,7 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
     size_t* queue_len=to_down?&p->udp_down_tx_len:&p->udp_up_tx_len;
     size_t queue_limit=udp_queue_limit_for_direction(p,to_down);
     int room=udp_queue_make_media_room(p,queue,queue_len,need,queue_limit,NULL);if(room!=0)return room;
-    uint32_t sequence=++p->udp_tx_sequence;
+    if(!preserve_sequence)sequence=++p->udp_tx_sequence;
     for(uint16_t i=0;i<fragments;i++){
         size_t offset=(size_t)i*NB_UDP_FRAGMENT_PAYLOAD;
         size_t part=payload_length-offset;if(part>NB_UDP_FRAGMENT_PAYLOAD)part=NB_UDP_FRAGMENT_PAYLOAD;
@@ -242,6 +242,11 @@ static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const cha
         if(n<0||udp_queue_wire_raw(p,to_down,wire,(size_t)n,queue_limit)!=0)return -1;
     }
     return 0;
+}
+
+static int udp_queue_packet(proxy_stream_t* p,int to_down,uint8_t type,const char* route,
+    const uint8_t* payload,size_t payload_length){
+    return udp_queue_packet_with_sequence(p,to_down,type,route,payload,payload_length,0,0);
 }
 
 static int udp_fec_record_source(proxy_stream_t* p,const nb_udp_wire_view_t* view,const char* route){

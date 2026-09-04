@@ -2,7 +2,8 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
     char tenant[NB_TENANT_NAME_MAX];const char* routed=route;
     int tenant_wire=nb_tenant_wire_parse(route,tenant,sizeof(tenant),&routed);if(tenant_wire<0)return NULL;
     char host[256];int port=0;if(parse_target_from_route(routed,host,sizeof(host),&port)!=0)return NULL;
-    if(!whitelist_allowed(host,port))return NULL;
+    int internal_echo=nb_udp_probe_echo_target(host,port);
+    if(!internal_echo&&!whitelist_allowed(host,port))return NULL;
     proxy_stream_t* p=ps_alloc();if(p==NULL)return NULL;
     p->udp_mode=1;p->udp_session_id=view->session_id;p->up_cnx=cnx;
     if(g_tenants_enabled){
@@ -15,12 +16,29 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
     ps_index_refresh(p);
     snprintf(p->route,sizeof(p->route),"%s",routed);snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);
     p->udp_target_port=port;p->target_port=port;nb_flow_policy_t pol;flow_policy_for_host(host,port,&pol);apply_flow_policy(p,&pol);
-    if(dns_submit(p->id,host,port)!=0){ps_set_close_reason(p,"udp-dns-queue-full");ps_free(p);return NULL;}
-    p->dns_pending=1;log4c_info("exit udp flow open id=%u usid=%u target=%s:%d",p->id,p->udp_session_id,host,port);return p;
+    if(internal_echo){
+        p->probe_mode=2;p->target_connect_state=2;p->udp_target_ready_at=picoquic_current_time();
+        log4c_info("exit UDP 内部回显就绪 id=%u usid=%u target=%s:%d",p->id,p->udp_session_id,host,port);
+    }else{
+        if(dns_submit(p->id,host,port)!=0){ps_set_close_reason(p,"udp-dns-queue-full");ps_free(p);return NULL;}
+        p->dns_pending=1;
+    }
+    log4c_info("exit udp flow open id=%u usid=%u target=%s:%d",p->id,p->udp_session_id,host,port);return p;
 }
 
 static int udp_deliver_reassembled(proxy_stream_t* p,const nb_udp_reassembled_t* complete){
     if(G.role==ROLE_EXIT){
+        nb_udp_probe_echo_plan_t echo={0};
+        int echo_rc=nb_udp_probe_echo_plan(p->udp_target_host,p->udp_target_port,complete,&echo);
+        if(echo_rc<0)return -1;
+        if(echo_rc>0){
+            int queue_rc=udp_queue_packet_with_sequence(p,0,echo.type,echo.route,echo.payload,
+                echo.payload_length,echo.sequence,1);
+            if(queue_rc!=0)return queue_rc<0?-1:0;
+            p->udp_packets_c2s+=echo.c2s_packets_delta;p->bytes_c2s+=echo.c2s_bytes_delta;
+            p->udp_packets_s2c+=echo.s2c_packets_delta;p->bytes_s2c+=echo.s2c_bytes_delta;
+            ps_touch(p);return 0;
+        }
         if(p->udp_fd>=0){
             ssize_t n=send(p->udp_fd,complete->payload,complete->payload_length,MSG_NOSIGNAL);
             if(n!=(ssize_t)complete->payload_length)return -1;
