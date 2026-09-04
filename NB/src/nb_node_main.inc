@@ -5,6 +5,38 @@ static int nb_runtime_id_ok(const char* value,size_t max_len){
     return 1;
 }
 
+static void exit_recovery_fail_stream(proxy_stream_t* p,const char* reason){
+    if(p==NULL||!p->in_use)return;
+    if(p->tcp_fd>=0){
+        if(G.epoll_fd>=0)epoll_ctl(G.epoll_fd,EPOLL_CTL_DEL,p->tcp_fd,NULL);
+        close(p->tcp_fd);p->tcp_fd=-1;
+    }
+    if(p->up_cnx)picoquic_reset_stream(p->up_cnx,p->up_stream_id,1);
+    ps_set_close_reason(p,reason);ps_free(p);
+}
+
+static int64_t exit_connect_wait_us(uint64_t now_us,int64_t wait_us){
+    if(G.role!=ROLE_EXIT)return wait_us;
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        wait_us=ps_exit_connect_wait_us(p,now_us,wait_us);
+    }
+    return wait_us;
+}
+
+static void exit_connect_expire_due(uint64_t now_us){
+    if(G.role!=ROLE_EXIT)return;
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(ps_exit_connect_timeout(p,now_us)!=NB_EXIT_RECOVERY_CONNECT_TIMEOUT)continue;
+        uint64_t latency_us=ps_exit_connect_latency_us(p);
+        nb_metrics_note_target_connect(&g_metrics_state,1,latency_us);
+        log4c_warn("Exit目标建连超时 id=%u connect_ms=%.1f result=timeout route=%s",
+            p->id,latency_us/1000.0,p->route);
+        exit_recovery_fail_stream(p,"target-connect-timeout");
+    }
+}
+
 static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
     if(instance==NULL)return 1;
     nb_current_instance=instance;
@@ -402,6 +434,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             int64_t fwd=(dl<=now)?0:(int64_t)(dl-now);if(fwd<wd)wd=fwd;
         }
         { uint64_t dl=nb_udp_lifecycle_next_deadline(&g_udp_lifecycle);if(dl){int64_t d=(dl<=now)?0:(int64_t)(dl-now);if(d<wd)wd=d;} }
+        wd=exit_connect_wait_us(now,wd);
         int64_t wait_us=wd<=0?0:(wd>1000000?1000000:wd);
         uint64_t wait_started=now,iteration_wake_late=0;
         struct epoll_event events[256];
@@ -445,11 +478,28 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                 while(dns_pop_result(&r)){
                     proxy_stream_t* p=ps_find_by_id(r.ps_id);
                     if(!p||!p->dns_pending)continue;
-                    p->dns_pending=0;
-                    if(!r.ok){
-                        p->target_connect_state=3;p->target_connect_done_at=picoquic_current_time();
-                        log4c_warn("exit id=%u target connect result=dns-fail route=%s",p->id,p->route);
-                        ps_teardown_reason(p,"target-dns-fail");continue;
+                    uint64_t dns_done_us=r.completed_at_us?r.completed_at_us:picoquic_current_time();
+                    uint64_t dns_latency_us=dns_done_us>=r.submitted_at_us?
+                        dns_done_us-r.submitted_at_us:0;
+                    char dns_address[96]="-";
+                    if(r.ok&&getnameinfo((struct sockaddr*)&r.addr,r.addrlen,
+                        dns_address,sizeof(dns_address),NULL,0,NI_NUMERICHOST)!=0)
+                        snprintf(dns_address,sizeof(dns_address),"unknown");
+                    int private_rejected=r.ok&&
+                        nb_dns_tiktok_private_answer(r.host,(const struct sockaddr*)&r.addr);
+                    nb_exit_recovery_action_t dns_action=ps_exit_dns_result(p,r.ok,
+                        private_rejected,dns_done_us);
+                    if(dns_action==NB_EXIT_RECOVERY_NONE)continue;
+                    const char* dns_result=dns_action==NB_EXIT_RECOVERY_DNS_FAIL?"fail":
+                        (dns_action==NB_EXIT_RECOVERY_PRIVATE_REJECT?"private-unreachable":"ok");
+                    nb_metrics_note_dns(&g_metrics_state,!r.ok,private_rejected,dns_latency_us);
+                    log4c_info("Exit DNS完成 id=%u host=%s address=%s dns_ms=%.3f result=%s",
+                        p->id,r.host[0]?r.host:"-",dns_address,dns_latency_us/1000.0,dns_result);
+                    if(dns_action==NB_EXIT_RECOVERY_DNS_FAIL){
+                        exit_recovery_fail_stream(p,"target-dns-fail");continue;
+                    }
+                    if(dns_action==NB_EXIT_RECOVERY_PRIVATE_REJECT){
+                        exit_recovery_fail_stream(p,"target-private-unreachable");continue;
                     }
                     if(p->udp_mode&&!p->udp_association){
                         int ufd=udp_connect_addr((struct sockaddr*)&r.addr,r.addrlen);
@@ -490,18 +540,26 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                             p->id,p->udp_session_id,p->udp_target_host,p->udp_target_port);
                         continue;
                     }
-                    p->target_connect_at=picoquic_current_time();p->target_connect_state=1;
+                    ps_exit_connect_started(p,picoquic_current_time());
                     int fd=tcp_connect_addr((struct sockaddr*)&r.addr,r.addrlen);
                     if(fd<0){
-                        p->target_connect_state=3;p->target_connect_done_at=picoquic_current_time();
-                        log4c_warn("exit id=%u target connect result=start-fail error=%s route=%s",p->id,strerror(errno),p->route);
-                        ps_teardown_reason(p,"target-connect-start-fail");continue;
+                        int connect_error=errno;
+                        (void)ps_exit_connect_complete(p,0,picoquic_current_time());
+                        uint64_t latency_us=ps_exit_connect_latency_us(p);
+                        nb_metrics_note_target_connect(&g_metrics_state,0,latency_us);
+                        log4c_warn("Exit目标建连启动失败 id=%u connect_ms=%.1f result=start-fail error=%s route=%s",
+                            p->id,latency_us/1000.0,strerror(connect_error),p->route);
+                        exit_recovery_fail_stream(p,"target-connect-start-fail");continue;
                     }
-                    p->tcp_fd=fd;p->tcp_connecting=1;
+                    p->tcp_fd=fd;
                     if(epoll_tcp_update(p,1)!=0){
-                        p->target_connect_state=3;p->target_connect_done_at=picoquic_current_time();
-                        log4c_warn("exit id=%u target connect result=epoll-fail error=%s route=%s",p->id,strerror(errno),p->route);
-                        ps_teardown_reason(p,"target-connect-epoll-fail");continue;
+                        int epoll_error=errno;
+                        (void)ps_exit_connect_complete(p,0,picoquic_current_time());
+                        uint64_t latency_us=ps_exit_connect_latency_us(p);
+                        nb_metrics_note_target_connect(&g_metrics_state,0,latency_us);
+                        log4c_warn("Exit目标建连注册失败 id=%u connect_ms=%.1f result=epoll-fail error=%s route=%s",
+                            p->id,latency_us/1000.0,strerror(epoll_error),p->route);
+                        exit_recovery_fail_stream(p,"target-connect-epoll-fail");continue;
                     }
                     if(ps_is_rtc_webcast(p)){ char target[96]; sockaddr_to_text((struct sockaddr*)&r.addr,r.addrlen,target,sizeof(target));
                       log4c_info("exit id=%u target connect result=pending target=%s route=%s",p->id,target,p->route); }
@@ -522,15 +580,19 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             proxy_stream_t* p=&G.streams[index];
             if(!p->in_use||p->id!=id||p->tcp_fd<0)continue;
             if(p->tcp_connecting&&(ee&(EPOLLOUT|EPOLLERR|EPOLLHUP))){
-                int se=0;socklen_t sl=sizeof(se);getsockopt(p->tcp_fd,SOL_SOCKET,SO_ERROR,&se,&sl);p->tcp_connecting=0;
-                p->target_connect_done_at=picoquic_current_time();
-                if(se!=0){p->target_connect_state=3;log4c_warn("exit id=%u target connect result=fail latency=%.1fms error=%s route=%s",
-                        p->id,(p->target_connect_done_at-p->target_connect_at)/1000.0,strerror(se),p->route);
-                    if(p->up_cnx)picoquic_reset_stream(p->up_cnx,p->up_stream_id,1);
-                    ps_set_close_reason(p,"target-connect-fail");ps_free(p);continue;}
-                p->target_connect_state=2;
-                if(ps_is_rtc_webcast(p)) log4c_info("exit id=%u target connect result=ok latency=%.1fms route=%s",
-                    p->id,(p->target_connect_done_at-p->target_connect_at)/1000.0,p->route);
+                int se=0;socklen_t sl=sizeof(se);
+                if(getsockopt(p->tcp_fd,SOL_SOCKET,SO_ERROR,&se,&sl)!=0)se=errno;
+                nb_exit_recovery_action_t connect_action=ps_exit_connect_complete(p,se==0,picoquic_current_time());
+                uint64_t latency_us=ps_exit_connect_latency_us(p);
+                nb_metrics_note_target_connect(&g_metrics_state,0,latency_us);
+                if(connect_action==NB_EXIT_RECOVERY_CONNECT_FAIL){
+                    log4c_warn("Exit目标建连失败 id=%u connect_ms=%.1f result=fail error=%s route=%s",
+                        p->id,latency_us/1000.0,strerror(se),p->route);
+                    exit_recovery_fail_stream(p,"target-connect-fail");continue;
+                }
+                if(connect_action==NB_EXIT_RECOVERY_CONNECT_OK&&ps_is_rtc_webcast(p))
+                    log4c_info("Exit目标建连完成 id=%u connect_ms=%.1f result=ok route=%s",
+                        p->id,latency_us/1000.0,p->route);
             }
             if(p->in_use&&!p->tcp_connecting&&!p->tcp_eof&&(ee&(EPOLLIN|EPOLLRDHUP|EPOLLHUP|EPOLLERR))){
                 if(p->udp_association){
@@ -552,6 +614,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             if(p->in_use&&p->tcp_fd>=0&&(ee&EPOLLOUT))flush_q2t(p);
             if(p->in_use)maybe_free(p);
         }
+        exit_connect_expire_due(picoquic_current_time());
         /* middle: 无 TCP 的流也要判释放 */
         for(i=0;i<MAX_CONN;i++){
             proxy_stream_t*p=&G.streams[i];

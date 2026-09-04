@@ -1,4 +1,5 @@
 #include "nb_dns.h"
+#include "nb_exit_recovery.h"
 #include <assert.h>
 #include <poll.h>
 #include <stdio.h>
@@ -32,6 +33,24 @@ int main(void){
     assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&outside_172_low)==0);
     assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&outside_172_high)==0);
     assert(nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&outside_192_low)==0);
+    nb_exit_recovery_state_t private_result={.active=1,.dns_pending=1};
+    assert(nb_exit_recovery_dns_result(&private_result,1,
+        nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&private_address),1234ULL)==
+        NB_EXIT_RECOVERY_PRIVATE_REJECT);
+    assert(private_result.dns_pending==0&&private_result.target_connect_state==3);
+    assert(private_result.terminal_claimed==1&&private_result.target_connect_done_at_us==1234ULL);
+    assert(nb_exit_recovery_dns_result(&private_result,1,1,2000ULL)==NB_EXIT_RECOVERY_NONE);
+    nb_exit_recovery_state_t public_result={.active=1,.dns_pending=1};
+    assert(nb_exit_recovery_dns_result(&public_result,1,
+        nb_dns_tiktok_private_answer("foo.sg-fn.tiktok-row.net",(const struct sockaddr*)&public_address),1300ULL)==
+        NB_EXIT_RECOVERY_START_CONNECT);
+    assert(public_result.dns_pending==0&&public_result.terminal_claimed==0);
+    nb_exit_recovery_connect_started(&public_result,1500ULL);
+    assert(public_result.tcp_connecting==1&&public_result.target_connect_state==1);
+    assert(public_result.target_connect_at_us==1500ULL);
+    nb_exit_recovery_state_t failed_result={.active=1,.dns_pending=1};
+    assert(nb_exit_recovery_dns_result(&failed_result,0,0,1400ULL)==NB_EXIT_RECOVERY_DNS_FAIL);
+    assert(failed_result.target_connect_state==3&&failed_result.terminal_claimed==1);
     assert(nb_dns_servers_valid("1.1.1.1,8.8.8.8")==1);
     assert(nb_dns_servers_valid("1.1.1.1,not-an-ip")==0);
     nb_dns_t* explicit_dns=nb_dns_create_with_servers(AF_INET,1,"1.1.1.1,8.8.8.8");

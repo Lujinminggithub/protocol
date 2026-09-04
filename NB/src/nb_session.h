@@ -179,6 +179,7 @@ typedef struct proxy_stream {
     uint64_t first_q2t_queue_at;
     uint64_t first_q2t_flush_at;
     int target_connect_state;    /* 0=n/a, 1=pending, 2=ok, 3=failed */
+    int exit_recovery_terminal;  /* exit: 失败动作已消费，禁止重复 reset/回收 */
     char peer_addr[96];
     char close_reason[48];
     int udp_mode;

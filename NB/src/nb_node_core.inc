@@ -58,6 +58,7 @@
 #include "nb_send.h"
 #include "nb_path.h"
 #include "nb_dns.h"
+#include "nb_exit_recovery.h"
 #include "nb_udp.h"
 #include "nb_udp_queue.h"
 #include "nb_udp_io.h"
@@ -671,6 +672,60 @@ static void ps_set_close_reason(proxy_stream_t* p, const char* reason){
     if(p != NULL && p->close_reason[0] == 0 && reason != NULL && reason[0] != 0){
         snprintf(p->close_reason, sizeof(p->close_reason), "%s", reason);
     }
+}
+
+static nb_exit_recovery_state_t ps_exit_recovery_state(const proxy_stream_t* p){
+    nb_exit_recovery_state_t state={0};
+    if(p==NULL)return state;
+    state.active=p->in_use;state.dns_pending=p->dns_pending;
+    state.tcp_connecting=p->tcp_connecting;state.target_connect_state=p->target_connect_state;
+    state.terminal_claimed=p->exit_recovery_terminal;
+    state.target_connect_at_us=p->target_connect_at;
+    state.target_connect_done_at_us=p->target_connect_done_at;
+    return state;
+}
+
+static void ps_exit_recovery_apply(proxy_stream_t* p,const nb_exit_recovery_state_t* state){
+    if(p==NULL||state==NULL)return;
+    p->dns_pending=state->dns_pending;p->tcp_connecting=state->tcp_connecting;
+    p->target_connect_state=state->target_connect_state;
+    p->exit_recovery_terminal=state->terminal_claimed;
+    p->target_connect_at=state->target_connect_at_us;
+    p->target_connect_done_at=state->target_connect_done_at_us;
+}
+
+static nb_exit_recovery_action_t ps_exit_dns_result(proxy_stream_t* p,int ok,
+    int private_rejected,uint64_t now_us){
+    nb_exit_recovery_state_t state=ps_exit_recovery_state(p);
+    nb_exit_recovery_action_t action=nb_exit_recovery_dns_result(&state,ok,private_rejected,now_us);
+    ps_exit_recovery_apply(p,&state);return action;
+}
+
+static void ps_exit_connect_started(proxy_stream_t* p,uint64_t now_us){
+    nb_exit_recovery_state_t state=ps_exit_recovery_state(p);
+    nb_exit_recovery_connect_started(&state,now_us);ps_exit_recovery_apply(p,&state);
+}
+
+static nb_exit_recovery_action_t ps_exit_connect_complete(proxy_stream_t* p,int ok,uint64_t now_us){
+    nb_exit_recovery_state_t state=ps_exit_recovery_state(p);
+    nb_exit_recovery_action_t action=nb_exit_recovery_connect_complete(&state,ok,now_us);
+    ps_exit_recovery_apply(p,&state);return action;
+}
+
+static nb_exit_recovery_action_t ps_exit_connect_timeout(proxy_stream_t* p,uint64_t now_us){
+    nb_exit_recovery_state_t state=ps_exit_recovery_state(p);
+    nb_exit_recovery_action_t action=nb_exit_recovery_connect_timeout(&state,now_us);
+    ps_exit_recovery_apply(p,&state);return action;
+}
+
+static int64_t ps_exit_connect_wait_us(const proxy_stream_t* p,uint64_t now_us,int64_t wait_us){
+    nb_exit_recovery_state_t state=ps_exit_recovery_state(p);
+    return nb_exit_recovery_wait_us(&state,now_us,wait_us);
+}
+
+static uint64_t ps_exit_connect_latency_us(const proxy_stream_t* p){
+    nb_exit_recovery_state_t state=ps_exit_recovery_state(p);
+    return nb_exit_recovery_latency_us(&state);
 }
 
 static const char* ps_connect_state_name(int state){
