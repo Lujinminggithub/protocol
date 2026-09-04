@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import pathlib
 import unittest
 
@@ -30,7 +31,7 @@ def pressure_sample(value: int = 7) -> dict:
             workers[key] = {
                 "role": role, "worker": worker, "release_id": "candidate-release",
                 "transport_generation": 2, "boot_id": f"boot-{key}",
-                "queue_pressure_dropped": value,
+                "queue_pressure_dropped": value, "sampled_at_utc": "2026-09-04T12:00:00Z",
             }
     return {"workers": workers}
 
@@ -206,7 +207,7 @@ class MediaBurstTests(unittest.TestCase):
                         "sent_bytes": 750000, "received_bytes": 742500, "elapsed_ms": 500}
             return {"average_kbps": 5000.0, "duration_s": 90}
 
-        samples = iter((pressure_sample(4), pressure_sample(4)))
+        samples = iter((pressure_sample(4), pressure_sample(4), pressure_sample(4)))
         result = self.module.run_synthetic_validation(runner, lambda: next(samples))
 
         self.assertEqual(result["queue_pressure_delta"], 0)
@@ -234,6 +235,8 @@ class MediaBurstTests(unittest.TestCase):
                         lambda: pressure_sample(4)),
             "short_sustained": (valid_burst, {**valid_sustained, "duration_s": 89},
                                 lambda: pressure_sample(4)),
+            "infinite_sustained": (valid_burst, {**valid_sustained, "duration_s": math.inf},
+                                    lambda: pressure_sample(4)),
             "missing_pressure": (valid_burst, valid_sustained, lambda: {}),
         }
         for name, (burst, sustained, collector) in cases.items():
@@ -243,6 +246,17 @@ class MediaBurstTests(unittest.TestCase):
 
                 with self.assertRaises(RuntimeError):
                     self.module.run_synthetic_validation(runner, collector)
+
+    def test_synthetic_validation_rechecks_queue_after_sustained_probe(self) -> None:
+        def runner(request):
+            if request["kind"] == "media_burst":
+                return {"planned_bps": 12000000, "planned_duration_ms": 500,
+                        "sent_bytes": 750000, "received_bytes": 742500, "elapsed_ms": 500}
+            return {"average_kbps": 5000, "duration_s": 90}
+
+        samples = iter((pressure_sample(4), pressure_sample(4), pressure_sample(5)))
+        with self.assertRaisesRegex(RuntimeError, "queue_pressure_dropped"):
+            self.module.run_synthetic_validation(runner, lambda: next(samples))
 
     def test_queue_pressure_rejects_worker_identity_drift_counter_reset_or_missing_role(self) -> None:
         before = pressure_sample(7)
@@ -257,6 +271,21 @@ class MediaBurstTests(unittest.TestCase):
                 mutate(after)
                 with self.assertRaises(RuntimeError):
                     self.module.compare_queue_pressure(before, after)
+
+    def test_worker_observation_requires_health_metrics_health_identity_match(self) -> None:
+        health = {"role": "exit", "worker": "1", "release_id": "candidate-release",
+                  "transport_generation": 2, "boot_id": "boot-exit-1", "status": "ok"}
+        metrics = {"role": "exit", "worker": "1", "release_id": "candidate-release",
+                   "udp_errors": {"queue_pressure_dropped": 7}}
+        result = self.module.validate_worker_observation("exit", "1", health, metrics, dict(health))
+        self.assertEqual(result["queue_pressure_dropped"], 7)
+
+        for field, value in (("boot_id", "restarted"), ("release_id", "other-release")):
+            with self.subTest(field=field):
+                changed = dict(health)
+                changed[field] = value
+                with self.assertRaises(RuntimeError):
+                    self.module.validate_worker_observation("exit", "1", health, metrics, changed)
 
     def test_every_transaction_or_gate_failure_restores_old_files_and_fingerprints(self) -> None:
         for failure in ("prepare", "publish", "commit", "readback", "pressure", "burst", "sustained"):

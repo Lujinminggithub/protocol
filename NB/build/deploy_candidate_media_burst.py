@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
@@ -124,6 +125,34 @@ def stage_directory(role: str, directory: str) -> None:
         connection.close()
 
 
+def validate_worker_observation(role: str, worker: str, health_before: dict[str, Any],
+                                metrics: dict[str, Any], health_after: dict[str, Any]) -> dict[str, Any]:
+    """Reject samples that crossed a worker restart or mixed metrics from another worker."""
+    identity: dict[str, Any] = {}
+    for label, health in (("health-before", health_before), ("health-after", health_after)):
+        if not isinstance(health, dict) or health.get("status") != "ok":
+            raise RuntimeError(f"{role}:{worker} {label} 不健康")
+        if health.get("role") != role or str(health.get("worker")) != worker:
+            raise RuntimeError(f"{role}:{worker} {label} 身份不一致")
+        current = {field: health.get(field) for field in ("release_id", "transport_generation", "boot_id")}
+        if (not isinstance(current["release_id"], str) or not current["release_id"] or
+                type(current["transport_generation"]) is not int or current["transport_generation"] < 0 or
+                not isinstance(current["boot_id"], str) or not current["boot_id"]):
+            raise RuntimeError(f"{role}:{worker} {label} 身份字段非法")
+        if identity and current != identity:
+            raise RuntimeError(f"{role}:{worker} health-before/after 身份漂移")
+        identity = current
+    if (not isinstance(metrics, dict) or metrics.get("role") != role or
+            str(metrics.get("worker")) != worker or metrics.get("release_id") != identity["release_id"]):
+        raise RuntimeError(f"{role}:{worker} metrics 身份不一致")
+    errors = metrics.get("udp_errors")
+    if not isinstance(errors, dict) or type(errors.get("queue_pressure_dropped")) is not int or errors["queue_pressure_dropped"] < 0:
+        raise RuntimeError(f"{role}:{worker} metrics 缺少 queue_pressure_dropped")
+    return {"role": role, "worker": worker, **identity,
+            "queue_pressure_dropped": errors["queue_pressure_dropped"],
+            "sampled_at_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")}
+
+
 def default_collector() -> dict[str, dict[str, dict[str, Any]]]:
     """采集六个固定 worker 的身份和队列丢弃计数，不把身份压缩为总数。"""
     records: dict[str, dict[str, Any]] = {}
@@ -135,10 +164,9 @@ def default_collector() -> dict[str, dict[str, dict[str, Any]]]:
             " def query(command):\n"
             "  s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(path);s.sendall((command+'\\n').encode());"
             "  value=json.loads(s.recv(262144));s.close();return value\n"
-            " health=query('health');metrics=query('metrics');"
-            " items.append({'worker':str(health.get('worker',path.rsplit('-',1)[-1].split('.',1)[0])),"
-            "'release_id':health.get('release_id'),'transport_generation':health.get('transport_generation'),"
-            "'boot_id':health.get('boot_id'),'udp_errors':metrics.get('udp_errors')})\n"
+            " health_before=query('health');metrics=query('metrics');health_after=query('health');"
+            " items.append({'worker':str(health_before.get('worker',path.rsplit('-',1)[-1].split('.',1)[0])),"
+            "'health_before':health_before,'metrics':metrics,'health_after':health_after})\n"
             "print(json.dumps(items,separators=(',',':')))"
         )
         connection = deploy.connect(role)
@@ -153,27 +181,14 @@ def default_collector() -> dict[str, dict[str, dict[str, Any]]]:
             for index, worker in enumerate(workers):
                 if not isinstance(worker, dict):
                     raise RuntimeError(f"{role}[{index}] 控制端采样格式非法")
-                errors = worker.get("udp_errors")
-                if not isinstance(errors, dict):
-                    raise RuntimeError(f"{role}[{index}] 缺少 udp_errors")
-                value = errors.get("queue_pressure_dropped")
-                if type(value) is not int or value < 0:
-                    raise RuntimeError(f"{role}[{index}] queue_pressure_dropped 非法")
                 worker_id = worker.get("worker")
                 if str(worker_id) not in ("0", "1"):
                     raise RuntimeError(f"{role}[{index}] worker 身份非法")
                 key = f"{role}:{worker_id}"
                 if key in records:
                     raise RuntimeError(f"{key} 控制端采样重复")
-                release_id = worker.get("release_id")
-                boot_id = worker.get("boot_id")
-                generation = worker.get("transport_generation")
-                if (not isinstance(release_id, str) or not release_id or not isinstance(boot_id, str) or
-                        not boot_id or type(generation) is not int or generation < 0):
-                    raise RuntimeError(f"{key} 控制端身份字段非法")
-                records[key] = {"role": role, "worker": str(worker_id), "release_id": release_id,
-                                "transport_generation": generation, "boot_id": boot_id,
-                                "queue_pressure_dropped": value}
+                records[key] = validate_worker_observation(
+                    role, str(worker_id), worker.get("health_before"), worker.get("metrics"), worker.get("health_after"))
         finally:
             connection.close()
     return {"workers": records}
@@ -230,12 +245,14 @@ def queue_pressure_sample(collector: Callable[[], dict[str, Any]]) -> dict[str, 
         boot = worker.get("boot_id")
         generation = worker.get("transport_generation")
         pressure = worker.get("queue_pressure_dropped")
+        sampled_at = worker.get("sampled_at_utc")
         if (not isinstance(release, str) or not release or not isinstance(boot, str) or not boot or
-                type(generation) is not int or generation < 0 or type(pressure) is not int or pressure < 0):
+                type(generation) is not int or generation < 0 or type(pressure) is not int or pressure < 0 or
+                not isinstance(sampled_at, str) or not sampled_at):
             raise RuntimeError(f"{key} 队列计数采样字段非法")
         snapshot[key] = {"role": role, "worker": worker_id, "release_id": release,
                          "transport_generation": generation, "boot_id": boot,
-                         "queue_pressure_dropped": pressure}
+                         "queue_pressure_dropped": pressure, "sampled_at_utc": sampled_at}
     return snapshot
 
 
@@ -272,10 +289,10 @@ def run_synthetic_validation(runner: Callable[[dict[str, Any]], dict[str, Any]],
     if required_integer(burst, "received_bytes", "媒体突发探针") < BURST_MIN_RECEIVED_BYTES:
         raise RuntimeError("媒体突发探针回显字节不足")
     elapsed_ms = required_integer(burst, "elapsed_ms", "媒体突发探针")
-    if not 500 <= elapsed_ms <= 1000:
+    if not 500 <= elapsed_ms < 1000:
         raise RuntimeError("媒体突发探针发送窗口必须为 500-1000ms")
     after = {"workers": queue_pressure_sample(collector)}
-    pressure = compare_queue_pressure(before, after)
+    burst_pressure = compare_queue_pressure(before, after)
     sustained = runner({"kind": "sustained_probe", "duration_s": 90,
                         "maximum_kbps": SUSTAINED_RATE_KBPS})
     if not isinstance(sustained, dict):
@@ -290,8 +307,13 @@ def run_synthetic_validation(runner: Callable[[dict[str, Any]], dict[str, Any]],
         raise RuntimeError("持续探针实际时长不足")
     if not SUSTAINED_MIN_KBPS <= average_kbps <= SUSTAINED_RATE_KBPS:
         raise RuntimeError("持续探针吞吐必须处于 4500-5000Kbps")
-    return {"queue_pressure_before": pressure["before"], "queue_pressure_after": pressure["after"],
-            "queue_pressure_delta": pressure["delta"], "configured_rate_kbps": SUSTAINED_RATE_KBPS,
+    after_sustained = {"workers": queue_pressure_sample(collector)}
+    sustained_pressure = compare_queue_pressure(after, after_sustained)
+    return {"queue_pressure_before": burst_pressure["before"],
+            "queue_pressure_after_burst": burst_pressure["after"],
+            "queue_pressure_after_sustained": sustained_pressure["after"],
+            "queue_pressure_delta": burst_pressure["delta"] + sustained_pressure["delta"],
+            "configured_rate_kbps": SUSTAINED_RATE_KBPS,
             "average_kbps": float(average_kbps), "duration_s": float(duration_s),
             "burst_sent_bytes": burst["sent_bytes"], "burst_elapsed_ms": burst["elapsed_ms"]}
 

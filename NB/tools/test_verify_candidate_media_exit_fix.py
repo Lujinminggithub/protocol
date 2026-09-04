@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import pathlib
 import sys
 import unittest
@@ -49,7 +50,9 @@ def valid_evidence() -> dict:
                 "metrics": metrics,
             })
     return {
-        "controlplane": {"deployment": deployment, "generation": 2, "signal_direct": False},
+        "controlplane": {"deployment": deployment, "generation": 2, "signal_direct": False,
+                         "test_window": {"started_at_utc": "2026-09-04T12:00:00Z",
+                                         "finished_at_utc": "2026-09-04T12:10:00Z"}},
         "workers": workers,
         "tenant": {
             "entry": {"rate_up_kbps": 5000, "rate_down_kbps": 5000,
@@ -75,6 +78,7 @@ def valid_evidence() -> dict:
             "elapsed_ms": 25,
             "result": "private-unreachable",
             "close_reason": "target-private-unreachable",
+            "event_at_utc": "2026-09-04T12:01:00Z",
             "exit_connectivity_before": {
                 "worker_key": "exit:0", "release_id": release, "deployment": deployment,
                 "boot_id": "boot-exit-0", "sampled_at_utc": "2026-09-04T12:00:00Z",
@@ -92,16 +96,19 @@ def valid_evidence() -> dict:
             "sustained": {"duration_s": 90, "average_kbps": 4500},
         },
         "phone_validation": {
-            "click_at_utc": "2026-09-04T12:00:00Z",
-            "enter_at_utc": "2026-09-04T12:00:02Z",
-            "state_timeline": [
+            "click_at": "2026-09-04T12:00:00Z",
+            "enter_at": "2026-09-04T12:00:02Z",
+            "target_zero_stalls": True,
+            "state_events": [
                 {"state": "red", "at_utc": "2026-09-04T12:00:03Z"},
                 {"state": "yellow", "at_utc": "2026-09-04T12:00:04Z"},
                 {"state": "green", "at_utc": "2026-09-04T12:00:05Z"},
             ],
             "viewer_events": [
-                {"event": "stall", "at_utc": "2026-09-04T12:00:06Z", "duration_ms": 120},
-                {"event": "stall", "at_utc": "2026-09-04T12:00:07Z", "duration_ms": 90},
+                {"kind": "nonstall", "observed_from_utc": "2026-09-04T12:00:06Z",
+                 "observed_to_utc": "2026-09-04T12:00:07Z", "duration_ms": 1000},
+                {"kind": "nonstall", "observed_from_utc": "2026-09-04T12:00:08Z",
+                 "observed_to_utc": "2026-09-04T12:00:09Z", "duration_ms": 1000},
             ],
         },
     }
@@ -212,6 +219,27 @@ class CandidateVerifierTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "合成"):
             self.module.validate_acceptance(evidence)
 
+        evidence = valid_evidence()
+        evidence["synthetic_validation"]["sustained"]["duration_s"] = math.inf
+        with self.assertRaisesRegex(ValueError, "合成"):
+            self.module.validate_acceptance(evidence)
+
+    def test_final_acceptance_rejects_phone_event_outside_window_or_zero_target_stall(self) -> None:
+        evidence = valid_evidence()
+        evidence["phone_validation"]["viewer_events"][0]["kind"] = "stall"
+        with self.assertRaisesRegex(ValueError, "手机"):
+            self.module.validate_acceptance(evidence)
+
+        evidence = valid_evidence()
+        evidence["phone_validation"]["viewer_events"][0]["observed_to_utc"] = "2026-09-04T12:11:00Z"
+        with self.assertRaisesRegex(ValueError, "手机"):
+            self.module.validate_acceptance(evidence)
+
+        evidence = valid_evidence()
+        evidence["private_dns_probe"]["event_at_utc"] = "2026-09-04T12:11:00Z"
+        with self.assertRaisesRegex(ValueError, "私网"):
+            self.module.validate_acceptance(evidence)
+
     def test_runner_request_rejects_unknown_or_invalid_values_before_opening_probe(self) -> None:
         for request in (
             {},
@@ -224,67 +252,11 @@ class CandidateVerifierTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.module.parse_runner_request(request)
 
-    def test_isolated_probe_always_closes_temporary_echo_after_traffic_error(self) -> None:
-        events = []
+    def test_native_probe_packet_targets_only_internal_echo(self) -> None:
+        packet = self.module.encode_native_probe_datagram(7, b"payload")
 
-        class Adapter:
-            def open_echo(self):
-                events.append("open")
-                return "temporary-echo"
-
-            def run_traffic(self, request, echo):
-                assert echo == "temporary-echo"
-                events.append("traffic")
-                raise RuntimeError("injected traffic failure")
-
-            def close_echo(self, echo):
-                assert echo == "temporary-echo"
-                events.append("close")
-
-        with self.assertRaisesRegex(RuntimeError, "injected traffic failure"):
-            self.module.run_isolated_probe({"kind": "media_burst", "rate_mbps": 12,
-                                            "duration_ms": 500}, Adapter())
-        self.assertEqual(events, ["open", "traffic", "close"])
-
-    def test_isolated_probe_fails_when_whitelist_restore_fails(self) -> None:
-        events = []
-
-        class Adapter:
-            def open_echo(self):
-                events.append("echo-open")
-                return "echo"
-
-            def run_traffic(self, request, echo):
-                events.append("traffic")
-                return {"ok": True}
-
-            def close_echo(self, echo):
-                events.append("echo-close")
-
-        class Lease:
-            def install(self):
-                events.append("whitelist-install")
-
-            def restore(self):
-                events.append("whitelist-restore")
-                raise RuntimeError("restore failed")
-
-        with self.assertRaisesRegex(RuntimeError, "清理"):
-            self.module.run_isolated_probe({"kind": "media_burst", "rate_mbps": 12,
-                                            "duration_ms": 500}, Adapter(), Lease())
-        self.assertEqual(events, ["whitelist-install", "echo-open", "traffic", "echo-close",
-                                  "whitelist-restore"])
-
-    def test_echo_kill_is_strict_and_never_masks_a_remote_failure(self) -> None:
-        commands = []
-
-        self.module.strict_kill_echo("connection", 321, lambda connection, command, tmo: commands.append(command))
-
-        self.assertEqual(commands, ["kill -- -321"])
-        with self.assertRaisesRegex(RuntimeError, "kill failed"):
-            self.module.strict_kill_echo("connection", 321,
-                                         lambda connection, command, tmo: (_ for _ in ()).throw(
-                                             RuntimeError("kill failed")))
+        self.assertIn(b"nb-probe-echo.internal", packet)
+        self.assertTrue(packet.endswith((7).to_bytes(8, "big") + b"payload"))
 
 
 if __name__ == "__main__":
