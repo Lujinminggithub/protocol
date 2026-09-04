@@ -267,6 +267,20 @@ def _phone_validation(evidence: dict[str, Any], window: tuple[dt.datetime, dt.da
     if raw is None:
         return None
     phone = _mapping(raw, "phone_validation")
+    for field in ("click_at", "enter_at"):
+        if field in phone:
+            _parse_timestamp(phone.get(field), f"phone_validation.{field}")
+    for collection, fields in (("state_events", ("at_utc",)),
+                               ("viewer_events", ("at_utc", "observed_from_utc",
+                                                  "observed_to_utc"))):
+        items = phone.get(collection)
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if isinstance(item, dict):
+                    for field in fields:
+                        if field in item:
+                            _parse_timestamp(item.get(field),
+                                             f"phone_validation.{collection}[{index}].{field}")
     if any(field not in phone for field in ("click_at", "enter_at", "state_events", "viewer_events")):
         return None
     click = _parse_timestamp(phone.get("click_at"), "phone_validation.click_at")
@@ -367,6 +381,32 @@ class _NativeProbeState:
     relay: tuple[str, int]
 
 
+def _resolve_udp_relay(relay: Any) -> tuple[str, int]:
+    if not isinstance(relay, tuple) or len(relay) != 2:
+        raise RuntimeError("SOCKS UDP relay 地址非法")
+    host, port = relay
+    if not isinstance(host, str) or not host or host.strip() != host:
+        raise RuntimeError("SOCKS UDP relay host 非法")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise RuntimeError("SOCKS UDP relay port 非法")
+    try:
+        addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("SOCKS UDP relay 无法解析为 IPv4") from error
+    for family, socktype, _protocol, _canonname, sockaddr in addresses:
+        if (family != socket.AF_INET or socktype != socket.SOCK_DGRAM or
+                not isinstance(sockaddr, tuple) or len(sockaddr) < 2):
+            continue
+        address, resolved_port = sockaddr[:2]
+        try:
+            numeric_host = str(ipaddress.IPv4Address(address))
+        except (ipaddress.AddressValueError, TypeError):
+            continue
+        if resolved_port == port:
+            return numeric_host, port
+    raise RuntimeError("SOCKS UDP relay 没有可用的 IPv4 地址")
+
+
 def encode_native_probe_datagram(sequence: int, payload: bytes) -> bytes:
     """SOCKS5 UDP request fixed to the NB-native echo name, never a public target."""
     if type(sequence) is not int or sequence < 0 or len(payload) > 65500:
@@ -425,9 +465,14 @@ class NativeProbeAdapter:
         import deploy  # pylint: disable=import-outside-toplevel
         import udp_e2e_probe  # pylint: disable=import-outside-toplevel
         control, relay = udp_e2e_probe.udp_associate(deploy._role_host("entry")["host"], 1080)
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.setblocking(False)
-        return _NativeProbeState(control, udp, relay)
+        try:
+            numeric_relay = _resolve_udp_relay(relay)
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.setblocking(False)
+            return _NativeProbeState(control, udp, numeric_relay)
+        except Exception:
+            control.close()
+            raise
 
     def close(self, state: _NativeProbeState) -> None:
         try:

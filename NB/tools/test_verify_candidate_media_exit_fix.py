@@ -9,6 +9,7 @@ import sys
 import threading
 import unittest
 from collections import deque
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -259,6 +260,33 @@ class CandidateVerifierTests(unittest.TestCase):
         result = self.module.validate_acceptance(evidence)
         self.assertEqual(result["status"], "pending_phone_validation")
 
+    def test_incomplete_phone_timestamps_require_utc_before_pending(self) -> None:
+        cases = {
+            "click": ({"click_at": "2026-09-04T12:00:00"},
+                      {"click_at": "2026-09-04T12:00:00Z"}),
+            "enter": ({"enter_at": "2026-09-04T20:00:02+08:00"},
+                      {"enter_at": "2026-09-04T12:00:02Z"}),
+            "state": ({"state_events": [{"at_utc": "2026-09-04T12:00:03"}]},
+                      {"state_events": [{"at_utc": "2026-09-04T12:00:03Z"}]}),
+            "viewer_at": ({"viewer_events": [{"at_utc": "2026-09-04T20:00:06+08:00"}]},
+                          {"viewer_events": [{"at_utc": "2026-09-04T12:00:06Z"}]}),
+            "viewer_from": ({"viewer_events": [{"observed_from_utc": "2026-09-04T12:00:06"}]},
+                            {"viewer_events": [{"observed_from_utc": "2026-09-04T12:00:06Z"}]}),
+            "viewer_to": ({"viewer_events": [{"observed_to_utc": "2026-09-04T20:00:07+08:00"}]},
+                          {"viewer_events": [{"observed_to_utc": "2026-09-04T12:00:07Z"}]}),
+        }
+        for name, (invalid_phone, valid_incomplete_phone) in cases.items():
+            with self.subTest(name=name, phase="invalid"):
+                evidence = valid_evidence()
+                evidence["phone_validation"] = invalid_phone
+                with self.assertRaisesRegex(ValueError, "UTC"):
+                    self.module.validate_acceptance(evidence)
+            with self.subTest(name=name, phase="pending"):
+                evidence = valid_evidence()
+                evidence["phone_validation"] = valid_incomplete_phone
+                result = self.module.validate_acceptance(evidence)
+                self.assertEqual(result["status"], "pending_phone_validation")
+
     def test_final_acceptance_requires_complete_synthetic_and_phone_evidence(self) -> None:
         for key in ("synthetic_validation", "phone_validation"):
             with self.subTest(key=key):
@@ -363,6 +391,68 @@ class CandidateVerifierTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "99%"):
                     self.module.NativeProbeAdapter._measure(
                         state, 12_000_000, 0.5, "media_burst")
+
+    def test_native_probe_resolves_domain_relay_and_uses_one_numeric_peer(self) -> None:
+        numeric_relay = ("127.0.0.1", 1081)
+
+        def ipv4_udp_resolution(host: str, port: int, family: int = 0,
+                                socktype: int = 0, *_args, **_kwargs):
+            if (host, port, family, socktype) != (
+                    "relay.example", 1081, self.module.socket.AF_INET,
+                    self.module.socket.SOCK_DGRAM):
+                return []
+            return [(self.module.socket.AF_INET, self.module.socket.SOCK_DGRAM,
+                     self.module.socket.IPPROTO_UDP, "", numeric_relay)]
+
+        class EchoSocket:
+            def __init__(self) -> None:
+                self.replies: deque[tuple[bytes, tuple[str, int]]] = deque()
+                self.lock = threading.Lock()
+
+            def sendto(self, data: bytes, relay: tuple[str, int]) -> int:
+                if relay != numeric_relay:
+                    raise OSError("relay was not pinned to numeric IPv4")
+                with self.lock:
+                    self.replies.append((b"malformed", ("127.0.0.2", relay[1])))
+                    self.replies.append((data, numeric_relay))
+                return len(data)
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                with self.lock:
+                    if self.replies:
+                        return self.replies.popleft()
+                raise BlockingIOError
+
+        with mock.patch.object(self.module.socket, "getaddrinfo",
+                               side_effect=ipv4_udp_resolution):
+            relay = self.module._resolve_udp_relay(("relay.example", 1081))
+        self.assertEqual(relay, numeric_relay)
+
+        state = self.module._NativeProbeState(object(), EchoSocket(), relay)
+        result = self.module.NativeProbeAdapter._measure(
+            state, 12_000_000, 0.5, "media_burst")
+        self.assertEqual(result["sent_bytes"], 750000)
+        self.assertEqual(result["received_bytes"], 750000)
+
+    def test_native_probe_relay_resolution_fails_closed(self) -> None:
+        cases = {
+            "empty": (("", 1081), []),
+            "ipv6": (("::1", 1081), [
+                (self.module.socket.AF_INET6, self.module.socket.SOCK_DGRAM,
+                 self.module.socket.IPPROTO_UDP, "", ("::1", 1081, 0, 0)),
+            ]),
+            "no_address": (("relay.example", 1081), []),
+        }
+        for name, (relay, resolved) in cases.items():
+            with self.subTest(name=name):
+                with mock.patch.object(self.module.socket, "getaddrinfo", return_value=resolved):
+                    with self.assertRaises(RuntimeError):
+                        self.module._resolve_udp_relay(relay)
+
+        with mock.patch.object(self.module.socket, "getaddrinfo",
+                               side_effect=self.module.socket.gaierror("lookup failed")):
+            with self.assertRaises(RuntimeError):
+                self.module._resolve_udp_relay(("relay.example", 1081))
 
 
 if __name__ == "__main__":
