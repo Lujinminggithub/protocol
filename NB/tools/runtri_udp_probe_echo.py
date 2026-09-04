@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import socket
 import struct
+import sys
 import time
 
 
@@ -61,6 +63,72 @@ def udp_sessions(path: str) -> int:
     return int(control_health(path)["flow_sessions"]["udp"])
 
 
+def exactly_zero(values: list[int]) -> bool:
+    return all(value == 0 for value in values)
+
+
+def require_stable_zero(controls: list[str]) -> None:
+    first = [udp_sessions(path) for path in controls]
+    second = [udp_sessions(path) for path in controls]
+    if not exactly_zero(first) or not exactly_zero(second):
+        raise RuntimeError(f"unstable UDP session baseline: first={first}, second={second}")
+
+
+def wait_for_reclaim(controls: list[str]) -> None:
+    deadline = time.monotonic() + 10
+    consecutive_zero = 0
+    while time.monotonic() < deadline:
+        current = [udp_sessions(path) for path in controls]
+        if exactly_zero(current):
+            consecutive_zero += 1
+            if consecutive_zero == 2:
+                return
+        else:
+            consecutive_zero = 0
+        time.sleep(0.1)
+    current = [udp_sessions(path) for path in controls]
+    raise RuntimeError(f"UDP child was not reclaimed: current={current}")
+
+
+def read_password(stream: object) -> bytes:
+    line = stream.readline()
+    if not isinstance(line, str):
+        raise RuntimeError("password stdin is not text")
+    password = line.rstrip("\r\n").encode("ascii")
+    if not password or len(password) > 255:
+        raise RuntimeError("invalid SOCKS password from stdin")
+    return password
+
+
+def numeric_ipv4_relay(host: str, port: int) -> tuple[str, int]:
+    try:
+        address = ipaddress.ip_address(host)
+        if address.version == 4:
+            return str(address), port
+    except ValueError:
+        pass
+    for family, _kind, _protocol, _canonname, endpoint in socket.getaddrinfo(
+        host, port, socket.AF_INET, socket.SOCK_DGRAM
+    ):
+        if family == socket.AF_INET:
+            return endpoint[0], endpoint[1]
+    raise RuntimeError(f"SOCKS UDP relay has no numeric IPv4 address: {host!r}")
+
+
+def recv_expected_peer(udp: socket.socket, expected: tuple[str, int], attempts: int) -> bytes:
+    bad_peer: tuple[object, ...] | None = None
+    for _ in range(attempts):
+        packet, peer = udp.recvfrom(65535)
+        peer_endpoint = (peer[0], peer[1])
+        if peer_endpoint != expected:
+            bad_peer = peer
+            continue
+        if bad_peer is not None:
+            raise RuntimeError(f"unexpected UDP peer {bad_peer!r} before expected relay {expected!r}")
+        return packet
+    raise RuntimeError(f"unexpected UDP peer {bad_peer!r}; expected relay {expected!r}")
+
+
 def associate(entry_host: str, entry_port: int, username: bytes, password: bytes) -> tuple[socket.socket, tuple[str, int]]:
     control = socket.create_connection((entry_host, entry_port), timeout=10)
     control.settimeout(10)
@@ -89,44 +157,37 @@ def decode_socks_udp(packet: bytes) -> tuple[str, int, bytes]:
     return packet[5:offset].decode("ascii"), struct.unpack("!H", packet[offset:offset + 2])[0], packet[offset + 2:]
 
 
-def wait_for_reclaim(controls: list[str], baseline: list[int]) -> None:
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if all(udp_sessions(path) <= before for path, before in zip(controls, baseline)):
-            return
-        time.sleep(0.1)
-    current = [udp_sessions(path) for path in controls]
-    raise RuntimeError(f"UDP child was not reclaimed: baseline={baseline}, current={current}")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--entry-host", default="127.0.0.1")
     parser.add_argument("--entry-port", type=int, required=True)
     parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--password-stdin", action="store_true")
     parser.add_argument("--control", action="append", required=True)
     args = parser.parse_args()
     username = args.username.encode("ascii")
-    password = args.password.encode("ascii")
+    if not args.password_stdin:
+        parser.error("--password-stdin is required")
+    password = read_password(sys.stdin)
     if not username or not password or len(username) > 255 or len(password) > 255:
         raise RuntimeError("invalid SOCKS credentials")
-    baseline = [udp_sessions(path) for path in args.control]
+    require_stable_zero(args.control)
     control, relay = associate(args.entry_host, args.entry_port, username, password)
+    relay_host, relay_port = relay
+    if relay_host in ("0.0.0.0", "::"):
+        relay_host = args.entry_host
+    relay_endpoint = numeric_ipv4_relay(relay_host, relay_port)
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.settimeout(10)
     try:
-        relay_host, relay_port = relay
-        if relay_host in ("0.0.0.0", "::"):
-            relay_host = args.entry_host
-        udp.sendto(encode_socks_udp(TARGET_HOST, TARGET_PORT, PAYLOAD), (relay_host, relay_port))
-        host, port, payload = decode_socks_udp(udp.recvfrom(65535)[0])
+        udp.sendto(encode_socks_udp(TARGET_HOST, TARGET_PORT, PAYLOAD), relay_endpoint)
+        host, port, payload = decode_socks_udp(recv_expected_peer(udp, relay_endpoint, 3))
         if (host, port, payload) != (TARGET_HOST, TARGET_PORT, PAYLOAD):
             raise RuntimeError(f"UDP echo mismatch host={host!r} port={port} bytes={len(payload)}")
     finally:
         udp.close()
         control.close()
-    wait_for_reclaim(args.control, baseline)
+    wait_for_reclaim(args.control)
     print("RESULT PASS: native UDP probe echo ATYP=3 2501-byte payload and child reclaim")
 
 
