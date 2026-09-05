@@ -105,9 +105,10 @@ if(BUILD_TESTING)
   target_compile_options(nb_udp_queue_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_udp_queue COMMAND nb_udp_queue_test)
 
-  add_executable(nb_udp_fec_test tools/test_udp_fec.c src/nb_udp_fec.c src/nb_udp.c)
+  add_executable(nb_udp_fec_test tools/test_udp_fec.c src/nb_udp_fec.c src/nb_udp.c src/nb_fec_rs.c)
   target_include_directories(nb_udp_fec_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_udp_fec_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_udp_fec_test Threads::Threads)
   add_test(NAME nb_udp_fec COMMAND nb_udp_fec_test)
 
   add_executable(nb_lstream_test tools/test_lstream.c src/nb_lstream.c src/nb_tenant_wire.c)

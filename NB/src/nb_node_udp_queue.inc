@@ -254,7 +254,7 @@ static int udp_fec_record_source(proxy_stream_t* p,const nb_udp_wire_view_t* vie
     char routed[NB_UDP_ROUTE_MAX];const char* wire_route=route;
     if(p->tenant_name[0]){if(nb_tenant_wire_render(routed,sizeof(routed),p->tenant_name,route)<0)return -1;wire_route=routed;}
     nb_udp_wire_view_t forwarded=*view;forwarded.route=(const uint8_t*)wire_route;
-    forwarded.route_length=(uint16_t)strlen(wire_route);uint8_t repair[1280];
+    forwarded.route_length=(uint16_t)strlen(wire_route);uint8_t repair[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+128];
     int length=nb_udp_fec_tx_feed(p->udp_fec_tx,&forwarded,picoquic_current_time(),repair,sizeof(repair));
     if(length<0)return -1;
     p->udp_fec_source_packets++;
@@ -264,12 +264,20 @@ static int udp_fec_record_source(proxy_stream_t* p,const nb_udp_wire_view_t* vie
         if(queued>0)return 0;
         p->udp_fec_repairs_sent++;
     }
+    for(;;){
+        length=nb_udp_fec_tx_next_repair(p->udp_fec_tx,repair,sizeof(repair));
+        if(length<0)return -1;
+        if(length==0)break;
+        int queued=udp_queue_optional_wire(p,1,repair,(size_t)length);
+        if(queued<0)return -1;
+        if(queued==0)p->udp_fec_repairs_sent++;
+    }
     return 0;
 }
 
 static int udp_fec_flush_due(proxy_stream_t* p,uint64_t now){
     if(p==NULL||p->udp_fec_tx==NULL)return 0;
-    uint8_t repair[1280];
+    uint8_t repair[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+128];
     int length=nb_udp_fec_tx_flush_due(p->udp_fec_tx,now,repair,sizeof(repair));
     if(length<0)return -1;
     if(length>0){
@@ -277,6 +285,14 @@ static int udp_fec_flush_due(proxy_stream_t* p,uint64_t now){
         if(queued<0)return -1;
         if(queued>0)return 0;
         p->udp_fec_repairs_sent++;
+    }
+    for(;;){
+        length=nb_udp_fec_tx_next_repair(p->udp_fec_tx,repair,sizeof(repair));
+        if(length<0)return -1;
+        if(length==0)break;
+        int queued=udp_queue_optional_wire(p,1,repair,(size_t)length);
+        if(queued<0)return -1;
+        if(queued==0)p->udp_fec_repairs_sent++;
     }
     return 0;
 }

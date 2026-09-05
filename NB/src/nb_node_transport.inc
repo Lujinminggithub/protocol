@@ -639,10 +639,15 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         if(p->udp_fec_rx==NULL)p->udp_fec_rx=nb_udp_fec_rx_create();
                         if(p->udp_fec_rx!=NULL){
                             uint8_t recovered[NB_UDP_FRAGMENT_PAYLOAD+NB_UDP_ROUTE_MAX+32];
-                            int recovered_len=nb_udp_fec_rx_recover(p->udp_fec_rx,bytes,length,
-                                picoquic_current_time(),recovered,sizeof(recovered));
                             p->udp_fec_repairs_received++;
-                            if(recovered_len>0){
+                            for(;;){
+                                int recovered_len=nb_udp_fec_rx_recover(p->udp_fec_rx,bytes,length,
+                                    picoquic_current_time(),recovered,sizeof(recovered));
+                                if(recovered_len<=0){
+                                    if(recovered_len<0)log4c_warn("%s udp FEC repair rejected usid=%u length=%zu",
+                                        role_name(G.role),sid,length);
+                                    break;
+                                }
                                 nb_udp_wire_view_t view;
                                 if(nb_udp_wire_decode(recovered,(size_t)recovered_len,&view)==0&&
                                     udp_on_quic_datagram(cnx,&view)==0){
@@ -651,9 +656,6 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                                         role_name(G.role),p->id,p->udp_session_id,view.sequence,
                                         view.fragment_index+1,view.fragment_count);
                                 }
-                            }else if(recovered_len<0){
-                                log4c_warn("%s udp FEC repair rejected usid=%u length=%zu",
-                                    role_name(G.role),sid,length);
                             }
                         }
                     }

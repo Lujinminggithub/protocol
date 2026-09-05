@@ -1,0 +1,35 @@
+{
+  "entry": {
+    "name": "gz2",
+    "host": "106.75.169.83",
+    "port": 22,
+    "user": "root",
+    "password_env": "NB_SSH_PASSWORD_ENTRY"
+  },
+  "middle": {
+    "name": "hk2",
+    "host": "152.32.171.216",
+    "private_ip": "172.16.31.28",
+    "port": 22,
+    "user": "root",
+    "password_env": "NB_SSH_PASSWORD_MIDDLE",
+    "jump_via": "entry",
+    "jump_target_host": "172.16.31.28"
+  },
+  "exit": {
+    "name": "kz",
+    "host": "2.135.147.47",
+    "port": 22735,
+    "user": "root",
+    "password_env": "NB_SSH_PASSWORD_EXIT"
+  },
+  "build_host": "entry",
+  "release_retention": 5,
+  "workers": {"entry": 2, "middle": 2, "exit": 2},
+  "paths": {
+    "compile_dir": "/opt/compile",
+    "work_dir": "/etc/NB",
+    "picoquic": "/etc/NB/third_party/picoquic",
+    "certs": "/etc/NB/certs"
+  }
+}
