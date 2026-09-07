@@ -128,7 +128,7 @@ nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
 static int rule_preserves_latency(const char* rule_name){
     static const char* const rules[]={
         "api*","im-api*","tnc*","mcs*","mon*","common-sign*",
-        "rtc-access*","rtc*","live-netacc*","frontier*","webcast*"
+        "rtc-access*","rtc*","live-netacc*","frontier*","webcast*","teko*"
     };
     if(rule_name==NULL)return 0;
     for(size_t i=0;i<sizeof(rules)/sizeof(rules[0]);i++)
@@ -144,6 +144,13 @@ nb_live_flow_action_t nb_live_flow_observe_rule(nb_live_flow_runtime_t* runtime,
     if((action==NB_LIVE_FLOW_DEMOTE_BULK||action==NB_LIVE_FLOW_DEMOTE_DOWNLINK)&&
         rule_preserves_latency(rule_name))return NB_LIVE_FLOW_KEEP;
     return action;
+}
+
+void nb_live_account_payload(uint64_t* bytes_c2s,uint64_t* bytes_s2c,
+    int c2s,size_t length){
+    if(length==0)return;
+    uint64_t* total=c2s?bytes_c2s:bytes_s2c;
+    if(total)*total+=length;
 }
 
 static void sched_refill(nb_live_sched_t* sched,uint64_t now_us){

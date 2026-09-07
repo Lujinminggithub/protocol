@@ -441,8 +441,11 @@ static void pump_tcp(proxy_stream_t* p){
         }
         int direction=G.role==ROLE_ENTRY?NB_TENANT_UP:NB_TENANT_DOWN;
         uint64_t now=picoquic_current_time();
-        size_t limit=g_tenants_enabled?nb_tenant_take(&g_tenants,p->tenant_index,desired,now,direction):desired;
-        if(limit==0){p->tenant_throttled_until=now+nb_tenant_retry_after_us(&g_tenants,p->tenant_index,1,direction);break;}
+        int media=p->flow_class==NB_FLOW_CLASS_MEDIA&&!p->downlink_bulk;
+        size_t limit=g_tenants_enabled?nb_tenant_take_class(&g_tenants,p->tenant_index,
+            desired,now,direction,media):desired;
+        if(limit==0){size_t retry_bytes=media?1:desired;
+            p->tenant_throttled_until=now+nb_tenant_retry_after_us(&g_tenants,p->tenant_index,retry_bytes,direction);break;}
         n=recv(p->tcp_fd,buf,limit,0);
         if(n>0){
             if(g_tenants_enabled&&(size_t)n<limit)nb_tenant_refund(&g_tenants,p->tenant_index,limit-(size_t)n,direction);

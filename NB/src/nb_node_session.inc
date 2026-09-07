@@ -813,6 +813,7 @@ static int logical_receive(proxy_stream_t* p,const uint8_t* data,size_t length){
 static void logical_note_delivered(proxy_stream_t* p,size_t length){
     if(p==NULL||!p->logical_endpoint||length==0)return;
     p->logical_rx_delivered+=length;
+    ps_note_payload(p,G.role==ROLE_EXIT,length);
     if(logical_send_ack(p,p->logical_rx_fin_seen&&p->logical_rx_delivered==p->logical_rx_fin_offset)!=0)p->need_teardown=1;
 }
 

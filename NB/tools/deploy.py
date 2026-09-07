@@ -260,7 +260,7 @@ def act_build(roles):
              "test_deploy_transfer.py",
              "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
              "test_line_provision.py", "test_line_open.py", "test_supervisor.py",
-             "test_shard_deploy.py"]
+             "test_shard_deploy.py", "test_media_reserve_deploy.py"]
     for test in tests:
         result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
         if result.returncode != 0:

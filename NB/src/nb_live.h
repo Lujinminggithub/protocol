@@ -61,6 +61,8 @@ nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
 nb_live_flow_action_t nb_live_flow_observe_rule(nb_live_flow_runtime_t* runtime,
     nb_flow_class_t flow_class, const char* rule_name, uint64_t total_c2s,
     uint64_t total_s2c, uint64_t now_us, double* c2s_kbps, double* s2c_kbps);
+void nb_live_account_payload(uint64_t* bytes_c2s,uint64_t* bytes_s2c,
+    int c2s,size_t length);
 size_t nb_live_sched_grant(nb_live_sched_t* sched, nb_flow_class_t flow_class,
     size_t requested, uint64_t now_us, int media_pending);
 int nb_live_sched_ctrl_ready(nb_live_sched_t* sched, uint64_t now_us);

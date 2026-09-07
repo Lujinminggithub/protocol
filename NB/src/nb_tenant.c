@@ -11,6 +11,13 @@ static int fail(char* out,size_t cap,const char* fmt,...){if(out&&cap){va_list a
 static int parse_u64(const char* text,uint64_t max,uint64_t* out){char* end=NULL;errno=0;unsigned long long v=strtoull(text,&end,10);if(errno||end==text||*end||v>max)return -1;*out=(uint64_t)v;return 0;}
 static int valid_name(const char* text){if(!text||!*text)return 0;for(const unsigned char* p=(const unsigned char*)text;*p;p++)if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'||*p=='.'||*p=='-'))return 0;return 1;}
 static int valid_direction(int direction){return direction==NB_TENANT_UP||direction==NB_TENANT_DOWN;}
+static uint64_t media_reserve_bytes(const nb_tenant_t* tenant,int direction){
+    uint64_t rate=tenant->rate_bytes_per_sec[direction];
+    uint64_t reserve=(rate/1000000ULL)*NB_TENANT_MEDIA_RESERVE_US+
+        (rate%1000000ULL)*NB_TENANT_MEDIA_RESERVE_US/1000000ULL;
+    uint64_t burst=tenant->burst_bytes[direction];
+    return burst&&reserve>burst?burst:reserve;
+}
 
 uint64_t nb_tenants_fingerprint(const nb_tenants_t* tenants){
     uint64_t h=1469598103934665603ULL;if(!tenants)return 0;
@@ -103,6 +110,7 @@ int nb_tenants_reconfigure(nb_tenants_t* current,const nb_tenants_t* next,char* 
             current->items[i].tokens[d]=runtime.tokens[d]>cap?cap:runtime.tokens[d];
             current->items[i].token_updated_us[d]=runtime.token_updated_us[d];
             current->items[i].token_fraction[d]=runtime.token_fraction[d];
+            current->items[i].media_active_until_us[d]=runtime.media_active_until_us[d];
         }
     }
     current->config_fingerprint=next->config_fingerprint;
@@ -122,7 +130,7 @@ void nb_tenant_release(nb_tenants_t* tenants,int index,int udp){if(!tenants||ind
 size_t nb_tenant_allowance(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int direction){
     if(!tenants||index<0||(size_t)index>=tenants->count)return requested;
     if(!valid_direction(direction))return 0;
-    if(tenants->shared_state)return nb_tenant_shared_allowance(tenants,index,requested,now_us,0,direction);
+    if(tenants->shared_state)return nb_tenant_shared_allowance(tenants,index,requested,now_us,0,direction,0);
     nb_tenant_t* t=&tenants->items[index];if(t->byte_quota){uint64_t used=t->bytes_up+t->bytes_down;if(used>=t->byte_quota)return 0;uint64_t left=t->byte_quota-used;if(left<requested)requested=(size_t)left;}
     uint64_t rate=t->rate_bytes_per_sec[direction],burst=t->burst_bytes[direction];if(!rate)return requested;
     nb_tenant_refill(rate,burst,now_us,&t->tokens[direction],&t->token_updated_us[direction],
@@ -132,7 +140,24 @@ size_t nb_tenant_allowance(nb_tenants_t* tenants,int index,size_t requested,uint
 }
 
 void nb_tenant_consume(nb_tenants_t* tenants,int index,size_t bytes,int direction){if(!tenants||index<0||(size_t)index>=tenants->count||tenants->shared_state||!valid_direction(direction))return;nb_tenant_t* t=&tenants->items[index];t->tokens[direction]=t->tokens[direction]>bytes?t->tokens[direction]-bytes:0;}
-size_t nb_tenant_take(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int direction){if(!tenants||index<0||(size_t)index>=tenants->count)return requested;if(!valid_direction(direction))return 0;if(tenants->shared_state)return nb_tenant_shared_allowance(tenants,index,requested,now_us,1,direction);size_t allowed=nb_tenant_allowance(tenants,index,requested,now_us,direction);nb_tenant_consume(tenants,index,allowed,direction);return allowed;}
+size_t nb_tenant_take_class(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,
+    int direction,int media){
+    if(!tenants||index<0||(size_t)index>=tenants->count)return requested;
+    if(!valid_direction(direction))return 0;
+    if(tenants->shared_state)return nb_tenant_shared_allowance(tenants,index,requested,now_us,1,direction,media);
+    nb_tenant_t* tenant=&tenants->items[index];
+    if(media&&requested>0)tenant->media_active_until_us[direction]=now_us+NB_TENANT_MEDIA_ACTIVE_US;
+    size_t allowed=nb_tenant_allowance(tenants,index,requested,now_us,direction);
+    if(!media&&now_us<tenant->media_active_until_us[direction]){
+        uint64_t reserve=media_reserve_bytes(tenant,direction);
+        uint64_t available=tenant->tokens[direction]>reserve?tenant->tokens[direction]-reserve:0;
+        if((uint64_t)allowed>available)allowed=(size_t)available;
+    }
+    nb_tenant_consume(tenants,index,allowed,direction);return allowed;
+}
+size_t nb_tenant_take(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int direction){
+    return nb_tenant_take_class(tenants,index,requested,now_us,direction,0);
+}
 uint64_t nb_tenant_retry_after_us(const nb_tenants_t* tenants,int index,size_t bytes,int direction){
     if(!tenants||index<0||(size_t)index>=tenants->count||!valid_direction(direction))return 0;
     uint64_t rate=tenants->items[index].rate_bytes_per_sec[direction];if(!rate)return 0;

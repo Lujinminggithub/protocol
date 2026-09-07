@@ -202,7 +202,8 @@ static int probe_source_pump(proxy_stream_t* p){
     uint64_t now=picoquic_current_time();if(p->tenant_throttled_until>now)return 0;
     p->tenant_throttled_until=0;uint8_t payload[16384];size_t desired=(size_t)(p->probe_expected_bytes-p->probe_bytes);
     if(desired>sizeof(payload))desired=sizeof(payload);
-    size_t allowed=g_tenants_enabled?nb_tenant_take(&g_tenants,p->tenant_index,desired,now,NB_TENANT_DOWN):desired;
+    size_t allowed=g_tenants_enabled?nb_tenant_take_class(&g_tenants,p->tenant_index,
+        desired,now,NB_TENANT_DOWN,p->flow_class==NB_FLOW_CLASS_MEDIA&&!p->downlink_bulk):desired;
     if(allowed==0){p->tenant_throttled_until=now+
         nb_tenant_retry_after_us(&g_tenants,p->tenant_index,1,NB_TENANT_DOWN);return 0;}
     nb_probe_source_fill(p->probe_bytes,payload,allowed);
@@ -574,7 +575,8 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                 if(nb_udp_wire_decode(dg,dg_len,&view)==0){
                     tenant_direction=G.role==ROLE_ENTRY?NB_TENANT_UP:NB_TENANT_DOWN;
                     tenant_charge=view.payload_length;
-                    size_t taken=nb_tenant_take(&g_tenants,p->tenant_index,tenant_charge,now,tenant_direction);
+                    size_t taken=nb_tenant_take_class(&g_tenants,p->tenant_index,tenant_charge,now,
+                        tenant_direction,p->flow_class==NB_FLOW_CLASS_MEDIA&&!p->downlink_bulk);
                     if(taken<tenant_charge){
                         nb_tenant_refund(&g_tenants,p->tenant_index,taken,tenant_direction);
                         (void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_active_any_path);

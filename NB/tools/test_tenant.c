@@ -61,6 +61,15 @@ int main(void){
     size_t local_refilled=0;for(uint64_t now=1000001;now<=1002000;now++)
         local_refilled+=nb_tenant_take(&tenants,fast,1,now,NB_TENANT_UP);
     ok=ok&&local_refilled==1250;
+    nb_tenants_t reserve={0};reserve.count=1;reserve.items[0].rate_bytes_per_sec[NB_TENANT_DOWN]=1000;
+    reserve.items[0].burst_bytes[NB_TENANT_DOWN]=1000;reserve.items[0].tokens[NB_TENANT_DOWN]=1000;
+    reserve.items[0].token_updated_us[NB_TENANT_DOWN]=1000000;
+    ok=ok&&nb_tenant_take_class(&reserve,0,100,1000000,NB_TENANT_DOWN,1)==100;
+    ok=ok&&nb_tenant_take_class(&reserve,0,1000,1000000,NB_TENANT_DOWN,0)==650;
+    ok=ok&&nb_tenant_take_class(&reserve,0,1,1000000,NB_TENANT_DOWN,0)==0;
+    ok=ok&&nb_tenant_take_class(&reserve,0,250,1000000,NB_TENANT_DOWN,1)==250;
+    ok=ok&&nb_tenant_take_class(&reserve,0,100,1100000,NB_TENANT_DOWN,1)==100;
+    ok=ok&&nb_tenant_take_class(&reserve,0,1000,4100001,NB_TENANT_DOWN,0)==1000;
     nb_tenant_account(&tenants,alice,400,100);ok=ok&&nb_tenants_render_json(&tenants,json,sizeof(json))>0&&strstr(json,"\"bytes_up\":400")&&strstr(json,"\"rate_kbps\":8")&&strstr(json,"\"rate_up_kbps\":8")&&strstr(json,"\"rate_down_kbps\":8");
 #ifndef _WIN32
     snprintf(state_path,sizeof(state_path),"%s.state",path);unlink(state_path);
@@ -73,6 +82,10 @@ int main(void){
     int status=0;ok=ok&&child>0&&waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0;
     nb_tenant_release(&shared,shared_alice,0);ok=ok&&nb_tenant_take(&shared,shared_alice,3000,2000000,NB_TENANT_UP)==3000;
     nb_tenant_refund(&shared,shared_alice,250,NB_TENANT_UP);ok=ok&&nb_tenant_allowance(&shared,shared_alice,251,2000000,NB_TENANT_UP)==250&&nb_tenant_allowance(&shared,shared_alice,3000,2000000,NB_TENANT_DOWN)==3000;
+    ok=ok&&nb_tenant_take_class(&shared,shared_alice,100,2000000,NB_TENANT_DOWN,1)==100;
+    ok=ok&&nb_tenant_take_class(&shared,shared_alice,4000,2000000,NB_TENANT_DOWN,0)==2650;
+    ok=ok&&nb_tenant_take_class(&shared,shared_alice,1,2000000,NB_TENANT_DOWN,0)==0;
+    ok=ok&&nb_tenant_take_class(&shared,shared_alice,250,2000000,NB_TENANT_DOWN,1)==250;
     int shared_fast=nb_tenant_find(&shared,"fast");ok=ok&&shared_fast==2&&
         nb_tenant_take(&shared,shared_fast,625000,3000000,NB_TENANT_UP)==625000;
     size_t shared_refilled=0;for(uint64_t now=3000001;now<=3002000;now++)

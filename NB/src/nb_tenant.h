@@ -11,6 +11,8 @@
 #define NB_TENANT_UP 0
 #define NB_TENANT_DOWN 1
 #define NB_TENANT_DIRECTIONS 2
+#define NB_TENANT_MEDIA_RESERVE_US 250000ULL
+#define NB_TENANT_MEDIA_ACTIVE_US 3000000ULL
 
 typedef struct {
     char name[NB_TENANT_NAME_MAX];
@@ -27,6 +29,7 @@ typedef struct {
     uint64_t tokens[NB_TENANT_DIRECTIONS];
     uint64_t token_updated_us[NB_TENANT_DIRECTIONS];
     uint64_t token_fraction[NB_TENANT_DIRECTIONS];
+    uint64_t media_active_until_us[NB_TENANT_DIRECTIONS];
 } nb_tenant_t;
 
 typedef struct {
@@ -49,6 +52,8 @@ void nb_tenant_release(nb_tenants_t* tenants,int index,int udp);
 size_t nb_tenant_allowance(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int direction);
 void nb_tenant_consume(nb_tenants_t* tenants,int index,size_t bytes,int direction);
 size_t nb_tenant_take(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,int direction);
+size_t nb_tenant_take_class(nb_tenants_t* tenants,int index,size_t requested,uint64_t now_us,
+    int direction,int media);
 uint64_t nb_tenant_retry_after_us(const nb_tenants_t* tenants,int index,size_t bytes,int direction);
 void nb_tenant_refund(nb_tenants_t* tenants,int index,size_t bytes,int direction);
 void nb_tenant_refill(uint64_t rate,uint64_t burst,uint64_t now_us,

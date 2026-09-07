@@ -65,7 +65,12 @@ int main(void){
     runtime=(nb_live_flow_runtime_t){0};
     assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"teko*",0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
     assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"teko*",8000,150000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
-    assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"teko*",16000,300000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_DEMOTE_DOWNLINK);
+    assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"teko*",16000,300000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+
+    runtime=(nb_live_flow_runtime_t){0};
+    assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"auto-high-uplink",0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"auto-high-uplink",8000,150000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe_rule(&runtime,NB_FLOW_CLASS_MEDIA,"auto-high-uplink",16000,300000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_DEMOTE_DOWNLINK);
 
     runtime=(nb_live_flow_runtime_t){0};
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
@@ -83,5 +88,10 @@ int main(void){
     assert(nb_live_sched_grant(&sched,NB_FLOW_CLASS_MEDIA,4096,1000000,1)==4096);
     assert(nb_live_sched_grant(&sched,NB_FLOW_CLASS_CTRL,4096,1100000,0)==4096);
     assert(nb_live_sched_ctrl_ready(&sched,1110000));
+    uint64_t payload_c2s=7,payload_s2c=11;
+    nb_live_account_payload(&payload_c2s,&payload_s2c,0,4096);
+    assert(payload_c2s==7&&payload_s2c==4107);
+    nb_live_account_payload(&payload_c2s,&payload_s2c,1,2048);
+    assert(payload_c2s==2055&&payload_s2c==4107);
     puts("nb_live tests passed");return 0;
 }

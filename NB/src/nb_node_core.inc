@@ -769,8 +769,8 @@ static void ps_update_runtime_policy(proxy_stream_t* p,uint64_t now){
     if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);p->tenant_accounted_up=p->bytes_c2s;p->tenant_accounted_down=p->bytes_s2c;}
     if(p->udp_mode)return;
     double c2s=0,s2c=0;
-    nb_live_flow_action_t action=nb_live_flow_observe(&p->live_runtime,p->flow_class,
-        p->bytes_c2s,p->bytes_s2c,now,&c2s,&s2c);
+    nb_live_flow_action_t action=nb_live_flow_observe_rule(&p->live_runtime,p->flow_class,
+        p->flow_rule,p->bytes_c2s,p->bytes_s2c,now,&c2s,&s2c);
     if(action==NB_LIVE_FLOW_PROMOTE_MEDIA)ps_promote_media(p,"auto-high-uplink",c2s);
     else if(action==NB_LIVE_FLOW_DEMOTE_BULK)
         ps_demote_bulk(p,"auto-high-throughput-ctrl",c2s,s2c);
@@ -782,9 +782,8 @@ static void ps_note_payload(proxy_stream_t* p, int c2s, size_t len){
     if(p == NULL || len == 0) return;
     uint64_t now = picoquic_current_time();
     p->last_active = now;
-    uint64_t* total = c2s ? &p->bytes_c2s : &p->bytes_s2c;
     uint64_t* first = c2s ? &p->first_c2s_at : &p->first_s2c_at;
-    *total += len;
+    nb_live_account_payload(&p->bytes_c2s,&p->bytes_s2c,c2s,len);
     if(*first == 0){
         *first = now;
         if(ps_is_rtc_webcast(p)){
