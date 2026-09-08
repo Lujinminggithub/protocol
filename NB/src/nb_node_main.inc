@@ -40,7 +40,7 @@ static void exit_connect_expire_due(uint64_t now_us){
 static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
     if(instance==NULL)return 1;
     nb_current_instance=instance;
-    int i; int listen_port=0, quic_port=0, next_port=0;
+    int i; int listen_port=0, quic_port=0, next_port=0, signal_direct=0;
     const char* rolestr=NULL; const char* next_host=NULL;
     const char* cert=NULL; const char* key=NULL; const char* cert_root=NULL; const char* route=NULL;
     const char* users_path=NULL;
@@ -59,6 +59,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
         else if(!strcmp(argv[i],"-N")&&i+1<argc) next_port=atoi(argv[++i]);
         else if(!strcmp(argv[i],"-R")&&i+1<argc) route=argv[++i];
         else if(!strcmp(argv[i],"-S")) G.socks_enabled=1;
+        else if(!strcmp(argv[i],"--signal-direct")) signal_direct=1;
         else if(!strcmp(argv[i],"-W")&&i+1<argc) wl_path=argv[++i];
         else if(!strcmp(argv[i],"-F")&&i+1<argc) tiktok_rules_path=argv[++i];
         else if(!strcmp(argv[i],"-M")&&i+1<argc) snprintf(G.mid_route,sizeof(G.mid_route),"%s",argv[++i]);
@@ -84,6 +85,10 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
     else if(!strcmp(rolestr,"middle")) G.role=ROLE_MIDDLE;
     else if(!strcmp(rolestr,"exit")) G.role=ROLE_EXIT;
     else { usage(argv[0]); return 1; }
+    if(signal_direct&&(G.role!=ROLE_ENTRY||!G.socks_enabled)){
+        log4c_error("--signal-direct requires SOCKS entry role");return 1;
+    }
+    G.signal_direct_enabled=signal_direct;
     { const char* worker=nb_instance_env(nb_current_instance,"NB_WORKER_ID");if(!worker)worker="0";const char* dir=nb_instance_env(nb_current_instance,"NB_CONTROL_DIR");if(!dir||!dir[0])dir="/run";
       const char* prefix=nb_instance_env(nb_current_instance,"NB_CONTROL_PREFIX");char fallback[48];
       if(!prefix||!prefix[0]){snprintf(fallback,sizeof(fallback),"nb-%s",role_name(G.role));prefix=fallback;}
@@ -372,7 +377,8 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
         listen(G.tcp_listen_fd,128); set_nonblock(G.tcp_listen_fd);
         if(entry_open_upstream()!=0){ log4c_error("entry open upstream fail"); log4c_shutdown(); return 1; }
         if(G.socks_enabled)
-            log4c_info("entry up: SOCKS5 :%d -> QUIC %s:%d mid=[%s] cc=%s",listen_port,next_host,next_port,G.mid_route,
+            log4c_info("entry up: SOCKS5 :%d -> QUIC %s:%d mid=[%s] signal_direct=%s cc=%s",listen_port,next_host,next_port,G.mid_route,
+                G.signal_direct_enabled?"on":"off",
                 (nb_instance_env(nb_current_instance,"NB_CC")&&nb_instance_env(nb_current_instance,"NB_CC")[0])?nb_instance_env(nb_current_instance,"NB_CC"):"bbr");
         else
             log4c_info("entry up: TCP :%d -> QUIC %s:%d route=%s cc=%s",listen_port,next_host,next_port,route,
@@ -392,6 +398,11 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
     if(g_socks_auth_enabled)log4c_info("async SOCKS authentication: %d workers ready",AUTH_WORKERS);
     G.epoll_fd=epoll_create1(EPOLL_CLOEXEC);
     if(G.epoll_fd<0){log4c_error("epoll_create1 fail: %s",strerror(errno));log4c_shutdown();return 1;}
+    if(G.role==ROLE_MIDDLE){
+        g_yfe2_worker=nb_yfe2_worker_create(NB_YFE2_WORKER_MAX_JOBS,
+            NB_YFE2_WORKER_MAX_BYTES,NULL,NULL);
+        if(g_yfe2_worker==NULL){log4c_error("NB YFE2 编码 worker 初始化失败");return 1;}
+    }
     { char error[256];G.control_fd=nb_control_open(control_path,error,sizeof(error));
       if(G.control_fd<0){log4c_error("control socket failed: %s",error);return 1;}
       log4c_info("control socket: %s",control_path); }
@@ -404,6 +415,9 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
         if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_dns_context_result_fd(nb_current_instance->dns),&ev)!=0){log4c_error("epoll add dns fail: %s",strerror(errno));return 1;}
         if(g_socks_auth_enabled){ev.data.u64=NB_EPOLL_TAG_AUTH;
             if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_auth_async_context_result_fd(nb_current_instance->auth_async),&ev)!=0){log4c_error("epoll add auth fail: %s",strerror(errno));return 1;}}
+        if(g_yfe2_worker){ev.data.u64=NB_EPOLL_TAG_YFE2;
+            if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,nb_yfe2_worker_event_fd(g_yfe2_worker),&ev)!=0){
+                log4c_error("epoll add NB YFE2 worker fail: %s",strerror(errno));return 1;}}
         if(G.tcp_listen_fd>=0){ev.data.u64=NB_EPOLL_TAG_LISTEN;
             if(epoll_ctl(G.epoll_fd,EPOLL_CTL_ADD,G.tcp_listen_fd,&ev)!=0){log4c_error("epoll add listen fail: %s",strerror(errno));return 1;}}
         ev.data.u64=NB_EPOLL_TAG_CONTROL;
@@ -414,7 +428,8 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
 
     /* ---- 自定义事件循环 ---- */
     uint64_t loop_stat_at=picoquic_current_time(),loop_busy_max=0,loop_wake_late_max=0;
-    uint64_t loop_iterations=0,loop_over_5ms=0,loop_over_20ms=0;
+    uint64_t loop_iterations=0,loop_over_5ms=0,loop_over_20ms=0,loop_empty_wake_backoffs=0;
+    int previous_empty_wake=0;
     while(!atomic_load(&instance->stop_requested)){
         uint64_t now=picoquic_current_time();
         udp_lifecycle_wake_due(now);
@@ -433,8 +448,12 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             uint64_t dl=nb_udp_fec_tx_next_deadline(p->udp_fec_tx);if(dl==0)continue;
             int64_t fwd=(dl<=now)?0:(int64_t)(dl-now);if(fwd<wd)wd=fwd;
         }
+        { uint64_t dl=yfe2_next_deadline();if(dl){int64_t d=(dl<=now)?0:(int64_t)(dl-now);if(d<wd)wd=d;} }
         { uint64_t dl=nb_udp_lifecycle_next_deadline(&g_udp_lifecycle);if(dl){int64_t d=(dl<=now)?0:(int64_t)(dl-now);if(d<wd)wd=d;} }
+        int64_t scheduled_wd=wd;
+        wd=nb_wait_guard_delay(wd,previous_empty_wake);
         wd=exit_connect_wait_us(now,wd);
+        if(wd!=scheduled_wd)loop_empty_wake_backoffs++;
         int64_t wait_us=wd<=0?0:(wd>1000000?1000000:wd);
         uint64_t wait_started=now,iteration_wake_late=0;
         struct epoll_event events[256];
@@ -454,6 +473,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             uint64_t tag=events[ei].data.u64;uint32_t ee=events[ei].events;
             if(tag==NB_EPOLL_TAG_UDP){udp_drain_fd(G.udp_fd,&G.local_addr);continue;}
             if(tag==NB_EPOLL_TAG_CLIENT_UDP){udp_drain_fd(G.client_udp_fd,&G.client_local_addr);continue;}
+            if(tag==NB_EPOLL_TAG_YFE2){yfe2_drain_worker();continue;}
             if(tag==NB_EPOLL_TAG_AUTH){
                 char drain[256];while(read(nb_auth_async_context_result_fd(nb_current_instance->auth_async),drain,sizeof(drain))>0){}
                 nb_auth_async_result_t result;
@@ -631,6 +651,8 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
             if(rc!=NB_FEC_OK){ log4c_warn("id=%u fec engine tick fail rc=%d",p->id,rc); p->need_teardown=1; }
             else (void)fec_pump_staged(p);
           } }
+        yfe2_tick(picoquic_current_time());
+        yfe2_drain_worker();
         { uint64_t fnow=picoquic_current_time();
           for(i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];
             if(p->in_use&&p->udp_fec_tx!=NULL&&udp_fec_flush_due(p,fnow)!=0)
@@ -812,7 +834,8 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                 }
             }
         }
-        udp_send_batch();
+        size_t packets_prepared=udp_send_batch();
+        previous_empty_wake=nb_wait_empty_wake(scheduled_wd,event_count,packets_prepared);
         /* 发送和 FEC tick 可能改变队列水位，循环末统一刷新 TCP EPOLLIN/EPOLLOUT。 */
         for(i=0;i<MAX_CONN;i++){proxy_stream_t* p=&G.streams[i];if(p->in_use&&p->tcp_fd>=0)(void)epoll_tcp_update(p,0);}
         { uint64_t loop_end=picoquic_current_time();uint64_t busy=loop_end-busy_started;
@@ -821,12 +844,13 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
           if(busy>=5000)loop_over_5ms++;
           if(busy>=20000)loop_over_20ms++;
           if(loop_end-loop_stat_at>=10000000ULL){
-              log4c_info("eventloop stat worker=%s iterations=%llu busy_max=%.1fms wake_late_max=%.1fms over5ms=%llu over20ms=%llu",
+              log4c_info("eventloop stat worker=%s iterations=%llu busy_max=%.1fms wake_late_max=%.1fms over5ms=%llu over20ms=%llu empty_wake_backoffs=%llu",
                   nb_instance_env(nb_current_instance,"NB_WORKER_ID")?nb_instance_env(nb_current_instance,"NB_WORKER_ID"):"0",
                   (unsigned long long)loop_iterations,loop_busy_max/1000.0,loop_wake_late_max/1000.0,
-                  (unsigned long long)loop_over_5ms,(unsigned long long)loop_over_20ms);
+                  (unsigned long long)loop_over_5ms,(unsigned long long)loop_over_20ms,
+                  (unsigned long long)loop_empty_wake_backoffs);
               loop_stat_at=loop_end;loop_busy_max=0;loop_wake_late_max=0;
-              loop_iterations=0;loop_over_5ms=0;loop_over_20ms=0;
+              loop_iterations=0;loop_over_5ms=0;loop_over_20ms=0;loop_empty_wake_backoffs=0;
           } }
     }
     atomic_store(&instance->running,0);
@@ -836,6 +860,7 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
 static void nb_node_instance_cleanup(nb_instance_t* instance){
     if(instance==NULL)return;
     nb_current_instance=instance;
+    nb_yfe2_worker_destroy(instance->yfe2_worker);instance->yfe2_worker=NULL;
     for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use)ps_free(&G.streams[i]);
     nb_auth_async_destroy(instance->auth_async);instance->auth_async=NULL;
     nb_dns_destroy(instance->dns);instance->dns=NULL;

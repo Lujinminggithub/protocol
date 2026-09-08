@@ -8,6 +8,23 @@ import worker_snapshot
 
 
 class WorkerSnapshotTest(unittest.TestCase):
+    def test_nb_yfe2_is_optional_diagnostic_data(self):
+        legacy = worker_snapshot.snapshot("line-1", "middle", "2026-09-08T00:00:00Z", {
+            "path": "/run/nb-middle-0.ctl", "health": {"status": "ok"}, "metrics": {"fec": {}},
+        })
+        self.assertEqual(legacy["health"], "ok")
+        self.assertEqual(legacy["payload"]["nb_yfe2"], {"available": False})
+
+        diagnostic = {"negotiation": {"state": "accepted"}}
+        current = worker_snapshot.snapshot("line-1", "middle", "2026-09-08T00:00:01Z", {
+            "path": "/run/nb-middle-0.ctl", "health": {"status": "ok"},
+            "metrics": {"fec": {"nb_yfe2": diagnostic}},
+            "fec": {"connections": [{"generation": 7}]},
+        })
+        self.assertEqual(current["payload"]["nb_yfe2"], diagnostic)
+        self.assertEqual(current["payload"]["fec_connections"]["connections"][0]["generation"], 7)
+        self.assertEqual(current["health"], "ok")
+
     def test_role_collection_failure_does_not_create_collector_node(self):
         original = worker_snapshot.query_role
 

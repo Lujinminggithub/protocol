@@ -21,5 +21,7 @@ int nb_routes_report_name(nb_routes_t* routes,const char* name,int result,uint64
 int nb_routes_control_command(nb_routes_t* routes,const char* command,char* out,size_t cap,uint64_t now_us,uint64_t cooldown_us);
 uint64_t nb_routes_hash(const char* first,const char* second,uint16_t port);
 int nb_routes_render_json(const nb_routes_t* routes,char* out,size_t cap,uint64_t now_us);
+int nb_routes_hop_endpoint(const nb_route_entry_t* route,char* host,size_t host_cap,uint16_t* port);
+int nb_routes_signal_direct_candidate(const char* rule_name,int udp_mode,int enabled);
 
 #endif

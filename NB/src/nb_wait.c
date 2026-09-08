@@ -3,6 +3,7 @@
 #include <errno.h>
 
 #define NB_WAIT_MAX_US 1000000LL
+#define NB_WAIT_EMPTY_WAKE_BACKOFF_US 1000LL
 
 static int64_t bounded_delay(int64_t delay_us){
     if(delay_us<=0)return 0;
@@ -19,6 +20,14 @@ int nb_wait_timespec(int64_t delay_us,struct timespec* timeout){
 
 int nb_wait_fallback_timeout_ms(int64_t delay_us){
     return (int)(bounded_delay(delay_us)/1000LL);
+}
+
+int64_t nb_wait_guard_delay(int64_t delay_us,int previous_empty_wake){
+    return previous_empty_wake&&delay_us<=0?NB_WAIT_EMPTY_WAKE_BACKOFF_US:delay_us;
+}
+
+int nb_wait_empty_wake(int64_t delay_us,int event_count,size_t packets_prepared){
+    return delay_us<=0&&event_count==0&&packets_prepared==0;
 }
 
 #if defined(__linux__)

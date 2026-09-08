@@ -46,6 +46,8 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
     fec = metrics.get("fec") if isinstance(metrics.get("fec"), dict) else {}
     byte_counts = metrics.get("bytes") if isinstance(metrics.get("bytes"), dict) else {}
     udp_errors = metrics.get("udp_errors") if isinstance(metrics.get("udp_errors"), dict) else {}
+    yfe2 = fec.get("nb_yfe2") if isinstance(fec.get("nb_yfe2"), dict) else {"available": False}
+    fec_connections = record.get("fec") if isinstance(record.get("fec"), dict) else {"available": False}
     return {
         "line_id": line_id,
         "node_id": node_id,
@@ -61,7 +63,8 @@ def snapshot(line_id: str, role: str, observed: str, record: dict) -> dict:
         "effective_loss_pct": number(link, "effective_loss_max_pct"),
         "fec_observe": number(fec, "observe") != 0,
         "fec_active": number(fec, "active") != 0,
-        "payload": {"health": health, "metrics": metrics, "collection_error": error},
+        "payload": {"health": health, "metrics": metrics, "nb_yfe2": yfe2,
+                    "fec_connections": fec_connections, "collection_error": error},
         "_bytes_c2s": number(byte_counts, "c2s"),
         "_bytes_s2c": number(byte_counts, "s2c"),
         "_rxq_overflow_total": number(udp_errors, "rxq_overflow"),
@@ -133,6 +136,18 @@ for path in paths:
                 item[command]=json.loads(client.recv(65536).decode())
             finally:
                 client.close()
+        try:
+            client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            client.settimeout(3)
+            try:
+                client.connect(path)
+                client.sendall(b'fec\\n')
+                response=client.recv(65536)
+                item['fec']=json.loads(response.decode()) if response else {{'available':False}}
+            finally:
+                client.close()
+        except Exception:
+            item['fec']={{'available':False}}
     except Exception as error:
         item['error']=type(error).__name__+': '+str(error)
     results.append(item)

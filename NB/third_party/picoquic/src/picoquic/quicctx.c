@@ -5301,6 +5301,18 @@ uint64_t picoquic_uniform_random(uint64_t rnd_max)
     return picoquic_public_uniform_random(rnd_max);
 }
 
+int picoquic_get_nb_limit_state(picoquic_cnx_t* cnx, picoquic_nb_limit_state_t* state)
+{
+    if (cnx == NULL || state == NULL) {
+        return -1;
+    }
+    state->app_limited = cnx->nb_paths > 0 && cnx->path != NULL &&
+        cnx->path[0] != NULL && cnx->path[0]->delivered_limited_index != 0;
+    state->send_queue_full = cnx->nb_trains_blocked_cwin +
+        cnx->nb_trains_blocked_others;
+    return 0;
+}
+
 #if defined(PICOQUIC_WITH_THREAD_CHECK)
 /* Thread check */
 

@@ -1217,8 +1217,14 @@ typedef struct st_picoquic_path_quality_t {
 
 } picoquic_path_quality_t;
 
+typedef struct st_picoquic_nb_limit_state_t {
+    int app_limited;
+    uint64_t send_queue_full;
+} picoquic_nb_limit_state_t;
+
 int picoquic_get_path_quality(picoquic_cnx_t* cnx, uint64_t unique_path_id, picoquic_path_quality_t * quality);
 void picoquic_get_default_path_quality(picoquic_cnx_t* cnx, picoquic_path_quality_t* quality);
+int picoquic_get_nb_limit_state(picoquic_cnx_t* cnx, picoquic_nb_limit_state_t* state);
 int picoquic_subscribe_to_quality_update_per_path(picoquic_cnx_t* cnx, uint64_t unique_path_id,
     uint64_t pacing_rate_delta, uint64_t rtt_delta);
 void picoquic_subscribe_to_quality_update(picoquic_cnx_t* cnx, uint64_t pacing_rate_delta, uint64_t rtt_delta);

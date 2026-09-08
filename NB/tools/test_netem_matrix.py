@@ -5,7 +5,8 @@ import tempfile
 from types import SimpleNamespace
 
 from netem_matrix import (SelectiveNetem, contract_met, load_scenarios, parse_losses, segment_target, summarize_cases,
-                          summarize_observation, validate_cluster, validate_resources)
+                          summarize_observation, validate_cluster, validate_resources,
+                          yfe2_acceptance, yfe2_scenarios)
 
 
 def snapshot(age: int = 0, loss: float = 0.0, status: str = "ok") -> dict:
@@ -26,6 +27,18 @@ def snapshot(age: int = 0, loss: float = 0.0, status: str = "ok") -> dict:
 
 
 def main() -> None:
+    yfe2 = yfe2_scenarios()
+    assert [item["loss_pct"] for item in yfe2 if item["category"] == "random-loss"] == [0, 0.1, 0.2, 0.5, 1.0]
+    assert [item["burst_packets"] for item in yfe2 if item["category"] == "burst-loss"] == [1, 3, 6, 12]
+    assert {item["category"] for item in yfe2} >= {"reorder", "policer", "app-limited", "rate-cap-limited"}
+    assert yfe2_acceptance({"open_line_status": "unchanged", "original_queue_drop": 0,
+                            "probe_parity": 0, "fec_off_business_mbps": 5,
+                            "fec_on_business_mbps": 4.95, "baseline_overhead_ratio": 0.07,
+                            "decode_p99_ms": 1.5, "event_loop_p99_delta_ms": 0.5}) == []
+    assert "业务吞吐" in "".join(yfe2_acceptance({"open_line_status": "unchanged",
+        "original_queue_drop": 0, "probe_parity": 0, "fec_off_business_mbps": 5,
+        "fec_on_business_mbps": 4.0, "baseline_overhead_ratio": 0.07,
+        "decode_p99_ms": 1.5, "event_loop_p99_delta_ms": 0.5}))
     assert parse_losses("0,1,2.5") == [0.0, 1.0, 2.5]
     try:
         parse_losses("31")

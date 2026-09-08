@@ -8,8 +8,12 @@ from deploy_core import *  # noqa: F403 - deploy_core publishes the CLI integrat
 PICOQUIC_PATCH_FILES = tuple(ROOT / path for path in (
     "third_party/picoquic/src/picoquic/bbr.c",
     "third_party/picoquic/src/picoquic/cubic.c",
+    "third_party/picoquic/src/picoquic/frames.c",
     "third_party/picoquic/src/picoquic/loss_recovery.c",
     "third_party/picoquic/src/picoquic/pacing.c",
+    "third_party/picoquic/src/picoquic/picoquic.h",
+    "third_party/picoquic/src/picoquic/picoquic_internal.h",
+    "third_party/picoquic/src/picoquic/quicctx.c",
 ))
 PICOQUIC_SOURCE_DIGEST = "\n".join(
     f"{path.relative_to(ROOT).as_posix()} {nb_release.sha256_file(path)}"
@@ -44,6 +48,12 @@ BUILD_FILES = {
     "scripts/runtri.sh": ROOT / "scripts" / "runtri.sh",
     "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
     "tools/runtri_udp_probe_echo.py": ROOT / "tools" / "runtri_udp_probe_echo.py",
+    "tools/worker_snapshot.py": ROOT / "tools" / "worker_snapshot.py",
+    "tools/nb_yfe2_canary.py": ROOT / "tools" / "nb_yfe2_canary.py",
+    "tools/netem_matrix.py": ROOT / "tools" / "netem_matrix.py",
+    "tools/test_worker_snapshot.py": ROOT / "tools" / "test_worker_snapshot.py",
+    "tools/test_yfe2_canary.py": ROOT / "tools" / "test_yfe2_canary.py",
+    "tools/test_netem_matrix.py": ROOT / "tools" / "test_netem_matrix.py",
     "src/nb_node.c": SRC / "nb_node.c",
     "src/nb_node_core.inc": SRC / "nb_node_core.inc",
     "src/nb_node_session.inc": SRC / "nb_node_session.inc",
@@ -260,7 +270,8 @@ def act_build(roles):
              "test_deploy_transfer.py",
              "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
              "test_line_provision.py", "test_line_open.py", "test_supervisor.py",
-             "test_shard_deploy.py", "test_media_reserve_deploy.py"]
+             "test_shard_deploy.py", "test_media_reserve_deploy.py",
+             "test_worker_snapshot.py", "test_yfe2_canary.py", "test_netem_matrix.py"]
     for test in tests:
         result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
         if result.returncode != 0:

@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type ICMP struct {
 	LossPct  float64 `json:"loss_pct"`
@@ -71,6 +71,7 @@ type Link struct {
 	UDPFECAdaptive   bool    `json:"udp_fec_adaptive"`
 	UDPFECK          int     `json:"udp_fec_k"`
 	UDPFECHoldUS     int64   `json:"udp_fec_hold_us"`
+	UDPFECMode       string  `json:"udp_fec_mode"`
 	TargetMbps       float64 `json:"target_mbps"`
 	TargetRateBPS    uint64  `json:"target_rate_bps"`
 	SeedRTTUS        int64   `json:"seed_rtt_us"`
@@ -269,10 +270,14 @@ func Generate(lineID string, generation uint64, committedMbps float64, probe Pro
 	if err != nil {
 		return Profile{}, fmt.Errorf("middle_exit: %w", err)
 	}
+	middleLink.UDPFECAdaptive = false
+	middleLink.UDPFECMode = "nb-yfe2-optional"
+	middleTarget := middleLink
+	middleTarget.UDPFECMode = "off"
 	return Profile{SchemaVersion: SchemaVersion, LineID: lineID, Generation: generation,
 		Segments: map[string]Segment{
 			"entry_middle": {Source: entryLink, Target: entryLink},
-			"middle_exit":  {Source: middleLink, Target: middleLink},
+			"middle_exit":  {Source: middleLink, Target: middleTarget},
 		}}, nil
 }
 

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "nb_yfe2_metrics.h"
+
 typedef struct {
     uint64_t bytes_c2s;
     uint64_t bytes_s2c;
@@ -98,6 +100,7 @@ typedef struct {
     uint64_t udp_repairs_sent;
     uint64_t udp_repairs_received;
     uint64_t udp_recovered;
+    nb_yfe2_metrics_t nb_yfe2;
 } nb_metrics_fec_t;
 
 void nb_metrics_note_close(nb_metrics_state_t* state, const char* reason);

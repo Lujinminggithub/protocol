@@ -29,8 +29,9 @@ if(BUILD_TESTING)
   target_compile_options(nb_connect_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_connect_test COMMAND nb_connect_test)
 
-  add_executable(nb_exit_recovery_test tools/test_exit_recovery.c src/nb_metrics.c)
-  target_link_libraries(nb_exit_recovery_test PRIVATE nb_connect)
+  add_executable(nb_exit_recovery_test tools/test_exit_recovery.c src/nb_metrics.c
+    src/nb_yfe2_metrics.c src/nb_yfe2_negotiation.c src/nb_yfe2_profile.c src/nb_yfe2_adaptive.c)
+  target_link_libraries(nb_exit_recovery_test PRIVATE nb_connect OpenSSL::Crypto)
   target_include_directories(nb_exit_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_exit_recovery_test PRIVATE -O2 -Wall -Wextra -Werror)
   add_test(NAME nb_exit_recovery_test COMMAND nb_exit_recovery_test)
@@ -111,6 +112,65 @@ if(BUILD_TESTING)
   target_link_libraries(nb_udp_fec_test Threads::Threads)
   add_test(NAME nb_udp_fec COMMAND nb_udp_fec_test)
 
+  add_executable(nb_yfe2_profile_test tools/test_yfe2_profile.c src/nb_yfe2_profile.c)
+  target_include_directories(nb_yfe2_profile_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_profile_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_profile_test OpenSSL::Crypto)
+  add_test(NAME nb_yfe2_profile COMMAND nb_yfe2_profile_test)
+
+  add_executable(nb_yfe2_negotiation_test tools/test_yfe2_negotiation.c
+    src/nb_yfe2_negotiation.c src/nb_yfe2_profile.c)
+  target_include_directories(nb_yfe2_negotiation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_negotiation_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_negotiation_test OpenSSL::Crypto)
+  add_test(NAME nb_yfe2_negotiation COMMAND nb_yfe2_negotiation_test)
+
+  add_executable(nb_yfe2_wire_test tools/test_yfe2_wire.c src/nb_yfe2_wire.c)
+  target_include_directories(nb_yfe2_wire_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_wire_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_yfe2_wire COMMAND nb_yfe2_wire_test)
+
+  add_executable(nb_yfe2_block_test tools/test_yfe2_block.c src/nb_yfe2_block.c
+    src/nb_yfe2_wire.c src/nb_fec_rs.c)
+  target_include_directories(nb_yfe2_block_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_block_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_block_test Threads::Threads)
+  add_test(NAME nb_yfe2_block COMMAND nb_yfe2_block_test)
+
+  add_executable(nb_yfe2_worker_test tools/test_yfe2_worker.c src/nb_yfe2_worker.c
+    src/nb_yfe2_block.c src/nb_yfe2_wire.c src/nb_fec_rs.c)
+  target_include_directories(nb_yfe2_worker_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(nb_yfe2_worker_test PRIVATE _GNU_SOURCE)
+  target_compile_options(nb_yfe2_worker_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_worker_test Threads::Threads)
+  add_test(NAME nb_yfe2_worker COMMAND nb_yfe2_worker_test)
+
+  add_executable(nb_yfe2_rx_test tools/test_yfe2_rx.c src/nb_yfe2_rx.c
+    src/nb_yfe2_block.c src/nb_yfe2_wire.c src/nb_udp.c src/nb_fec_rs.c)
+  target_include_directories(nb_yfe2_rx_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_rx_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_rx_test Threads::Threads)
+  add_test(NAME nb_yfe2_rx COMMAND nb_yfe2_rx_test)
+
+  add_executable(nb_yfe2_adaptive_test tools/test_yfe2_adaptive.c src/nb_yfe2_adaptive.c)
+  target_include_directories(nb_yfe2_adaptive_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_adaptive_test PRIVATE -O2 -Wall -Wextra)
+  add_test(NAME nb_yfe2_adaptive COMMAND nb_yfe2_adaptive_test)
+
+  add_executable(nb_yfe2_node_contract_test tools/test_yfe2_node_contract.c
+    src/nb_yfe2_node.c src/nb_udp.c src/nb_yfe2_negotiation.c src/nb_yfe2_profile.c)
+  target_include_directories(nb_yfe2_node_contract_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_node_contract_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_node_contract_test OpenSSL::Crypto)
+  add_test(NAME nb_yfe2_node_contract COMMAND nb_yfe2_node_contract_test)
+
+  add_executable(nb_yfe2_metrics_test tools/test_yfe2_metrics.c src/nb_yfe2_metrics.c
+    src/nb_yfe2_negotiation.c src/nb_yfe2_profile.c src/nb_yfe2_adaptive.c)
+  target_include_directories(nb_yfe2_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_options(nb_yfe2_metrics_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_yfe2_metrics_test OpenSSL::Crypto)
+  add_test(NAME nb_yfe2_metrics COMMAND nb_yfe2_metrics_test)
+
   add_executable(nb_lstream_test tools/test_lstream.c src/nb_lstream.c src/nb_tenant_wire.c)
   target_include_directories(nb_lstream_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_lstream_test PRIVATE -O2 -Wall -Wextra)
@@ -158,9 +218,11 @@ if(BUILD_TESTING)
   target_compile_options(nb_probe_test PRIVATE -O2 -Wall -Wextra)
   add_test(NAME nb_probe COMMAND nb_probe_test)
 
-  add_executable(nb_metrics_test tools/test_metrics.c src/nb_metrics.c)
+  add_executable(nb_metrics_test tools/test_metrics.c src/nb_metrics.c
+    src/nb_yfe2_metrics.c src/nb_yfe2_negotiation.c src/nb_yfe2_profile.c src/nb_yfe2_adaptive.c)
   target_include_directories(nb_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_options(nb_metrics_test PRIVATE -O2 -Wall -Wextra)
+  target_link_libraries(nb_metrics_test OpenSSL::Crypto)
   add_test(NAME nb_metrics COMMAND nb_metrics_test)
 
   add_executable(nb_session_index_test tools/test_session_index.c src/nb_session_index.c)
@@ -226,7 +288,7 @@ if(BUILD_TESTING)
 
   foreach(_nb_test_target
       nb_connect_test nb_exit_recovery_test nb_fec_test nb_fec_policy_test nb_fec_rs_test nb_ring_test nb_auth_test nb_control_test nb_transport_profile_test nb_transport_seed_test
-      nb_auth_async_test nb_routes_test nb_udp_test nb_udp_probe_echo_test nb_udp_queue_test nb_lstream_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_wait_test nb_probe_test nb_metrics_test
+      nb_auth_async_test nb_routes_test nb_udp_test nb_udp_probe_echo_test nb_udp_queue_test nb_udp_fec_test nb_yfe2_profile_test nb_yfe2_negotiation_test nb_yfe2_wire_test nb_yfe2_block_test nb_yfe2_worker_test nb_yfe2_rx_test nb_yfe2_adaptive_test nb_yfe2_node_contract_test nb_yfe2_metrics_test nb_lstream_test nb_v2_metadata_test nb_pmtu_test nb_udp_io_test nb_udp_lifecycle_test nb_policy_test nb_live_test nb_wait_test nb_probe_test nb_metrics_test
       nb_session_index_test nb_session_memory_test nb_bridge_test nb_send_test nb_path_test
       nb_pool_health_test nb_dns_test nb_tenant_test nb_whitelist_test nb_shard_config_test)
     target_compile_options(${_nb_test_target} PRIVATE -UNDEBUG -Werror)
@@ -250,7 +312,7 @@ else()
   message(STATUS "NB: using prebuilt picoquic for '${NB_PLATFORM}'")
 endif()
 
-add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_transport_profile.c src/nb_transport_seed.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_wait.c src/nb_probe.c src/nb_udp_probe_echo.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_tenant_wire.c src/nb_udp.c src/nb_udp_queue.c src/nb_udp_fec.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
+add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_transport_profile.c src/nb_transport_seed.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_wait.c src/nb_probe.c src/nb_udp_probe_echo.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_yfe2_profile.c src/nb_yfe2_negotiation.c src/nb_yfe2_wire.c src/nb_yfe2_block.c src/nb_yfe2_worker.c src/nb_yfe2_rx.c src/nb_yfe2_adaptive.c src/nb_yfe2_node.c src/nb_yfe2_metrics.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_tenant_wire.c src/nb_udp.c src/nb_udp_queue.c src/nb_udp_fec.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_link_libraries(nb_node nb_connect)
 target_compile_definitions(nb_node PRIVATE _GNU_SOURCE)
 target_compile_options(nb_node PRIVATE -O2 -Wall -Wextra -Werror)
@@ -266,6 +328,22 @@ set(PQ_LIBS
   ${PQ_PREBUILT}/libpicotls-openssl.a
   ${PQ_PREBUILT}/libpicotls-core.a
   ${PQ_PREBUILT}/libpicotls-minicrypto.a)
+
+if(BUILD_TESTING)
+  add_executable(nb_yfe2_pico_limit_test tools/test_yfe2_pico_limit.c)
+  target_include_directories(nb_yfe2_pico_limit_test PRIVATE
+    ${PQ_DIR}/src/picoquic ${PQ_DIR}/src/loglib ${PQ_DIR}/src/picotls/include)
+  target_compile_options(nb_yfe2_pico_limit_test PRIVATE -O2 -Wall -Wextra -Werror)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
+    target_link_libraries(nb_yfe2_pico_limit_test
+      -Wl,--start-group ${PQ_LIBS} -Wl,--end-group
+      OpenSSL::SSL OpenSSL::Crypto Threads::Threads resolv)
+  else()
+    target_link_libraries(nb_yfe2_pico_limit_test ${PQ_LIBS}
+      OpenSSL::SSL OpenSSL::Crypto Threads::Threads resolv)
+  endif()
+  add_test(NAME nb_yfe2_pico_limit COMMAND nb_yfe2_pico_limit_test)
+endif()
 
 # 静态库间循环依赖 -> GNU ld group(Linux)。非 GNU ld 平台(如 macOS ld64)可去掉 group。
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)

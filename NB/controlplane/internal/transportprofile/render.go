@@ -11,6 +11,10 @@ func appendLink(lines []string, name string, link *Link) []string {
 	if link == nil {
 		return lines
 	}
+	fecMode := link.UDPFECMode
+	if fecMode == "" {
+		fecMode = "off"
+	}
 	values := [][2]string{
 		{name + ".cc", link.CC},
 		{name + ".bbr_options", link.BBROptions},
@@ -24,6 +28,7 @@ func appendLink(lines []string, name string, link *Link) []string {
 		{name + ".udp_fec_adaptive", strconv.FormatBool(link.UDPFECAdaptive)},
 		{name + ".udp_fec_k", strconv.Itoa(link.UDPFECK)},
 		{name + ".udp_fec_hold_us", strconv.FormatInt(link.UDPFECHoldUS, 10)},
+		{name + ".udp_fec_mode", fecMode},
 		{name + ".target_rate_bps", strconv.FormatUint(link.TargetRateBPS, 10)},
 		{name + ".seed_rtt_us", strconv.FormatInt(link.SeedRTTUS, 10)},
 		{name + ".startup_cwin_bytes", strconv.FormatUint(link.StartupCWinBytes, 10)},
@@ -38,7 +43,7 @@ func Render(profile RoleProfile) ([]byte, uint64, error) {
 	if !validLineID(profile.LineID) || profile.Generation == 0 {
 		return nil, 0, fmt.Errorf("invalid role profile")
 	}
-	lines := []string{"schema=1", "line_id=" + profile.LineID,
+	lines := []string{"schema=" + strconv.Itoa(profile.SchemaVersion), "line_id=" + profile.LineID,
 		"generation=" + strconv.FormatUint(profile.Generation, 10), "role=" + profile.Role}
 	lines = appendLink(lines, "ingress", profile.Ingress)
 	lines = appendLink(lines, "egress", profile.Egress)

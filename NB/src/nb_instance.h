@@ -21,6 +21,10 @@
 #include "nb_udp_lifecycle.h"
 #include "nb_whitelist.h"
 #include "nb_policy.h"
+#include "nb_yfe2_adaptive.h"
+#include "nb_yfe2_negotiation.h"
+#include "nb_yfe2_worker.h"
+#include "nb_yfe2_metrics.h"
 
 #define NB_FEC_SESSION_INDEX_CAP 2048u
 #define NB_SCHED_CNX_CAP 64u
@@ -36,6 +40,13 @@ typedef struct {
     uint64_t seed_cwin_bytes;
     int transport_profile_bound;
     int seed_configured;
+    uint64_t yfe2_generation;
+    uint32_t yfe2_control_session;
+    size_t yfe2_control_length;
+    uint8_t yfe2_control_wire[512];
+    nb_yfe2_negotiation_t yfe2_negotiation;
+    nb_yfe2_adaptive_t yfe2_adaptive;
+    uint64_t yfe2_sample_at;
 } nb_sched_cnx_t;
 
 typedef struct {
@@ -92,6 +103,9 @@ typedef struct nb_instance {
     uint64_t memory_released_pending;
     nb_fec_session_index_t fec_session_index[NB_FEC_SESSION_INDEX_CAP];
     nb_sched_cnx_t sched_cnx[NB_SCHED_CNX_CAP];
+    nb_yfe2_worker_t* yfe2_worker;
+    uint64_t yfe2_generation_next;
+    nb_yfe2_metrics_t yfe2_lifetime;
     uint64_t queue_bytes;
     uint64_t queue_limit_bytes;
     uint32_t session_limit;

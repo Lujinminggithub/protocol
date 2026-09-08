@@ -6,6 +6,7 @@
 
 #define NB_TRANSPORT_CC_MAX 16
 #define NB_TRANSPORT_BBR_OPTIONS_MAX 128
+#define NB_TRANSPORT_FEC_MODE_MAX 24
 
 typedef struct {
     int present;
@@ -21,6 +22,7 @@ typedef struct {
     int udp_fec_adaptive;
     uint32_t udp_fec_k;
     uint64_t udp_fec_hold_us;
+    char udp_fec_mode[NB_TRANSPORT_FEC_MODE_MAX];
     uint64_t target_rate_bps;
     uint64_t seed_rtt_us;
     uint64_t startup_cwin_bytes;
@@ -46,6 +48,8 @@ typedef struct {
 } nb_transport_profile_state_t;
 
 void nb_transport_profile_state_init(nb_transport_profile_state_t* state);
+uint64_t nb_transport_shared_cwin_max(const nb_transport_link_profile_t* ingress,
+    const nb_transport_link_profile_t* egress);
 int nb_transport_profile_load(const char* path,nb_transport_profile_t* profile,
     char* error,size_t error_cap);
 int nb_transport_profile_prepare(nb_transport_profile_state_t* state,const char* path,

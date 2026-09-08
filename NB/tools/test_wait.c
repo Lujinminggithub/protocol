@@ -18,5 +18,16 @@ int main(void){
     assert(nb_wait_fallback_timeout_ms(1000)==1);
     assert(nb_wait_fallback_timeout_ms(1500)==1);
     assert(nb_wait_fallback_timeout_ms(1000001)==1000);
+
+    assert(nb_wait_guard_delay(0,0)==0);
+    assert(nb_wait_guard_delay(0,1)==1000);
+    assert(nb_wait_guard_delay(-1,1)==1000);
+    assert(nb_wait_guard_delay(500,1)==500);
+
+    assert(nb_wait_empty_wake(0,0,0)==1);
+    assert(nb_wait_empty_wake(-1,0,0)==1);
+    assert(nb_wait_empty_wake(0,1,0)==0);
+    assert(nb_wait_empty_wake(0,0,1)==0);
+    assert(nb_wait_empty_wake(1,0,0)==0);
     return 0;
 }

@@ -25,6 +25,52 @@ FILTER_PREF = 49152
 QUIC_PORT = 4443
 
 
+def yfe2_scenarios() -> list[dict]:
+    scenarios = [
+        {"name": f"随机丢包-{loss:g}%", "category": "random-loss", "loss_pct": loss}
+        for loss in (0, 0.1, 0.2, 0.5, 1.0)
+    ]
+    scenarios.extend({"name": f"突发丢包-{packets}包", "category": "burst-loss",
+                      "loss_pct": 0.0, "burst_packets": packets}
+                     for packets in (1, 3, 6, 12))
+    scenarios.extend([
+        {"name": "乱序", "category": "reorder", "loss_pct": 0.0,
+         "delay_ms": 20, "reorder_pct": 5.0},
+        {"name": "限速器", "category": "policer", "loss_pct": 0.0,
+         "rate_mbps": 5.0},
+        {"name": "应用受限", "category": "app-limited", "loss_pct": 0.0,
+         "requires_runtime_mode": "app-limited"},
+        {"name": "产品限速", "category": "rate-cap-limited", "loss_pct": 0.0,
+         "requires_runtime_mode": "rate-cap-limited"},
+    ])
+    for scenario in scenarios:
+        scenario.setdefault("delay_ms", 0);scenario.setdefault("jitter_ms", 0)
+        scenario.setdefault("reorder_pct", 0.0);scenario.setdefault("expected", "pass")
+    return scenarios
+
+
+def yfe2_acceptance(result: dict) -> list[str]:
+    reasons = []
+    if result.get("open_line_status") != "unchanged":
+        reasons.append("开线状态发生变化")
+    if int(result.get("original_queue_drop", -1)) != 0:
+        reasons.append("原始包队列存在丢弃")
+    if int(result.get("probe_parity", -1)) != 0:
+        reasons.append("探针产生了 parity")
+    baseline = float(result.get("fec_off_business_mbps", 0) or 0)
+    candidate = float(result.get("fec_on_business_mbps", 0) or 0)
+    if baseline <= 0 or candidate < baseline * 0.98:
+        reasons.append("业务吞吐低于 FEC-off 的 98%")
+    overhead = float(result.get("baseline_overhead_ratio", -1) or 0)
+    if not 0.06 <= overhead <= 0.085:
+        reasons.append("baseline 开销不在 6%-8.5%")
+    if float(result.get("decode_p99_ms", float("inf"))) > 2.0:
+        reasons.append("解码 P99 超过 2ms")
+    if float(result.get("event_loop_p99_delta_ms", float("inf"))) > 1.0:
+        reasons.append("事件循环 P99 恶化超过 1ms")
+    return reasons
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0

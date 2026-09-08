@@ -128,6 +128,8 @@ void nb_metrics_snapshot_add_seed(nb_metrics_snapshot_t* s,int applied,uint64_t 
 int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* worker,
     const char* release,const char* profile,int schema,const nb_metrics_snapshot_t* s,const nb_metrics_fec_t* f){
     if(out==NULL||cap==0||s==NULL||f==NULL)return -1;
+    char yfe2[4096];
+    if(nb_yfe2_metrics_render_json(yfe2,sizeof(yfe2),&f->nb_yfe2)<0)return -1;
     return snprintf(out,cap,
         "{\"role\":\"%s\",\"worker\":\"%s\",\"release_id\":\"%s\",\"line_profile\":\"%s\",\"line_profile_schema\":%d,"
         "\"sessions\":%llu,\"sessions_peak\":%llu,\"sessions_limit\":%llu,\"pools\":%llu,\"exit_routes\":%llu,"
@@ -149,7 +151,8 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"pool_recovery\":{\"retired\":%llu,\"suppressed\":%llu,\"quarantined\":%llu,\"mbb_promotions\":%llu},"
         "\"pmtu\":{\"promotions\":%llu,\"fallbacks\":%llu},"
         "\"fec\":{\"observe\":%d,\"active\":%d,\"tx_blocks\":%llu,\"rx_blocks\":%llu,\"recovered\":%llu,\"nack\":%llu,\"retx\":%llu,"
-        "\"udp_adaptive_active\":%d,\"udp_source_packets\":%llu,\"udp_repairs_sent\":%llu,\"udp_repairs_received\":%llu,\"udp_recovered\":%llu}}\n",
+        "\"udp_adaptive_active\":%d,\"udp_source_packets\":%llu,\"udp_repairs_sent\":%llu,\"udp_repairs_received\":%llu,\"udp_recovered\":%llu,"
+        "\"nb_yfe2\":%s}}\n",
         role,worker,release,profile,schema,
         (unsigned long long)s->sessions,(unsigned long long)s->sessions_peak,(unsigned long long)s->sessions_limit,
         (unsigned long long)s->pools,(unsigned long long)s->exit_routes,
@@ -185,5 +188,5 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)f->recovered,(unsigned long long)f->nack,(unsigned long long)f->retx,
         f->udp_adaptive_active,(unsigned long long)f->udp_source_packets,
         (unsigned long long)f->udp_repairs_sent,(unsigned long long)f->udp_repairs_received,
-        (unsigned long long)f->udp_recovered);
+        (unsigned long long)f->udp_recovered,yfe2);
 }

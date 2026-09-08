@@ -72,9 +72,350 @@ static int udp_deliver_reassembled(proxy_stream_t* p,const nb_udp_reassembled_t*
     return -1;
 }
 
+static void yfe2_stream_metrics_snapshot(const proxy_stream_t* p,
+    nb_yfe2_metrics_t* metrics){
+    nb_yfe2_metrics_init(metrics);if(p==NULL)return;
+    metrics->business_bytes=p->yfe2_business_bytes;metrics->wire_bytes=p->yfe2_wire_bytes;
+    metrics->original=p->yfe2_original;metrics->baseline_parity=p->yfe2_baseline_parity;
+    metrics->burst_parity=p->yfe2_burst_parity;
+    metrics->parity_received=p->yfe2_parity_received;
+    metrics->parity_queue_drop=p->yfe2_parity_queue_drop;
+    metrics->pmtu_fallback=p->yfe2_pmtu_fallback;
+    metrics->probe_parity_suppressed=p->yfe2_probe_parity_suppressed;
+    if(p->yfe2_rx){
+        nb_yfe2_rx_metrics_t receive;nb_yfe2_rx_snapshot(p->yfe2_rx,&receive);
+        metrics->recovered=receive.recovered;metrics->unrecoverable=receive.unrecoverable;
+        metrics->duplicate=receive.duplicate;metrics->corrupt=receive.corrupt;
+        metrics->decoder_queue_drop=receive.evicted;metrics->decode_ns=receive.decode_ns;
+        metrics->memory_high_bytes=receive.memory_high;
+    }
+}
+
+static size_t yfe2_max_datagram_payload(picoquic_cnx_t* cnx){
+    if(cnx==NULL)return 0;
+    return (size_t)cnx->remote_parameters.max_datagram_frame_size;
+}
+
+static uint32_t yfe2_control_session_new(void){
+    uint32_t session_id=0;
+    for(int attempt=0;attempt<8&&session_id==0;attempt++)
+        picoquic_crypto_random(G.quic,&session_id,sizeof(session_id));
+    return session_id;
+}
+
+static int yfe2_queue_control(picoquic_cnx_t* cnx,nb_sched_cnx_t* runtime,
+    const nb_yfe2_control_t* control){
+    int length;
+    if(cnx==NULL||runtime==NULL||control==NULL)return -1;
+    if(runtime->yfe2_control_session==0)runtime->yfe2_control_session=yfe2_control_session_new();
+    if(runtime->yfe2_control_session==0)return -1;
+    length=nb_yfe2_control_datagram_encode(runtime->yfe2_control_wire,
+        sizeof(runtime->yfe2_control_wire),runtime->yfe2_control_session,control);
+    if(length<0)return -1;
+    runtime->yfe2_control_length=(size_t)length;
+    (void)picoquic_mark_datagram_ready(cnx,1);
+    return 0;
+}
+
+static void yfe2_maybe_start(picoquic_cnx_t* cnx){
+    nb_sched_cnx_t* runtime;
+    nb_yfe2_control_t proposal={0};
+    uint64_t nonce=0,now;
+    const nb_transport_profile_t* profile;
+    if(G.role!=ROLE_MIDDLE||cnx==NULL||!nb_current_instance->transport_profiles.has_active)return;
+    profile=&nb_current_instance->transport_profiles.active;
+    size_t max_payload=yfe2_max_datagram_payload(cnx);
+    if(profile->schema_version==2&&
+        !strcmp(nb_current_instance->transport_egress.link.udp_fec_mode,"nb-yfe2-optional")&&
+        max_payload>0&&max_payload<nb_yfe2_required_datagram(NB_UDP_FRAGMENT_PAYLOAD)){
+        runtime=runtime_for_cnx(cnx,1);
+        if(runtime&&runtime->yfe2_negotiation.state==NB_YFE2_NEG_DISABLED)
+            runtime->yfe2_negotiation.state=NB_YFE2_NEG_FALLBACK_PMTU;
+        return;
+    }
+    if(!nb_yfe2_sender_eligible(profile->schema_version,
+        nb_current_instance->transport_egress.link.udp_fec_mode,G.role,1,
+        NB_UDP_TYPE_C2S,1,0,max_payload,NB_UDP_FRAGMENT_PAYLOAD))return;
+    runtime=runtime_for_cnx(cnx,1);
+    if(runtime==NULL||runtime->yfe2_negotiation.state!=NB_YFE2_NEG_DISABLED)return;
+    for(int attempt=0;attempt<8&&nonce==0;attempt++)picoquic_crypto_random(G.quic,&nonce,sizeof(nonce));
+    now=picoquic_current_time();
+    if(nonce==0||nb_yfe2_negotiation_start(&runtime->yfe2_negotiation,nonce,now)!=0)return;
+    proposal.type=NB_YFE2_CTL_PROPOSE;proposal.nonce=nonce;
+    nb_yfe2_default_profile(&proposal.profile);
+    if(yfe2_queue_control(cnx,runtime,&proposal)!=0){
+        (void)nb_yfe2_negotiation_reject(&runtime->yfe2_negotiation,nonce,
+            NB_YFE2_REASON_RESOURCE);
+        log4c_warn("middle NB YFE2 协商入队失败 generation=%llu",
+            (unsigned long long)runtime->yfe2_generation);
+    }else log4c_info("middle NB YFE2 发起协商 generation=%llu profile=%u",
+        (unsigned long long)runtime->yfe2_generation,NB_YFE2_PROFILE_ID);
+}
+
+static int yfe2_handle_control(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view){
+    nb_yfe2_control_t control;
+    nb_sched_cnx_t* runtime;
+    if(view==NULL||!nb_yfe2_control_target(view->route,view->route_length))return 0;
+    if(nb_yfe2_control_decode(view->payload,view->payload_length,&control)!=0){
+        log4c_warn("%s NB YFE2 协商包无效",role_name(G.role));return 1;
+    }
+    runtime=runtime_for_cnx(cnx,1);if(runtime==NULL)return 1;
+    if(G.role==ROLE_EXIT&&view->type==NB_UDP_TYPE_C2S&&control.type==NB_YFE2_CTL_PROPOSE){
+        nb_yfe2_control_t response=control;response.type=NB_YFE2_CTL_ACCEPT;
+        if(nb_yfe2_negotiation_start(&runtime->yfe2_negotiation,control.nonce,
+            picoquic_current_time())==0&&nb_yfe2_negotiation_accept(&runtime->yfe2_negotiation,
+            control.nonce,control.profile_id)==0){
+            runtime->yfe2_control_session=view->session_id;
+            if(yfe2_queue_control(cnx,runtime,&response)==0)
+                log4c_info("exit NB YFE2 接受协商 generation=%llu profile=%u",
+                    (unsigned long long)runtime->yfe2_generation,control.profile_id);
+        }
+        return 1;
+    }
+    if(G.role==ROLE_MIDDLE&&view->type==NB_UDP_TYPE_S2C&&
+        runtime->yfe2_negotiation.state==NB_YFE2_NEG_PROPOSED){
+        int result=control.type==NB_YFE2_CTL_ACCEPT?
+            nb_yfe2_negotiation_accept(&runtime->yfe2_negotiation,control.nonce,
+                control.profile_id):
+            (control.type==NB_YFE2_CTL_REJECT?
+                nb_yfe2_negotiation_reject(&runtime->yfe2_negotiation,control.nonce,
+                    control.reason):-1);
+        if(result==0)log4c_info("middle NB YFE2 协商结果 generation=%llu state=%s",
+            (unsigned long long)runtime->yfe2_generation,
+            nb_yfe2_negotiation_state_name(runtime->yfe2_negotiation.state));
+        return 1;
+    }
+    return 1;
+}
+
+typedef struct {proxy_stream_t* stream;nb_sched_cnx_t* runtime;uint16_t route_length;} yfe2_original_context_t;
+
+static int yfe2_record_source(void* opaque,const nb_udp_wire_view_t* source,uint64_t now_us,
+    nb_yfe2_encode_job_t* sealed){
+    yfe2_original_context_t* context=opaque;proxy_stream_t* p=context->stream;
+    if(p->yfe2_tx==NULL){
+        p->yfe2_tx=calloc(1,sizeof(*p->yfe2_tx));
+        if(p->yfe2_tx==NULL)return -1;
+    }
+    if(p->yfe2_generation!=context->runtime->yfe2_generation){
+        nb_yfe2_tx_init(p->yfe2_tx,context->runtime->yfe2_generation,p->udp_session_id);
+        p->yfe2_generation=context->runtime->yfe2_generation;
+    }
+    uint8_t parity=context->runtime->yfe2_adaptive.mode==NB_YFE2_MODE_BURST?
+        NB_YFE2_BURST_PARITY:NB_YFE2_BASE_PARITY;
+    int result=nb_yfe2_tx_add(p->yfe2_tx,source,now_us,parity,sealed);
+    if(result>=0){p->udp_fec_source_packets++;p->yfe2_original++;
+        p->yfe2_business_bytes+=source->payload_length;
+        p->yfe2_wire_bytes+=24u+context->route_length+source->payload_length;}
+    return result;
+}
+
+static int yfe2_submit_job(void* opaque,const nb_yfe2_encode_job_t* job){
+    yfe2_original_context_t* context=opaque;
+    int result=g_yfe2_worker?nb_yfe2_worker_submit(g_yfe2_worker,job):-1;
+    if(result!=0)context->stream->yfe2_encoder_queue_drop++;
+    return result;
+}
+
+static void yfe2_on_original_queued(proxy_stream_t* p,const nb_udp_wire_view_t* view,
+    const char* route,uint64_t now_us){
+    nb_sched_cnx_t* runtime;
+    yfe2_original_context_t context;
+    nb_yfe2_node_ops_t ops;
+    if(p==NULL||view==NULL||route==NULL||G.role!=ROLE_MIDDLE||p->flow_class!=NB_FLOW_CLASS_MEDIA)return;
+    if(nb_yfe2_probe_route((const uint8_t*)route,(uint16_t)strlen(route))){
+        nb_sched_cnx_t* probe_runtime=runtime_for_cnx(p->down_cnx,0);
+        if(probe_runtime&&probe_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED)
+            p->yfe2_probe_parity_suppressed++;
+        return;
+    }
+    yfe2_maybe_start(p->down_cnx);
+    runtime=runtime_for_cnx(p->down_cnx,0);
+    if(runtime==NULL||runtime->yfe2_negotiation.state!=NB_YFE2_NEG_ACCEPTED)return;
+    context=(yfe2_original_context_t){p,runtime,(uint16_t)strlen(route)};
+    ops=(nb_yfe2_node_ops_t){yfe2_record_source,yfe2_submit_job,NULL,&context};
+    (void)nb_yfe2_node_on_original_queued(&ops,view,now_us);
+}
+
+static void yfe2_receive_parity(picoquic_cnx_t* cnx,const uint8_t* wire,size_t length){
+    nb_yfe2_parity_view_t parity;
+    nb_sched_cnx_t* runtime=runtime_for_cnx(cnx,0);
+    if(G.role!=ROLE_EXIT||runtime==NULL||
+        runtime->yfe2_negotiation.state!=NB_YFE2_NEG_ACCEPTED)return;
+    if(nb_yfe2_wire_decode(wire,length,&parity)!=NB_YFE2_WIRE_OK){
+        log4c_warn("exit NB YFE2 parity 拒绝 length=%zu",length);return;
+    }
+    proxy_stream_t* p=ps_find_udp_up(cnx,parity.session_id);if(p==NULL||
+        p->flow_class!=NB_FLOW_CLASS_MEDIA||p->probe_mode)return;
+    if(p->yfe2_rx==NULL)p->yfe2_rx=nb_yfe2_rx_create();
+    if(p->yfe2_rx==NULL)return;
+    nb_yfe2_recovered_t recovered[NB_YFE2_BURST_PARITY];size_t count=0;
+    int result=nb_yfe2_rx_add_parity(p->yfe2_rx,runtime->yfe2_generation,&parity,
+        p->route,(uint16_t)strlen(p->route),picoquic_current_time(),recovered,
+        NB_YFE2_BURST_PARITY,&count);
+    p->udp_fec_repairs_received++;p->yfe2_parity_received++;
+    if(result<0)return;
+    for(size_t i=0;i<count;i++){
+        nb_udp_wire_view_t view;
+        if(nb_udp_wire_decode(recovered[i].wire,recovered[i].length,&view)==0&&
+            udp_on_quic_datagram(cnx,&view)==0){
+            p->udp_fec_recovered++;
+            log4c_info("exit NB YFE2 恢复 id=%u usid=%u seq=%u frag=%u/%u",
+                p->id,p->udp_session_id,view.sequence,view.fragment_index+1,
+                view.fragment_count);
+        }
+    }
+}
+
+typedef struct {proxy_stream_t* stream;} yfe2_parity_context_t;
+
+static int yfe2_queue_parity(void* opaque,const uint8_t* wire,size_t length,int priority){
+    yfe2_parity_context_t* context=opaque;
+    proxy_stream_t* p=context->stream;
+    if(priority!=NB_PRIO_FEC)return -1;
+    size_t need=NB_UDP_QUEUE_RECORD_HEADER+length;
+    int result=1;
+    if(p->yfe2_parity_tx_len+need<=NB_DGRAM_QUEUE_MAX&&
+        nb_current_instance->queue_bytes<=nb_current_instance->queue_limit_bytes&&
+        need<=nb_current_instance->queue_limit_bytes-nb_current_instance->queue_bytes){
+        result=dgramq_append(&p->yfe2_parity_tx,&p->yfe2_parity_tx_len,
+            &p->yfe2_parity_tx_cap,wire,length,p->id,NB_DGRAM_QUEUE_MAX);
+        if(result==0&&picoquic_mark_datagram_ready(p->down_cnx,1)!=0){
+            p->yfe2_parity_tx_len-=need;instance_queue_release(need);result=-1;
+        }
+    }
+    if(result==0){p->udp_fec_repairs_sent++;p->yfe2_wire_bytes+=length;
+        if(length>5&&(wire[5]&NB_YFE2_FLAG_BURST))p->yfe2_burst_parity++;
+        else p->yfe2_baseline_parity++;
+    }else p->yfe2_parity_queue_drop++;
+    return result;
+}
+
+static proxy_stream_t* yfe2_find_result_stream(const nb_yfe2_encode_result_t* result){
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(!p->in_use||!p->udp_mode||p->udp_session_id!=result->session_id||
+            p->down_cnx==NULL||p->yfe2_generation!=result->connection_generation)continue;
+        nb_sched_cnx_t* runtime=runtime_for_cnx(p->down_cnx,0);
+        if(runtime&&runtime->yfe2_generation==result->connection_generation&&
+            runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED)return p;
+    }
+    return NULL;
+}
+
+static void yfe2_drain_worker(void){
+    if(g_yfe2_worker==NULL)return;
+    nb_yfe2_encode_result_t result;
+    while(nb_yfe2_worker_drain(g_yfe2_worker,&result)>0){
+        proxy_stream_t* p=yfe2_find_result_stream(&result);if(p==NULL)continue;
+        yfe2_parity_context_t context={p};
+        nb_yfe2_node_ops_t ops={NULL,NULL,yfe2_queue_parity,&context};
+        (void)nb_yfe2_node_drain_result(&ops,&result,p->yfe2_generation);
+    }
+}
+
+static void yfe2_flush_due(uint64_t now_us){
+    if(g_yfe2_worker==NULL)return;
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(!p->in_use||p->yfe2_tx==NULL)continue;
+        for(;;){
+            nb_yfe2_encode_job_t job;
+            int result=nb_yfe2_tx_flush_due(p->yfe2_tx,now_us,&job);
+            if(result<=0)break;
+            (void)nb_yfe2_worker_submit(g_yfe2_worker,&job);
+        }
+    }
+}
+
+static uint64_t yfe2_next_deadline(void){
+    uint64_t earliest=0;
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(!p->in_use)continue;
+        if(p->yfe2_tx){
+            uint64_t deadline=nb_yfe2_tx_next_deadline(p->yfe2_tx);
+            if(deadline&&(earliest==0||deadline<earliest))earliest=deadline;
+        }
+        if(p->yfe2_rx){
+            uint64_t deadline=nb_yfe2_rx_next_deadline(p->yfe2_rx);
+            if(deadline&&(earliest==0||deadline<earliest))earliest=deadline;
+        }
+    }
+    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++){
+        nb_sched_cnx_t* runtime=&g_sched_cnx[i];
+        if(runtime->cnx&&runtime->yfe2_negotiation.state==NB_YFE2_NEG_PROPOSED){
+            uint64_t deadline=runtime->yfe2_negotiation.deadline_us;
+            if(deadline&&(earliest==0||deadline<earliest))earliest=deadline;
+        }else if(runtime->cnx&&runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED){
+            uint64_t deadline=runtime->yfe2_sample_at?runtime->yfe2_sample_at+200000ULL:1;
+            if(earliest==0||deadline<earliest)earliest=deadline;
+        }
+    }
+    return earliest;
+}
+
+static uint64_t yfe2_pmtu_fallbacks(picoquic_cnx_t* cnx){
+    for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int slot=0;slot<POOL_SIZE;slot++)
+        if(G.pools[pool_id].cnx[slot]==cnx)return G.pools[pool_id].pmtu[slot].fallbacks;
+    return 0;
+}
+
+static void yfe2_adaptive_tick(uint64_t now_us){
+    if(G.role!=ROLE_MIDDLE)return;
+    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++){
+        nb_sched_cnx_t* runtime=&g_sched_cnx[i];
+        if(runtime->cnx==NULL||runtime->yfe2_negotiation.state!=NB_YFE2_NEG_ACCEPTED||
+            (runtime->yfe2_sample_at&&now_us-runtime->yfe2_sample_at<200000ULL))continue;
+        picoquic_path_quality_t quality;memset(&quality,0,sizeof(quality));
+        picoquic_get_default_path_quality(runtime->cnx,&quality);
+        picoquic_nb_limit_state_t limit={0};
+        (void)picoquic_get_nb_limit_state(runtime->cnx,&limit);
+        nb_yfe2_loss_sample_t sample={0};
+        sample.generation=runtime->yfe2_generation;sample.sent=quality.sent;
+        sample.declared_lost=quality.lost;sample.spurious_lost=quality.spurious_losses;
+        sample.send_queue_full=limit.send_queue_full;
+        sample.pmtu_fallbacks=yfe2_pmtu_fallbacks(runtime->cnx);
+        if(limit.app_limited)sample.invalid_reasons|=NB_YFE2_IGNORE_APP_LIMITED;
+        for(int stream=0;stream<MAX_CONN;stream++){
+            proxy_stream_t* p=&G.streams[stream];
+            if(!p->in_use||p->down_cnx!=runtime->cnx)continue;
+            sample.local_drops+=p->udp_queue_pressure_dropped;
+            sample.scheduler_expired+=p->yfe2_scheduler_expired;
+            if(p->tenant_throttled_until>now_us)
+                sample.invalid_reasons|=NB_YFE2_IGNORE_RATE_CAP;
+            if(p->probe_mode||strstr(p->route,"nb-probe-")!=NULL)
+                sample.invalid_reasons|=NB_YFE2_IGNORE_PROBE;
+        }
+        int previous=runtime->yfe2_adaptive.mode;
+        int current=nb_yfe2_adaptive_update(&runtime->yfe2_adaptive,&sample,now_us);
+        runtime->yfe2_sample_at=now_us;
+        if(current!=previous)log4c_info("middle NB YFE2 自适应 generation=%llu mode=%s effective_loss=%llu",
+            (unsigned long long)runtime->yfe2_generation,
+            current==NB_YFE2_MODE_BURST?"burst":"baseline",
+            (unsigned long long)runtime->yfe2_adaptive.effective_physical_loss);
+    }
+}
+
+static void yfe2_tick(uint64_t now_us){
+    yfe2_flush_due(now_us);
+    yfe2_adaptive_tick(now_us);
+    for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use&&G.streams[i].yfe2_rx)
+        (void)nb_yfe2_rx_expire(G.streams[i].yfe2_rx,now_us,NULL);
+    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++){
+        nb_sched_cnx_t* runtime=&g_sched_cnx[i];
+        if(runtime->cnx&&runtime->yfe2_negotiation.state==NB_YFE2_NEG_PROPOSED&&
+            nb_yfe2_negotiation_timeout(&runtime->yfe2_negotiation,now_us)==
+                NB_YFE2_NEG_FALLBACK_TIMEOUT)
+            log4c_info("%s NB YFE2 协商超时 generation=%llu，保持普通 NBUD",
+                role_name(G.role),(unsigned long long)runtime->yfe2_generation);
+    }
+}
+
 static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view){
     char route[NB_UDP_ROUTE_MAX];if(view->route_length>=sizeof(route))return -2;
     memcpy(route,view->route,view->route_length);route[view->route_length]=0;
+    if(yfe2_handle_control(cnx,view))return 0;
     if(view->type==NB_UDP_TYPE_CLOSE_ACK){(void)nb_udp_lifecycle_ack(&g_udp_lifecycle,(uintptr_t)cnx,view->session_id);return 0;}
     if(view->type==NB_UDP_TYPE_CLOSE){
         proxy_stream_t* p=NULL;(void)udp_lifecycle_schedule(cnx,NB_UDP_TYPE_CLOSE_ACK,view->session_id,route);
@@ -98,15 +439,21 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
             int forward_rc=udp_forward_fragment(p,1,view,rest);
             if(forward_rc<0)return -4;
             if(forward_rc>0)return 0;
-            if(p->flow_class==NB_FLOW_CLASS_MEDIA&&nb_current_instance->transport_egress.active&&
+            yfe2_on_original_queued(p,view,rest,picoquic_current_time());
+            nb_sched_cnx_t* yfe2_runtime=runtime_for_cnx(p->down_cnx,0);
+            int yfe2_accepted=yfe2_runtime&&
+                yfe2_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED;
+            if(!yfe2_accepted&&p->flow_class==NB_FLOW_CLASS_MEDIA&&nb_current_instance->transport_egress.active&&
                 nb_current_instance->transport_egress.link.udp_fec_adaptive&&
                 pool_udp_fec_needed(&G.pools[p->down_pool_id],picoquic_current_time())){
                 if(p->udp_fec_tx==NULL){
                     const nb_transport_link_profile_t* link=&nb_current_instance->transport_egress.link;
-                    p->udp_fec_tx=nb_udp_fec_tx_create((uint8_t)link->udp_fec_k,link->udp_fec_hold_us);
+                    uint8_t repair_count=G.pools[p->down_pool_id].udp_fec.repair_count;
+                    if(repair_count<1||repair_count>NB_UDP_FEC_MAX_R)repair_count=NB_UDP_FEC_DEFAULT_R;
+                    p->udp_fec_tx=nb_udp_fec_tx_create_ex((uint8_t)link->udp_fec_k,repair_count,link->udp_fec_hold_us);
                     if(p->udp_fec_tx==NULL)return -4;
-                    log4c_info("middle udp FEC flow armed id=%u usid=%u k=%u hold=%lluus target=%s:%d",
-                        p->id,p->udp_session_id,link->udp_fec_k,(unsigned long long)link->udp_fec_hold_us,
+                    log4c_info("middle udp FEC flow armed id=%u usid=%u k=%u r=%u hold=%lluus target=%s:%d",
+                        p->id,p->udp_session_id,link->udp_fec_k,repair_count,(unsigned long long)link->udp_fec_hold_us,
                         p->udp_target_host,p->udp_target_port);
                 }
                 if(udp_fec_record_source(p,view,rest)!=0)return -4;
@@ -538,19 +885,39 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_prepare_datagram: {
         int handled = 0;
         uint32_t* datagram_rr=&nb_current_instance->datagram_rr;uint64_t now=picoquic_current_time();
+        { nb_sched_cnx_t* runtime=runtime_for_cnx(cnx,0);
+          if(runtime&&runtime->yfe2_control_length>0){
+            size_t control_length=runtime->yfe2_control_length;
+            if(control_length<=length){
+                uint8_t* dst=picoquic_provide_datagram_buffer_ex(bytes,control_length,
+                    picoquic_datagram_not_active);
+                if(dst){memcpy(dst,runtime->yfe2_control_wire,control_length);
+                    runtime->yfe2_control_length=0;handled=1;}
+            }else{
+                (void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_not_active);
+                handled=1;
+            }
+          } }
         { const uint8_t* control=NULL;size_t control_len=0,token=0;
-          if(nb_udp_lifecycle_next(&g_udp_lifecycle,(uintptr_t)cnx,now,&control,&control_len,&token)){
+          if(!handled&&nb_udp_lifecycle_next(&g_udp_lifecycle,(uintptr_t)cnx,now,&control,&control_len,&token)){
             if(control_len<=length){uint8_t* dst=picoquic_provide_datagram_buffer_ex(bytes,control_len,picoquic_datagram_not_active);if(dst!=NULL){memcpy(dst,control,control_len);nb_udp_lifecycle_sent(&g_udp_lifecycle,token,now);handled=1;}}
             else {(void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_not_active);handled=1;} } }
-        for(int media_pass=0;media_pass<2&&!handled;media_pass++){
+        for(int media_pass=0;media_pass<3&&!handled;media_pass++){
           for(int scan=0;scan<MAX_CONN&&!handled;scan++){
             int i=(int)((*datagram_rr+(uint32_t)scan)%MAX_CONN);
             p=&G.streams[i];if(!p->in_use||!p->udp_mode||p->udp_association)continue;
             if(media_pass==0&&p->flow_class!=NB_FLOW_CLASS_MEDIA)continue;
-            if(media_pass==1&&p->flow_class==NB_FLOW_CLASS_MEDIA)continue;
+            if(media_pass==2&&p->flow_class==NB_FLOW_CLASS_MEDIA)continue;
             uint8_t* queue=NULL;size_t* queue_len=NULL;
-            if(p->down_cnx==cnx&&p->udp_down_tx_len>=10){queue=p->udp_down_tx;queue_len=&p->udp_down_tx_len;}
-            else if(p->up_cnx==cnx&&p->udp_up_tx_len>=10){queue=p->udp_up_tx;queue_len=&p->udp_up_tx_len;}
+            if(media_pass==1){
+                if(p->flow_class==NB_FLOW_CLASS_MEDIA&&p->down_cnx==cnx&&p->yfe2_parity_tx_len>=10){
+                    queue=p->yfe2_parity_tx;queue_len=&p->yfe2_parity_tx_len;
+                }else continue;
+            }else if(p->down_cnx==cnx&&p->udp_down_tx_len>=10){
+                queue=p->udp_down_tx;queue_len=&p->udp_down_tx_len;
+            }else if(p->up_cnx==cnx&&p->udp_up_tx_len>=10){
+                queue=p->udp_up_tx;queue_len=&p->udp_up_tx_len;
+            }
             if(queue==NULL)continue;
             const nb_transport_runtime_t* runtime=p->down_cnx==cnx?
                 &nb_current_instance->transport_egress:&nb_current_instance->transport_ingress;
@@ -559,12 +926,24 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
             nb_live_queue_limits_t limits=nb_live_queue_limits_for_path(p->flow_class,1,reorder_delay_us);
             uint64_t dropped=nb_live_queue_expiry_enabled(p->flow_class,1)?
                 dgramq_drop_expired(queue,queue_len,limits.deadline_us,now):0;
+            p->yfe2_scheduler_expired+=dropped;
             if(dropped>0)log4c_info("%s udp deadline drop id=%u packets=%llu deadline=%.1fms target=%s:%d",
                 role_name(G.role),p->id,(unsigned long long)dropped,limits.deadline_us/1000.0,
                 p->udp_target_host,p->udp_target_port);
             const uint8_t* dg=NULL;size_t dg_len=0;uint64_t queued_at=0;
             if(!dgramq_peek(queue,*queue_len,&dg,&dg_len,&queued_at))continue;
             if(dg_len>length){
+                if(dg_len>=NB_YFE2_WIRE_HEADER&&nb_get_u32(dg)==NB_UDP_FEC_MAGIC&&dg[4]==3){
+                    dgramq_consume(queue,queue_len);
+                    p->yfe2_pmtu_fallback++;p->yfe2_parity_queue_drop++;
+                    nb_sched_cnx_t* yfe2_runtime=runtime_for_cnx(cnx,0);
+                    if(yfe2_runtime)yfe2_runtime->yfe2_negotiation.state=
+                        NB_YFE2_NEG_FALLBACK_PMTU;
+                    log4c_info("%s NB YFE2 parity 因 PMTU 丢弃 id=%u wire=%zu allowance=%zu",
+                        role_name(G.role),p->id,dg_len,length);
+                    (void)picoquic_mark_datagram_ready(cnx,1);
+                    handled=1;break;
+                }
                 (void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_active_any_path);
                 handled=1;break;
             }
@@ -631,7 +1010,11 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
     case picoquic_callback_datagram_acked:
     case picoquic_callback_datagram_lost:
     case picoquic_callback_datagram_spurious: {
-        if(length>=24&&nb_get_u32(bytes)==NB_UDP_FEC_MAGIC){
+        if(length>=NB_YFE2_WIRE_HEADER&&nb_get_u32(bytes)==NB_UDP_FEC_MAGIC&&bytes[4]==3){
+            if(ev==picoquic_callback_datagram)yfe2_receive_parity(cnx,bytes,length);
+            break;
+        }
+        if(length>=24&&nb_get_u32(bytes)==NB_UDP_FEC_MAGIC&&bytes[4]==NB_UDP_FEC_VERSION){
             if(ev==picoquic_callback_datagram){
                 uint32_t sid=0;uint8_t direction=0;
                 if(nb_udp_fec_peek(bytes,length,&sid,&direction)==0){
@@ -675,6 +1058,15 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                     p=G.role==ROLE_EXIT?ps_find_udp_up(cnx,view.session_id):
                         (G.role==ROLE_ENTRY?ps_find_udp_down(cnx,view.session_id):NULL);
                     if(p!=NULL&&p->udp_fec_rx!=NULL&&nb_udp_fec_rx_seen(p->udp_fec_rx,&view))break;
+                    int yfe2_source_noted=0;
+                    nb_sched_cnx_t* yfe2_runtime=runtime_for_cnx(cnx,0);
+                    if(p!=NULL&&p->yfe2_rx!=NULL&&yfe2_runtime&&
+                        yfe2_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED){
+                        int note_result=nb_yfe2_rx_note_source(p->yfe2_rx,
+                            yfe2_runtime->yfe2_generation,&view,picoquic_current_time());
+                        if(note_result>0)break;
+                        yfe2_source_noted=note_result==0;
+                    }
                     int handler_rc=udp_on_quic_datagram(cnx,&view);
                     if(handler_rc!=0)log4c_warn("%s udp datagram reject stage=handler rc=%d length=%zu type=%u usid=%u seq=%u frag=%u/%u route_len=%u",
                         role_name(G.role),handler_rc,length,view.type,view.session_id,view.sequence,
@@ -685,6 +1077,13 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                         if(p!=NULL&&p->flow_class==NB_FLOW_CLASS_MEDIA){
                             if(p->udp_fec_rx==NULL)p->udp_fec_rx=nb_udp_fec_rx_create();
                             if(p->udp_fec_rx!=NULL)(void)nb_udp_fec_rx_note(p->udp_fec_rx,&view,picoquic_current_time());
+                            yfe2_runtime=runtime_for_cnx(cnx,0);
+                            if(!yfe2_source_noted&&G.role==ROLE_EXIT&&yfe2_runtime&&
+                                yfe2_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED&&!p->probe_mode){
+                                if(p->yfe2_rx==NULL)p->yfe2_rx=nb_yfe2_rx_create();
+                                if(p->yfe2_rx)(void)nb_yfe2_rx_note_source(p->yfe2_rx,
+                                    yfe2_runtime->yfe2_generation,&view,picoquic_current_time());
+                            }
                         }
                     }
                 }

@@ -2,6 +2,16 @@ static int entry_open_upstream(void){
     return pool_get_or_create(&G.next_addr)<0?-1:0;
 }
 
+static int entry_signal_direct_pool(const nb_route_entry_t* selected,const nb_flow_policy_t* policy){
+    if(!selected||!nb_routes_signal_direct_candidate(policy?policy->rule_name:NULL,0,G.signal_direct_enabled))return -1;
+    char host[256];uint16_t base_port=0;
+    if(nb_routes_hop_endpoint(selected,host,sizeof(host),&base_port)!=0)return -1;
+    int port=worker_lane_port((int)base_port);if(port<1)return -1;
+    struct sockaddr_storage address;int is_name=0;
+    if(picoquic_get_server_address(host,port,&address,&is_name)!=0)return -1;
+    return pool_get_or_create(&address);
+}
+
 static int socks_udp_bind_socket(struct sockaddr_in* bound){
     return nb_udp_bind_relay_socket(g_socks_udp_port_min,g_socks_udp_port_max,
         &g_socks_udp_port_next,bound);
@@ -203,6 +213,7 @@ static void socks_handshake(proxy_stream_t* p){
         if(!whitelist_allowed(host,port)){ /* 白名单外 -> 拒绝(0x02 not allowed by ruleset), 不占三跳线路 */
             log4c_debug("entry id=%u BLOCKED %s:%d (not in whitelist)",p->id,host,port);
             uint8_t r[10]={0x05,0x02,0,0x01,0,0,0,0,0,0}; (void)send(p->tcp_fd,r,10,MSG_NOSIGNAL); ps_free(p); return; }
+        nb_flow_policy_t pol; flow_policy_for_host(host, port, &pol);
         const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(p->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
         if(G.exit_routes_enabled&&!selected){uint8_t r[10]={5,1,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"no-healthy-route");ps_free(p);return;}if(selected){p->route_index=nb_routes_acquire(&G.exit_routes,selected);if(p->route_index<0){ps_free(p);return;}}
         if(port==NB_PROBE_PORT&&(!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
@@ -213,7 +224,12 @@ static void socks_handshake(proxy_stream_t* p){
         memmove(p->socks_buf,p->socks_buf+need,p->socks_len-need); p->socks_len-=need;
         /* 构造 route: 中间跳前缀(可空) + 动态 target */
         char route[300];
-        const char* mid=selected?selected->hop:G.mid_route;
+        int direct_pool=entry_signal_direct_pool(selected,&pol);
+        int signal_direct=direct_pool>=0;
+        if(signal_direct)p->down_pool_id=direct_pool;
+        else if(G.signal_direct_enabled&&nb_routes_signal_direct_candidate(pol.rule_name,0,1))
+            log4c_warn("entry id=%u signal direct unavailable rule=%s; fallback=middle",p->id,pol.rule_name);
+        const char* mid=signal_direct?"":(selected?selected->hop:G.mid_route);
         int route_len=mid[0]
             ? snprintf(route,sizeof(route),"%s,T:%s:%d",mid,host,port)
             : snprintf(route,sizeof(route),"T:%s:%d",host,port);
@@ -223,11 +239,10 @@ static void socks_handshake(proxy_stream_t* p){
             (void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_free(p);return;
         }
         snprintf(p->route,sizeof(p->route),"%s",route);
-        nb_flow_policy_t pol; flow_policy_for_host(host, port, &pol);
         int prio=pol.prio;
-        log4c_info("entry id=%u classify peer=%s host=%s port=%d class=%s lane=%s fec=%s rule=%s prio=%d route=%s",
+        log4c_info("entry id=%u classify peer=%s host=%s port=%d class=%s lane=%s fec=%s rule=%s prio=%d path=%s route=%s",
             p->id, p->peer_addr, host, port, nb_flow_class_name(pol.flow_class), nb_flow_lane_name(pol.lane_hint),
-            nb_flow_fec_name(pol.fec_hint), pol.rule_name, prio, route);
+            nb_flow_fec_name(pol.fec_hint), pol.rule_name, prio, signal_direct?"signal-direct":"middle", route);
         if(selected)log4c_debug("entry id=%u selected exit route=%s hop=%s",p->id,selected->name,selected->hop);
         if(downstream_open_stream(p,route,&pol)!=0){ ps_free(p); return; }
         p->socks_stage=3;
@@ -536,14 +551,16 @@ static void udp_drain_fd(int fd,const struct sockaddr_storage* local){
 /* P1-2b: UDP GSO 批量发送。picoquic 逐包 prepare, 我们把连续的、同目的地址、同段大小的包攒进一个
  * 缓冲, 用 sendmsg + UDP_SEGMENT 一次 syscall 发出(内核分段)。段大小需统一(除末段可更小)。
  * GSO 不支持(老内核/EIO)时逐段 sendto 回退, 保证正确性。 */
-static void udp_send_batch(void){
+static size_t udp_send_batch(void){
     uint8_t gbuf[64*1536]; size_t glen=0; int gseg=0,gfd=-1; struct sockaddr_storage gto; socklen_t gtolen=0;
+    size_t prepared=0;
     for(;;){
         uint8_t sb[1536]; size_t sl=0; struct sockaddr_storage to,fr; int ifx=0;
         picoquic_connection_id_t lc; picoquic_cnx_t* lcnx=NULL;
         uint64_t send_now=picoquic_current_time();
         int r=picoquic_prepare_next_packet(G.quic,send_now,sb,sizeof(sb),&sl,&to,&fr,&ifx,&lc,&lcnx);
         if(r!=0||sl==0) break;
+        prepared++;
         int fd=(G.role==ROLE_MIDDLE&&pool_contains_cnx(lcnx))?G.client_udp_fd:G.udp_fd;
         socklen_t tl=(to.ss_family==AF_INET)?sizeof(struct sockaddr_in):sizeof(struct sockaddr_in6);
         if(!g_udp_gso_enabled){
@@ -570,17 +587,19 @@ static void udp_send_batch(void){
     }
     if(glen>0){size_t errors=nb_udp_send_gso(gfd,gbuf,glen,(size_t)gseg,(struct sockaddr*)&gto,gtolen);
         if(errors)nb_metrics_note_udp_error(&g_metrics_state,errors);}
+    return prepared;
 }
 
 static void usage(const char* prog){
     fprintf(stderr,
         "Usage:\n"
         "  entry(固定target): %s -r entry -l <tcp_port> -n <hop1_host> -N <hop1_qport> -R <route> -c <cert> -k <key> -a <ca>\n"
-        "  entry(SOCKS5入口): %s -r entry -l <socks_port> -n <hop1_host> -N <hop1_qport> -S -U <users> -Q <tenants> [-M <mid_route>] -c <cert> -k <key> -a <ca>\n"
+        "  entry(SOCKS5入口): %s -r entry -l <socks_port> -n <hop1_host> -N <hop1_qport> -S -U <users> -Q <tenants> [-M <mid_route>] [--signal-direct] -c <cert> -k <key> -a <ca>\n"
         "  middle           : %s -r middle -p <quic_port> -c <cert> -k <key> -a <ca>\n"
         "  exit             : %s -r exit   -p <quic_port> -c <cert> -k <key> -a <ca>\n"
         "  route(发给第一跳): \"H:hop2:qport,...,T:target:port\" (两跳仅 \"T:target:port\")\n"
         "  -S: SOCKS5 入口, target 由 SOCKS5 CONNECT 动态获取; -M: 中间跳前缀如 \"H:kz:4443\"(空=两跳)\n"
+        "  --signal-direct: 指定低流量 TCP 信令绕过 middle，仍由 exit 访问 target\n"
         "  -F: TikTok 内部分流规则文件(默认尝试 /root/nb/tiktok_flow_rules.conf 或环境变量 NB_TIKTOK_RULES)\n",
         prog,prog,prog,prog);
 }

@@ -31,6 +31,7 @@ typedef struct nb_global {
     char mid_route[256];                 /* entry SOCKS 模式: 中间跳前缀 "H:kz:4443"(可空=两跳) */
     nb_routes_t exit_routes;
     int exit_routes_enabled;
+    int signal_direct_enabled;           /* selected low-volume TCP rules connect directly to exit */
     /* entry/middle: 到下一跳的 QUIC 连接池(每条独立 cwnd/pacing/flow-control, round-robin 分流) */
     cnx_pool_t pools[NB_MAX_PATH_POOLS];
     int pool_count;

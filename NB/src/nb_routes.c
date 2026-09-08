@@ -34,6 +34,21 @@ int nb_routes_load(nb_routes_t* routes,const char* path,char* error,size_t error
 
 uint64_t nb_routes_hash(const char* first,const char* second,uint16_t port){uint64_t h=1469598103934665603ULL;const char* parts[2]={first?first:"",second?second:""};for(int p=0;p<2;p++)for(const unsigned char* s=(const unsigned char*)parts[p];*s;s++){h^=*s;h*=1099511628211ULL;}h^=port;h*=1099511628211ULL;return h;}
 
+int nb_routes_hop_endpoint(const nb_route_entry_t* route,char* host,size_t host_cap,uint16_t* port){
+    if(!route||!host||host_cap==0||!port||strncmp(route->hop,"H:",2))return -1;
+    const char* start=route->hop+2;const char* colon=strrchr(start,':');char* end=NULL;
+    long parsed=colon?strtol(colon+1,&end,10):0;size_t length=colon?(size_t)(colon-start):0;
+    if(!colon||length==0||length>=host_cap||!end||*end||parsed<1||parsed>65535)return -1;
+    memcpy(host,start,length);host[length]=0;*port=(uint16_t)parsed;return 0;
+}
+
+int nb_routes_signal_direct_candidate(const char* rule_name,int udp_mode,int enabled){
+    static const char* const rules[]={"live-netacc*","rtc-access*","frontier*","teko*"};
+    if(!enabled||udp_mode||!rule_name)return 0;
+    for(size_t i=0;i<sizeof(rules)/sizeof(rules[0]);i++)if(!strcmp(rule_name,rules[i]))return 1;
+    return 0;
+}
+
 const nb_route_entry_t* nb_routes_pick_key(nb_routes_t* routes,uint64_t key,uint64_t now_us){
     if(!routes)return NULL;
     size_t best=NB_ROUTE_MAX;uint64_t best_score=0;

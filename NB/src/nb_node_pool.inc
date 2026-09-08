@@ -203,15 +203,24 @@ static int pool_line_bad(cnx_pool_t* pool, int prio, double* best_loss, double* 
 
 static int pool_udp_fec_refresh(cnx_pool_t* pool,uint64_t now){
     if(pool==NULL)return 0;
-    int best=pool_quality_best(pool,-1,1);
-    int second=best>=0?pool_quality_best(pool,best,1):-1;
-    int sample=second>=0?second:best;
+    int sample=-1;
+    for(int idx=0;idx<POOL_SIZE;idx++){
+        if(!pool_quality_sampled(pool,idx,now))continue;
+        if(sample<0||pool->recent_loss[idx]>pool->recent_loss[sample]||
+            (pool->recent_loss[idx]==pool->recent_loss[sample]&&pool->recent_rtt_var[idx]>pool->recent_rtt_var[sample]))sample=idx;
+    }
     if(sample<0)return nb_udp_fec_adaptive_update(&pool->udp_fec,0,0,0,now);
     double loss=pool->recent_loss[sample];uint64_t jitter=pool->recent_rtt_var[sample];
     int previous=pool->udp_fec.active;
+    uint8_t previous_r=pool->udp_fec.repair_count;
     int active=nb_udp_fec_adaptive_update(&pool->udp_fec,loss,jitter,1,now);
-    if(active!=previous)log4c_info("udp FEC adaptive state=%s loss=%.3f%% jitter=%.1fms",
-        active?"on":"off",loss,jitter/1000.0);
+    if(active!=previous||(active&&pool->udp_fec.repair_count!=previous_r))log4c_info("udp FEC adaptive state=%s loss=%.3f%% jitter=%.1fms r=%u",
+        active?"on":"off",loss,jitter/1000.0,pool->udp_fec.repair_count);
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(p->in_use&&p->udp_fec_tx&&p->down_pool_id>=0&&(&G.pools[p->down_pool_id]==pool))
+            (void)nb_udp_fec_tx_set_repair_count(p->udp_fec_tx,pool->udp_fec.repair_count?pool->udp_fec.repair_count:NB_UDP_FEC_DEFAULT_R);
+    }
     return active;
 }
 

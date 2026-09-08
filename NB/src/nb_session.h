@@ -16,6 +16,8 @@
 #include "nb_udp_queue.h"
 #include "nb_udp_fec.h"
 #include "nb_udp_io.h"
+#include "nb_yfe2_block.h"
+#include "nb_yfe2_rx.h"
 
 typedef struct {
     nb_live_queue_clock_t down_tx;
@@ -206,9 +208,15 @@ typedef struct proxy_stream {
     uint8_t* udp_pending_tx;
     size_t udp_pending_tx_len;
     size_t udp_pending_tx_cap;
+    uint8_t* yfe2_parity_tx;
+    size_t yfe2_parity_tx_len;
+    size_t yfe2_parity_tx_cap;
     nb_udp_reassembly_t* udp_reassembly;
     nb_udp_fec_tx_t* udp_fec_tx;
     nb_udp_fec_rx_t* udp_fec_rx;
+    nb_yfe2_tx_t* yfe2_tx;
+    nb_yfe2_rx_t* yfe2_rx;
+    uint64_t yfe2_generation;
     uint64_t udp_fec_source_packets;
     uint64_t udp_fec_repairs_sent;
     uint64_t udp_fec_repairs_received;
@@ -220,6 +228,17 @@ typedef struct proxy_stream {
     uint64_t udp_assoc_malformed;
     uint64_t udp_assoc_policy_drop;
     uint64_t udp_queue_pressure_dropped;
+    uint64_t yfe2_scheduler_expired;
+    uint64_t yfe2_original;
+    uint64_t yfe2_baseline_parity;
+    uint64_t yfe2_burst_parity;
+    uint64_t yfe2_parity_received;
+    uint64_t yfe2_business_bytes;
+    uint64_t yfe2_wire_bytes;
+    uint64_t yfe2_encoder_queue_drop;
+    uint64_t yfe2_parity_queue_drop;
+    uint64_t yfe2_pmtu_fallback;
+    uint64_t yfe2_probe_parity_suppressed;
     uint64_t udp_queue_pressure_last_warn_at;
     nb_udp_queue_drop_history_t udp_queue_drop_history;
     uint64_t udp_assoc_first_raw_at;

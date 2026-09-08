@@ -48,7 +48,7 @@ static uint64_t directive_bit(const char* key){
     if(!strcmp(key,"role"))return 1ULL<<3;
     static const char* fields[]={"cc","bbr_options","cwin_max_bytes","mtu_max","reorder_gap",
         "reorder_delay_us","udp_gso","fec_observe","fec_active","udp_fec_adaptive","udp_fec_k",
-        "udp_fec_hold_us","target_rate_bps","seed_rtt_us","startup_cwin_bytes"};
+        "udp_fec_hold_us","target_rate_bps","seed_rtt_us","startup_cwin_bytes","udp_fec_mode"};
     const char* field=NULL;unsigned offset=0;
     if(!strncmp(key,"ingress.",8)){field=key+8;offset=4;}
     else if(!strncmp(key,"egress.",7)){field=key+7;offset=20;}
@@ -78,6 +78,10 @@ static int parse_link(nb_transport_link_profile_t* link,const char* field,const 
     if(!strcmp(field,"udp_fec_adaptive"))return parse_bool(value,&link->udp_fec_adaptive);
     if(!strcmp(field,"udp_fec_k")){uint64_t parsed=0;if(parse_u64(value,2,8,&parsed))return -1;link->udp_fec_k=(uint32_t)parsed;return 0;}
     if(!strcmp(field,"udp_fec_hold_us"))return parse_u64(value,100,1000000,&link->udp_fec_hold_us);
+    if(!strcmp(field,"udp_fec_mode")){
+        if(strcmp(value,"off")&&strcmp(value,"adaptive-v2")&&strcmp(value,"nb-yfe2-optional"))return -1;
+        memcpy(link->udp_fec_mode,value,strlen(value)+1);return 0;
+    }
     if(!strcmp(field,"target_rate_bps"))return parse_u64(value,1000000,1000000000ULL,&link->target_rate_bps);
     if(!strcmp(field,"seed_rtt_us"))return parse_u64(value,1000,60000000ULL,&link->seed_rtt_us);
     if(!strcmp(field,"startup_cwin_bytes"))return parse_u64(value,65536,67108864ULL,&link->startup_cwin_bytes);
@@ -97,6 +101,15 @@ static int validate_link(const nb_transport_link_profile_t* link){
 }
 
 void nb_transport_profile_state_init(nb_transport_profile_state_t* state){if(state)memset(state,0,sizeof(*state));}
+
+uint64_t nb_transport_shared_cwin_max(const nb_transport_link_profile_t* ingress,
+    const nb_transport_link_profile_t* egress){
+    if(ingress==NULL||!ingress->present)return egress&&egress->present?egress->cwin_max_bytes:0;
+    if(egress==NULL||!egress->present)return ingress->cwin_max_bytes;
+    if(ingress->cwin_max_bytes==0||egress->cwin_max_bytes==0)return 0;
+    return ingress->cwin_max_bytes>egress->cwin_max_bytes?
+        ingress->cwin_max_bytes:egress->cwin_max_bytes;
+}
 
 static int absolute_path(const char* path){
 #ifdef _WIN32
@@ -124,7 +137,7 @@ int nb_transport_profile_load(const char* path,nb_transport_profile_t* profile,c
         *separator=0;char* key=trim(line);char* value=trim(separator+1);uint64_t parsed=0;
         uint64_t bit=directive_bit(key);if(bit==0){free(bytes);return fail(error,error_cap,"unknown profile directive: %s",key);}
         if(directives&bit){free(bytes);return fail(error,error_cap,"duplicate profile directive: %s",key);}directives|=bit;
-        if(!strcmp(key,"schema")){if(parse_u64(value,1,1,&parsed)){free(bytes);return fail(error,error_cap,"invalid profile schema");}profile->schema_version=(uint32_t)parsed;continue;}
+        if(!strcmp(key,"schema")){if(parse_u64(value,1,2,&parsed)){free(bytes);return fail(error,error_cap,"invalid profile schema");}profile->schema_version=(uint32_t)parsed;continue;}
         if(!strcmp(key,"line_id")){if(!safe_id(value,64)){free(bytes);return fail(error,error_cap,"invalid profile line id");}memcpy(profile->line_id,value,strlen(value)+1);continue;}
         if(!strcmp(key,"generation")){if(parse_u64(value,1,UINT64_MAX,&profile->generation)){free(bytes);return fail(error,error_cap,"invalid profile generation");}continue;}
         if(!strcmp(key,"role")){if(strcmp(value,"entry")&&strcmp(value,"middle")&&strcmp(value,"exit")){free(bytes);return fail(error,error_cap,"invalid profile role");}memcpy(profile->role,value,strlen(value)+1);continue;}
@@ -134,11 +147,20 @@ int nb_transport_profile_load(const char* path,nb_transport_profile_t* profile,c
         if(link==NULL||parse_link(link,field,value)){free(bytes);return fail(error,error_cap,"invalid profile directive: %s",key);}
     }
     free(bytes);
-    if(profile->schema_version!=1||profile->line_id[0]==0||profile->generation==0||profile->role[0]==0||
+    if((profile->schema_version!=1&&profile->schema_version!=2)||profile->line_id[0]==0||profile->generation==0||profile->role[0]==0||
         validate_link(&profile->ingress)||validate_link(&profile->egress))return fail(error,error_cap,"profile is incomplete");
     if((!strcmp(profile->role,"entry")&&(!profile->egress.present||profile->ingress.present))||
         (!strcmp(profile->role,"middle")&&(!profile->ingress.present||!profile->egress.present))||
         (!strcmp(profile->role,"exit")&&(!profile->ingress.present||profile->egress.present)))return fail(error,error_cap,"profile links do not match role");
+    if(profile->schema_version==1&&(profile->ingress.udp_fec_mode[0]||profile->egress.udp_fec_mode[0]))
+        return fail(error,error_cap,"schema 1 does not support udp_fec_mode");
+    if(profile->schema_version==2){
+        const char* ingress=profile->ingress.udp_fec_mode[0]?profile->ingress.udp_fec_mode:"off";
+        const char* egress=profile->egress.udp_fec_mode[0]?profile->egress.udp_fec_mode:"off";
+        if(!strcmp(ingress,"nb-yfe2-optional")||
+            (!strcmp(egress,"nb-yfe2-optional")&&strcmp(profile->role,"middle")))
+            return fail(error,error_cap,"nb-yfe2-optional is only valid on middle egress");
+    }
     return 0;
 }
 

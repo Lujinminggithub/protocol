@@ -27,6 +27,11 @@ int main(void){
     if(load!=0)fprintf(stderr,"load failed: %s path=%s\n",error,absolute);
     CHECK(load==0&&loaded.egress.udp_fec_adaptive==1&&loaded.egress.udp_fec_k==8&&loaded.egress.udp_fec_hold_us==2000);
     CHECK(loaded.egress.target_rate_bps==5000000&&loaded.egress.seed_rtt_us==202000&&loaded.egress.startup_cwin_bytes==262144);
+    CHECK(nb_transport_shared_cwin_max(&loaded.ingress,&loaded.egress)==0);
+    nb_transport_link_profile_t bounded=loaded.egress;bounded.cwin_max_bytes=1048576;
+    CHECK(nb_transport_shared_cwin_max(&loaded.ingress,&bounded)==1048576);
+    bounded.present=0;
+    CHECK(nb_transport_shared_cwin_max(&loaded.ingress,&bounded)==loaded.ingress.cwin_max_bytes);
     nb_transport_profile_state_t state;nb_transport_profile_state_init(&state);
     CHECK(nb_transport_profile_prepare(&state,absolute,2,loaded.fingerprint,"line-1","middle",error,sizeof(error))==0);
     CHECK(nb_transport_profile_commit(&state,2,error,sizeof(error))==0&&state.active.generation==2);
@@ -42,6 +47,24 @@ int main(void){
     CHECK(nb_transport_profile_load(absolute,&loaded,error,sizeof(error))==0&&loaded.egress.target_rate_bps==0);
     const char* partial="egress.target_rate_bps=5000000\n";
     fd=open(path,O_WRONLY|O_APPEND);CHECK(fd>=0);CHECK(write(fd,partial,strlen(partial))==(ssize_t)strlen(partial));close(fd);
+    CHECK(nb_transport_profile_load(absolute,&loaded,error,sizeof(error))!=0);
+    const char* schema2="schema=2\nline_id=line-1\ngeneration=3\nrole=middle\n"
+        "ingress.cc=cubic\ningress.cwin_max_bytes=524288\ningress.mtu_max=1404\ningress.reorder_gap=8\ningress.reorder_delay_us=20000\n"
+        "egress.cc=bbr\negress.cwin_max_bytes=0\negress.mtu_max=1404\negress.reorder_gap=16\negress.reorder_delay_us=120000\n"
+        "egress.udp_fec_mode=nb-yfe2-optional\n";
+    fd=open(path,O_WRONLY|O_TRUNC);CHECK(fd>=0);CHECK(write(fd,schema2,strlen(schema2))==(ssize_t)strlen(schema2));close(fd);
+    CHECK(nb_transport_profile_load(absolute,&loaded,error,sizeof(error))==0);
+    CHECK(loaded.schema_version==2&&!strcmp(loaded.egress.udp_fec_mode,"nb-yfe2-optional"));
+    const char* schema1_mode="schema=1\nline_id=line-1\ngeneration=3\nrole=middle\n"
+        "ingress.cc=cubic\ningress.cwin_max_bytes=524288\ningress.mtu_max=1404\ningress.reorder_gap=8\ningress.reorder_delay_us=20000\n"
+        "egress.cc=bbr\negress.cwin_max_bytes=0\negress.mtu_max=1404\negress.reorder_gap=16\negress.reorder_delay_us=120000\n"
+        "egress.udp_fec_mode=nb-yfe2-optional\n";
+    fd=open(path,O_WRONLY|O_TRUNC);CHECK(fd>=0);CHECK(write(fd,schema1_mode,strlen(schema1_mode))==(ssize_t)strlen(schema1_mode));close(fd);
+    CHECK(nb_transport_profile_load(absolute,&loaded,error,sizeof(error))!=0);
+    const char* entry_mode="schema=2\nline_id=line-1\ngeneration=3\nrole=entry\n"
+        "egress.cc=cubic\negress.cwin_max_bytes=524288\negress.mtu_max=1404\negress.reorder_gap=8\negress.reorder_delay_us=20000\n"
+        "egress.udp_fec_mode=nb-yfe2-optional\n";
+    fd=open(path,O_WRONLY|O_TRUNC);CHECK(fd>=0);CHECK(write(fd,entry_mode,strlen(entry_mode))==(ssize_t)strlen(entry_mode));close(fd);
     CHECK(nb_transport_profile_load(absolute,&loaded,error,sizeof(error))!=0);
     unlink(path);puts("transport profile tests passed");return 0;
 }

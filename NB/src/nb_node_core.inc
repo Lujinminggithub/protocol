@@ -67,6 +67,7 @@
 #include "nb_wait.h"
 #include "nb_shard.h"
 #include "nb_udp_probe_echo.h"
+#include "nb_yfe2_node.h"
 #include "log/log4c.h"
 
 #define NB_ALPN "nb/1"          /* Newbility(NB) 新传输协议 ALPN */
@@ -154,6 +155,7 @@ static _Thread_local nb_instance_t* nb_current_instance;
 #define g_memory_released_pending (nb_current_instance->memory_released_pending)
 #define g_fec_session_index (nb_current_instance->fec_session_index)
 #define g_sched_cnx (nb_current_instance->sched_cnx)
+#define g_yfe2_worker (nb_current_instance->yfe2_worker)
 static int worker_lane_port(int base){
     const char* enabled=nb_instance_env(nb_current_instance,"NB_WORKER_LANE_PORTS");
     if(!enabled||(!strcmp(enabled,"0")||!strcasecmp(enabled,"off")))return base;
@@ -167,8 +169,13 @@ static nb_sched_cnx_t* runtime_for_cnx(picoquic_cnx_t* cnx,int create){
     for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==cnx)return &g_sched_cnx[i];
     if(!create)return NULL;
     for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==NULL){
-        g_sched_cnx[i].cnx=cnx;memset(&g_sched_cnx[i].sched,0,sizeof(g_sched_cnx[i].sched));
-        return &g_sched_cnx[i];
+        nb_sched_cnx_t* runtime=&g_sched_cnx[i];memset(runtime,0,sizeof(*runtime));
+        runtime->cnx=cnx;
+        runtime->yfe2_generation=++nb_current_instance->yfe2_generation_next;
+        if(runtime->yfe2_generation==0)runtime->yfe2_generation=++nb_current_instance->yfe2_generation_next;
+        nb_yfe2_negotiation_init(&runtime->yfe2_negotiation);
+        nb_yfe2_adaptive_init(&runtime->yfe2_adaptive);
+        return runtime;
     }
     return NULL;
 }
@@ -177,12 +184,58 @@ static nb_live_sched_t* sched_for_cnx(picoquic_cnx_t* cnx,int create){
     nb_sched_cnx_t* runtime=runtime_for_cnx(cnx,create);return runtime?&runtime->sched:NULL;
 }
 
+static void yfe2_runtime_metrics_snapshot(const nb_sched_cnx_t* runtime,
+    nb_yfe2_metrics_t* metrics){
+    nb_yfe2_metrics_init(metrics);if(runtime==NULL)return;
+    metrics->negotiation_state=runtime->yfe2_negotiation.state;
+    metrics->mode=runtime->yfe2_adaptive.mode;
+    metrics->transitions=runtime->yfe2_adaptive.transitions;
+    metrics->effective_physical_loss=runtime->yfe2_adaptive.effective_physical_loss;
+    metrics->last_trigger_us=runtime->yfe2_adaptive.last_trigger_us;
+    metrics->burst_until_us=runtime->yfe2_adaptive.burst_until_us;
+    memcpy(metrics->ignored_samples,runtime->yfe2_adaptive.ignored_samples,
+        sizeof(metrics->ignored_samples));
+    metrics->probe_samples_ignored=
+        runtime->yfe2_adaptive.ignored_samples[NB_YFE2_IGNORE_REASON_COUNT-1];
+}
+
+static void yfe2_stream_metrics_snapshot(const proxy_stream_t* p,
+    nb_yfe2_metrics_t* metrics);
+
+static void yfe2_collect_metrics(nb_yfe2_metrics_t* aggregate,uint64_t generation,
+    int include_lifetime){
+    if(include_lifetime)*aggregate=nb_current_instance->yfe2_lifetime;
+    else nb_yfe2_metrics_init(aggregate);
+    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++){
+        nb_sched_cnx_t* runtime=&g_sched_cnx[i];
+        if(runtime->cnx==NULL||(generation&&runtime->yfe2_generation!=generation))continue;
+        nb_yfe2_metrics_t metrics;yfe2_runtime_metrics_snapshot(runtime,&metrics);
+        nb_yfe2_metrics_add(aggregate,&metrics);
+    }
+    for(int i=0;i<MAX_CONN;i++){
+        proxy_stream_t* p=&G.streams[i];
+        if(!p->in_use||(generation&&p->yfe2_generation!=generation))continue;
+        nb_yfe2_metrics_t metrics;yfe2_stream_metrics_snapshot(p,&metrics);
+        nb_yfe2_metrics_add(aggregate,&metrics);
+    }
+    if(include_lifetime&&g_yfe2_worker){
+        nb_yfe2_worker_metrics_t worker;nb_yfe2_worker_snapshot(g_yfe2_worker,&worker);
+        aggregate->encode_ns=worker.encode_ns;aggregate->encoder_queue_drop=worker.dropped;
+        if(worker.memory_high>aggregate->memory_high_bytes)
+            aggregate->memory_high_bytes=worker.memory_high;
+    }
+}
+
 static void udp_lifecycle_wake_due(uint64_t now_us){uintptr_t link;while((link=nb_udp_lifecycle_mark_due(&g_udp_lifecycle,now_us))!=0)(void)picoquic_mark_datagram_ready((picoquic_cnx_t*)link,1);}
 static int udp_lifecycle_schedule(picoquic_cnx_t* cnx,uint8_t type,uint32_t session_id,const char* route){if(cnx==NULL||session_id==0||route==NULL||!*route)return -1;uint64_t now=picoquic_current_time();int rc=nb_udp_lifecycle_schedule(&g_udp_lifecycle,(uintptr_t)cnx,type,session_id,route,now);if(rc==0)udp_lifecycle_wake_due(now);return rc;}
 static void udp_lifecycle_forget_cnx(picoquic_cnx_t* cnx){nb_udp_lifecycle_forget_link(&g_udp_lifecycle,(uintptr_t)cnx);}
 
 static void sched_forget_cnx(picoquic_cnx_t* cnx){
-    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==cnx){memset(&g_sched_cnx[i],0,sizeof(g_sched_cnx[i]));return;}
+    for(size_t i=0;i<NB_SCHED_CNX_CAP;i++)if(g_sched_cnx[i].cnx==cnx){
+        nb_yfe2_metrics_t metrics;yfe2_runtime_metrics_snapshot(&g_sched_cnx[i],&metrics);
+        nb_yfe2_metrics_add(&nb_current_instance->yfe2_lifetime,&metrics);
+        memset(&g_sched_cnx[i],0,sizeof(g_sched_cnx[i]));return;
+    }
 }
 
 static int sched_media_pending(picoquic_cnx_t* cnx,const proxy_stream_t* exclude){
@@ -218,6 +271,7 @@ static void sched_refresh_stream(proxy_stream_t* p,uint64_t now){
 #define NB_EPOLL_TAG_LISTEN 3ULL
 #define NB_EPOLL_TAG_CONTROL 4ULL
 #define NB_EPOLL_TAG_AUTH 6ULL
+#define NB_EPOLL_TAG_YFE2 7ULL
 #define NB_EPOLL_TAG_STREAM (1ULL<<63)
 #define NB_EPOLL_TAG_UDP_SESSION (1ULL<<62)
 
@@ -271,6 +325,7 @@ static int queue_down(proxy_stream_t* p, const uint8_t* d, size_t n, int fin);
 static void middle_upstream_fc_set(proxy_stream_t* p, int enabled);
 static void middle_upstream_fc_update(proxy_stream_t* p, uint64_t now_us);
 static int queue_up(proxy_stream_t* p, const uint8_t* d, size_t n, int fin);
+static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* view);
 static void fwd_down(proxy_stream_t* p, uint8_t* d, size_t n, int fin);
 static void fwd_up(proxy_stream_t* p, uint8_t* d, size_t n, int fin);
 static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr);
@@ -331,14 +386,18 @@ static int transport_apply_active_profile(void){
         nb_current_instance->transport_ingress.generation=state->active.generation;nb_current_instance->transport_ingress.active=1;}
     if(state->active.egress.present){nb_current_instance->transport_egress.link=state->active.egress;
         nb_current_instance->transport_egress.generation=state->active.generation;nb_current_instance->transport_egress.active=1;}
-    transport_set_default_cc(local);picoquic_set_cwin_max(G.quic,local->cwin_max_bytes);
+    uint64_t shared_cwin_max=G.role==ROLE_MIDDLE?
+        nb_transport_shared_cwin_max(&state->active.ingress,&state->active.egress):
+        local->cwin_max_bytes;
+    transport_set_default_cc(local);picoquic_set_cwin_max(G.quic,shared_cwin_max);
     picoquic_set_mtu_max(G.quic,local->mtu_max);g_udp_gso_enabled=local->udp_gso;
     g_reorder_gap=outbound->reorder_gap;g_reorder_delay_us=outbound->reorder_delay_us;
     g_fec_v15_observe=outbound->fec_observe;g_fec_v15_active=outbound->fec_active;
     transport_refresh_outbound_pools();
-    log4c_info("transport profile committed generation=%llu role=%s ingress=%d egress=%d cc=%s mtu=%u",
+    log4c_info("transport profile committed generation=%llu role=%s ingress=%d egress=%d cc=%s mtu=%u cwin_max=%llu",
         (unsigned long long)state->active.generation,role_name(G.role),state->active.ingress.present,
-        state->active.egress.present,local->cc,local->mtu_max);return 0;
+        state->active.egress.present,local->cc,local->mtu_max,
+        (unsigned long long)shared_cwin_max);return 0;
 }
 
 static int transport_bind_connection(picoquic_cnx_t* cnx,int outbound){
@@ -609,10 +668,34 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
         }
         int udp_fec_active=0;
         for(int pool=0;pool<G.pool_count;pool++)udp_fec_active|=G.pools[pool].udp_fec.active;
-        nb_metrics_fec_t fec={g_fec_v15_observe,g_fec_v15_active,fm.blocks_encoded,fm.blocks_delivered,
-            fm.blocks_recovered,fm.nack_sent,fm.retx_sent,udp_fec_active,udp_fec_source,
-            udp_fec_sent,udp_fec_received,udp_fec_recovered};
+        nb_metrics_fec_t fec={.observe=g_fec_v15_observe,.active=g_fec_v15_active,
+            .tx_blocks=fm.blocks_encoded,.rx_blocks=fm.blocks_delivered,
+            .recovered=fm.blocks_recovered,.nack=fm.nack_sent,.retx=fm.retx_sent,
+            .udp_adaptive_active=udp_fec_active,.udp_source_packets=udp_fec_source,
+            .udp_repairs_sent=udp_fec_sent,.udp_repairs_received=udp_fec_received,
+            .udp_recovered=udp_fec_recovered};
+        yfe2_collect_metrics(&fec.nb_yfe2,0,1);
         return nb_metrics_render_json(out,cap,role_name(G.role),worker,release,profile,profile_schema,&snapshot,&fec);
+    }
+    if(!strcmp(command,"fec")||!strcmp(command,"GET /fec")){
+        size_t used=0;int written=snprintf(out,cap,"{\"connections\":[");
+        if(written<0||(size_t)written>=cap)return -1;
+        used=(size_t)written;
+        size_t emitted=0;
+        for(size_t i=0;i<NB_SCHED_CNX_CAP&&emitted<8;i++){
+            nb_sched_cnx_t* runtime=&g_sched_cnx[i];
+            if(runtime->cnx==NULL||runtime->yfe2_negotiation.state==NB_YFE2_NEG_DISABLED)continue;
+            nb_yfe2_metrics_t metrics;yfe2_collect_metrics(&metrics,runtime->yfe2_generation,0);
+            char item[4096];if(nb_yfe2_metrics_render_json(item,sizeof(item),&metrics)<0)return -1;
+            written=snprintf(out+used,cap-used,"%s{\"generation\":%llu,\"metrics\":%s}",
+                emitted?",":"",(unsigned long long)runtime->yfe2_generation,item);
+            if(written<0||(size_t)written>=cap-used)return -1;
+            used+=(size_t)written;emitted++;
+        }
+        nb_yfe2_metrics_t aggregate;yfe2_collect_metrics(&aggregate,0,1);
+        char summary[4096];if(nb_yfe2_metrics_render_json(summary,sizeof(summary),&aggregate)<0)return -1;
+        written=snprintf(out+used,cap-used,"],\"aggregate\":%s}\n",summary);
+        return written<0||(size_t)written>=cap-used?-1:(int)(used+(size_t)written);
     }
     if(!strcmp(command,"tenants")||!strcmp(command,"GET /tenants"))return nb_tenants_render_json(&g_tenants,out,cap);
     if(!strcmp(command,"routes")||!strcmp(command,"GET /routes"))return nb_routes_render_json(&G.exit_routes,out,cap,picoquic_current_time());

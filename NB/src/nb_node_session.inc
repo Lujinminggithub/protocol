@@ -101,7 +101,8 @@ static int udp_reassembly_ensure(proxy_stream_t* p){
 static uint64_t ps_dynamic_capacity(const proxy_stream_t* p){
     if(p==NULL)return 0;
     uint64_t total=p->down_tx.cap+p->up_tx.cap+p->q2t.cap+p->logical_tx.replay_capacity+
-        p->fec_dg_tx_cap+p->fec_stage_tx_cap+p->udp_down_tx_cap+p->udp_up_tx_cap+p->udp_pending_tx_cap;
+        p->fec_dg_tx_cap+p->fec_stage_tx_cap+p->udp_down_tx_cap+p->udp_up_tx_cap+
+        p->udp_pending_tx_cap+p->yfe2_parity_tx_cap;
     if(p->queue_clocks)total+=sizeof(*p->queue_clocks);
     if(p->logical_decoder)total+=sizeof(*p->logical_decoder);
     if(p->fec_ctrl_rxbuf)total+=NB_FEC_CTRL_RX_CAP;
@@ -211,6 +212,8 @@ static void ps_clear_stream_ctx_once(picoquic_cnx_t* cnx, uint64_t sid,
 }
 static void ps_free(proxy_stream_t* p){
     if(!p->in_use) return;               /* 幂等: 防拆流/回调重入导致 double free */
+    { nb_yfe2_metrics_t metrics;yfe2_stream_metrics_snapshot(p,&metrics);
+      nb_yfe2_metrics_add(&nb_current_instance->yfe2_lifetime,&metrics); }
     g_memory_released_pending+=ps_dynamic_capacity(p);
     if(p->close_reason[0] == 0) ps_set_close_reason(p, "released");
     if(p->logical_endpoint)log4c_info("%s logical flow close id=%u flow=%016llx%016llx reason=%s tx_base=%llu tx_next=%llu replay=%zu rx_delivered=%llu rx_next=%llu",
@@ -281,15 +284,18 @@ static void ps_free(proxy_stream_t* p){
     free(p->logical_decoder);p->logical_decoder=NULL;
     free(p->fec_ctrl_rxbuf);p->fec_ctrl_rxbuf=NULL;
     instance_queue_release(p->fec_dg_tx_len+p->fec_stage_tx_len+p->udp_down_tx_len+
-        p->udp_up_tx_len+p->udp_pending_tx_len);
+        p->udp_up_tx_len+p->udp_pending_tx_len+p->yfe2_parity_tx_len);
     free(p->fec_dg_tx); p->fec_dg_tx=NULL;
     free(p->fec_stage_tx); p->fec_stage_tx=NULL;
     free(p->udp_down_tx);p->udp_down_tx=NULL;
     free(p->udp_up_tx);p->udp_up_tx=NULL;
     free(p->udp_pending_tx);p->udp_pending_tx=NULL;
+    free(p->yfe2_parity_tx);p->yfe2_parity_tx=NULL;
     if(p->udp_reassembly){nb_udp_reassembly_dispose(p->udp_reassembly);free(p->udp_reassembly);p->udp_reassembly=NULL;}
     nb_udp_fec_tx_destroy(p->udp_fec_tx);p->udp_fec_tx=NULL;
     nb_udp_fec_rx_destroy(p->udp_fec_rx);p->udp_fec_rx=NULL;
+    free(p->yfe2_tx);p->yfe2_tx=NULL;
+    nb_yfe2_rx_destroy(p->yfe2_rx);p->yfe2_rx=NULL;
     fec_session_index_remove(p->fec_session_id,p);
     if(p->fec_engine!=NULL) fec_metrics_add(&g_fec_metrics_done,nb_fec_metrics(p->fec_engine));
     nb_fec_session_destroy(p->fec_engine); p->fec_engine=NULL;

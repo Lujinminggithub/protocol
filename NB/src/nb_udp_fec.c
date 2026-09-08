@@ -10,6 +10,8 @@
 #define NB_UDP_FEC_GROUPS 16u
 #define NB_UDP_FEC_LOSS_ON_PCT 0.30
 #define NB_UDP_FEC_LOSS_OFF_PCT 0.03
+#define NB_UDP_FEC_LOSS_R3_PCT 1.0
+#define NB_UDP_FEC_LOSS_R4_PCT 3.0
 #define NB_UDP_FEC_MIN_ON_US 30000000u
 
 typedef struct {
@@ -50,6 +52,7 @@ struct nb_udp_fec_tx {
     uint8_t direction;
     uint8_t repair_count;
     uint8_t repair_next;
+    uint8_t pending_repair_count;
     uint32_t session_id;
     uint32_t group_id;
     uint64_t hold_us;
@@ -80,9 +83,13 @@ static int source_valid(const nb_udp_wire_view_t* source){
 }
 
 nb_udp_fec_tx_t* nb_udp_fec_tx_create(uint8_t k,uint64_t hold_us){
-    if(k<2||k>NB_UDP_FEC_MAX_K||hold_us<100||hold_us>1000000)return NULL;
+    return nb_udp_fec_tx_create_ex(k,NB_UDP_FEC_DEFAULT_R,hold_us);
+}
+
+nb_udp_fec_tx_t* nb_udp_fec_tx_create_ex(uint8_t k,uint8_t repair_count,uint64_t hold_us){
+    if(k<2||k>NB_UDP_FEC_MAX_K||repair_count<1||repair_count>NB_UDP_FEC_MAX_R||hold_us<100||hold_us>1000000)return NULL;
     nb_udp_fec_tx_t* state=calloc(1,sizeof(*state));
-    if(state){state->k=k;state->hold_us=hold_us;state->repair_count=NB_UDP_FEC_MAX_R;state->repair_next=NB_UDP_FEC_MAX_R;}
+    if(state){state->k=k;state->hold_us=hold_us;state->repair_count=repair_count;state->repair_next=repair_count;}
     return state;
 }
 
@@ -95,7 +102,9 @@ uint64_t nb_udp_fec_tx_next_deadline(const nb_udp_fec_tx_t* state){
 
 static void tx_reset(nb_udp_fec_tx_t* state){
     uint8_t k=state->k;uint64_t hold=state->hold_us;uint8_t r=state->repair_count;
-    memset(state,0,sizeof(*state));state->k=k;state->hold_us=hold;state->repair_count=r;state->repair_next=r;
+    uint8_t pending=state->pending_repair_count;
+    memset(state,0,sizeof(*state));state->k=k;state->hold_us=hold;
+    state->repair_count=pending?pending:r;state->repair_next=state->repair_count;
 }
 
 static int tx_emit_next(nb_udp_fec_tx_t* state,uint8_t* out,size_t cap){
@@ -138,6 +147,14 @@ int nb_udp_fec_tx_feed(nb_udp_fec_tx_t* state,const nb_udp_wire_view_t* source,u
 }
 
 int nb_udp_fec_tx_next_repair(nb_udp_fec_tx_t* state,uint8_t* repair,size_t repair_cap){return tx_emit_next(state,repair,repair_cap);}
+
+int nb_udp_fec_tx_set_repair_count(nb_udp_fec_tx_t* state,uint8_t repair_count){
+    if(state==NULL||repair_count<1||repair_count>NB_UDP_FEC_MAX_R)return -1;
+    if(state->repair_next<state->repair_count||state->count>0){
+        state->pending_repair_count=repair_count;return 0;
+    }
+    state->repair_count=repair_count;state->repair_next=repair_count;state->pending_repair_count=0;return 0;
+}
 
 int nb_udp_fec_tx_flush_due(nb_udp_fec_tx_t* state,uint64_t now_us,uint8_t* repair,size_t repair_cap){
     if(state==NULL||repair==NULL)return -1;
@@ -199,7 +216,10 @@ int nb_udp_fec_adaptive_update(nb_udp_fec_adaptive_t* state,double loss_pct,uint
     (void)jitter_us;
     if(!sample_valid)return state->active;
     int degraded=loss_pct>NB_UDP_FEC_LOSS_ON_PCT;
-    if(degraded){state->active=1;state->changed_at=now_us;}
+    if(degraded){
+        state->active=1;state->changed_at=now_us;
+        state->repair_count=(uint8_t)(loss_pct>NB_UDP_FEC_LOSS_R4_PCT?4:loss_pct>NB_UDP_FEC_LOSS_R3_PCT?3:2);
+    }
     else if(state->active&&now_us>=state->changed_at&&now_us-state->changed_at>=NB_UDP_FEC_MIN_ON_US&&loss_pct<=NB_UDP_FEC_LOSS_OFF_PCT){state->active=0;state->changed_at=now_us;}
     return state->active;
 }

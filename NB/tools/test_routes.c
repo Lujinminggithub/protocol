@@ -18,6 +18,19 @@ int main(void){
     for(int i=0;i<4&&ok;i++){const nb_route_entry_t* route=nb_routes_pick(&routes);ok=route&&!strcmp(route->name,expected[i]);}
     uint64_t key=nb_routes_hash("alice","live",443);const nb_route_entry_t* sticky=nb_routes_pick_key(&routes,key,1000);ok=ok&&sticky==nb_routes_pick_key(&routes,key,1000);
     int index=nb_routes_acquire(&routes,&routes.entries[0]);ok=ok&&index==0&&routes.entries[index].active==1;
+    char direct_host[256];uint16_t direct_port=0;
+    ok=ok&&nb_routes_hop_endpoint(&routes.entries[0],direct_host,sizeof(direct_host),&direct_port)==0;
+    ok=ok&&!strcmp(direct_host,"10.0.0.1")&&direct_port==4443;
+    ok=ok&&nb_routes_signal_direct_candidate("live-netacc*",0,1);
+    ok=ok&&nb_routes_signal_direct_candidate("rtc-access*",0,1);
+    ok=ok&&nb_routes_signal_direct_candidate("frontier*",0,1);
+    ok=ok&&nb_routes_signal_direct_candidate("teko*",0,1);
+    ok=ok&&!nb_routes_signal_direct_candidate("live-netacc*",1,1);
+    ok=ok&&!nb_routes_signal_direct_candidate("live-netacc*",0,0);
+    ok=ok&&!nb_routes_signal_direct_candidate("api*",0,1);
+    ok=ok&&!nb_routes_signal_direct_candidate("rtc*",0,1);
+    nb_route_entry_t invalid=routes.entries[0];snprintf(invalid.hop,sizeof(invalid.hop),"T:10.0.0.1:443");
+    ok=ok&&nb_routes_hop_endpoint(&invalid,direct_host,sizeof(direct_host),&direct_port)<0;
     ok=ok&&nb_routes_acquire(&routes,&routes.entries[0])<0;nb_routes_release(&routes,(size_t)index);
     index=nb_routes_acquire(&routes,&routes.entries[0]);routes.entries[index].failures=2;
     nb_routes_finish_session(&routes,(size_t)index);
