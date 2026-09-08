@@ -81,6 +81,13 @@ int nb_yfe2_counter_advanced(uint64_t previous,uint64_t current){
     return current>previous;
 }
 
+int nb_yfe2_rate_cap_limited(uint64_t business_bytes,uint64_t elapsed_us,
+    uint64_t target_rate_bps){
+    if(elapsed_us==0||target_rate_bps==0)return 0;
+    long double observed=(long double)business_bytes*8000000.0L/(long double)elapsed_us;
+    return observed>=(long double)target_rate_bps*0.95L;
+}
+
 int nb_yfe2_control_datagram_encode(uint8_t* out,size_t cap,uint32_t session_id,
     const nb_yfe2_control_t* control){
     uint8_t payload[NB_YFE2_CONTROL_SIZE];

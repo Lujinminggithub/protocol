@@ -220,6 +220,7 @@ static int yfe2_record_source(void* opaque,const nb_udp_wire_view_t* source,uint
     int result=nb_yfe2_tx_add(p->yfe2_tx,source,now_us,parity,sealed);
     if(result>=0){p->udp_fec_source_packets++;p->yfe2_original++;
         p->yfe2_business_bytes+=source->payload_length;
+        context->runtime->yfe2_business_bytes+=source->payload_length;
         p->yfe2_wire_bytes+=source->payload_length;}
     return result;
 }
@@ -395,6 +396,13 @@ static void yfe2_adaptive_tick(uint64_t now_us){
         sample.send_queue_full=limit.send_queue_full;
         sample.pmtu_fallbacks=yfe2_pmtu_fallbacks(runtime->cnx);
         if(limit.app_limited)sample.invalid_reasons|=NB_YFE2_IGNORE_APP_LIMITED;
+        uint64_t elapsed=runtime->yfe2_sample_at?now_us-runtime->yfe2_sample_at:0;
+        uint64_t business_delta=runtime->yfe2_business_bytes>=runtime->yfe2_business_bytes_previous?
+            runtime->yfe2_business_bytes-runtime->yfe2_business_bytes_previous:0;
+        if(nb_yfe2_rate_cap_limited(business_delta,elapsed,
+            nb_current_instance->transport_egress.link.target_rate_bps))
+            sample.invalid_reasons|=NB_YFE2_IGNORE_RATE_CAP;
+        runtime->yfe2_business_bytes_previous=runtime->yfe2_business_bytes;
         for(int stream=0;stream<MAX_CONN;stream++){
             proxy_stream_t* p=&G.streams[stream];
             if(!p->in_use||p->down_cnx!=runtime->cnx)continue;

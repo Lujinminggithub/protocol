@@ -49,6 +49,8 @@ typedef struct {
     uint64_t yfe2_sample_at;
     uint64_t yfe2_probe_packets;
     uint64_t yfe2_probe_packets_previous;
+    uint64_t yfe2_business_bytes;
+    uint64_t yfe2_business_bytes_previous;
 } nb_sched_cnx_t;
 
 typedef struct {

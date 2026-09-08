@@ -165,7 +165,7 @@ Exit 收到 systematic `NBUD` 时立即走原业务路径，同时按 `(connecti
 - scheduler expiry/send queue full增长；
 - PMTU blackhole/fallback 发生；
 - connection 为 app-limited 且当前 200ms 窗口发送少于 16 包；直播码率低于路径容量时 BBR 会长期正确标记 app-limited，但密集发送窗口内的实际丢包仍是有效物理证据；
-- 租户产品令牌发生等待，处于 rate-cap-limited；
+- 租户产品令牌发生等待，处于 rate-cap-limited；Relay 无法直接读取 Entry 的令牌状态时，以该 connection 最近 200ms 原始业务字节达到 profile `target_rate_bps` 的 95% 作为保守限速代理，parity 字节不参与该判断；
 - 样本来自内置开线/周期探针。
 
 Picoquic 必须通过只读适配接口暴露 app-limited、send queue full和累计路径丢包；租户 limiter 暴露当前 connection 的限速等待。任一信号不可可靠读取时，该窗口标记 invalid，不能猜测为物理丢包。
