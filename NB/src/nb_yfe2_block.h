@@ -9,6 +9,7 @@
 
 #define NB_YFE2_INTERLEAVE 4u
 #define NB_YFE2_FLUSH_US 10000ULL
+#define NB_YFE2_BLOCK_MAX_US 150000ULL
 
 typedef struct {
     uint64_t connection_generation;
@@ -36,6 +37,7 @@ typedef struct {
     uint32_t next_block_id;
     uint8_t next_slot;
     uint8_t parity_shards;
+    uint64_t last_source_at;
     nb_yfe2_tx_slot_t slots[NB_YFE2_INTERLEAVE];
 } nb_yfe2_tx_t;
 

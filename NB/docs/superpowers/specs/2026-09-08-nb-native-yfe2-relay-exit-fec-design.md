@@ -122,7 +122,9 @@ route 不在每个 parity 中重复；Exit 由同一 connection 上的 session I
 
 ## 编码数据路径
 
-每个媒体 UDP flow 维护四个交错 block。连续 systematic 分片轮流进入四个 block，使相邻丢包分散。block 满 16 个或首个分片等待 10ms 后封口。partial block 的缺位以全零 shard补足 K=16参与 RS，但 wire 只携带实际 descriptor count；decoder将未使用位置视为已知零 shard，只恢复和交付实际 data count，不向业务端交付 padding。
+每个媒体 UDP flow 维护四个交错 block。连续 systematic 分片轮流进入四个 block，使相邻丢包分散。block 满 16 个时立即封口；整个 flow 连续 10ms 没有新 systematic 时刷出全部 partial block；持续有流量时单个 block 最长 150ms 封口。partial block 的缺位以全零 shard补足 K=16参与 RS，但 wire 只携带实际 descriptor count；decoder将未使用位置视为已知零 shard，只恢复和交付实际 data count，不向业务端交付 padding。
+
+这里的 `flush_ms=10` 明确定义为 flow 空闲间隔，不是从 block 首包开始的硬期限。2026-09-08 首次 worker 0 canary 证明“首包后 10ms”在四路交错和低包率下会退化为接近每个原包一个 parity，实测开销 172.7%，因此被验收门禁拒绝并回滚。150ms 持续流上限用于同时约束恢复等待和正常期开销。
 
 原始路径顺序固定：
 
@@ -187,7 +189,7 @@ Picoquic 必须通过只读适配接口暴露 app-limited、send queue full和�
 - 产品业务字节、租户配额和 5Mbps/其他套餐限速只统计原始 payload；recovered payload 不重复计费。
 - systematic `NBUD` 使用原媒体优先级和原 deadline。
 - parity 使用 `NB_PRIO_FEC=12`，低于 systematic 媒体 `4`、高于普通 Bulk `20`；媒体队列有待发数据时 parity 不得抢占 systematic。
-- parity 计入 QUIC pacing、wire bytes、CPU和内存，不计入业务吞吐门禁。
+- parity 计入 QUIC pacing、YFE2 wire bytes、CPU和内存，不计入业务吞吐门禁。YFE2 `wire_bytes` 定义为原始业务 payload 加 parity frame，用于计算 FEC 增量开销；既有 NBUD/QUIC framing 不重复归因给 FEC。
 - FEC不得修改 BBR状态、cwnd seed、PMTU搜索、媒体分类或租户媒体保底。
 
 ## 诊断

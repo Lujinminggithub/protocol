@@ -188,7 +188,7 @@ static int yfe2_handle_control(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vie
     return 1;
 }
 
-typedef struct {proxy_stream_t* stream;nb_sched_cnx_t* runtime;uint16_t route_length;} yfe2_original_context_t;
+typedef struct {proxy_stream_t* stream;nb_sched_cnx_t* runtime;} yfe2_original_context_t;
 
 static int yfe2_record_source(void* opaque,const nb_udp_wire_view_t* source,uint64_t now_us,
     nb_yfe2_encode_job_t* sealed){
@@ -206,7 +206,7 @@ static int yfe2_record_source(void* opaque,const nb_udp_wire_view_t* source,uint
     int result=nb_yfe2_tx_add(p->yfe2_tx,source,now_us,parity,sealed);
     if(result>=0){p->udp_fec_source_packets++;p->yfe2_original++;
         p->yfe2_business_bytes+=source->payload_length;
-        p->yfe2_wire_bytes+=24u+context->route_length+source->payload_length;}
+        p->yfe2_wire_bytes+=source->payload_length;}
     return result;
 }
 
@@ -232,7 +232,7 @@ static void yfe2_on_original_queued(proxy_stream_t* p,const nb_udp_wire_view_t* 
     yfe2_maybe_start(p->down_cnx);
     runtime=runtime_for_cnx(p->down_cnx,0);
     if(runtime==NULL||runtime->yfe2_negotiation.state!=NB_YFE2_NEG_ACCEPTED)return;
-    context=(yfe2_original_context_t){p,runtime,(uint16_t)strlen(route)};
+    context=(yfe2_original_context_t){p,runtime};
     ops=(nb_yfe2_node_ops_t){yfe2_record_source,yfe2_submit_job,NULL,&context};
     (void)nb_yfe2_node_on_original_queued(&ops,view,now_us);
 }

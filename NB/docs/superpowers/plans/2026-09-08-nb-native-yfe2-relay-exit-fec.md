@@ -288,7 +288,7 @@ Assert source 1/5 share slot 0, 2/6 slot 1, and block IDs are monotonic.
 
 - [ ] **Step 2: Write failing block-boundary tests**
 
-Assert the 16th shard seals one job, a 9,999us partial block does not flush, 10,000us does flush, actual count is retained, and missing positions are zero-filled through K=16.
+Assert the 16th shard seals one job, a 9,999us flow idle does not flush, 10,000us idle does flush, a continuously fed block seals at 150ms, actual count is retained, and missing positions are zero-filled through K=16.
 
 - [ ] **Step 3: Write failing adaptive-boundary tests**
 

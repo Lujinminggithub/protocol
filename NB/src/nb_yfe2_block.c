@@ -17,8 +17,12 @@ void nb_yfe2_tx_set_parity(nb_yfe2_tx_t* state,uint8_t parity_shards){if(state&&
 size_t nb_yfe2_tx_slot_count(const nb_yfe2_tx_t* state,size_t slot){return state&&slot<NB_YFE2_INTERLEAVE?state->slots[slot].job.actual_count:0;}
 uint64_t nb_yfe2_tx_next_deadline(const nb_yfe2_tx_t* state){
     uint64_t earliest=0;if(state==NULL)return 0;
-    for(size_t i=0;i<NB_YFE2_INTERLEAVE;i++)if(state->slots[i].active){uint64_t deadline=state->slots[i].first_at+NB_YFE2_FLUSH_US;
+    int active=0;
+    for(size_t i=0;i<NB_YFE2_INTERLEAVE;i++)if(state->slots[i].active){
+        active=1;uint64_t deadline=state->slots[i].first_at+NB_YFE2_BLOCK_MAX_US;
         if(earliest==0||deadline<earliest)earliest=deadline;}
+    if(active&&state->last_source_at){uint64_t idle=state->last_source_at+NB_YFE2_FLUSH_US;
+        if(earliest==0||idle<earliest)earliest=idle;}
     return earliest;
 }
 static void slot_begin(nb_yfe2_tx_t* state,nb_yfe2_tx_slot_t* slot,uint64_t now,uint8_t parity){
@@ -42,14 +46,18 @@ int nb_yfe2_tx_add(nb_yfe2_tx_t* state,const nb_udp_wire_view_t* source,uint64_t
         source->total_length,source->payload_length};
     memcpy(slot->job.source[item],source->payload,source->payload_length);
     if(source->payload_length>slot->job.shard_size)slot->job.shard_size=source->payload_length;
-    slot->job.actual_count++;
+    slot->job.actual_count++;state->last_source_at=now_us;
     return slot->job.actual_count==NB_YFE2_DATA_SHARDS?slot_seal(slot,sealed):0;
 }
 int nb_yfe2_tx_flush_due(nb_yfe2_tx_t* state,uint64_t now_us,nb_yfe2_encode_job_t* sealed){
     if(state==NULL||sealed==NULL)return -1;
+    int idle_due=state->last_source_at&&now_us>=state->last_source_at&&
+        now_us-state->last_source_at>=NB_YFE2_FLUSH_US;
     size_t selected=NB_YFE2_INTERLEAVE;uint64_t oldest=UINT64_MAX;
     for(size_t i=0;i<NB_YFE2_INTERLEAVE;i++){nb_yfe2_tx_slot_t* slot=&state->slots[i];
-        if(slot->active&&now_us>=slot->first_at&&now_us-slot->first_at>=NB_YFE2_FLUSH_US&&slot->first_at<oldest){selected=i;oldest=slot->first_at;}}
+        int max_due=slot->active&&now_us>=slot->first_at&&
+            now_us-slot->first_at>=NB_YFE2_BLOCK_MAX_US;
+        if(slot->active&&(idle_due||max_due)&&slot->first_at<oldest){selected=i;oldest=slot->first_at;}}
     return selected==NB_YFE2_INTERLEAVE?0:slot_seal(&state->slots[selected],sealed);
 }
 int nb_yfe2_encode_job_run(const nb_yfe2_encode_job_t* job,nb_yfe2_encode_result_t* result){
