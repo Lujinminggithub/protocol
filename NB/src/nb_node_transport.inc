@@ -93,7 +93,13 @@ static void yfe2_stream_metrics_snapshot(const proxy_stream_t* p,
 
 static size_t yfe2_max_datagram_payload(picoquic_cnx_t* cnx){
     if(cnx==NULL)return 0;
-    return (size_t)cnx->remote_parameters.max_datagram_frame_size;
+    size_t maximum=(size_t)cnx->remote_parameters.max_datagram_frame_size;
+    picoquic_path_t* path=cnx->nb_paths>0?cnx->path[0]:NULL;
+    if(path&&path->send_mtu>64){
+        size_t path_payload=path->send_mtu-64;
+        if(maximum==0||path_payload<maximum)maximum=path_payload;
+    }
+    return maximum;
 }
 
 static uint32_t yfe2_control_session_new(void){
@@ -934,15 +940,17 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
             if(!dgramq_peek(queue,*queue_len,&dg,&dg_len,&queued_at))continue;
             if(dg_len>length){
                 if(dg_len>=NB_YFE2_WIRE_HEADER&&nb_get_u32(dg)==NB_UDP_FEC_MAGIC&&dg[4]==3){
-                    dgramq_consume(queue,queue_len);
-                    p->yfe2_pmtu_fallback++;p->yfe2_parity_queue_drop++;
-                    nb_sched_cnx_t* yfe2_runtime=runtime_for_cnx(cnx,0);
-                    if(yfe2_runtime)yfe2_runtime->yfe2_negotiation.state=
-                        NB_YFE2_NEG_FALLBACK_PMTU;
-                    log4c_info("%s NB YFE2 parity 因 PMTU 丢弃 id=%u wire=%zu allowance=%zu",
-                        role_name(G.role),p->id,dg_len,length);
-                    (void)picoquic_mark_datagram_ready(cnx,1);
-                    handled=1;break;
+                    int action=nb_yfe2_prepare_action(dg_len,length,
+                        yfe2_max_datagram_payload(cnx));
+                    if(action==NB_YFE2_PREPARE_FALLBACK){
+                        dgramq_consume(queue,queue_len);
+                        p->yfe2_pmtu_fallback++;p->yfe2_parity_queue_drop++;
+                        nb_sched_cnx_t* yfe2_runtime=runtime_for_cnx(cnx,0);
+                        if(yfe2_runtime)yfe2_runtime->yfe2_negotiation.state=
+                            NB_YFE2_NEG_FALLBACK_PMTU;
+                        log4c_info("%s NB YFE2 parity 因 PMTU 丢弃 id=%u wire=%zu max=%zu",
+                            role_name(G.role),p->id,dg_len,yfe2_max_datagram_payload(cnx));
+                    }
                 }
                 (void)picoquic_provide_datagram_buffer_ex(bytes,0,picoquic_datagram_active_any_path);
                 handled=1;break;

@@ -43,6 +43,9 @@ int main(void){test_t test={0};nb_yfe2_node_ops_t ops={record,submit,queue,&test
         NB_UDP_TYPE_C2S,0,0,1216,1000)==0);
     CHECK(nb_yfe2_sender_eligible(2,"nb-yfe2-optional",NB_YFE2_ROLE_MIDDLE,1,
         NB_UDP_TYPE_C2S,1,1,1216,1000)==0);
+    CHECK(nb_yfe2_prepare_action(1216,900,1400)==NB_YFE2_PREPARE_WAIT);
+    CHECK(nb_yfe2_prepare_action(1216,1216,1400)==NB_YFE2_PREPARE_SEND);
+    CHECK(nb_yfe2_prepare_action(1216,900,1200)==NB_YFE2_PREPARE_FALLBACK);
     const char* probe_sink="T:nb-probe-sink.internal:9";
     const char* probe_source="U:t,T:nb-probe-source.internal:9";
     const char* probe_echo="T:nb-probe-echo.internal:9";

@@ -18,6 +18,11 @@ enum {
     NB_YFE2_ROLE_MIDDLE=1,
     NB_YFE2_ROLE_EXIT=2
 };
+enum {
+    NB_YFE2_PREPARE_SEND=0,
+    NB_YFE2_PREPARE_WAIT=1,
+    NB_YFE2_PREPARE_FALLBACK=2
+};
 
 typedef struct {
     int (*record_source)(void* context,const nb_udp_wire_view_t* source,uint64_t now_us,
@@ -37,6 +42,8 @@ size_t nb_yfe2_required_datagram(size_t shard_size);
 int nb_yfe2_sender_eligible(uint32_t schema_version,const char* fec_mode,int role,
     int outbound,uint8_t direction,int media,int probe,size_t max_datagram_payload,
     size_t shard_size);
+int nb_yfe2_prepare_action(size_t wire_length,size_t allowance,
+    size_t max_datagram_payload);
 int nb_yfe2_control_datagram_encode(uint8_t* out,size_t cap,uint32_t session_id,
     const nb_yfe2_control_t* control);
 int nb_yfe2_control_datagram_decode(const uint8_t* wire,size_t length,

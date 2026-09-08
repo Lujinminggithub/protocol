@@ -61,6 +61,12 @@ int nb_yfe2_sender_eligible(uint32_t schema_version,const char* fec_mode,int rol
         nb_yfe2_required_datagram(shard_size)<=max_datagram_payload;
 }
 
+int nb_yfe2_prepare_action(size_t wire_length,size_t allowance,
+    size_t max_datagram_payload){
+    if(wire_length==0||max_datagram_payload<wire_length)return NB_YFE2_PREPARE_FALLBACK;
+    return allowance<wire_length?NB_YFE2_PREPARE_WAIT:NB_YFE2_PREPARE_SEND;
+}
+
 int nb_yfe2_control_datagram_encode(uint8_t* out,size_t cap,uint32_t session_id,
     const nb_yfe2_control_t* control){
     uint8_t payload[NB_YFE2_CONTROL_SIZE];

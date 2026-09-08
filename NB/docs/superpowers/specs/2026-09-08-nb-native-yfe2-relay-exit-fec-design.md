@@ -118,7 +118,7 @@ systematic 分片继续按原 `NBUD v1` 立即发送，不等待凑满 block，�
 
 route 不在每个 parity 中重复；Exit 由同一 connection 上的 session ID 找到已认证的业务 flow。decoder 同时接受同一 Profile 的 `16+1` 和带 `BURST` 的 `16+3`，拒绝其他 K/R、未知 flags、错误 Profile、越界长度和损坏 shard。`NBUF v2` 继续由原 decoder 独立处理，不得与 v3 block 混合。
 
-发送前按该 connection 实际 QUIC Datagram payload 上限计算完整 v3 frame。若最坏 parity frame 无法容纳，只将该 connection 标记 `fallback_pmtu`；不得缩短原始 `NBUD`、拆 parity 或降低业务 MTU来强行启用。
+发送前按该 connection 实际 QUIC Datagram payload 上限计算完整 v3 frame。picoquic prepare callback 当次提供的 `length` 只是当前包剩余 allowance；若它小于 parity 但连接上限足够，必须保留独立 parity 队列并请求下一包，不能误判 PMTU。只有完整 frame 超过连接上限时才将该 connection 标记 `fallback_pmtu`；不得缩短原始 `NBUD`、拆 parity 或降低业务 MTU来强行启用。
 
 ## 编码数据路径
 
