@@ -6,7 +6,9 @@
 - Task 10 本地门禁：47 项 CTest、Go 源码包测试、canary/netem/snapshot Python 测试已完成。
 - Task 10 兼容部署：真实 HK-108 Middle 与 KZ Exit 已部署 `4fc96af6b87669f3`；Entry 保持原版本；schema 1 TCP/UDP probe 通过。
 - Task 10 worker 0 canary：协商 accepted；约 3.3Mbps 无损 baseline 开销 7.6%；0.2% 定向丢包进入 BURST，Exit 恢复 17 包；5 秒后回落 baseline；probe parity 不增长；worker 1 保持 schema 1/disabled；netem 已清理。
-- 尚未完成：完整随机/突发/乱序/policer/app-limited/rate-cap 矩阵、30 分钟生产无损观察、worker 1 扩面。未达到这些门禁前不得扩面。
+- Task 10 完整矩阵：随机 0/0.1/0.2/0.5/1%、burst 1/3/6/12、reorder、policer-4m、app-limited、rate-cap 共 13 个场景已完成；合并报告为 `/opt/nb-controlplane/data/worker/lines/gz-hk-kz-00012/yfe2-full-matrix-accepted.json`。
+- Task 10 扩面：Middle/Exit worker 0/1 均运行 `acaacb05ea79dcc6`，两个 Middle worker 均使用 schema 2 optional profile，两个 Exit connection 均验证 accepted；Entry 保持 `17318d22ec914a0c`。
+- Task 10 生产观察：30 分钟、31 个每分钟样本全部通过，报告为 `/opt/nb-controlplane/data/worker/lines/gz-hk-kz-00012/yfe2-observation-30m-20260908T072715Z.json`。窗口内无业务会话，属于空闲稳定性观察；扩面前已分别对 worker 0/1 执行持续媒体负载、恢复和 probe 隔离验证。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
