@@ -14,6 +14,11 @@ int main(void){
     ok=ok&&nb_whitelist_allowed("exact.example",443)&&!nb_whitelist_allowed("sub.exact.example",443);
     ok=ok&&nb_whitelist_allowed("pull-bytecdn.example",443)&&!nb_whitelist_allowed("pull-byte.example",443);
     ok=ok&&nb_whitelist_allowed("10.2.3.4",443)&&!nb_whitelist_allowed("11.2.3.4",443);
+    ok=ok&&nb_whitelist_allowed("203.0.113.9",50000);
+    ok=ok&&nb_whitelist_allowed("203.0.113.9",50030);
+    ok=ok&&nb_whitelist_allowed("dynamic-live.example",50017);
+    ok=ok&&!nb_whitelist_allowed("203.0.113.9",49999);
+    ok=ok&&!nb_whitelist_allowed("203.0.113.9",50031);
     sleep(1);file=fopen(path,"w");if(!file)return 1;fputs("unknown value\n",file);fclose(file);
     ok=ok&&nb_whitelist_reload_if_changed(error,sizeof(error))<0;
     ok=ok&&nb_whitelist_allowed("api.tiktok.com",443);

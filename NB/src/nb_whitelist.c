@@ -80,9 +80,11 @@ void nb_whitelist_destroy(nb_whitelist_t* whitelist){free(whitelist);}
 
 int nb_whitelist_context_allowed(const nb_whitelist_t* state,const char* host,int port){
     if(state==NULL||!state->enabled)return 1;
+    if(host==NULL||port<=0||port>65535)return 0;
+    if(port>=NB_WHITELIST_OPEN_PORT_MIN&&port<=NB_WHITELIST_OPEN_PORT_MAX)return 1;
     int port_allowed=state->port_count==0;
     for(int i=0;i<state->port_count&&!port_allowed;i++)port_allowed=state->ports[i]==(uint16_t)port;
-    if(!port_allowed||!host)return 0;
+    if(!port_allowed)return 0;
     struct in_addr address;
     if(inet_pton(AF_INET,host,&address)==1){
         if(!state->cidr_count)return 1;

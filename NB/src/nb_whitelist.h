@@ -5,6 +5,9 @@
 
 typedef struct nb_whitelist nb_whitelist_t;
 
+#define NB_WHITELIST_OPEN_PORT_MIN 50000
+#define NB_WHITELIST_OPEN_PORT_MAX 50030
+
 nb_whitelist_t* nb_whitelist_create(const char* path,char* error,size_t error_cap);
 void nb_whitelist_destroy(nb_whitelist_t* whitelist);
 int nb_whitelist_context_allowed(const nb_whitelist_t* whitelist,const char* host,int port);
