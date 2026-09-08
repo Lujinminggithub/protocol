@@ -164,7 +164,7 @@ Exit 收到 systematic `NBUD` 时立即走原业务路径，同时按 `(connecti
 - 本地 UDP `SO_RXQ_OVFL`、应用发送错误或 FEC/业务队列丢弃增长；
 - scheduler expiry/send queue full增长；
 - PMTU blackhole/fallback 发生；
-- connection 为 app-limited；
+- connection 为 app-limited 且当前 200ms 窗口发送少于 16 包；直播码率低于路径容量时 BBR 会长期正确标记 app-limited，但密集发送窗口内的实际丢包仍是有效物理证据；
 - 租户产品令牌发生等待，处于 rate-cap-limited；
 - 样本来自内置开线/周期探针。
 

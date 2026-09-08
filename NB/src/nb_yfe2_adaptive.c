@@ -16,7 +16,9 @@ int nb_yfe2_adaptive_update(nb_yfe2_adaptive_t* state,const nb_yfe2_loss_sample_
     }
     uint64_t declared=sample->declared_lost-state->previous.declared_lost;
     uint64_t spurious=sample->spurious_lost-state->previous.spurious_lost;
+    uint64_t sent=sample->sent-state->previous.sent;
     uint32_t invalid=sample->invalid_reasons;
+    if(sent>=NB_YFE2_APP_LIMITED_MIN_PACKETS)invalid&=~NB_YFE2_IGNORE_APP_LIMITED;
     if(sample->local_drops>state->previous.local_drops)invalid|=NB_YFE2_IGNORE_LOCAL_DROP;
     if(sample->scheduler_expired>state->previous.scheduler_expired)invalid|=NB_YFE2_IGNORE_SCHEDULER;
     if(sample->send_queue_full>state->previous.send_queue_full)invalid|=NB_YFE2_IGNORE_SEND_QUEUE;

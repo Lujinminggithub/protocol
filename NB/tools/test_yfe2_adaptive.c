@@ -21,10 +21,17 @@ int main(void){
     for(size_t i=0;i<sizeof(reasons)/sizeof(reasons[0]);i++){
         nb_yfe2_adaptive_init(&state);sample=baseline();
         CHECK(nb_yfe2_adaptive_update(&state,&sample,1000000)==NB_YFE2_MODE_BASELINE);
-        sample.sent+=100;sample.declared_lost++;sample.invalid_reasons=reasons[i];
+        sample.sent+=reasons[i]==NB_YFE2_IGNORE_APP_LIMITED?1:100;
+        sample.declared_lost++;sample.invalid_reasons=reasons[i];
         CHECK(nb_yfe2_adaptive_update(&state,&sample,1200000)==NB_YFE2_MODE_BASELINE);
         CHECK(state.effective_physical_loss==0&&state.ignored_samples[i]==1);
     }
+    nb_yfe2_adaptive_init(&state);sample=baseline();
+    CHECK(nb_yfe2_adaptive_update(&state,&sample,1000000)==NB_YFE2_MODE_BASELINE);
+    sample.sent+=NB_YFE2_APP_LIMITED_MIN_PACKETS;sample.declared_lost++;
+    sample.invalid_reasons=NB_YFE2_IGNORE_APP_LIMITED;
+    CHECK(nb_yfe2_adaptive_update(&state,&sample,1200000)==NB_YFE2_MODE_BURST);
+    CHECK(state.effective_physical_loss==1&&state.ignored_samples[4]==0);
     nb_yfe2_adaptive_init(&state);sample=baseline();nb_yfe2_adaptive_update(&state,&sample,1000000);
     sample.sent+=100;sample.declared_lost++;sample.spurious_lost++;
     CHECK(nb_yfe2_adaptive_update(&state,&sample,1200000)==NB_YFE2_MODE_BASELINE);
