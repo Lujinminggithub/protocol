@@ -67,6 +67,16 @@ int nb_yfe2_prepare_action(size_t wire_length,size_t allowance,
     return allowance<wire_length?NB_YFE2_PREPARE_WAIT:NB_YFE2_PREPARE_SEND;
 }
 
+int nb_yfe2_start_action(size_t required_payload,size_t advertised_payload,
+    size_t current_path_payload){
+    if(required_payload==0)return NB_YFE2_START_FALLBACK;
+    if(advertised_payload==0)return NB_YFE2_START_WAIT;
+    if(advertised_payload<required_payload)
+        return NB_YFE2_START_FALLBACK;
+    return current_path_payload<required_payload?NB_YFE2_START_WAIT:
+        NB_YFE2_START_NEGOTIATE;
+}
+
 int nb_yfe2_control_datagram_encode(uint8_t* out,size_t cap,uint32_t session_id,
     const nb_yfe2_control_t* control){
     uint8_t payload[NB_YFE2_CONTROL_SIZE];

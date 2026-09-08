@@ -19,6 +19,11 @@ enum {
     NB_YFE2_ROLE_EXIT=2
 };
 enum {
+    NB_YFE2_START_NEGOTIATE=0,
+    NB_YFE2_START_WAIT=1,
+    NB_YFE2_START_FALLBACK=2
+};
+enum {
     NB_YFE2_PREPARE_SEND=0,
     NB_YFE2_PREPARE_WAIT=1,
     NB_YFE2_PREPARE_FALLBACK=2
@@ -44,6 +49,8 @@ int nb_yfe2_sender_eligible(uint32_t schema_version,const char* fec_mode,int rol
     size_t shard_size);
 int nb_yfe2_prepare_action(size_t wire_length,size_t allowance,
     size_t max_datagram_payload);
+int nb_yfe2_start_action(size_t required_payload,size_t advertised_payload,
+    size_t current_path_payload);
 int nb_yfe2_control_datagram_encode(uint8_t* out,size_t cap,uint32_t session_id,
     const nb_yfe2_control_t* control);
 int nb_yfe2_control_datagram_decode(const uint8_t* wire,size_t length,

@@ -91,9 +91,13 @@ static void yfe2_stream_metrics_snapshot(const proxy_stream_t* p,
     }
 }
 
+static size_t yfe2_advertised_datagram_payload(picoquic_cnx_t* cnx){
+    return cnx?(size_t)cnx->remote_parameters.max_datagram_frame_size:0;
+}
+
 static size_t yfe2_max_datagram_payload(picoquic_cnx_t* cnx){
     if(cnx==NULL)return 0;
-    size_t maximum=(size_t)cnx->remote_parameters.max_datagram_frame_size;
+    size_t maximum=yfe2_advertised_datagram_payload(cnx);
     picoquic_path_t* path=cnx->nb_paths>0?cnx->path[0]:NULL;
     if(path&&path->send_mtu>64){
         size_t path_payload=path->send_mtu-64;
@@ -131,14 +135,18 @@ static void yfe2_maybe_start(picoquic_cnx_t* cnx){
     if(G.role!=ROLE_MIDDLE||cnx==NULL||!nb_current_instance->transport_profiles.has_active)return;
     profile=&nb_current_instance->transport_profiles.active;
     size_t max_payload=yfe2_max_datagram_payload(cnx);
+    size_t advertised=yfe2_advertised_datagram_payload(cnx);
+    size_t required=nb_yfe2_required_datagram(NB_UDP_FRAGMENT_PAYLOAD);
+    int start_action=nb_yfe2_start_action(required,advertised,max_payload);
     if(profile->schema_version==2&&
         !strcmp(nb_current_instance->transport_egress.link.udp_fec_mode,"nb-yfe2-optional")&&
-        max_payload>0&&max_payload<nb_yfe2_required_datagram(NB_UDP_FRAGMENT_PAYLOAD)){
+        start_action==NB_YFE2_START_FALLBACK){
         runtime=runtime_for_cnx(cnx,1);
         if(runtime&&runtime->yfe2_negotiation.state==NB_YFE2_NEG_DISABLED)
             runtime->yfe2_negotiation.state=NB_YFE2_NEG_FALLBACK_PMTU;
         return;
     }
+    if(start_action!=NB_YFE2_START_NEGOTIATE)return;
     if(!nb_yfe2_sender_eligible(profile->schema_version,
         nb_current_instance->transport_egress.link.udp_fec_mode,G.role,1,
         NB_UDP_TYPE_C2S,1,0,max_payload,NB_UDP_FRAGMENT_PAYLOAD))return;
