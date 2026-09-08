@@ -236,13 +236,17 @@ static void yfe2_on_original_queued(proxy_stream_t* p,const nb_udp_wire_view_t* 
     nb_sched_cnx_t* runtime;
     yfe2_original_context_t context;
     nb_yfe2_node_ops_t ops;
-    if(p==NULL||view==NULL||route==NULL||G.role!=ROLE_MIDDLE||p->flow_class!=NB_FLOW_CLASS_MEDIA)return;
+    if(p==NULL||view==NULL||route==NULL||G.role!=ROLE_MIDDLE)return;
     if(nb_yfe2_probe_route((const uint8_t*)route,(uint16_t)strlen(route))){
         nb_sched_cnx_t* probe_runtime=runtime_for_cnx(p->down_cnx,0);
+        if(probe_runtime){
+            probe_runtime->yfe2_probe_packets++;
+        }
         if(probe_runtime&&probe_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED)
             p->yfe2_probe_parity_suppressed++;
         return;
     }
+    if(p->flow_class!=NB_FLOW_CLASS_MEDIA)return;
     yfe2_maybe_start(p->down_cnx);
     runtime=runtime_for_cnx(p->down_cnx,0);
     if(runtime==NULL||runtime->yfe2_negotiation.state!=NB_YFE2_NEG_ACCEPTED)return;
@@ -398,9 +402,11 @@ static void yfe2_adaptive_tick(uint64_t now_us){
             sample.scheduler_expired+=p->yfe2_scheduler_expired;
             if(p->tenant_throttled_until>now_us)
                 sample.invalid_reasons|=NB_YFE2_IGNORE_RATE_CAP;
-            if(p->probe_mode||strstr(p->route,"nb-probe-")!=NULL)
-                sample.invalid_reasons|=NB_YFE2_IGNORE_PROBE;
         }
+        if(nb_yfe2_counter_advanced(runtime->yfe2_probe_packets_previous,
+            runtime->yfe2_probe_packets))
+            sample.invalid_reasons|=NB_YFE2_IGNORE_PROBE;
+        runtime->yfe2_probe_packets_previous=runtime->yfe2_probe_packets;
         int previous=runtime->yfe2_adaptive.mode;
         int current=nb_yfe2_adaptive_update(&runtime->yfe2_adaptive,&sample,now_us);
         runtime->yfe2_sample_at=now_us;

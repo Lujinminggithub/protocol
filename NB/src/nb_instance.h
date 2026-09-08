@@ -47,6 +47,8 @@ typedef struct {
     nb_yfe2_negotiation_t yfe2_negotiation;
     nb_yfe2_adaptive_t yfe2_adaptive;
     uint64_t yfe2_sample_at;
+    uint64_t yfe2_probe_packets;
+    uint64_t yfe2_probe_packets_previous;
 } nb_sched_cnx_t;
 
 typedef struct {

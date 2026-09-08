@@ -49,6 +49,9 @@ int main(void){test_t test={0};nb_yfe2_node_ops_t ops={record,submit,queue,&test
     CHECK(nb_yfe2_start_action(1216,1536,1136)==NB_YFE2_START_WAIT);
     CHECK(nb_yfe2_start_action(1216,1536,1340)==NB_YFE2_START_NEGOTIATE);
     CHECK(nb_yfe2_start_action(1216,1200,1136)==NB_YFE2_START_FALLBACK);
+    CHECK(nb_yfe2_counter_advanced(10,10)==0);
+    CHECK(nb_yfe2_counter_advanced(10,11)==1);
+    CHECK(nb_yfe2_counter_advanced(10,2)==0);
     const char* probe_sink="T:nb-probe-sink.internal:9";
     const char* probe_source="U:t,T:nb-probe-source.internal:9";
     const char* probe_echo="T:nb-probe-echo.internal:9";

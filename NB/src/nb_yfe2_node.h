@@ -51,6 +51,7 @@ int nb_yfe2_prepare_action(size_t wire_length,size_t allowance,
     size_t max_datagram_payload);
 int nb_yfe2_start_action(size_t required_payload,size_t advertised_payload,
     size_t current_path_payload);
+int nb_yfe2_counter_advanced(uint64_t previous,uint64_t current);
 int nb_yfe2_control_datagram_encode(uint8_t* out,size_t cap,uint32_t session_id,
     const nb_yfe2_control_t* control);
 int nb_yfe2_control_datagram_decode(const uint8_t* wire,size_t length,

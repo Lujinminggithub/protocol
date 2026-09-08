@@ -179,7 +179,7 @@ Picoquic 必须通过只读适配接口暴露 app-limited、send queue full和�
 - 不加入 FEC block；
 - 不生成 parity；
 - 不进入 decoder恢复缓存；
-- 不更新有效丢包、自适应模式或 5 秒保持期；
+- 仅在 probe 字节计数于当前 200ms 窗口增长时忽略该窗口；已结束但尚未超时回收的 probe flow 不得持续屏蔽物理丢包样本，也不更新自适应模式或 5 秒保持期；
 - 探针按业务 payload 计算吞吐与完整性。
 
 探针前后 `current_mode` 和 `burst_until` 必须一致，诊断增加 `probe_parity_suppressed` 和 `probe_samples_ignored`。
