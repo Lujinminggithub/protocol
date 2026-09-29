@@ -23,6 +23,7 @@ func (s *Store) migrateMySQL(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS `+"`lines`"+` (
  id VARCHAR(191) PRIMARY KEY, name VARCHAR(100) NOT NULL, status VARCHAR(32) NOT NULL,
+ environment VARCHAR(32) NOT NULL DEFAULT 'production',
  entry_region VARCHAR(100) NOT NULL, exit_region VARCHAR(100) NOT NULL, provider VARCHAR(100) NOT NULL,
  capacity_mbps BIGINT NOT NULL, active_deployment VARCHAR(191) NOT NULL DEFAULT '',
  profile VARCHAR(191) NOT NULL DEFAULT '', secret_ref VARCHAR(191) NOT NULL DEFAULT '',
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 		return err
 	}
 	for _, statement := range []string{
+		`ALTER TABLE ` + "`lines`" + ` ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE devices ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE line_specs ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 	} {
@@ -142,6 +144,10 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 		}
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE devices SET environment='production' WHERE environment IS NULL OR environment=''`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, "UPDATE `lines` SET environment='production' WHERE environment IS NULL OR environment=''")
 	if err != nil {
 		return err
 	}

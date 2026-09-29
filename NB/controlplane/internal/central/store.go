@@ -41,6 +41,7 @@ type Line struct {
 	ID               string `json:"id"`
 	Name             string `json:"name"`
 	Status           string `json:"status"`
+	Environment      string `json:"environment"`
 	EntryRegion      string `json:"entry_region"`
 	ExitRegion       string `json:"exit_region"`
 	Provider         string `json:"provider"`
@@ -325,6 +326,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS lines (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+	environment TEXT NOT NULL DEFAULT 'production',
  entry_region TEXT NOT NULL, exit_region TEXT NOT NULL, provider TEXT NOT NULL,
  capacity_mbps INTEGER NOT NULL, active_deployment TEXT NOT NULL DEFAULT '',
  profile TEXT NOT NULL DEFAULT '', secret_ref TEXT NOT NULL DEFAULT '',
@@ -491,6 +493,32 @@ CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_a
 	if err != nil {
 		return err
 	}
+	baseLineColumns := map[string]bool{}
+	baseLineRows, lineErr := s.db.QueryContext(ctx, `PRAGMA table_info(lines)`)
+	if lineErr != nil {
+		return lineErr
+	}
+	for baseLineRows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if lineErr = baseLineRows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); lineErr != nil {
+			_ = baseLineRows.Close()
+			return lineErr
+		}
+		baseLineColumns[name] = true
+	}
+	if lineErr = baseLineRows.Close(); lineErr != nil {
+		return lineErr
+	}
+	if !baseLineColumns["environment"] {
+		if _, lineErr = s.db.ExecContext(ctx, `ALTER TABLE lines ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'`); lineErr != nil {
+			return lineErr
+		}
+	}
+	if _, lineErr = s.db.ExecContext(ctx, `UPDATE lines SET environment='production' WHERE environment IS NULL OR environment=''`); lineErr != nil {
+		return lineErr
+	}
 	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(line_specs)`)
 	if err != nil {
 		return err
@@ -648,20 +676,26 @@ CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_a
 }
 
 func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
+	if line.Environment == "" {
+		line.Environment = "production"
+	}
+	if !validEnvironment(line.Environment) {
+		return Line{}, errors.New("invalid line environment")
+	}
 	stamp := now()
 	query := s.controlSQL(`INSERT INTO lines
- (id,name,status,entry_region,exit_region,provider,capacity_mbps,active_deployment,profile,secret_ref,created_at,updated_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,
- entry_region=excluded.entry_region,exit_region=excluded.exit_region,provider=excluded.provider,
- capacity_mbps=excluded.capacity_mbps,active_deployment=excluded.active_deployment,
+	 (id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,active_deployment,profile,secret_ref,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,environment=excluded.environment,
+	 entry_region=excluded.entry_region,exit_region=excluded.exit_region,provider=excluded.provider,
+	 capacity_mbps=excluded.capacity_mbps,active_deployment=excluded.active_deployment,
 	 profile=excluded.profile,secret_ref=excluded.secret_ref,updated_at=excluded.updated_at`, `INSERT INTO `+s.linesTable()+`
- (id,name,status,entry_region,exit_region,provider,capacity_mbps,active_deployment,profile,secret_ref,created_at,updated_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),status=VALUES(status),
- entry_region=VALUES(entry_region),exit_region=VALUES(exit_region),provider=VALUES(provider),
+ (id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,active_deployment,profile,secret_ref,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),status=VALUES(status),environment=VALUES(environment),
+	 entry_region=VALUES(entry_region),exit_region=VALUES(exit_region),provider=VALUES(provider),
  capacity_mbps=VALUES(capacity_mbps),active_deployment=VALUES(active_deployment),profile=VALUES(profile),
  secret_ref=VALUES(secret_ref),updated_at=VALUES(updated_at)`)
 	_, err := s.db.ExecContext(ctx, query,
-		line.ID, line.Name, line.Status, line.EntryRegion, line.ExitRegion, line.Provider,
+		line.ID, line.Name, line.Status, line.Environment, line.EntryRegion, line.ExitRegion, line.Provider,
 		line.CapacityMbps, line.ActiveDeployment, line.Profile, line.SecretRef, stamp, stamp)
 	if err != nil {
 		return Line{}, err
@@ -671,15 +705,15 @@ func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
 
 func (s *Store) Line(ctx context.Context, id string) (Line, error) {
 	var line Line
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
+	err := s.db.QueryRowContext(ctx, `SELECT id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,
  active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE id=?`, id).Scan(
-		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
+		&line.ID, &line.Name, &line.Status, &line.Environment, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt)
 	return line, err
 }
 
 func (s *Store) Lines(ctx context.Context) ([]Line, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,
  active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE status<>'archived' ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -688,7 +722,7 @@ func (s *Store) Lines(ctx context.Context) ([]Line, error) {
 	var result []Line
 	for rows.Next() {
 		var line Line
-		if err = rows.Scan(&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
+		if err = rows.Scan(&line.ID, &line.Name, &line.Status, &line.Environment, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 			&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt); err != nil {
 			return nil, err
 		}

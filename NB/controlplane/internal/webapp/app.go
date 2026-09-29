@@ -321,6 +321,9 @@ func validLine(line central.Line) error {
 	if line.Status != "draft" && line.Status != "validating" && line.Status != "active" && line.Status != "maintenance" && line.Status != "disabled" && line.Status != "archived" && line.Status != "deleting" {
 		return errors.New("invalid line status")
 	}
+	if line.Environment != "" && line.Environment != "production" && line.Environment != "test" {
+		return errors.New("invalid line environment")
+	}
 	if line.CapacityMbps < 0 || line.CapacityMbps > 1000000 {
 		return errors.New("invalid line capacity")
 	}
@@ -341,6 +344,9 @@ func (a *App) upsertLine(w http.ResponseWriter, r *http.Request) {
 	var line central.Line
 	if !decode(w, r, &line) {
 		return
+	}
+	if line.Environment == "" {
+		line.Environment = "production"
 	}
 	if err := validLine(line); err != nil {
 		problem(w, 400, err.Error())
@@ -380,7 +386,7 @@ func (a *App) patchLine(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &patch) {
 		return
 	}
-	fields := map[string]any{"name": &line.Name, "status": &line.Status, "entry_region": &line.EntryRegion,
+	fields := map[string]any{"name": &line.Name, "status": &line.Status, "environment": &line.Environment, "entry_region": &line.EntryRegion,
 		"exit_region": &line.ExitRegion, "provider": &line.Provider, "capacity_mbps": &line.CapacityMbps,
 		"active_deployment": &line.ActiveDeployment, "profile": &line.Profile, "secret_ref": &line.SecretRef}
 	for key, value := range patch {

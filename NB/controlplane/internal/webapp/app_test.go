@@ -491,7 +491,7 @@ func TestCreateLineRejectsDuplicateID(t *testing.T) {
 	defer database.Close()
 	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
 	defer server.Close()
-	line := map[string]any{"id": "line-unique", "name": "unique", "status": "draft", "entry_region": "entry",
+	line := map[string]any{"id": "line-unique", "name": "unique", "status": "draft", "environment": "test", "entry_region": "entry",
 		"exit_region": "exit", "provider": "test", "capacity_mbps": 10, "active_deployment": "", "profile": "", "secret_ref": ""}
 	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
 	if response.StatusCode != http.StatusCreated {
@@ -503,7 +503,7 @@ func TestCreateLineRejectsDuplicateID(t *testing.T) {
 		t.Fatalf("duplicate create status=%d body=%s", response.StatusCode, body)
 	}
 	stored, err := database.Line(t.Context(), "line-unique")
-	if err != nil || stored.Name != "unique" {
+	if err != nil || stored.Name != "unique" || stored.Environment != "test" {
 		t.Fatalf("duplicate create changed line: %+v err=%v", stored, err)
 	}
 }
