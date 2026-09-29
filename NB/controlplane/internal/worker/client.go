@@ -33,11 +33,13 @@ type operationRunner interface {
 }
 
 type Client struct {
-	registry  Registry
-	runner    operationRunner
-	cfg       ClientConfig
-	http      *http.Client
-	snapshots sync.Map
+	registry             Registry
+	runner               operationRunner
+	cfg                  ClientConfig
+	http                 *http.Client
+	snapshots            sync.Map
+	runtimeScanMu        sync.Mutex
+	runtimeScanCooldowns map[string]time.Time
 }
 
 type persistedResult struct {
@@ -87,7 +89,7 @@ func NewClient(registry Registry, runner operationRunner, cfg ClientConfig) (*Cl
 	if cfg.SnapshotTimeout <= 0 {
 		cfg.SnapshotTimeout = 30 * time.Second
 	}
-	return &Client{registry: registry, runner: runner, cfg: cfg,
+	return &Client{registry: registry, runner: runner, cfg: cfg, runtimeScanCooldowns: map[string]time.Time{},
 		http: &http.Client{Timeout: 20 * time.Second}}, nil
 }
 

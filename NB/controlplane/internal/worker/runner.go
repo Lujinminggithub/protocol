@@ -333,7 +333,7 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 		return []commandStep{{Name: python, Stage: "rollback", Args: []string{deploy, "rollback-socks", "--deployment-id", request.Deployment,
 			"--socks-port", socks}}}, nil
 	case "line.disable":
-		return []commandStep{{Name: python, Stage: "stop", Args: []string{deploy, "stop"}}}, nil
+		return []commandStep{{Name: python, Stage: "stop", Args: []string{deploy, "stop", "--ignore-unavailable"}}}, nil
 	default:
 		return nil, errors.New("该任务类型不在 worker 白名单中")
 	}

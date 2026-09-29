@@ -393,10 +393,24 @@ def _distribute(role):
     return c
 
 
-def act_stop(roles):
+def _is_ignorable_stop_error(error):
+    text = str(error)
+    return any(marker in text for marker in (
+        "BadHostKeyException", "NoValidConnectionsError", "ConnectionRefusedError",
+        "ConnectionResetError", "TimeoutError", "timed out", "Error reading SSH protocol banner",
+    ))
+
+
+def act_stop(roles, ignore_unavailable=False):
     for r in roles:
-        c = connect(r); _systemd_stop(c, r); c.close()
-    print("三跳 nb_node 已停")
+        try:
+            c = connect(r); _systemd_stop(c, r); c.close()
+            print(f"{r}: nb_node 已停止")
+        except Exception as error:
+            if not ignore_unavailable or not _is_ignorable_stop_error(error):
+                raise
+            print(f"{r}: 节点不可连接，跳过停止并保留孤儿风险: {error}")
+    print("三跳 nb_node 停止流程完成")
 
 
 def act_logs(roles):
@@ -728,6 +742,7 @@ def main():
     ap.add_argument("--socks-port", type=int, default=DEFAULT_SOCKS_PORT)
     ap.add_argument("--whitelist", default=str(WHITELIST_LOCAL))
     ap.add_argument("--deployment-id")
+    ap.add_argument("--ignore-unavailable", action="store_true")
     a = ap.parse_args()
     roles = [r.strip() for r in a.roles.split(",") if r.strip()]
     if a.action == "recon": act_recon(roles)
@@ -737,7 +752,7 @@ def main():
     elif a.action == "deploy-socks": act_deploy_socks(a.socks_port)
     elif a.action == "current": act_current_deployment()
     elif a.action == "rollback-socks": act_rollback_socks(a.deployment_id,a.socks_port)
-    elif a.action == "stop": act_stop(roles)
+    elif a.action == "stop": act_stop(roles, ignore_unavailable=a.ignore_unavailable)
     elif a.action == "logs": act_logs(roles)
     elif a.action == "wl-show": act_wl_show()
     elif a.action == "wl-push": act_wl_push(pathlib.Path(a.whitelist))

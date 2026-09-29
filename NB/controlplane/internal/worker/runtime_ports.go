@@ -39,6 +39,8 @@ type runtimePortClaimBatch struct {
 	Claims       []runtimePortClaim `json:"claims"`
 }
 
+const runtimePortScanCooldown = 5 * time.Minute
+
 type parsedShardConfig struct {
 	instance string
 	args     []string
@@ -177,6 +179,60 @@ func parseRuntimeShardPortClaims(workerID, deviceID, role string, files map[stri
 
 func filepathToSlash(value string) string { return strings.ReplaceAll(value, "\\", "/") }
 
+func isIgnorableRuntimeScanError(err error) bool {
+	if err == nil {
+		return false
+	}
+	parts := strings.Split(err.Error(), ";")
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		if !strings.Contains(strings.TrimSpace(part), "运行时端口扫描失败") {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Client) runtimePlanCooling(plan dynamicPlan, now time.Time) bool {
+	c.runtimeScanMu.Lock()
+	defer c.runtimeScanMu.Unlock()
+	for _, node := range plan.Nodes {
+		if until, ok := c.runtimeScanCooldowns[node.DeviceID]; ok && until.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) noteRuntimeScanFailure(plans []dynamicPlan, now time.Time, err error) {
+	if !isIgnorableRuntimeScanError(err) {
+		return
+	}
+	c.runtimeScanMu.Lock()
+	defer c.runtimeScanMu.Unlock()
+	if c.runtimeScanCooldowns == nil {
+		c.runtimeScanCooldowns = map[string]time.Time{}
+	}
+	until := now.Add(runtimePortScanCooldown)
+	for _, plan := range plans {
+		for _, node := range plan.Nodes {
+			c.runtimeScanCooldowns[node.DeviceID] = until
+		}
+	}
+}
+
+func (c *Client) filterRuntimeScanPlans(plans []dynamicPlan, now time.Time) []dynamicPlan {
+	result := make([]dynamicPlan, 0, len(plans))
+	for _, plan := range plans {
+		if !c.runtimePlanCooling(plan, now) {
+			result = append(result, plan)
+		}
+	}
+	return result
+}
+
 func readRemoteShardConfigs(client *ssh.Client, role string) (map[string]string, error) {
 	directory := role
 	if role == "relay" {
@@ -311,7 +367,14 @@ func (c *Client) syncRuntimePortClaims(ctx context.Context) error {
 	if err := c.request(ctx, http.MethodGet, "/agent/v1/runtime-port-scan-plans", nil, &response); err != nil {
 		return err
 	}
-	batches, scanErr := scanner.runtimePortBatches(ctx, response.Plans)
+	plans := c.filterRuntimeScanPlans(response.Plans, time.Now())
+	if len(plans) == 0 {
+		return nil
+	}
+	batches, scanErr := scanner.runtimePortBatches(ctx, plans)
+	if scanErr != nil {
+		c.noteRuntimeScanFailure(plans, time.Now(), scanErr)
+	}
 	if err := c.postRuntimePortBatches(ctx, batches); err != nil {
 		return err
 	}
@@ -372,9 +435,10 @@ func (c *Client) confirmRuntimeCleanup(ctx context.Context, operation Operation)
 		return errors.New("当前 Worker 不支持删除后运行时扫描")
 	}
 	batches, scanErr := scanner.runtimePortBatches(ctx, []dynamicPlan{request.Plan})
-	if scanErr != nil {
+	if scanErr != nil && !isIgnorableRuntimeScanError(scanErr) {
 		return scanErr
 	}
+	scanSkipped := scanErr != nil
 	seen := map[string]bool{}
 	for _, batch := range batches {
 		seen[batch.DeviceID+":"+batch.Role] = batch.ScanComplete
@@ -386,7 +450,7 @@ func (c *Client) confirmRuntimeCleanup(ctx context.Context, operation Operation)
 		}
 	}
 	for _, node := range request.Plan.Nodes {
-		if !seen[node.DeviceID+":"+node.Role] {
+		if !seen[node.DeviceID+":"+node.Role] && !scanSkipped {
 			return fmt.Errorf("节点 %s 尚未完成删除后端口扫描", node.DeviceID)
 		}
 	}

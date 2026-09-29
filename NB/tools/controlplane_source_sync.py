@@ -63,6 +63,11 @@ def deployment_source_files(root: pathlib.Path = ROOT) -> dict[str, pathlib.Path
     files = dict(deploy.RELEASE_INPUTS)
     for name in ORCHESTRATION_FILES:
         files[name] = root.joinpath(*pathlib.PurePosixPath(name).parts)
+    controlplane = root / "controlplane"
+    for path in sorted(controlplane.rglob("*.go")):
+        files[path.relative_to(root).as_posix()] = path
+    for name in ("controlplane/go.mod", "controlplane/go.sum"):
+        files[name] = root.joinpath(*pathlib.PurePosixPath(name).parts)
     return files
 
 

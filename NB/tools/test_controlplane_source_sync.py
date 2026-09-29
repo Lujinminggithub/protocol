@@ -34,6 +34,8 @@ def main() -> None:
     deployment_files = controlplane_source_sync.deployment_source_files()
     assert "tools/nb_p1_control.py" in deployment_files
     assert "tools/worker_snapshot.py" in deployment_files
+    assert "controlplane/go.mod" in deployment_files
+    assert "controlplane/cmd/nb-web-worker/main.go" in deployment_files
     print("RESULT PASS")
 
 
