@@ -179,6 +179,19 @@ func parseRuntimeShardPortClaims(workerID, deviceID, role string, files map[stri
 
 func filepathToSlash(value string) string { return strings.ReplaceAll(value, "\\", "/") }
 
+func isMissingRuntimeShardConfigExitStatus(status int) bool { return status == 3 }
+
+func runtimeScanFailure(deviceID, stage string, cause error) string {
+	detail := "未知错误"
+	if cause != nil && strings.TrimSpace(cause.Error()) != "" {
+		detail = strings.TrimSpace(cause.Error())
+	}
+	if len(detail) > 240 {
+		detail = detail[:240] + "..."
+	}
+	return fmt.Sprintf("设备 %s 运行时端口扫描失败（%s）：%s", deviceID, stage, detail)
+}
+
 func isIgnorableRuntimeScanError(err error) bool {
 	if err == nil {
 		return false
@@ -250,7 +263,7 @@ func readRemoteShardConfigs(client *ssh.Client, role string) (map[string]string,
 	if err != nil {
 		return nil, err
 	}
-	if err = session.Start("tar -C /etc/NB/shards/configs/" + directory + " -cf - ."); err != nil {
+	if err = session.Start("if test -d /etc/NB/shards/configs/" + directory + "; then tar -C /etc/NB/shards/configs/" + directory + " -cf - .; else exit 3; fi"); err != nil {
 		return nil, err
 	}
 	reader := tar.NewReader(stdout)
@@ -274,6 +287,10 @@ func readRemoteShardConfigs(client *ssh.Client, role string) (map[string]string,
 		files[name] = string(data)
 	}
 	if err = session.Wait(); err != nil {
+		var exitErr *ssh.ExitError
+		if errors.As(err, &exitErr) && isMissingRuntimeShardConfigExitStatus(exitErr.ExitStatus()) {
+			return files, nil
+		}
 		return nil, err
 	}
 	return files, nil
@@ -319,19 +336,19 @@ func (r *Runner) runtimePortBatches(ctx context.Context, plans []dynamicPlan) ([
 				}
 			}
 			if client == nil {
-				failures = append(failures, fmt.Sprintf("设备 %s 运行时端口扫描失败", node.DeviceID))
+				failures = append(failures, runtimeScanFailure(node.DeviceID, "SSH连接", dialErr))
 				continue
 			}
 			clients[node.DeviceID] = client
 			files, scanErr := readRemoteShardConfigs(client, node.Role)
 			if scanErr != nil {
-				failures = append(failures, fmt.Sprintf("设备 %s 运行时端口扫描失败", node.DeviceID))
+				failures = append(failures, runtimeScanFailure(node.DeviceID, "读取配置", scanErr))
 				continue
 			}
 			observed := time.Now().UTC()
 			claims, parseErr := parseRuntimeShardPortClaims(r.registry.WorkerID, node.DeviceID, node.Role, files, observed)
 			if parseErr != nil {
-				failures = append(failures, fmt.Sprintf("设备 %s 运行时端口解析失败", node.DeviceID))
+				failures = append(failures, fmt.Sprintf("设备 %s 运行时端口解析失败：%s", node.DeviceID, parseErr))
 				continue
 			}
 			seen[key] = true
