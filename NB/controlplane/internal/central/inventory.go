@@ -300,6 +300,9 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 	if err != nil {
 		return LineSpec{}, err
 	}
+	if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET environment=?,updated_at=? WHERE id=?`, spec.Environment, stamp, spec.LineID); err != nil {
+		return LineSpec{}, err
+	}
 	allocationQuery := s.controlSQL(`INSERT INTO line_port_allocation
 	 (line_id,socks_port_auto,relay_port_auto,exit_port_auto,udp_ports_auto,updated_at)
 	 VALUES(?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET socks_port_auto=excluded.socks_port_auto,

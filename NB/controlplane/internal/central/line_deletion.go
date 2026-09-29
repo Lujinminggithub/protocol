@@ -70,9 +70,9 @@ func (s *Store) ScheduleLineDeletion(ctx context.Context, id, operationID string
 	}
 	defer tx.Rollback()
 	var line Line
-	if err = tx.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
+	if err = tx.QueryRowContext(ctx, `SELECT id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,
  active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE id=?`, id).Scan(
-		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
+		&line.ID, &line.Name, &line.Status, &line.Environment, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt); err != nil {
 		return Operation{}, err
 	}
@@ -121,9 +121,9 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 	}
 	defer tx.Rollback()
 	var line Line
-	err = tx.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
+	err = tx.QueryRowContext(ctx, `SELECT id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,
  active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE id=?`, id).Scan(
-		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
+		&line.ID, &line.Name, &line.Status, &line.Environment, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt)
 	if err != nil {
 		return err
@@ -158,6 +158,7 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 		"force": request.Force, "confirmation": request.Confirmation,
 		"acknowledge_orphans": request.AcknowledgeOrphans, "devices": devices,
 		"line": map[string]any{"id": line.ID, "name": line.Name, "status": line.Status,
+			"environment":  line.Environment,
 			"entry_region": line.EntryRegion, "exit_region": line.ExitRegion, "provider": line.Provider,
 			"capacity_mbps": line.CapacityMbps, "active_deployment": line.ActiveDeployment, "profile": line.Profile},
 		"counts": map[string]int{"specs": specs, "snapshots": snapshots, "incidents": incidents,
@@ -246,9 +247,9 @@ func (s *Store) completeScheduledDeletion(ctx context.Context, tx *sql.Tx, lineI
 		return true, false, err
 	}
 	var line Line
-	if err = tx.QueryRowContext(ctx, `SELECT id,name,status,entry_region,exit_region,provider,capacity_mbps,
+	if err = tx.QueryRowContext(ctx, `SELECT id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,
  active_deployment,profile,secret_ref,created_at,updated_at FROM `+s.linesTable()+` WHERE id=?`, lineID).Scan(
-		&line.ID, &line.Name, &line.Status, &line.EntryRegion, &line.ExitRegion, &line.Provider,
+		&line.ID, &line.Name, &line.Status, &line.Environment, &line.EntryRegion, &line.ExitRegion, &line.Provider,
 		&line.CapacityMbps, &line.ActiveDeployment, &line.Profile, &line.SecretRef, &line.CreatedAt, &line.UpdatedAt); err != nil {
 		return true, false, err
 	}
@@ -269,6 +270,7 @@ func (s *Store) completeScheduledDeletion(ctx context.Context, tx *sql.Tx, lineI
 	audit, err := json.Marshal(map[string]any{
 		"force": false, "cleanup_operation": operationID, "devices": devices,
 		"line": map[string]any{"id": line.ID, "name": line.Name, "status": previousStatus,
+			"environment":  line.Environment,
 			"entry_region": line.EntryRegion, "exit_region": line.ExitRegion, "provider": line.Provider,
 			"capacity_mbps": line.CapacityMbps, "active_deployment": line.ActiveDeployment, "profile": line.Profile},
 		"counts": map[string]int{"specs": specs, "snapshots": snapshots, "incidents": incidents, "operations": operations},

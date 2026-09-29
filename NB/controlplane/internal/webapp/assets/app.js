@@ -184,7 +184,15 @@ function lineRow(line) {
     `<button class="action-button danger-action" disabled title="${escapeHTML(deletion.reason)}">${deletion.label}</button>`;
   const upstream=detail?.spec?.upstream_mbps||detail?.spec?.bandwidth_mbps||line.capacity_mbps,downstream=detail?.spec?.downstream_mbps||detail?.spec?.bandwidth_mbps||line.capacity_mbps;
   const environment = detail?.spec?.environment || line.environment || "production";
-  return `<tr data-line-search="${escapeHTML(`${line.id} ${line.name} ${route}`.toLowerCase())}" data-line-status="${escapeHTML(line.status)}" data-line-environment="${escapeHTML(environment)}"><td><button class="text-button" data-line-detail="${escapeHTML(line.id)}"><strong>${escapeHTML(line.name)}</strong><small>${escapeHTML(line.id)}</small></button></td><td>${environmentBadge(environment)}</td><td>${badge(line.status)}</td><td><div class="route-summary">${escapeHTML(route)}</div></td><td>↑ ${number(upstream)} / ↓ ${number(downstream)} Mbps</td><td>${detail?.spec?.socks_port || "--"}</td><td><span class="mono">${escapeHTML(line.profile || "--")}</span></td><td><div class="actions">${actions}${deleteAction}</div></td></tr>`;
+  const environmentAction = line.status === "deleting" || line.status === "archived" ? "" : `<button class="action-button" data-edit-line-environment="${escapeHTML(line.id)}">改环境</button>`;
+  return `<tr data-line-search="${escapeHTML(`${line.id} ${line.name} ${route}`.toLowerCase())}" data-line-status="${escapeHTML(line.status)}" data-line-environment="${escapeHTML(environment)}"><td><button class="text-button" data-line-detail="${escapeHTML(line.id)}"><strong>${escapeHTML(line.name)}</strong><small>${escapeHTML(line.id)}</small></button></td><td>${environmentBadge(environment)}</td><td>${badge(line.status)}</td><td><div class="route-summary">${escapeHTML(route)}</div></td><td>↑ ${number(upstream)} / ↓ ${number(downstream)} Mbps</td><td>${detail?.spec?.socks_port || "--"}</td><td><span class="mono">${escapeHTML(line.profile || "--")}</span></td><td><div class="actions">${environmentAction}${actions}${deleteAction}</div></td></tr>`;
+}
+
+function openLineEnvironmentEdit(id) {
+  const line = state.lines.find((item) => item.id === id), detail = state.details[id], form = $("#lineEnvironmentForm");
+  if (!line || !form) return;
+  form.reset(); form.elements.line_id.value = id; form.elements.environment.value = detail?.spec?.environment || line.environment || "production";
+  $("#lineEnvironmentError").textContent = ""; $("#lineEnvironmentModal").classList.remove("hidden");
 }
 
 async function deleteLine(id) {
@@ -211,6 +219,7 @@ function renderLines() {
   $$('[data-action]').forEach((button) => button.addEventListener("click", () => openOperation(button.dataset.line, button.dataset.action)));
   $$('[data-delete-line]').forEach((button) => button.addEventListener("click", () => deleteLine(button.dataset.deleteLine)));
   $$('[data-force-delete-line]').forEach((button) => button.addEventListener("click", () => openForceDeleteLine(button.dataset.forceDeleteLine)));
+  $$('[data-edit-line-environment]').forEach((button) => button.addEventListener("click", () => openLineEnvironmentEdit(button.dataset.editLineEnvironment)));
   $("#operationLine").innerHTML = `<option value="">全部线路</option>${state.lines.map((line) => `<option value="${escapeHTML(line.id)}">${escapeHTML(line.name)}</option>`).join("")}`;
   bindDetails();
 }
@@ -346,11 +355,12 @@ $("#forceDeleteLineForm").addEventListener("submit",async(event)=>{
     $("#forceDeleteLineModal").classList.add("hidden");await loadAll();toast("线路已强制删除，审计记录已保留");
   }catch(error){$("#forceDeleteLineError").textContent=error.message;}finally{button.disabled=false;}
 });
+$("#lineEnvironmentForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,v=Object.fromEntries(new FormData(form)),submit=form.querySelector("[type=submit]");submit.disabled=true;try{await api(`/api/v1/lines/${encodeURIComponent(v.line_id)}`,{method:"PATCH",body:JSON.stringify({environment:v.environment})});$("#lineEnvironmentModal").classList.add("hidden");await loadAll();toast("线路环境已更新");}catch(error){$("#lineEnvironmentError").textContent=error.message;}finally{submit.disabled=false;}});
 
 $$('.nav-item').forEach((item)=>item.addEventListener("click",()=>switchView(item.dataset.view)));
 $("#contextAction").addEventListener("click",()=>{if(state.view==="devices"){const form=$("#deviceForm");form.reset();delete form.dataset.originalHost;delete form.dataset.originalPort;delete form.dataset.hostKeyStatus;clearDeviceHostKeyConfirmation();form.elements.id.readOnly=false;form.elements.password.required=true;$("#devicePasswordLabel").textContent="SSH 密码";$("#devicePasswordHint").textContent="首次登记必须输入，保存后不会回显";$("#scanDeviceHostKey").textContent="扫描主机密钥";$("#deviceError").textContent="";$("#deviceModal").classList.remove("hidden");}else{$("#lineError").textContent="";$("#lineModal").classList.remove("hidden");}});
 $("#refreshButton").addEventListener("click",()=>loadAll().catch(()=>{}));
-$$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-force-delete-line').forEach((x)=>x.addEventListener("click",()=>$("#forceDeleteLineModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
+$$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-line-environment').forEach((x)=>x.addEventListener("click",()=>$("#lineEnvironmentModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-force-delete-line').forEach((x)=>x.addEventListener("click",()=>$("#forceDeleteLineModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
 $("#deviceSearch").addEventListener("input",filterDevices);$("#deviceEnvironment").addEventListener("change",filterDevices);$("#deviceStatus").addEventListener("change",filterDevices);$("#exportDevices").addEventListener("click",async()=>{try{const response=await fetch("/api/v1/devices/export",{headers:{Authorization:`Bearer ${state.token}`}});if(!response.ok)throw new Error(`导出失败（HTTP ${response.status}）`);const blob=await response.blob(),url=URL.createObjectURL(blob),anchor=document.createElement("a");anchor.href=url;anchor.download="nb-devices.csv";anchor.click();URL.revokeObjectURL(url);toast("设备信息已导出");}catch(error){toast(error.message);}});$("#lineSearch").addEventListener("input",filterLines);$("#lineEnvironment").addEventListener("change",filterLines);$("#lineStatus").addEventListener("change",filterLines);$("#topologyLine").addEventListener("change",renderOverviewTopology);
 for(const selector of ["#deviceTopologyLine","#deviceTopologyRegion","#deviceTopologyRole","#deviceTopologyHealth"])$(selector).addEventListener("change",renderDeviceTopology);
 const resetTopologyButton=document.createElement("button");

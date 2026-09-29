@@ -703,6 +703,42 @@ func (s *Store) UpsertLine(ctx context.Context, line Line) (Line, error) {
 	return s.Line(ctx, line.ID)
 }
 
+func (s *Store) UpdateLineEnvironment(ctx context.Context, id, environment string) (Line, error) {
+	if environment == "" {
+		environment = "production"
+	}
+	if !validEnvironment(environment) {
+		return Line{}, errors.New("invalid line environment")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Line{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET environment=?,updated_at=? WHERE id=?`, environment, now(), id)
+	if err != nil {
+		return Line{}, err
+	}
+	if count, countErr := result.RowsAffected(); countErr != nil {
+		return Line{}, countErr
+	} else if count != 1 {
+		return Line{}, sql.ErrNoRows
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE line_specs SET environment=?,updated_at=? WHERE line_id=?`, environment, now(), id); err != nil {
+		return Line{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Line{}, err
+	}
+	return s.Line(ctx, id)
+}
+
+func (s *Store) HasActiveOperations(ctx context.Context, lineID string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running')`, lineID).Scan(&count)
+	return count > 0, err
+}
+
 func (s *Store) Line(ctx context.Context, id string) (Line, error) {
 	var line Line
 	err := s.db.QueryRowContext(ctx, `SELECT id,name,status,environment,entry_region,exit_region,provider,capacity_mbps,

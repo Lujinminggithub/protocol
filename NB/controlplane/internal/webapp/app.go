@@ -400,16 +400,45 @@ func (a *App) patchLine(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if line.Environment == "" {
+		line.Environment = "production"
+	}
 	if err = validLine(line); err != nil {
 		problem(w, 400, err.Error())
 		return
 	}
-	line, err = a.store.UpsertLine(r.Context(), line)
+	environmentChanged := line.Environment != currentLineEnvironment(r.Context(), a.store, r.PathValue("id"))
+	if environmentChanged {
+		if line.Status == "deleting" || line.Status == "archived" {
+			problem(w, http.StatusConflict, "清理中或已归档线路不能修改环境")
+			return
+		}
+		active, activeErr := a.store.HasActiveOperations(r.Context(), line.ID)
+		if activeErr != nil {
+			problem(w, 500, activeErr.Error())
+			return
+		}
+		if active {
+			problem(w, http.StatusConflict, "线路仍有排队中或执行中的任务，完成后才能修改环境")
+			return
+		}
+		line, err = a.store.UpdateLineEnvironment(r.Context(), line.ID, line.Environment)
+	} else {
+		line, err = a.store.UpsertLine(r.Context(), line)
+	}
 	if err != nil {
 		problem(w, 409, err.Error())
 		return
 	}
 	writeJSON(w, 200, line)
+}
+
+func currentLineEnvironment(ctx context.Context, store *central.Store, id string) string {
+	line, err := store.Line(ctx, id)
+	if err != nil || line.Environment == "" {
+		return "production"
+	}
+	return line.Environment
 }
 
 func limit(r *http.Request) int {

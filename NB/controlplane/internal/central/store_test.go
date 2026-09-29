@@ -602,6 +602,10 @@ func TestLineSpecEnvironmentDefaultsAndPersists(t *testing.T) {
 	if err != nil || loaded.Environment != "test" {
 		t.Fatalf("environment=%q err=%v", loaded.Environment, err)
 	}
+	line, err := store.Line(t.Context(), spec.LineID)
+	if err != nil || line.Environment != "test" {
+		t.Fatalf("line environment=%q err=%v", line.Environment, err)
+	}
 	if _, err = store.SaveLineSpec(t.Context(), LineSpec{LineID: "line-env", ResourceGroup: "group", InstanceID: "line-env-1", BandwidthMbps: 10,
 		SocksPort: 1080, UDPPortMin: 22000, UDPPortMax: 23023, RelayPort: 4443, ExitPort: 4444,
 		BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Environment: "invalid"}); err == nil {

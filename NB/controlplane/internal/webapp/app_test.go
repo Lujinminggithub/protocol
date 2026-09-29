@@ -508,6 +508,43 @@ func TestCreateLineRejectsDuplicateID(t *testing.T) {
 	}
 }
 
+func TestPatchLineEnvironmentUpdatesLineAndSpec(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	line := map[string]any{"id": "line-environment-edit", "name": "environment edit", "status": "draft", "environment": "production", "entry_region": "entry", "exit_region": "exit", "provider": "test", "capacity_mbps": 10}
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", response.StatusCode, body)
+	}
+	if _, err = database.SaveLineSpec(t.Context(), central.LineSpec{LineID: "line-environment-edit", ResourceGroup: "group", InstanceID: "line-environment-edit-1", BandwidthMbps: 10, UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1082, UDPPortMin: 22048, UDPPortMax: 23071, RelayPort: 4445, ExitPort: 4443, BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Environment: "production", Whitelist: json.RawMessage(`[]`)}); err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, server.Client(), http.MethodPatch, server.URL+"/api/v1/lines/line-environment-edit", "admin", "", map[string]any{"environment": "test"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("patch status=%d body=%s", response.StatusCode, body)
+	}
+	storedLine, err := database.Line(t.Context(), "line-environment-edit")
+	if err != nil || storedLine.Environment != "test" {
+		t.Fatalf("line environment=%q err=%v", storedLine.Environment, err)
+	}
+	storedSpec, err := database.LineSpec(t.Context(), "line-environment-edit")
+	if err != nil || storedSpec.Environment != "test" {
+		t.Fatalf("spec environment=%q err=%v", storedSpec.Environment, err)
+	}
+	if _, _, err = database.CreateOperation(t.Context(), central.Operation{ID: "op-environment-edit", LineID: "line-environment-edit", Kind: "line.validate", RequestedBy: "operator", IdempotencyKey: "environment-edit-operation", Request: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, server.Client(), http.MethodPatch, server.URL+"/api/v1/lines/line-environment-edit", "admin", "", map[string]any{"environment": "production"})
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("排队中或执行中")) {
+		t.Fatalf("active operation environment patch status=%d body=%s", response.StatusCode, body)
+	}
+}
+
 func TestDevicePasswordIsStoredLocallyAndNeverReturned(t *testing.T) {
 	directory := t.TempDir()
 	database, err := central.Open(filepath.Join(directory, "central.db"))
