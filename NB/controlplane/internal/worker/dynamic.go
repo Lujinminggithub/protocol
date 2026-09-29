@@ -51,10 +51,14 @@ type dynamicPlan struct {
 	UpstreamMbps   int           `json:"upstream_mbps"`
 	DownstreamMbps int           `json:"downstream_mbps"`
 	SocksPort      int           `json:"socks_port"`
+	SocksPortAuto  bool          `json:"socks_port_auto"`
 	UDPPortMin     int           `json:"udp_port_min"`
 	UDPPortMax     int           `json:"udp_port_max"`
+	UDPPortsAuto   bool          `json:"udp_ports_auto"`
 	RelayPort      int           `json:"relay_port"`
+	RelayPortAuto  bool          `json:"relay_port_auto"`
 	ExitPort       int           `json:"exit_port"`
+	ExitPortAuto   bool          `json:"exit_port_auto"`
 	ExitBindIP     string        `json:"exit_bind_ip"`
 	DNSServers     []string      `json:"dns_servers"`
 	Whitelist      []string      `json:"whitelist"`

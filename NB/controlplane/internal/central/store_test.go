@@ -341,6 +341,109 @@ func TestAllocateLineSpecAssignsUniqueEntryPortAndSaveRechecksConflict(t *testin
 	}
 }
 
+func TestRuntimePortClaimsParticipateInAllocationAndRequireConfirmedAbsence(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	for _, id := range []string{"line-new", "entry-1", "relay-1", "exit-1"} {
+		if id == "line-new" {
+			if _, err = store.UpsertLine(ctx, Line{ID: id, Name: id, Status: "draft", Provider: "test"}); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if _, err = store.UpsertDevice(ctx, Device{ID: id, Name: id, Status: "ready", Host: "192.0.2.1",
+			SSHPort: 22, SSHUser: "root", SecretRef: "device:" + id, Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims := []RuntimePortClaim{{WorkerID: "worker-1", DeviceID: "entry-1", Role: "entry",
+		ResourceKind: "socks", InstanceID: "legacy-a", PortStart: 1082, PortEnd: 1083,
+		ObservedAt: "2026-09-07T00:00:00Z", ExpiresAt: "2026-09-07T00:05:00Z", Source: "runtime"}}
+	if err = store.ReplaceRuntimePortClaims(ctx, "worker-1", "entry-1", "entry", claims); err != nil {
+		t.Fatal(err)
+	}
+	spec := LineSpec{LineID: "line-new", ResourceGroup: "shared", InstanceID: "line-new_1", BandwidthMbps: 5,
+		Nodes: []LineNode{{DeviceID: "entry-1", Role: "entry"}, {DeviceID: "relay-1", Role: "relay"}, {DeviceID: "exit-1", Role: "exit"}}}
+	allocated, err := store.AllocateLineSpec(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocated.SocksPort != 1084 || !allocated.SocksPortAuto {
+		t.Fatalf("runtime claim was ignored: %+v", allocated)
+	}
+	explicit := allocated
+	explicit.SocksPort, explicit.SocksPortAuto = 1083, false
+	conflict, err := store.LineSpecConflict(ctx, explicit)
+	if err != nil || !strings.Contains(conflict, "legacy-a") {
+		t.Fatalf("explicit runtime conflict=%q err=%v", conflict, err)
+	}
+	if err = store.ReplaceRuntimePortClaims(ctx, "worker-1", "entry-1", "entry", nil); err != nil {
+		t.Fatal(err)
+	}
+	allocated.SocksPort = 0
+	allocated, err = store.AllocateLineSpec(ctx, allocated)
+	if err != nil || allocated.SocksPort != 1082 {
+		t.Fatalf("confirmed absence did not release claim: %+v err=%v", allocated, err)
+	}
+}
+
+func TestPrepareLineOpenOperationReallocatesAutomaticRuntimeConflict(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	if _, err = store.UpsertLine(ctx, Line{ID: "line-cas", Name: "cas", Status: "draft", Provider: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"entry-cas", "relay-cas", "exit-cas"} {
+		if _, err = store.UpsertDevice(ctx, Device{ID: id, Name: id, Status: "ready", Host: "192.0.2.1",
+			SSHPort: 22, SSHUser: "root", SecretRef: "device:" + id, Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := LineSpec{LineID: "line-cas", ResourceGroup: "shared", InstanceID: "line-cas_1", BandwidthMbps: 5,
+		SocksPort: 1082, SocksPortAuto: true, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto",
+		Nodes: []LineNode{{DeviceID: "entry-cas", Role: "entry"}, {DeviceID: "relay-cas", Role: "relay"}, {DeviceID: "exit-cas", Role: "exit"}}}
+	if _, err = store.SaveLineSpec(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := json.Marshal(map[string]any{"plan": spec})
+	op := Operation{ID: "op-cas", LineID: spec.LineID, Kind: "line.open", RequestedBy: "operator", IdempotencyKey: "op-cas", Request: request}
+	if _, _, err = store.CreateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`UPDATE operations SET status='dispatched' WHERE id=?`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim := RuntimePortClaim{WorkerID: "worker-1", DeviceID: "entry-cas", Role: "entry", ResourceKind: "socks",
+		InstanceID: "legacy-cas", PortStart: 1082, PortEnd: 1082, ObservedAt: "2026-09-07T00:00:00Z",
+		ExpiresAt: "2026-09-07T00:05:00Z", Source: "runtime"}
+	if err = store.ReplaceRuntimePortClaims(ctx, "worker-1", "entry-cas", "entry", []RuntimePortClaim{claim}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := store.PrepareLineOpenOperation(ctx, op.ID, op.LineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.LineSpec(ctx, spec.LineID)
+	if err != nil || updated.SocksPort != 1083 {
+		t.Fatalf("updated spec=%+v err=%v", updated, err)
+	}
+	var values struct {
+		Plan LineSpec `json:"plan"`
+	}
+	if err = json.Unmarshal(prepared.Request, &values); err != nil || values.Plan.SocksPort != 1083 {
+		t.Fatalf("prepared plan=%+v err=%v", values.Plan, err)
+	}
+}
+
 func TestTuneCompletionUpdatesLineProfile(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

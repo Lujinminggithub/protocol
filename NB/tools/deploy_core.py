@@ -609,10 +609,19 @@ def _systemd_stop(c, role):
     if DEPLOY_INSTANCE:
         paths=[f"{nb_shard_deploy.shard_config_dir(WORK,role,worker)}/{DEPLOY_INSTANCE}.conf"
                for worker in range(_effective_workers(role))]
+        controls=[nb_shard_deploy.line_control_path(DEPLOY_INSTANCE,role,worker)
+                  for worker in range(_effective_workers(role))]
         run(c,"rm -f "+" ".join(shlex.quote(path) for path in paths))
         for worker in range(_effective_workers(role)):
             run(c,f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role,worker))} 2>/dev/null || true")
-        run(c,f"systemctl stop {shlex.quote(_service_name(role))} 2>/dev/null || true; rm -f {_control_socket_glob(role)}")
+        run(c,f"systemctl stop {shlex.quote(_service_name(role))} 2>/dev/null || true")
+        absent=" && ".join([*(f"test ! -e {shlex.quote(path)}" for path in paths),
+                            *(f"test ! -S {shlex.quote(path)}" for path in controls)])
+        details=" ".join(shlex.quote(path) for path in [*paths,*controls])
+        result=run(c,f"for i in $(seq 1 40); do if {absent}; then echo LINE_INSTANCE_REMOVED; exit 0; fi; sleep 0.25; done; "
+                     f"ls -l {details} 2>/dev/null || true; exit 1",tmo=20)
+        if "LINE_INSTANCE_REMOVED" not in result:
+            raise RuntimeError(f"{role} line instance cleanup verification failed")
         return "line instance removed; shard remains active"
     unit = _service_name(role)
     cleanup = (f"rm -f {_control_socket_glob(role)}; " if DEPLOY_INSTANCE else
@@ -768,11 +777,15 @@ def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_i
     rules = f"{INSTANCE_WORK}/releases/{release_id}/tiktok_flow_rules.conf" if release_id else _tiktok_rules_remote()
     base = f"{INSTANCE_WORK}/nb_node -r {role} -c {sec['cert']} -k {sec['key']} -a {sec['ca']} -F {rules}"
     if role == "entry":
+        signal_direct=LAB.get("transport",{}).get("entry",{}).get("signal_direct",False)
+        if not isinstance(signal_direct,bool):
+            raise ValueError("transport.entry.signal_direct 必须为 true 或 false")
+        signal_direct_arg=" --signal-direct" if signal_direct else ""
         mid = f"H:{kz['host']}:{EXIT_PORT}"
         middle_data_host = hk.get("private_ip") or hk.get("jump_target_host") or hk["host"]
         if not wl_remote:
             raise ValueError("entry SOCKS 启动需要 whitelist 路径")
-        return f"{base} -l {socks_port} -n {middle_data_host} -N {MIDDLE_PORT} -S -U {sec['users']} -Q {sec['tenants']} -W {wl_remote} -M {shlex.quote(mid)} -E {exit_routes or _exit_routes_remote()}"
+        return f"{base} -l {socks_port} -n {middle_data_host} -N {MIDDLE_PORT} -S -U {sec['users']} -Q {sec['tenants']} -W {wl_remote} -M {shlex.quote(mid)} -E {exit_routes or _exit_routes_remote()}{signal_direct_arg}"
     if role == "middle":
         return f"{base} -p {MIDDLE_PORT}"
     if role == "exit":

@@ -86,8 +86,11 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
     if "COLLISION" in staged or not ("STAGED" in staged or "REUSED" in staged):
         raise RuntimeError(f"{role} shared shard release staging failed")
     previous_target = run(c, f"readlink -f {shlex.quote(root + '/nb_node')} 2>/dev/null || true").strip()
+    previous_target_exists = bool(previous_target) and "PRESENT" in run(
+        c, f"if test -x {shlex.quote(previous_target)}; then echo PRESENT; else echo ABSENT; fi"
+    )
     binary_changed = previous_target != shared_release
-    if previous_target and binary_changed:
+    if previous_target_exists and binary_changed:
         require_idle_for_binary_change(c, role, work=work, run=run)
     high, maximum = _memory_limits(lab, role)
     unit = nb_shard_deploy.render_systemd_unit(work, role, binary_release_id, high, maximum)
@@ -110,8 +113,8 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
             detail = run(c, f"systemctl status {shlex.quote(service)} --no-pager -l; "
                 f"journalctl -u {shlex.quote(service)} -n 40 --no-pager")
             raise RuntimeError(f"{service} failed to start:\n{detail}")
-        if binary_changed:
-            verify_all_controls(c, role, work=work, run=run)
+    if binary_changed:
+        verify_all_controls(c, role, work=work, run=run)
 
     legacy = legacy_service_name(role)
     legacy_was_active = run(c, f"systemctl is-active {shlex.quote(legacy)} 2>/dev/null || true").strip() == "active"

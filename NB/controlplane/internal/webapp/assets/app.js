@@ -16,7 +16,7 @@ const escapeHTML = (value = "") => String(value).replace(/[&<>'"]/g, (char) => (
 const formatTime = (value) => value ? new Intl.DateTimeFormat("zh-CN", {month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"}).format(new Date(value)) : "--";
 const number = (value, digits = 0) => Number(value || 0).toLocaleString("zh-CN", {maximumFractionDigits:digits});
 const formatDurationUS = (value) => { const us=Number(value||0); if(us<1000)return `${number(us)} μs`; if(us<1000000)return `${number(us/1000,2)} ms`; return `${number(us/1000000,2)} s`; };
-const statusText = {ok:"健康",healthy:"健康",degraded:"异常",down:"离线",unreachable:"不可达",unhealthy:"异常",unknown:"待采集",ready:"已就绪",provisioning:"初始化",offline:"离线",retired:"退役",active:"运行中",draft:"草稿",validating:"验证中",maintenance:"维护",disabled:"停用",queued:"排队中",dispatched:"已下发",running:"执行中",succeeded:"成功",failed:"失败",cancelled:"已取消",rolled_back:"已回滚",open:"未处理",firing:"告警中",resolved:"已恢复",critical:"严重",warning:"警告",info:"信息",pending:"等待",skipped:"跳过"};
+const statusText = {ok:"健康",healthy:"健康",degraded:"异常",down:"离线",unreachable:"不可达",unhealthy:"异常",unknown:"待采集",ready:"已就绪",provisioning:"初始化",offline:"离线",retired:"退役",active:"运行中",draft:"草稿",validating:"验证中",maintenance:"维护",disabled:"停用",deleting:"清理中",queued:"排队中",dispatched:"已下发",running:"执行中",succeeded:"成功",failed:"失败",cancelled:"已取消",rolled_back:"已回滚",open:"未处理",firing:"告警中",resolved:"已恢复",critical:"严重",warning:"警告",info:"信息",pending:"等待",skipped:"跳过"};
 const deviceStatusText = {ready:"已启用",provisioning:"初始化",maintenance:"维护",offline:"停用",retired:"退役"};
 function healthState(value) { return value === "ok" ? "healthy" : (value || "unknown"); }
 const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优"};
@@ -170,7 +170,7 @@ function lineRow(line) {
   const detail = state.details[line.id];
   const nodes = detail?.spec?.nodes || [];
   const route = nodes.map((n) => n.device?.name || n.device_id).join(" → ") || `${line.entry_region} → ${line.exit_region}`;
-  const definitions = line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.validate","验证",""] ,["line.tune","协议调优",""] ,["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
+  const definitions = line.status === "deleting" ? [] : line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.validate","验证",""] ,["line.tune","协议调优",""] ,["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
   const actions = definitions.map(([kind,label,style]) => { const a = operationAvailability(line.id,kind); return `<button class="action-button ${style}" ${a.enabled ? `data-action="${kind}" data-line="${escapeHTML(line.id)}"` : `disabled title="${escapeHTML(a.reason)}"`}>${label}</button>`; }).join("");
   const hasActiveOperation=state.operations.some((item)=>item.line_id===line.id&&["queued","dispatched","running"].includes(item.status));
   const hasFailedDisable=state.operations.some((item)=>item.line_id===line.id&&item.kind==="line.disable"&&item.status==="failed");
@@ -185,10 +185,10 @@ function lineRow(line) {
 
 async function deleteLine(id) {
   const detail = state.details[id], incomplete = !(detail?.spec?.nodes || []).length;
-  if (!confirm(`确认删除线路 ${id}？任务和监控历史将从当前视图移除，删除审计会保留。`)) return;
+  if (!confirm(`确认删除线路 ${id}？系统将先清理三端实例和端口，确认完成后再删除线路记录。`)) return;
   try {
-    await api(`/api/v1/lines/${encodeURIComponent(id)}`, {method:"DELETE", body:JSON.stringify({requested_by:"operator", reason:incomplete?"remove incomplete discovered line":"operator requested line deletion"})});
-    await loadAll(); toast("线路已删除");
+    const result=await api(`/api/v1/lines/${encodeURIComponent(id)}`, {method:"DELETE", body:JSON.stringify({requested_by:"operator", reason:incomplete?"remove incomplete discovered line":"operator requested line deletion"})});
+    await loadAll(); toast(result?.kind==="line.disable"?"节点清理任务已创建，完成后自动删除线路":"线路已删除");
   } catch (error) { toast(error.message); }
 }
 

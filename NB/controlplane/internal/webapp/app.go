@@ -133,8 +133,11 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
 	mux.HandleFunc("POST /agent/v1/inventory", a.agent(a.discoverInventory))
 	mux.HandleFunc("GET /agent/v1/line-plans", a.agent(a.agentLinePlans))
+	mux.HandleFunc("GET /agent/v1/runtime-port-scan-plans", a.agent(a.runtimePortScanPlans))
+	mux.HandleFunc("POST /agent/v1/runtime-port-claims", a.agent(a.replaceRuntimePortClaims))
 	mux.HandleFunc("POST /agent/v1/lines/{id}/client-config", a.agent(a.attachClientConfig))
 	mux.HandleFunc("GET /agent/v1/operations", a.agent(a.claimOperations))
+	mux.HandleFunc("POST /agent/v1/operations/{id}/port-preflight", a.agent(a.prepareOperationPorts))
 	mux.HandleFunc("POST /agent/v1/operations/{id}/result", a.agent(a.completeOperation))
 	mux.HandleFunc("POST /agent/v1/operations/{id}/events", a.agent(a.operationEvent))
 	mux.HandleFunc("POST /api/nb/v1/node-snapshots", a.agent(a.legacySnapshot))
@@ -314,7 +317,7 @@ func validLine(line central.Line) error {
 	if !safeID.MatchString(line.ID) || strings.TrimSpace(line.Name) == "" || len(line.Name) > 100 {
 		return errors.New("invalid line identity")
 	}
-	if line.Status != "draft" && line.Status != "validating" && line.Status != "active" && line.Status != "maintenance" && line.Status != "disabled" && line.Status != "archived" {
+	if line.Status != "draft" && line.Status != "validating" && line.Status != "active" && line.Status != "maintenance" && line.Status != "disabled" && line.Status != "archived" && line.Status != "deleting" {
 		return errors.New("invalid line status")
 	}
 	if line.CapacityMbps < 0 || line.CapacityMbps > 1000000 {
@@ -961,6 +964,12 @@ func (a *App) completeOperation(w http.ResponseWriter, r *http.Request) {
 		req.Result = json.RawMessage(`{}`)
 	}
 	operation, err := a.store.Operation(r.Context(), r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) && req.Status == "succeeded" {
+		if completed, completedErr := a.store.LineDeletionCompleted(r.Context(), r.PathValue("id"), req.LineID); completedErr == nil && completed {
+			writeJSON(w, 200, map[string]bool{"updated": true})
+			return
+		}
+	}
 	if err != nil || operation.LineID != req.LineID {
 		problem(w, 404, "operation not found")
 		return

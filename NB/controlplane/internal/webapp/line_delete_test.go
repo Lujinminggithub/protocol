@@ -1,6 +1,7 @@
 package webapp
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -67,5 +68,57 @@ func TestForceDeleteLineAPIRequiresManualConfirmation(t *testing.T) {
 			"confirmation": "line-unreachable", "acknowledge_orphans": true})
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("force deletion status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestDeleteDraftWithSpecQueuesCleanup(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := t.Context()
+	lineID := "draft-cleanup"
+	if _, err = database.UpsertLine(ctx, central.Line{ID: lineID, Name: "draft", Status: "draft", Provider: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"entry-cleanup", "relay-cleanup", "exit-cleanup"} {
+		if _, err = database.UpsertDevice(ctx, central.Device{ID: id, Name: id, Status: "ready", Host: "192.0.2.1",
+			SSHPort: 22, SSHUser: "root", SecretRef: "device:" + id, Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = database.SaveLineSpec(ctx, central.LineSpec{LineID: lineID, ResourceGroup: "shared", InstanceID: lineID + "_1",
+		BandwidthMbps: 5, UpstreamMbps: 5, DownstreamMbps: 5, SocksPort: 1091, RelayPort: 4459, ExitPort: 4459,
+		UDPPortMin: 30240, UDPPortMax: 31263, Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`),
+		BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Nodes: []central.LineNode{
+			{DeviceID: "entry-cleanup", Role: "entry"}, {DeviceID: "relay-cleanup", Role: "relay"}, {DeviceID: "exit-cleanup", Role: "exit"}}}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	response, body := call(t, server.Client(), http.MethodDelete, server.URL+"/api/v1/lines/"+lineID, "admin", "",
+		map[string]any{"requested_by": "operator", "reason": "remove failed draft"})
+	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"kind":"line.disable"`)) {
+		t.Fatalf("delete status=%d body=%s", response.StatusCode, body)
+	}
+	line, err := database.Line(ctx, lineID)
+	if err != nil || line.Status != "deleting" {
+		t.Fatalf("line=%+v err=%v", line, err)
+	}
+	var cleanup central.Operation
+	if err = json.Unmarshal(body, &cleanup); err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/agent/v1/operations?line_id="+lineID+"&limit=1", "agent", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(cleanup.ID)) {
+		t.Fatalf("claim status=%d body=%s", response.StatusCode, body)
+	}
+	completion := map[string]any{"line_id": lineID, "status": "succeeded", "result": map[string]any{}}
+	for attempt := 0; attempt < 2; attempt++ {
+		response, body = call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/operations/"+cleanup.ID+"/result", "agent", "", completion)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("completion attempt=%d status=%d body=%s", attempt+1, response.StatusCode, body)
+		}
 	}
 }

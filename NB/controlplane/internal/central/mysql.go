@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS line_specs (
  artifact_ref TEXT NOT NULL, source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy VARCHAR(64) NOT NULL,
  created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS line_port_allocation (
+ line_id VARCHAR(191) PRIMARY KEY, socks_port_auto BOOLEAN NOT NULL DEFAULT FALSE,
+ relay_port_auto BOOLEAN NOT NULL DEFAULT FALSE, exit_port_auto BOOLEAN NOT NULL DEFAULT FALSE,
+ udp_ports_auto BOOLEAN NOT NULL DEFAULT FALSE, updated_at VARCHAR(40) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS runtime_port_claims (
+ worker_id VARCHAR(191) NOT NULL, device_id VARCHAR(191) NOT NULL, role VARCHAR(32) NOT NULL,
+ resource_kind VARCHAR(32) NOT NULL, instance_id VARCHAR(191) NOT NULL,
+ port_start INT NOT NULL, port_end INT NOT NULL, observed_at VARCHAR(40) NOT NULL,
+ expires_at VARCHAR(40) NOT NULL, source VARCHAR(32) NOT NULL,
+ PRIMARY KEY(worker_id,device_id,role,resource_kind,instance_id,port_start,port_end),
+ INDEX runtime_port_claims_lookup(device_id,role,resource_kind,port_start,port_end)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS line_nodes (
  line_id VARCHAR(191) NOT NULL, device_id VARCHAR(191) NOT NULL, role VARCHAR(32) NOT NULL,
  ordinal INT NOT NULL, next_hop_device_id VARCHAR(191) NOT NULL DEFAULT '',
@@ -91,6 +104,15 @@ CREATE TABLE IF NOT EXISTS line_deletion_audit (
  id BIGINT AUTO_INCREMENT PRIMARY KEY, line_id VARCHAR(191) NOT NULL, line_name VARCHAR(100) NOT NULL,
  requested_by VARCHAR(191) NOT NULL, reason TEXT NOT NULL, snapshot MEDIUMBLOB NOT NULL,
  deleted_at VARCHAR(40) NOT NULL, INDEX line_deletion_audit_line(line_id,deleted_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS line_deletion_requests (
+ line_id VARCHAR(191) PRIMARY KEY, operation_id VARCHAR(191) NOT NULL UNIQUE,
+ requested_by VARCHAR(191) NOT NULL, reason TEXT NOT NULL, previous_status VARCHAR(32) NOT NULL,
+ created_at VARCHAR(40) NOT NULL, INDEX line_deletion_requests_operation(operation_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS line_deletion_completions (
+ operation_id VARCHAR(191) PRIMARY KEY, line_id VARCHAR(191) NOT NULL,
+ completed_at VARCHAR(40) NOT NULL, INDEX line_deletion_completions_line(line_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS transport_generations (
  line_id VARCHAR(191) PRIMARY KEY, current_generation BIGINT UNSIGNED NOT NULL, updated_at VARCHAR(40) NOT NULL

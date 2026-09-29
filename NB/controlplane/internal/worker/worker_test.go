@@ -987,3 +987,120 @@ func TestWorkerLocalSecretReusesStaticMachineCredentials(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRuntimeShardPortClaims(t *testing.T) {
+	observed := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	entryConfig := "schema=1\ninstance_id=legacy-entry\narg=-r\narg=entry\narg=-l\narg=1083\nenv.NB_SOCKS_UDP_PORT_MIN=22048\nenv.NB_SOCKS_UDP_PORT_MAX=23071\n"
+	entryClaims, err := parseRuntimeShardPortClaims("worker-1", "entry-device", "entry", map[string]string{
+		"0/legacy.conf": entryConfig, "1/legacy.conf": entryConfig,
+	}, observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entryClaims) != 2 || entryClaims[0].ResourceKind != "socks" || entryClaims[0].PortStart != 1083 ||
+		entryClaims[1].ResourceKind != "udp" || entryClaims[1].PortStart != 22048 || entryClaims[1].PortEnd != 23071 {
+		t.Fatalf("entry claims=%+v", entryClaims)
+	}
+	middleConfig := "schema=1\ninstance_id=legacy-middle\narg=-r\narg=middle\narg=-p\narg=4445\nenv.NB_WORKER_LANE_PORTS=on\n"
+	middleClaims, err := parseRuntimeShardPortClaims("worker-1", "relay-device", "relay", map[string]string{
+		"0/legacy.conf": middleConfig, "1/legacy.conf": middleConfig,
+	}, observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(middleClaims) != 1 || middleClaims[0].ResourceKind != "transport" ||
+		middleClaims[0].PortStart != 4445 || middleClaims[0].PortEnd != 4446 {
+		t.Fatalf("middle claims=%+v", middleClaims)
+	}
+}
+
+type fakeRuntimePortRunner struct{}
+
+func (*fakeRuntimePortRunner) Run(context.Context, Operation) (Result, error) { return Result{}, nil }
+func (*fakeRuntimePortRunner) runtimePortBatches(_ context.Context, plans []dynamicPlan) ([]runtimePortClaimBatch, error) {
+	return []runtimePortClaimBatch{{WorkerID: "worker-1", DeviceID: "entry-1", Role: "entry", ScanComplete: true,
+		ObservedAt: "2026-09-07T12:00:00Z", Claims: []runtimePortClaim{{ResourceKind: "socks", InstanceID: "legacy", PortStart: 1082, PortEnd: 1082}}}}, nil
+}
+
+func TestPrepareRuntimePortsUploadsClaimsBeforePreflight(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Dynamic = DynamicConfig{Enabled: true, ResourceGroups: []string{"shared-1"}, Operations: []string{"line.open"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599, UDPPortMin: 22048, UDPPortMax: 65535}
+	var claimsUploaded atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/agent/v1/runtime-port-claims":
+			claimsUploaded.Store(true)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"updated":1}`))
+		case "/agent/v1/operations/op-runtime/port-preflight":
+			if !claimsUploaded.Load() {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"op-runtime","line_id":"line-runtime","kind":"line.open","request":{"plan":{"line_id":"line-runtime","socks_port":1083}}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(registry, &fakeRuntimePortRunner{}, ClientConfig{BaseURL: server.URL, Token: "agent-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := json.Marshal(map[string]any{"plan": dynamicPlan{LineID: "line-runtime", ResourceGroup: "shared-1"}})
+	prepared, err := client.prepareRuntimePorts(context.Background(), Operation{ID: "op-runtime", LineID: "line-runtime", Kind: "line.open", Request: request})
+	if err != nil || prepared.ID != "op-runtime" || !claimsUploaded.Load() {
+		t.Fatalf("prepared=%+v uploaded=%v err=%v", prepared, claimsUploaded.Load(), err)
+	}
+}
+
+type fakeCleanupPortRunner struct{ residual bool }
+
+func (*fakeCleanupPortRunner) Run(context.Context, Operation) (Result, error) { return Result{}, nil }
+func (r *fakeCleanupPortRunner) runtimePortBatches(_ context.Context, plans []dynamicPlan) ([]runtimePortClaimBatch, error) {
+	roles := []struct{ role, device string }{{"entry", "entry-1"}, {"relay", "relay-1"}, {"exit", "exit-1"}}
+	result := make([]runtimePortClaimBatch, 0, len(roles))
+	for _, item := range roles {
+		claims := []runtimePortClaim{}
+		if r.residual && item.role == "entry" {
+			claims = append(claims, runtimePortClaim{ResourceKind: "socks", InstanceID: "line-cleanup_1-entry", PortStart: 1091, PortEnd: 1091})
+		}
+		result = append(result, runtimePortClaimBatch{WorkerID: "worker-1", DeviceID: item.device, Role: item.role,
+			ObservedAt: "2026-09-07T12:00:00Z", ScanComplete: true, Claims: claims})
+	}
+	return result, nil
+}
+
+func TestConfirmRuntimeCleanupRequiresAllRolesAndNoResidualInstance(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Dynamic = DynamicConfig{Enabled: true, ResourceGroups: []string{"shared-1"}, Operations: []string{"line.disable"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599, UDPPortMin: 22048, UDPPortMax: 65535}
+	posted := atomic.Int64{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/agent/v1/runtime-port-claims" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		posted.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"updated":0}`))
+	}))
+	defer server.Close()
+	plan := dynamicPlan{LineID: "line-cleanup", ResourceGroup: "shared-1", InstanceID: "line-cleanup_1", Nodes: []dynamicNode{
+		{DeviceID: "entry-1", Role: "entry"}, {DeviceID: "relay-1", Role: "relay"}, {DeviceID: "exit-1", Role: "exit"}}}
+	request, _ := json.Marshal(map[string]any{"plan": plan, "delete_after_cleanup": true})
+	operation := Operation{ID: "op-cleanup", LineID: plan.LineID, Kind: "line.disable", Request: request}
+	client, err := NewClient(registry, &fakeCleanupPortRunner{}, ClientConfig{BaseURL: server.URL, Token: "agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = client.confirmRuntimeCleanup(context.Background(), operation); err != nil || posted.Load() != 3 {
+		t.Fatalf("posted=%d err=%v", posted.Load(), err)
+	}
+	client.runner = &fakeCleanupPortRunner{residual: true}
+	if err = client.confirmRuntimeCleanup(context.Background(), operation); err == nil || !strings.Contains(err.Error(), "仍存在") {
+		t.Fatalf("residual cleanup error=%v", err)
+	}
+}

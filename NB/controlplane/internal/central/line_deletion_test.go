@@ -88,3 +88,113 @@ func TestForceDeleteLineRequiresConfirmationAndPreservesAudit(t *testing.T) {
 		t.Fatalf("force deletion audit=%s", snapshot)
 	}
 }
+
+func TestDeleteDraftLineWithSeparateTelemetryDatabase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	lineID := "draft-split-telemetry"
+	if _, err = store.UpsertLine(ctx, Line{ID: lineID, Name: "draft", Status: "draft",
+		EntryRegion: "gz", ExitRegion: "kz", Provider: "mixed", CapacityMbps: 5}); err != nil {
+		t.Fatal(err)
+	}
+	operation := Operation{ID: "op-failed-open", LineID: lineID, Kind: "line.open",
+		RequestedBy: "operator", IdempotencyKey: "failed-open", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`UPDATE operations SET status='failed',result='{}' WHERE id=?`, operation.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{`DROP TABLE latest_snapshots`, `DROP TABLE snapshots`, `DROP TABLE traffic_rollups`} {
+		if _, err = store.db.Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.dialect = "mysql"
+	request := LineDeletionRequest{RequestedBy: "operator", Reason: "remove failed draft"}
+	if err = store.DeleteLine(ctx, lineID, request); err != nil {
+		t.Fatalf("delete split-database draft: %v", err)
+	}
+	if _, err = store.Line(ctx, lineID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted line lookup error=%v", err)
+	}
+	var operations int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM operations WHERE line_id=?`, lineID).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 0 {
+		t.Fatalf("operations=%d, want 0", operations)
+	}
+	var audit int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM line_deletion_audit WHERE line_id=?`, lineID).Scan(&audit); err != nil {
+		t.Fatal(err)
+	}
+	if audit != 1 {
+		t.Fatalf("audit=%d, want 1", audit)
+	}
+}
+
+func TestScheduledDeletionKeepsDraftUntilCleanupSucceeds(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	lineID := "draft-cleanup"
+	if _, err = store.UpsertLine(ctx, Line{ID: lineID, Name: "draft", Status: "draft", Provider: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"entry-cleanup", "relay-cleanup", "exit-cleanup"} {
+		if _, err = store.UpsertDevice(ctx, Device{ID: id, Name: id, Status: "ready", Host: "192.0.2.1",
+			SSHPort: 22, SSHUser: "root", SecretRef: "device:" + id, Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := LineSpec{LineID: lineID, ResourceGroup: "shared", InstanceID: lineID + "_1", BandwidthMbps: 5,
+		SocksPort: 1091, RelayPort: 4459, ExitPort: 4459, UDPPortMin: 30240, UDPPortMax: 31263,
+		Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto",
+		Nodes: []LineNode{{DeviceID: "entry-cleanup", Role: "entry"}, {DeviceID: "relay-cleanup", Role: "relay"}, {DeviceID: "exit-cleanup", Role: "exit"}}}
+	if _, err = store.SaveLineSpec(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatal(err)
+	}
+	store.dialect = "mysql"
+	request := LineDeletionRequest{RequestedBy: "operator", Reason: "remove failed draft"}
+	operation, err := store.ScheduleLineDeletion(ctx, lineID, "op-delete-cleanup", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Kind != "line.disable" || operation.Status != "queued" || !strings.Contains(string(operation.Request), `"delete_after_cleanup":true`) {
+		t.Fatalf("cleanup operation=%+v", operation)
+	}
+	if line, lineErr := store.Line(ctx, lineID); lineErr != nil || line.Status != "deleting" {
+		t.Fatalf("pending line=%+v err=%v", line, lineErr)
+	}
+	if _, err = store.db.Exec(`UPDATE operations SET status='running' WHERE id=?`, operation.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteOperation(ctx, operation.ID, lineID, "succeeded", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteOperation(ctx, operation.ID, lineID, "succeeded", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("idempotent cleanup completion failed: %v", err)
+	}
+	if _, err = store.Line(ctx, lineID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("line still exists after cleanup: %v", err)
+	}
+	var audit int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM line_deletion_audit WHERE line_id=?`, lineID).Scan(&audit); err != nil || audit != 1 {
+		t.Fatalf("audit=%d err=%v", audit, err)
+	}
+	var nodes int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM line_nodes WHERE line_id=?`, lineID).Scan(&nodes); err != nil || nodes != 0 {
+		t.Fatalf("line_nodes=%d err=%v", nodes, err)
+	}
+}

@@ -416,6 +416,19 @@ CREATE TABLE IF NOT EXISTS line_specs (
  source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy TEXT NOT NULL,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS line_port_allocation (
+ line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
+ socks_port_auto INTEGER NOT NULL DEFAULT 0, relay_port_auto INTEGER NOT NULL DEFAULT 0,
+ exit_port_auto INTEGER NOT NULL DEFAULT 0, udp_ports_auto INTEGER NOT NULL DEFAULT 0,
+ updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_port_claims (
+ worker_id TEXT NOT NULL, device_id TEXT NOT NULL, role TEXT NOT NULL,
+ resource_kind TEXT NOT NULL, instance_id TEXT NOT NULL,
+ port_start INTEGER NOT NULL, port_end INTEGER NOT NULL, observed_at TEXT NOT NULL,
+ expires_at TEXT NOT NULL, source TEXT NOT NULL,
+ PRIMARY KEY(worker_id,device_id,role,resource_kind,instance_id,port_start,port_end)
+);
 CREATE TABLE IF NOT EXISTS line_nodes (
  line_id TEXT NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
  device_id TEXT NOT NULL REFERENCES devices(id), role TEXT NOT NULL,
@@ -439,6 +452,14 @@ CREATE TABLE IF NOT EXISTS line_deletion_audit (
  requested_by TEXT NOT NULL, reason TEXT NOT NULL, snapshot BLOB NOT NULL,
  deleted_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS line_deletion_requests (
+ line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
+ operation_id TEXT NOT NULL UNIQUE, requested_by TEXT NOT NULL, reason TEXT NOT NULL,
+ previous_status TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS line_deletion_completions (
+ operation_id TEXT PRIMARY KEY, line_id TEXT NOT NULL, completed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS transport_generations (
  line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
  current_generation INTEGER NOT NULL CHECK(current_generation > 0), updated_at TEXT NOT NULL
@@ -460,8 +481,11 @@ CREATE INDEX IF NOT EXISTS operations_ready ON operations(line_id,status,created
 CREATE INDEX IF NOT EXISTS raw_events_path ON raw_events(path,received_at);
 CREATE INDEX IF NOT EXISTS devices_status ON devices(status,region,name);
 CREATE INDEX IF NOT EXISTS line_nodes_device ON line_nodes(device_id,line_id);
+CREATE INDEX IF NOT EXISTS runtime_port_claims_lookup ON runtime_port_claims(device_id,role,resource_kind,port_start,port_end);
 CREATE INDEX IF NOT EXISTS operation_events_order ON operation_events(operation_id,sequence);
 CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_id,deleted_at DESC);
+CREATE INDEX IF NOT EXISTS line_deletion_requests_operation ON line_deletion_requests(operation_id);
+CREATE INDEX IF NOT EXISTS line_deletion_completions_line ON line_deletion_completions(line_id);
 CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_at);
 `)
 	if err != nil {
@@ -956,6 +980,12 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 	var kind, currentStatus string
 	var currentResult []byte
 	if err = tx.QueryRowContext(ctx, `SELECT kind,status,result FROM operations WHERE id=? AND line_id=?`, id, lineID).Scan(&kind, &currentStatus, &currentResult); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			var completed int
+			if completionErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM line_deletion_completions WHERE operation_id=? AND line_id=?`, id, lineID).Scan(&completed); completionErr == nil && completed == 1 && status == "succeeded" {
+				return nil
+			}
+		}
 		return fmt.Errorf("operation is not active")
 	}
 	if currentStatus != "dispatched" && currentStatus != "running" {
@@ -976,6 +1006,10 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 	if err != nil {
 		return err
 	}
+	pendingDeletion, _, err := s.completeScheduledDeletion(ctx, tx, lineID, id, status)
+	if err != nil {
+		return err
+	}
 	if status == "succeeded" {
 		var values struct {
 			Deployment          string `json:"deployment"`
@@ -992,7 +1026,10 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 				return err
 			}
 		case "line.disable":
-			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='disabled',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+			if !pendingDeletion {
+				_, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='disabled',updated_at=? WHERE id=?`, now(), lineID)
+			}
+			if err != nil {
 				return err
 			}
 		case "line.tune":

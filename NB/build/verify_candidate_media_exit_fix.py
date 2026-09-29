@@ -566,7 +566,10 @@ class NativeProbeAdapter:
                 f"sent_bytes={sent_bytes} target_bytes={target_bytes} received_bytes={received_bytes}")
         if kind == "media_burst":
             if not 0.5 <= send_elapsed_s < 1.0 or received_bytes < BURST_MIN_RECEIVED_BYTES:
-                raise RuntimeError("原生 UDP 突发未在 500-1000ms 内取得 99% 回显")
+                raise RuntimeError(
+                    "原生 UDP 突发未在 500-1000ms 内取得 99% 回显 "
+                    f"elapsed_ms={send_elapsed_s * 1000:.3f} sent_bytes={sent_bytes} "
+                    f"received_bytes={received_bytes} required_bytes={BURST_MIN_RECEIVED_BYTES}")
         elif send_elapsed_s < 90 or not SUSTAINED_MIN_KBPS <= received_bytes * 8 / send_elapsed_s / 1000 <= SUSTAINED_MAX_KBPS:
             raise RuntimeError("原生 UDP 持续探针吞吐未处于 4500-5000Kbps")
         if kind == "media_burst":

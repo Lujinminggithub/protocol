@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import pathlib
 import tempfile
+import copy
 
 import deploy
 import deploy_core
@@ -33,6 +34,41 @@ def main() -> None:
     runner = "tools/runtri_udp_probe_echo.py"
     assert deploy.BUILD_FILES[runner] == deploy.ROOT / "tools" / "runtri_udp_probe_echo.py"
     assert "test -r tools/nb_supervisor.py -a -r scripts/runtri.sh -a -r tools/runtri_udp_probe_echo.py" in deploy.BUILD_CMD
+
+    saved_lab = copy.deepcopy(deploy_core.LAB)
+    try:
+        deploy_core.LAB.setdefault("transport", {}).setdefault("entry", {})["signal_direct"] = True
+        command = deploy_core._node_command(
+            "entry", socks_port=1089, wl_remote="/runtime/whitelist.conf",
+            release_id="release", exit_routes="/runtime/exit_routes.conf")
+        assert "--signal-direct" in command
+        deploy_core.LAB["transport"]["entry"]["signal_direct"] = False
+        command = deploy_core._node_command(
+            "entry", socks_port=1089, wl_remote="/runtime/whitelist.conf",
+            release_id="release", exit_routes="/runtime/exit_routes.conf")
+        assert "--signal-direct" not in command
+    finally:
+        deploy_core.LAB = saved_lab
+
+    saved_stop = {name: getattr(deploy_core, name) for name in
+                  ("DEPLOY_INSTANCE", "WORK", "run", "_effective_workers", "_service_name", "_control_socket_glob")}
+    stop_commands = []
+    try:
+        deploy_core.DEPLOY_INSTANCE = "line-cleanup_1"
+        deploy_core.WORK = "/etc/NB"
+        deploy_core._effective_workers = lambda _role: 2
+        deploy_core._service_name = lambda role: f"nb-{role}.service"
+        deploy_core._control_socket_glob = lambda role: f"/run/nb-line-cleanup_1-{role}-*.ctl"
+        deploy_core.run = lambda _client, command, **_kwargs: stop_commands.append(command) or "LINE_INSTANCE_REMOVED"
+        result = deploy_core._systemd_stop(FakeClient("entry"), "entry")
+        assert result == "line instance removed; shard remains active"
+        verification = "\n".join(stop_commands)
+        assert "/etc/NB/shards/configs/entry/0/line-cleanup_1.conf" in verification
+        assert "/run/nb-line-cleanup_1-entry-0.ctl" in verification
+        assert "LINE_INSTANCE_REMOVED" in verification
+    finally:
+        for name, value in saved_stop.items():
+            setattr(deploy_core, name, value)
 
     with tempfile.TemporaryDirectory(prefix="nb-security-push-") as security_tmp:
         security = pathlib.Path(security_tmp)

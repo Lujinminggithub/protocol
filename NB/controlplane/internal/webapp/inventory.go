@@ -29,6 +29,15 @@ type inventoryDiscovery struct {
 	Lines      []discoveredLine `json:"lines"`
 }
 
+type runtimePortClaimBatch struct {
+	WorkerID     string                     `json:"worker_id"`
+	DeviceID     string                     `json:"device_id"`
+	Role         string                     `json:"role"`
+	ObservedAt   string                     `json:"observed_at"`
+	ScanComplete bool                       `json:"scan_complete"`
+	Claims       []central.RuntimePortClaim `json:"claims"`
+}
+
 type deviceUpsertRequest struct {
 	central.Device
 	Password                 string `json:"password"`
@@ -348,6 +357,67 @@ func (a *App) agentLinePlans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"plans": plans})
+}
+
+func (a *App) runtimePortScanPlans(w http.ResponseWriter, r *http.Request) {
+	plans, err := a.store.AllLineSpecs(r.Context())
+	if err != nil {
+		problem(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"plans": plans})
+}
+
+func (a *App) replaceRuntimePortClaims(w http.ResponseWriter, r *http.Request) {
+	var batch runtimePortClaimBatch
+	if !decode(w, r, &batch) {
+		return
+	}
+	if !safeID.MatchString(batch.WorkerID) || !safeID.MatchString(batch.DeviceID) ||
+		(batch.Role != "entry" && batch.Role != "relay" && batch.Role != "exit") ||
+		!batch.ScanComplete || len(batch.Claims) > 512 {
+		problem(w, 400, "运行时端口扫描结果无效")
+		return
+	}
+	observed, err := time.Parse(time.RFC3339Nano, batch.ObservedAt)
+	if err != nil || observed.After(time.Now().UTC().Add(time.Minute)) {
+		problem(w, 400, "运行时端口扫描时间无效")
+		return
+	}
+	expires := observed.Add(central.RuntimePortClaimTTL).Format(time.RFC3339Nano)
+	for index := range batch.Claims {
+		batch.Claims[index].WorkerID = batch.WorkerID
+		batch.Claims[index].DeviceID = batch.DeviceID
+		batch.Claims[index].Role = batch.Role
+		batch.Claims[index].ObservedAt = observed.Format(time.RFC3339Nano)
+		batch.Claims[index].ExpiresAt = expires
+		batch.Claims[index].Source = "runtime"
+	}
+	if err = a.store.ReplaceRuntimePortClaims(r.Context(), batch.WorkerID, batch.DeviceID, batch.Role, batch.Claims); err != nil {
+		problem(w, 409, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"updated": len(batch.Claims), "expires_at": expires})
+}
+
+func (a *App) prepareOperationPorts(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		LineID   string `json:"line_id"`
+		WorkerID string `json:"worker_id"`
+	}
+	if !decode(w, r, &request) {
+		return
+	}
+	if !safeID.MatchString(request.LineID) || !safeID.MatchString(request.WorkerID) {
+		problem(w, 400, "开线端口预占请求无效")
+		return
+	}
+	operation, err := a.store.PrepareLineOpenOperation(r.Context(), r.PathValue("id"), request.LineID)
+	if err != nil {
+		problem(w, 409, err.Error())
+		return
+	}
+	writeJSON(w, 200, operation)
 }
 
 func (a *App) lineDetail(w http.ResponseWriter, r *http.Request) {

@@ -384,9 +384,22 @@ func (c *Client) poll(ctx context.Context) error {
 				}
 				continue
 			}
+			prepared, prepareErr := c.prepareRuntimePorts(ctx, operation)
+			if prepareErr != nil {
+				failure := operationFailure("prepare", prepareErr, "")
+				payload := Result{Message: failure.Summary, Failure: failure}
+				if err = c.completeWithRetry(ctx, operation, "failed", payload); err != nil {
+					return err
+				}
+				continue
+			}
+			operation = prepared
 			operationCtx, cancel := context.WithTimeout(ctx, c.cfg.OperationTimeout)
 			operationCtx = context.WithValue(operationCtx, eventContextKey{}, eventEmitter(func(eventCtx context.Context, event OperationEvent) error { return c.event(eventCtx, operation, event) }))
 			result, runErr := c.runner.Run(operationCtx, operation)
+			if runErr == nil {
+				runErr = c.confirmRuntimeCleanup(operationCtx, operation)
+			}
 			cancel()
 			status := "succeeded"
 			var payload any = result
@@ -438,6 +451,9 @@ func (c *Client) runHeartbeat(ctx context.Context) {
 			if err := c.syncInventory(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
 			}
+			if err := c.syncRuntimePortClaims(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "nb-web-worker runtime port scan: %v\n", err)
+			}
 		}
 	}
 }
@@ -448,6 +464,9 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	if err := c.syncInventory(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+	}
+	if err := c.syncRuntimePortClaims(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "nb-web-worker runtime port scan: %v\n", err)
 	}
 	if err := c.syncClientConfigs(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)

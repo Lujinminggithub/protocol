@@ -973,3 +973,78 @@ func TestAgentDiscoversMissingTopologyAndIncompleteLineCanBeDeleted(t *testing.T
 		t.Fatalf("discovery overwrote operator device status=%d body=%s", response.StatusCode, body)
 	}
 }
+
+func TestAgentRuntimePortClaimsProtectAutomaticAndExplicitPorts(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	client := server.Client()
+	for _, device := range []map[string]any{
+		{"id": "entry-runtime", "name": "entry", "status": "ready", "host": "192.0.2.10", "ssh_port": 22, "ssh_user": "root", "secret_ref": "device:entry-runtime", "labels": map[string]any{}},
+		{"id": "relay-runtime", "name": "relay", "status": "ready", "host": "192.0.2.11", "ssh_port": 22, "ssh_user": "root", "secret_ref": "device:relay-runtime", "labels": map[string]any{}},
+		{"id": "exit-runtime", "name": "exit", "status": "ready", "host": "192.0.2.12", "ssh_port": 22, "ssh_user": "root", "secret_ref": "device:exit-runtime", "labels": map[string]any{}},
+	} {
+		if _, err = database.UpsertDevice(t.Context(), central.Device{ID: device["id"].(string), Name: device["name"].(string), Status: "ready",
+			Host: device["host"].(string), SSHPort: 22, SSHUser: "root", SecretRef: device["secret_ref"].(string), Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "line-runtime", Name: "runtime", Status: "draft", Provider: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC()
+	batch := map[string]any{"worker_id": "worker-1", "device_id": "entry-runtime", "role": "entry", "scan_complete": true,
+		"observed_at": observed.Format(time.RFC3339Nano), "claims": []map[string]any{{"resource_kind": "socks", "instance_id": "legacy-runtime",
+			"port_start": 1082, "port_end": 1083, "source": "runtime"}}}
+	response, body := call(t, client, http.MethodPost, server.URL+"/agent/v1/runtime-port-claims", "agent", "", batch)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("claim upload status=%d body=%s", response.StatusCode, body)
+	}
+	nodes := []map[string]any{{"device_id": "entry-runtime", "role": "entry", "ordinal": 0},
+		{"device_id": "relay-runtime", "role": "relay", "ordinal": 0}, {"device_id": "exit-runtime", "role": "exit", "ordinal": 0}}
+	autoSpec := map[string]any{"resource_group": "shared", "instance_id": "line-runtime_1", "bandwidth_mbps": 5,
+		"upstream_mbps": 5, "downstream_mbps": 5, "socks_port": 0, "relay_port": 0, "exit_port": 0,
+		"udp_port_min": 0, "udp_port_max": 0, "dns_servers": []string{"1.1.1.1"}, "whitelist": []string{},
+		"build_mode": "auto", "source_ref": "repo://current", "jump_policy": "auto", "nodes": nodes}
+	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-runtime/spec", "admin", "", autoSpec)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"socks_port":1084`)) || !bytes.Contains(body, []byte(`"socks_port_auto":true`)) {
+		t.Fatalf("claim-aware allocation status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/agent/v1/runtime-port-scan-plans", "agent", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("line-runtime")) {
+		t.Fatalf("scan plans status=%d body=%s", response.StatusCode, body)
+	}
+	heartbeat := map[string]any{"worker_id": "worker-1", "status": "ready", "version": "test", "observed_at": time.Now().UTC(),
+		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open"}}}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/executors/heartbeat", "agent", "", heartbeat)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)
+	}
+	operationRequest := map[string]any{"line_id": "line-runtime", "kind": "line.open", "requested_by": "operator", "request": map[string]any{}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "runtime-preflight", operationRequest)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("operation create status=%d body=%s", response.StatusCode, body)
+	}
+	var operation central.Operation
+	if err = json.Unmarshal(body, &operation); err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, client, http.MethodGet, server.URL+"/agent/v1/operations?line_id=*&limit=1", "agent", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(operation.ID)) {
+		t.Fatalf("operation claim status=%d body=%s", response.StatusCode, body)
+	}
+	batch["claims"] = []map[string]any{{"resource_kind": "socks", "instance_id": "legacy-runtime", "port_start": 1082, "port_end": 1084, "source": "runtime"}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/runtime-port-claims", "agent", "", batch)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("late claim status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/operations/"+operation.ID+"/port-preflight", "agent", "",
+		map[string]any{"line_id": "line-runtime", "worker_id": "worker-1"})
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"socks_port":1085`)) {
+		t.Fatalf("port preflight status=%d body=%s", response.StatusCode, body)
+	}
+}

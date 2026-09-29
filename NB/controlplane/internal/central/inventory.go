@@ -52,10 +52,14 @@ type LineSpec struct {
 	UpstreamMbps   int             `json:"upstream_mbps"`
 	DownstreamMbps int             `json:"downstream_mbps"`
 	SocksPort      int             `json:"socks_port"`
+	SocksPortAuto  bool            `json:"socks_port_auto"`
 	UDPPortMin     int             `json:"udp_port_min"`
 	UDPPortMax     int             `json:"udp_port_max"`
+	UDPPortsAuto   bool            `json:"udp_ports_auto"`
 	RelayPort      int             `json:"relay_port"`
+	RelayPortAuto  bool            `json:"relay_port_auto"`
 	ExitPort       int             `json:"exit_port"`
+	ExitPortAuto   bool            `json:"exit_port_auto"`
 	ExitBindIP     string          `json:"exit_bind_ip"`
 	DNSServers     json.RawMessage `json:"dns_servers"`
 	Whitelist      json.RawMessage `json:"whitelist"`
@@ -67,6 +71,19 @@ type LineSpec struct {
 	Nodes          []LineNode      `json:"nodes"`
 	CreatedAt      string          `json:"created_at"`
 	UpdatedAt      string          `json:"updated_at"`
+}
+
+type RuntimePortClaim struct {
+	WorkerID     string `json:"worker_id"`
+	DeviceID     string `json:"device_id"`
+	Role         string `json:"role"`
+	ResourceKind string `json:"resource_kind"`
+	InstanceID   string `json:"instance_id"`
+	PortStart    int    `json:"port_start"`
+	PortEnd      int    `json:"port_end"`
+	ObservedAt   string `json:"observed_at"`
+	ExpiresAt    string `json:"expires_at"`
+	Source       string `json:"source"`
 }
 
 func (spec *LineSpec) NormalizeRates() {
@@ -261,6 +278,19 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 	if err != nil {
 		return LineSpec{}, err
 	}
+	allocationQuery := s.controlSQL(`INSERT INTO line_port_allocation
+	 (line_id,socks_port_auto,relay_port_auto,exit_port_auto,udp_ports_auto,updated_at)
+	 VALUES(?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET socks_port_auto=excluded.socks_port_auto,
+	 relay_port_auto=excluded.relay_port_auto,exit_port_auto=excluded.exit_port_auto,
+	 udp_ports_auto=excluded.udp_ports_auto,updated_at=excluded.updated_at`, `INSERT INTO line_port_allocation
+	 (line_id,socks_port_auto,relay_port_auto,exit_port_auto,udp_ports_auto,updated_at)
+	 VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE socks_port_auto=VALUES(socks_port_auto),
+	 relay_port_auto=VALUES(relay_port_auto),exit_port_auto=VALUES(exit_port_auto),
+	 udp_ports_auto=VALUES(udp_ports_auto),updated_at=VALUES(updated_at)`)
+	if _, err = tx.ExecContext(ctx, allocationQuery, spec.LineID, spec.SocksPortAuto, spec.RelayPortAuto,
+		spec.ExitPortAuto, spec.UDPPortsAuto, stamp); err != nil {
+		return LineSpec{}, err
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM line_nodes WHERE line_id=?`, spec.LineID); err != nil {
 		return LineSpec{}, err
 	}
@@ -294,6 +324,14 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 	}
 	item.Whitelist = json.RawMessage(whitelist)
 	item.DNSServers = json.RawMessage(dnsServers)
+	var socksAuto, relayAuto, exitAuto, udpAuto bool
+	allocationErr := s.db.QueryRowContext(ctx, `SELECT socks_port_auto,relay_port_auto,exit_port_auto,udp_ports_auto
+	 FROM line_port_allocation WHERE line_id=?`, lineID).Scan(&socksAuto, &relayAuto, &exitAuto, &udpAuto)
+	if allocationErr != nil && !errors.Is(allocationErr, sql.ErrNoRows) {
+		return LineSpec{}, allocationErr
+	}
+	item.SocksPortAuto, item.RelayPortAuto = socksAuto, relayAuto
+	item.ExitPortAuto, item.UDPPortsAuto = exitAuto, udpAuto
 	rows, err := s.db.QueryContext(ctx, `SELECT device_id,role,ordinal,next_hop_device_id,jump_candidates,config
  FROM line_nodes WHERE line_id=? ORDER BY CASE role WHEN 'entry' THEN 1 WHEN 'relay' THEN 2 ELSE 3 END,ordinal`, lineID)
 	if err != nil {
@@ -360,6 +398,34 @@ func (s *Store) ActiveLineSpecs(ctx context.Context) ([]LineSpec, error) {
 	return result, nil
 }
 
+func (s *Store) AllLineSpecs(ctx context.Context) ([]LineSpec, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT line_id FROM line_specs ORDER BY line_id`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	result := make([]LineSpec, 0, len(ids))
+	for _, id := range ids {
+		spec, loadErr := s.LineSpec(ctx, id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		result = append(result, spec)
+	}
+	return result, nil
+}
+
 func lineDevice(spec LineSpec, role string) string {
 	for _, node := range spec.Nodes {
 		if node.Role == role {
@@ -402,7 +468,7 @@ func nextFreePortSpan(used map[int]bool, first, last, width int) (int, error) {
 	return 0, errors.New("no internal port is available")
 }
 
-func (s *Store) usedRolePortSpans(ctx context.Context, lineID, deviceID, role, column string, width int) (map[int]bool, error) {
+func (s *Store) usedRolePortSpans(ctx context.Context, lineID, instanceID, deviceID, role, resourceKind, column string, width int) (map[int]bool, error) {
 	query := fmt.Sprintf(`SELECT s.%s FROM line_specs s
  JOIN line_nodes n ON n.line_id=s.line_id AND n.role=?
  WHERE s.line_id<>? AND n.device_id=?`, column)
@@ -410,7 +476,6 @@ func (s *Store) usedRolePortSpans(ctx context.Context, lineID, deviceID, role, c
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	used := map[int]bool{}
 	for rows.Next() {
 		var port int
@@ -421,12 +486,38 @@ func (s *Store) usedRolePortSpans(ctx context.Context, lineID, deviceID, role, c
 			used[port+lane] = true
 		}
 	}
-	return used, rows.Err()
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	claims, err := s.db.QueryContext(ctx, `SELECT port_start,port_end FROM runtime_port_claims
+ WHERE device_id=? AND role=? AND resource_kind=? AND instance_id<>?`, deviceID, role, resourceKind, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	defer claims.Close()
+	for claims.Next() {
+		var first, last int
+		if err = claims.Scan(&first, &last); err != nil {
+			return nil, err
+		}
+		for port := first; port <= last; port++ {
+			used[port] = true
+		}
+	}
+	return used, claims.Err()
 }
 
 // AllocateLineSpec fills control-plane-owned ports without changing an explicitly supplied value.
 func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, error) {
 	spec.NormalizeRates()
+	spec.SocksPortAuto = spec.SocksPortAuto || spec.SocksPort == 0
+	spec.RelayPortAuto = spec.RelayPortAuto || spec.RelayPort == 0
+	spec.ExitPortAuto = spec.ExitPortAuto || spec.ExitPort == 0
+	spec.UDPPortsAuto = spec.UDPPortsAuto || (spec.UDPPortMin == 0 && spec.UDPPortMax == 0)
 	if spec.InstanceID == "" {
 		if len(spec.LineID)+2 > 48 {
 			return LineSpec{}, errors.New("线路 ID 过长，无法生成部署实例名称")
@@ -440,7 +531,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 		return LineSpec{}, errors.New("分配端口前必须指定 Entry、Relay 和 Exit 设备")
 	}
 	if spec.SocksPort == 0 {
-		used, err := s.usedRolePortSpans(ctx, spec.LineID, entryDevice, "entry", "socks_port", 1)
+		used, err := s.usedRolePortSpans(ctx, spec.LineID, spec.InstanceID, entryDevice, "entry", "socks", "socks_port", 1)
 		if err != nil {
 			return LineSpec{}, err
 		}
@@ -449,7 +540,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 		}
 	}
 	if spec.RelayPort == 0 {
-		used, err := s.usedRolePortSpans(ctx, spec.LineID, relayDevice, "relay", "relay_port", transportWorkerLanes)
+		used, err := s.usedRolePortSpans(ctx, spec.LineID, spec.InstanceID, relayDevice, "relay", "transport", "relay_port", transportWorkerLanes)
 		if err != nil {
 			return LineSpec{}, err
 		}
@@ -458,7 +549,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 		}
 	}
 	if spec.ExitPort == 0 {
-		used, err := s.usedRolePortSpans(ctx, spec.LineID, exitDevice, "exit", "exit_port", transportWorkerLanes)
+		used, err := s.usedRolePortSpans(ctx, spec.LineID, spec.InstanceID, exitDevice, "exit", "transport", "exit_port", transportWorkerLanes)
 		if err != nil {
 			return LineSpec{}, err
 		}
@@ -468,8 +559,8 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 	}
 	if spec.UDPPortMin == 0 && spec.UDPPortMax == 0 {
 		rows, err := s.db.QueryContext(ctx, `SELECT s.udp_port_min,s.udp_port_max FROM line_specs s
- JOIN line_nodes n ON n.line_id=s.line_id AND n.role='relay'
- WHERE s.line_id<>? AND n.device_id=?`, spec.LineID, relayDevice)
+	 JOIN line_nodes n ON n.line_id=s.line_id AND n.role='entry'
+	 WHERE s.line_id<>? AND n.device_id=?`, spec.LineID, entryDevice)
 		if err != nil {
 			return LineSpec{}, err
 		}
@@ -483,6 +574,22 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 			ranges = append(ranges, item)
 		}
 		if err = rows.Close(); err != nil {
+			return LineSpec{}, err
+		}
+		claimRows, err := s.db.QueryContext(ctx, `SELECT port_start,port_end FROM runtime_port_claims
+		 WHERE device_id=? AND role='entry' AND resource_kind='udp' AND instance_id<>?`, entryDevice, spec.InstanceID)
+		if err != nil {
+			return LineSpec{}, err
+		}
+		for claimRows.Next() {
+			var item [2]int
+			if err = claimRows.Scan(&item[0], &item[1]); err != nil {
+				_ = claimRows.Close()
+				return LineSpec{}, err
+			}
+			ranges = append(ranges, item)
+		}
+		if err = claimRows.Close(); err != nil {
 			return LineSpec{}, err
 		}
 		for first := ManagedUDPPortMin; first+1023 <= 65023; first += 1024 {
@@ -511,10 +618,10 @@ type rowQuerier interface {
 
 func lineSpecConflict(ctx context.Context, queryer rowQuerier, spec LineSpec) (string, error) {
 	checks := []struct {
-		role, column, label string
-		port                int
-		width               int
-	}{{"entry", "socks_port", "入口", spec.SocksPort, 1}, {"relay", "relay_port", "Relay", spec.RelayPort, transportWorkerLanes}, {"exit", "exit_port", "Exit", spec.ExitPort, transportWorkerLanes}}
+		role, resource, column, label string
+		port                          int
+		width                         int
+	}{{"entry", "socks", "socks_port", "入口", spec.SocksPort, 1}, {"relay", "transport", "relay_port", "Relay", spec.RelayPort, transportWorkerLanes}, {"exit", "transport", "exit_port", "Exit", spec.ExitPort, transportWorkerLanes}}
 	for _, check := range checks {
 		deviceID := lineDevice(spec, check.role)
 		var conflictingLine string
@@ -528,18 +635,29 @@ func lineSpecConflict(ctx context.Context, queryer rowQuerier, spec LineSpec) (s
 		if !errors.Is(err, sql.ErrNoRows) {
 			return "", err
 		}
+		if instanceID, claimErr := runtimeClaimConflict(ctx, queryer, spec, check.role, check.resource,
+			check.port, check.port+check.width-1); claimErr != nil {
+			return "", claimErr
+		} else if instanceID != "" {
+			return fmt.Sprintf("%s端口与运行实例 %s 在设备 %s 上冲突", check.label, instanceID, deviceID), nil
+		}
 	}
-	relayDevice := lineDevice(spec, "relay")
+	entryDevice := lineDevice(spec, "entry")
 	var conflictingLine string
 	err := queryer.QueryRowContext(ctx, `SELECT s.line_id FROM line_specs s
- JOIN line_nodes n ON n.line_id=s.line_id AND n.role='relay'
+	 JOIN line_nodes n ON n.line_id=s.line_id AND n.role='entry'
  WHERE s.line_id<>? AND n.device_id=? AND ?<=s.udp_port_max AND s.udp_port_min<=? LIMIT 1`,
-		spec.LineID, relayDevice, spec.UDPPortMin, spec.UDPPortMax).Scan(&conflictingLine)
+		spec.LineID, entryDevice, spec.UDPPortMin, spec.UDPPortMax).Scan(&conflictingLine)
 	if err == nil {
-		return fmt.Sprintf("UDP Relay 端口段与线路 %s 在设备 %s 上冲突", conflictingLine, relayDevice), nil
+		return fmt.Sprintf("UDP Relay 端口段与线路 %s 在设备 %s 上冲突", conflictingLine, entryDevice), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
+	}
+	if instanceID, claimErr := runtimeClaimConflict(ctx, queryer, spec, "entry", "udp", spec.UDPPortMin, spec.UDPPortMax); claimErr != nil {
+		return "", claimErr
+	} else if instanceID != "" {
+		return fmt.Sprintf("UDP Relay 端口段与运行实例 %s 在设备 %s 上冲突", instanceID, lineDevice(spec, "entry")), nil
 	}
 	return "", nil
 }

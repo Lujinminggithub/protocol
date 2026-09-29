@@ -63,11 +63,12 @@ type transportRolloutResult struct {
 }
 
 type requestValues struct {
-	Deployment       string                   `json:"deployment"`
-	DeploymentID     string                   `json:"deployment_id"`
-	Note             string                   `json:"note"`
-	Plan             dynamicPlan              `json:"plan"`
-	TransportProfile transportprofile.Profile `json:"transport_profile"`
+	Deployment         string                   `json:"deployment"`
+	DeploymentID       string                   `json:"deployment_id"`
+	Note               string                   `json:"note"`
+	Plan               dynamicPlan              `json:"plan"`
+	DeleteAfterCleanup bool                     `json:"delete_after_cleanup"`
+	TransportProfile   transportprofile.Profile `json:"transport_profile"`
 }
 
 type commandStep struct {

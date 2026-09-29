@@ -43,6 +43,48 @@ def main() -> None:
             os.environ.pop("NB_SHARD_DRAIN_SECONDS", None)
         else:
             os.environ["NB_SHARD_DRAIN_SECONDS"] = previous_drain
+
+    commands = []
+    pushed = []
+    started_workers = set()
+
+    def cold_start_run(_client, command, **_kwargs):
+        commands.append(command)
+        if "responses.append" in command:
+            raise AssertionError("dangling shared binary link triggered a session drain query")
+        if "echo STAGED" in command:
+            return "STAGED\n"
+        if command.startswith("readlink -f "):
+            return "/etc/xgw/shards/releases/old/nb_node\n"
+        if command.startswith("if test -x "):
+            return "ABSENT\n"
+        if "SHARD_CONTROLS_OK" in command:
+            if len(started_workers) != 2:
+                raise AssertionError("all controls were checked before both cold-start workers ran")
+            return "SHARD_CONTROLS_OK 2\n"
+        if command.startswith("systemctl is-active "):
+            return "inactive\n"
+        if command.startswith("systemctl enable "):
+            for worker in (0, 1):
+                if f"nb-middle-shard@{worker}" in command:
+                    started_workers.add(worker)
+            return "active\n"
+        if command.startswith("if test -f "):
+            return "ABSENT\n"
+        return ""
+
+    result = runtime.install_role(
+        None, "middle", command, {}, "deploy-new", "new", 0,
+        work="/etc/xgw", instance_work="/etc/xgw/instances/line-a",
+        deploy_instance="line-a", lab={}, run=cold_start_run,
+        push_bytes=lambda _client, data, path, **kwargs: pushed.append((path, data, kwargs)),
+        effective_workers=lambda _role: 2,
+        legacy_service_name=lambda role: f"nb-{role}.service")
+    assert "binary_changed=true" in result
+    assert started_workers == {0, 1}
+    assert any(path == "/etc/systemd/system/nb-middle-shard@.service" for path, _, _ in pushed)
+    assert not any("responses.append" in item for item in commands)
+
     for invalid in ("bad id", "../escape", ""):
         try:
             shard.render_instance_config(invalid, "entry", 0, command, {}, 1, 1024 * 1024)

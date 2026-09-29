@@ -18,6 +18,25 @@ func (a *App) deleteLine(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "发起人和删除原因不能为空，删除原因不能超过 300 个字符")
 		return
 	}
+	if !request.Force {
+		if _, err := a.store.LineSpec(r.Context(), r.PathValue("id")); err == nil {
+			id, idErr := operationID()
+			if idErr != nil {
+				problem(w, 500, "无法创建线路清理任务")
+				return
+			}
+			operation, scheduleErr := a.store.ScheduleLineDeletion(r.Context(), r.PathValue("id"), id, request)
+			if scheduleErr != nil {
+				problem(w, http.StatusConflict, scheduleErr.Error())
+				return
+			}
+			writeJSON(w, http.StatusAccepted, operation)
+			return
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			problem(w, 500, err.Error())
+			return
+		}
+	}
 	if err := a.store.DeleteLine(r.Context(), r.PathValue("id"), request); err != nil {
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
