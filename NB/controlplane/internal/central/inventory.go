@@ -13,6 +13,7 @@ type Device struct {
 	ID                    string          `json:"id"`
 	Name                  string          `json:"name"`
 	Status                string          `json:"status"`
+	Environment           string          `json:"environment"`
 	Host                  string          `json:"host"`
 	SSHPort               int             `json:"ssh_port"`
 	SSHUser               string          `json:"ssh_user"`
@@ -46,6 +47,7 @@ type LineNode struct {
 
 type LineSpec struct {
 	LineID         string          `json:"line_id"`
+	Environment    string          `json:"environment"`
 	ResourceGroup  string          `json:"resource_group"`
 	InstanceID     string          `json:"instance_id"`
 	BandwidthMbps  int             `json:"bandwidth_mbps"`
@@ -87,6 +89,9 @@ type RuntimePortClaim struct {
 }
 
 func (spec *LineSpec) NormalizeRates() {
+	if spec.Environment == "" {
+		spec.Environment = "production"
+	}
 	if spec.UpstreamMbps <= 0 {
 		spec.UpstreamMbps = spec.BandwidthMbps
 	}
@@ -103,6 +108,8 @@ func (spec *LineSpec) NormalizeRates() {
 		spec.DNSServers = json.RawMessage(`["1.1.1.1","8.8.8.8"]`)
 	}
 }
+
+func validEnvironment(value string) bool { return value == "production" || value == "test" }
 
 type OperationEvent struct {
 	ID          int64           `json:"id"`
@@ -127,39 +134,45 @@ func scanDevice(row scanner, item *Device) error {
 	err := row.Scan(&item.ID, &item.Name, &item.Status, &item.Host, &item.SSHPort,
 		&item.SSHUser, &item.SSHHostKey, &item.SSHHostKeyType, &item.SSHHostKeySHA256,
 		&item.SSHHostKeyStatus, &item.SSHHostKeyConfirmedAt, &item.PrivateIP, &item.Region, &item.Provider, &item.OS, &item.Arch,
-		&item.SecretRef, &labels, &item.LastHealth, &item.LastSeenAt, &item.CreatedAt, &item.UpdatedAt)
+		&item.SecretRef, &labels, &item.LastHealth, &item.LastSeenAt, &item.CreatedAt, &item.UpdatedAt, &item.Environment)
 	item.Labels = json.RawMessage(labels)
 	return err
 }
 
 const deviceColumns = `id,name,status,host,ssh_port,ssh_user,ssh_host_key,ssh_host_key_type,
  ssh_host_key_sha256,ssh_host_key_status,ssh_host_key_confirmed_at,private_ip,region,provider,os,arch,
- secret_ref,labels,last_health,last_seen_at,created_at,updated_at`
+ secret_ref,labels,last_health,last_seen_at,created_at,updated_at,environment`
 
 func (s *Store) UpsertDevice(ctx context.Context, item Device) (Device, error) {
+	if item.Environment == "" {
+		item.Environment = "production"
+	}
+	if !validEnvironment(item.Environment) {
+		return Device{}, errors.New("invalid device environment")
+	}
 	if item.SSHHostKeyStatus == "" {
 		item.SSHHostKeyStatus = "pending"
 	}
 	stamp := now()
-	query := s.controlSQL(`INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	query := s.controlSQL(`INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,host=excluded.host,
 	 ssh_port=excluded.ssh_port,ssh_user=excluded.ssh_user,ssh_host_key=excluded.ssh_host_key,
 	 ssh_host_key_type=excluded.ssh_host_key_type,ssh_host_key_sha256=excluded.ssh_host_key_sha256,
 	 ssh_host_key_status=excluded.ssh_host_key_status,ssh_host_key_confirmed_at=excluded.ssh_host_key_confirmed_at,
 	 private_ip=excluded.private_ip,
 	 region=excluded.region,provider=excluded.provider,os=excluded.os,arch=excluded.arch,
-	 secret_ref=excluded.secret_ref,labels=excluded.labels,updated_at=excluded.updated_at`, `INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	 secret_ref=excluded.secret_ref,labels=excluded.labels,updated_at=excluded.updated_at,environment=excluded.environment`, `INSERT INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON DUPLICATE KEY UPDATE name=VALUES(name),status=VALUES(status),host=VALUES(host),ssh_port=VALUES(ssh_port),
  ssh_user=VALUES(ssh_user),ssh_host_key=VALUES(ssh_host_key),ssh_host_key_type=VALUES(ssh_host_key_type),
  ssh_host_key_sha256=VALUES(ssh_host_key_sha256),ssh_host_key_status=VALUES(ssh_host_key_status),
  ssh_host_key_confirmed_at=VALUES(ssh_host_key_confirmed_at),private_ip=VALUES(private_ip),region=VALUES(region),
- provider=VALUES(provider),os=VALUES(os),arch=VALUES(arch),secret_ref=VALUES(secret_ref),labels=VALUES(labels),
- updated_at=VALUES(updated_at)`)
+	 provider=VALUES(provider),os=VALUES(os),arch=VALUES(arch),secret_ref=VALUES(secret_ref),labels=VALUES(labels),
+	 updated_at=VALUES(updated_at),environment=VALUES(environment)`)
 	_, err := s.db.ExecContext(ctx, query,
 		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser,
 		item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256, item.SSHHostKeyStatus, item.SSHHostKeyConfirmedAt, item.PrivateIP,
 		item.Region, item.Provider, item.OS, item.Arch, item.SecretRef,
-		normalizedJSON(item.Labels, `{}`), item.LastHealth, item.LastSeenAt, stamp, stamp)
+		normalizedJSON(item.Labels, `{}`), item.LastHealth, item.LastSeenAt, stamp, stamp, item.Environment)
 	if err != nil {
 		return Device{}, err
 	}
@@ -168,17 +181,23 @@ func (s *Store) UpsertDevice(ctx context.Context, item Device) (Device, error) {
 
 // EnsureDevice adds worker-discovered inventory without overwriting operator-managed fields.
 func (s *Store) EnsureDevice(ctx context.Context, item Device) (Device, bool, error) {
+	if item.Environment == "" {
+		item.Environment = "production"
+	}
+	if !validEnvironment(item.Environment) {
+		return Device{}, false, errors.New("invalid device environment")
+	}
 	if item.SSHHostKeyStatus == "" {
 		item.SSHHostKeyStatus = "pending"
 	}
 	stamp := now()
-	query := s.controlSQL(`INSERT OR IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		`INSERT IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	query := s.controlSQL(`INSERT OR IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT IGNORE INTO devices (`+deviceColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	result, err := s.db.ExecContext(ctx, query,
 		item.ID, item.Name, item.Status, item.Host, item.SSHPort, item.SSHUser,
 		item.SSHHostKey, item.SSHHostKeyType, item.SSHHostKeySHA256, item.SSHHostKeyStatus, item.SSHHostKeyConfirmedAt, item.PrivateIP,
 		item.Region, item.Provider, item.OS, item.Arch, item.SecretRef,
-		normalizedJSON(item.Labels, `{}`), item.LastHealth, item.LastSeenAt, stamp, stamp)
+		normalizedJSON(item.Labels, `{}`), item.LastHealth, item.LastSeenAt, stamp, stamp, item.Environment)
 	if err != nil {
 		return Device{}, false, err
 	}
@@ -237,6 +256,9 @@ func (s *Store) UpdateDeviceHealth(ctx context.Context, id, health string) error
 
 func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, error) {
 	spec.NormalizeRates()
+	if !validEnvironment(spec.Environment) {
+		return LineSpec{}, errors.New("invalid line environment")
+	}
 	s.specMu.Lock()
 	defer s.specMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -252,29 +274,29 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 	stamp := now()
 	query := s.controlSQL(`INSERT INTO line_specs
 	 (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
-	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
+	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at,environment)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
  resource_group=excluded.resource_group,instance_id=excluded.instance_id,
 	 bandwidth_mbps=excluded.bandwidth_mbps,upstream_mbps=excluded.upstream_mbps,
 	 downstream_mbps=excluded.downstream_mbps,socks_port=excluded.socks_port,
  udp_port_min=excluded.udp_port_min,udp_port_max=excluded.udp_port_max,
 	 relay_port=excluded.relay_port,exit_port=excluded.exit_port,exit_bind_ip=excluded.exit_bind_ip,dns_servers=excluded.dns_servers,whitelist=excluded.whitelist,
  build_mode=excluded.build_mode,artifact_ref=excluded.artifact_ref,source_ref=excluded.source_ref,
-	 srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at`, `INSERT INTO line_specs
+	 srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at,environment=excluded.environment`, `INSERT INTO line_specs
  (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
- relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE resource_group=VALUES(resource_group),
+	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at,environment)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE resource_group=VALUES(resource_group),
  instance_id=VALUES(instance_id),bandwidth_mbps=VALUES(bandwidth_mbps),upstream_mbps=VALUES(upstream_mbps),
  downstream_mbps=VALUES(downstream_mbps),socks_port=VALUES(socks_port),udp_port_min=VALUES(udp_port_min),
  udp_port_max=VALUES(udp_port_max),relay_port=VALUES(relay_port),exit_port=VALUES(exit_port),
  exit_bind_ip=VALUES(exit_bind_ip),dns_servers=VALUES(dns_servers),whitelist=VALUES(whitelist),build_mode=VALUES(build_mode),
  artifact_ref=VALUES(artifact_ref),source_ref=VALUES(source_ref),srs_ref=VALUES(srs_ref),
- jump_policy=VALUES(jump_policy),updated_at=VALUES(updated_at)`)
+	 jump_policy=VALUES(jump_policy),updated_at=VALUES(updated_at),environment=VALUES(environment)`)
 	_, err = tx.ExecContext(ctx, query,
 		spec.LineID, spec.ResourceGroup, spec.InstanceID, spec.BandwidthMbps, spec.UpstreamMbps, spec.DownstreamMbps, spec.SocksPort,
 		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort, spec.ExitBindIP, normalizedJSON(spec.DNSServers, `["1.1.1.1","8.8.8.8"]`),
 		normalizedJSON(spec.Whitelist, `[]`), spec.BuildMode, spec.ArtifactRef, spec.SourceRef,
-		spec.SRSRef, spec.JumpPolicy, stamp, stamp)
+		spec.SRSRef, spec.JumpPolicy, stamp, stamp, spec.Environment)
 	if err != nil {
 		return LineSpec{}, err
 	}
@@ -314,11 +336,11 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 	var dnsServers, whitelist []byte
 	err := s.db.QueryRowContext(ctx, `SELECT line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,
  socks_port,udp_port_min,udp_port_max,relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,
- source_ref,srs_ref,jump_policy,created_at,updated_at FROM line_specs WHERE line_id=?`, lineID).Scan(
+	 source_ref,srs_ref,jump_policy,created_at,updated_at,environment FROM line_specs WHERE line_id=?`, lineID).Scan(
 		&item.LineID, &item.ResourceGroup, &item.InstanceID, &item.BandwidthMbps, &item.UpstreamMbps, &item.DownstreamMbps, &item.SocksPort,
 		&item.UDPPortMin, &item.UDPPortMax, &item.RelayPort, &item.ExitPort, &item.ExitBindIP, &dnsServers, &whitelist,
 		&item.BuildMode, &item.ArtifactRef, &item.SourceRef, &item.SRSRef, &item.JumpPolicy,
-		&item.CreatedAt, &item.UpdatedAt)
+		&item.CreatedAt, &item.UpdatedAt, &item.Environment)
 	if err != nil {
 		return LineSpec{}, err
 	}

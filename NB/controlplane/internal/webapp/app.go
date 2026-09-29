@@ -114,6 +114,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/lines/{id}/spec", a.admin(a.lineSpec))
 	mux.HandleFunc("PUT /api/v1/lines/{id}/spec", a.admin(a.saveLineSpec))
 	mux.HandleFunc("GET /api/v1/devices", a.admin(a.devices))
+	mux.HandleFunc("GET /api/v1/devices/export", a.admin(a.exportDevices))
 	mux.HandleFunc("POST /api/v1/devices/host-key/scan", a.admin(a.scanDeviceHostKey))
 	mux.HandleFunc("POST /api/v1/devices", a.admin(a.upsertDevice))
 	mux.HandleFunc("GET /api/v1/devices/{id}", a.admin(a.device))

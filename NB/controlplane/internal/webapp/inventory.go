@@ -3,6 +3,7 @@ package webapp
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +67,12 @@ func validDevice(item central.Device) error {
 	if item.Status != "ready" && item.Status != "provisioning" && item.Status != "maintenance" && item.Status != "offline" && item.Status != "retired" {
 		return errors.New("invalid device status")
 	}
+	if item.Environment == "" {
+		item.Environment = "production"
+	}
+	if item.Environment != "production" && item.Environment != "test" {
+		return errors.New("invalid device environment")
+	}
 	if !validHost(item.Host) || item.SSHPort < 1 || item.SSHPort > 65535 || strings.TrimSpace(item.SSHUser) == "" {
 		return errors.New("invalid SSH endpoint")
 	}
@@ -98,6 +105,24 @@ func (a *App) devices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"devices": items})
 }
 
+func (a *App) exportDevices(w http.ResponseWriter, r *http.Request) {
+	items, err := a.store.Devices(r.Context())
+	if err != nil {
+		problem(w, 500, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="nb-devices.csv"`)
+	writer := csv.NewWriter(w)
+	_ = writer.Write([]string{"id", "name", "environment", "status", "host", "ssh_port", "ssh_user", "private_ip", "region", "provider", "os", "arch", "host_key_status", "last_health", "last_seen_at"})
+	for _, item := range items {
+		_ = writer.Write([]string{item.ID, item.Name, item.Environment, item.Status, item.Host,
+			strconv.Itoa(item.SSHPort), item.SSHUser, item.PrivateIP, item.Region, item.Provider,
+			item.OS, item.Arch, item.SSHHostKeyStatus, item.LastHealth, item.LastSeenAt})
+	}
+	writer.Flush()
+}
+
 func (a *App) upsertDevice(w http.ResponseWriter, r *http.Request) {
 	var request deviceUpsertRequest
 	if !decode(w, r, &request) {
@@ -106,6 +131,9 @@ func (a *App) upsertDevice(w http.ResponseWriter, r *http.Request) {
 	item := request.Device
 	if item.Status == "" {
 		item.Status = "ready"
+	}
+	if item.Environment == "" {
+		item.Environment = "production"
 	}
 	if item.SSHPort == 0 {
 		item.SSHPort = 22
@@ -209,6 +237,9 @@ func (a *App) deleteDevice(w http.ResponseWriter, r *http.Request) {
 func validLineSpecRequest(spec central.LineSpec) error {
 	if !safeID.MatchString(spec.LineID) || !safeID.MatchString(spec.ResourceGroup) || (spec.InstanceID != "" && !safeID.MatchString(spec.InstanceID)) {
 		return errors.New("invalid line deployment identity")
+	}
+	if spec.Environment != "production" && spec.Environment != "test" {
+		return errors.New("invalid line environment")
 	}
 	if spec.BandwidthMbps < 1 || spec.BandwidthMbps > 1000 || spec.UpstreamMbps < 1 || spec.UpstreamMbps > 1000 ||
 		spec.DownstreamMbps < 1 || spec.DownstreamMbps > 1000 || spec.SocksPort < 0 || spec.SocksPort > 65535 || spec.RelayPort < 0 || spec.RelayPort > 65534 || spec.ExitPort < 0 || spec.ExitPort > 65534 {

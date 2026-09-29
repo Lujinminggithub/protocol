@@ -396,7 +396,7 @@ CREATE TABLE IF NOT EXISTS devices (
  provider TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
  secret_ref TEXT NOT NULL DEFAULT '', labels BLOB NOT NULL DEFAULT '{}',
  last_health TEXT NOT NULL DEFAULT 'unknown', last_seen_at TEXT NOT NULL DEFAULT '',
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, environment TEXT NOT NULL DEFAULT 'production'
 );
 CREATE TABLE IF NOT EXISTS topology_layouts (
  device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
@@ -414,7 +414,7 @@ CREATE TABLE IF NOT EXISTS line_specs (
  dns_servers BLOB NOT NULL DEFAULT '["1.1.1.1","8.8.8.8"]',
  whitelist BLOB NOT NULL, build_mode TEXT NOT NULL, artifact_ref TEXT NOT NULL,
  source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy TEXT NOT NULL,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, environment TEXT NOT NULL DEFAULT 'production'
 );
 CREATE TABLE IF NOT EXISTS line_port_allocation (
  line_id TEXT PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
@@ -587,12 +587,42 @@ CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_a
 		"ssh_host_key_sha256":       "TEXT NOT NULL DEFAULT ''",
 		"ssh_host_key_status":       "TEXT NOT NULL DEFAULT 'pending'",
 		"ssh_host_key_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+		"environment":               "TEXT NOT NULL DEFAULT 'production'",
 	} {
 		if !deviceColumns[name] {
 			if _, deviceErr = s.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN `+name+` `+definition); deviceErr != nil {
 				return deviceErr
 			}
 		}
+	}
+	if _, deviceErr = s.db.ExecContext(ctx, `UPDATE devices SET environment='production' WHERE environment IS NULL OR environment=''`); deviceErr != nil {
+		return deviceErr
+	}
+	lineColumns := map[string]bool{}
+	lineRows, lineErr := s.db.QueryContext(ctx, `PRAGMA table_info(line_specs)`)
+	if lineErr != nil {
+		return lineErr
+	}
+	for lineRows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if lineErr = lineRows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); lineErr != nil {
+			_ = lineRows.Close()
+			return lineErr
+		}
+		lineColumns[name] = true
+	}
+	if lineErr = lineRows.Close(); lineErr != nil {
+		return lineErr
+	}
+	if !lineColumns["environment"] {
+		if _, lineErr = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'`); lineErr != nil {
+			return lineErr
+		}
+	}
+	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET environment='production' WHERE environment IS NULL OR environment=''`); lineErr != nil {
+		return lineErr
 	}
 	// Older workers represented a role-wide collection failure as a fake node.
 	// Remove those placeholders so they cannot degrade an otherwise healthy line.

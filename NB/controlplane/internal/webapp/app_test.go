@@ -586,6 +586,28 @@ func TestDevicePasswordIsStoredLocallyAndNeverReturned(t *testing.T) {
 	}
 }
 
+func TestDeviceExportIncludesEnvironmentAndExcludesSecrets(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err = database.UpsertDevice(t.Context(), central.Device{ID: "test-device", Name: "Test device", Status: "ready", Environment: "test",
+		Host: "192.0.2.10", SSHPort: 22, SSHUser: "root", SecretRef: "device:test-device", Region: "test", Provider: "lab"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	response, body := call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/devices/export", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/csv; charset=utf-8" {
+		t.Fatalf("export status=%d content-type=%q body=%s", response.StatusCode, response.Header.Get("Content-Type"), body)
+	}
+	text := string(body)
+	if !strings.Contains(text, "id,name,environment") || !strings.Contains(text, "test-device,Test device,test") || strings.Contains(text, "device:test-device") {
+		t.Fatalf("unexpected export: %s", text)
+	}
+}
+
 func call(t *testing.T, client *http.Client, method, url, token, key string, body any) (*http.Response, []byte) {
 	t.Helper()
 	var reader io.Reader

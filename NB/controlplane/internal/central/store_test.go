@@ -577,6 +577,38 @@ func TestOpenMigratesLineSpecFields(t *testing.T) {
 	}
 }
 
+func TestLineSpecEnvironmentDefaultsAndPersists(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-env", Name: "Environment", Status: "draft", EntryRegion: "test", ExitRegion: "test", Provider: "lab", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"entry", "exit"} {
+		if _, err = store.UpsertDevice(t.Context(), Device{ID: id, Name: id, Status: "ready", Host: "192.0.2.10", SSHPort: 22, SSHUser: "root", SecretRef: "device:" + id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := LineSpec{LineID: "line-env", ResourceGroup: "group", InstanceID: "line-env-1", BandwidthMbps: 10,
+		SocksPort: 1080, UDPPortMin: 22000, UDPPortMax: 23023, RelayPort: 4443, ExitPort: 4444,
+		BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Environment: "test",
+		Whitelist: json.RawMessage(`[]`), Nodes: []LineNode{{DeviceID: "entry", Role: "entry"}, {DeviceID: "exit", Role: "exit"}}}
+	if _, err = store.SaveLineSpec(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LineSpec(t.Context(), spec.LineID)
+	if err != nil || loaded.Environment != "test" {
+		t.Fatalf("environment=%q err=%v", loaded.Environment, err)
+	}
+	if _, err = store.SaveLineSpec(t.Context(), LineSpec{LineID: "line-env", ResourceGroup: "group", InstanceID: "line-env-1", BandwidthMbps: 10,
+		SocksPort: 1080, UDPPortMin: 22000, UDPPortMax: 23023, RelayPort: 4443, ExitPort: 4444,
+		BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "auto", Environment: "invalid"}); err == nil {
+		t.Fatal("invalid environment was accepted")
+	}
+}
+
 func TestOpenAllowsConcurrentDatabaseWork(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
