@@ -15,7 +15,7 @@ compile_dir，Entry 向 Relay 分发，Exit 直传失败时由 Relay 中转；mi
 用法: python deploy.py <action> [--target host:port]
 """
 from __future__ import annotations
-import argparse, hashlib, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex, subprocess, logging, random
+import argparse, hashlib, io, ipaddress, json, pathlib, tarfile, time, sys, os, shlex, subprocess, logging, random, re
 import paramiko
 import nb_release
 import nb_shard_deploy
