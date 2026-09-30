@@ -22,6 +22,13 @@ class NBWebNginxConfigTest(unittest.TestCase):
         self.assertIn("ssl_certificate_key ", self.config)
         self.assertIn("proxy_pass http://127.0.0.1:19091;", self.config)
 
+    def test_streams_large_node_source_uploads(self):
+        self.assertIn("client_max_body_size 1025m;", self.config)
+        self.assertIn("client_body_timeout 30m;", self.config)
+        self.assertIn("proxy_request_buffering off;", self.config)
+        self.assertIn("proxy_send_timeout 30m;", self.config)
+        self.assertIn("proxy_read_timeout 30m;", self.config)
+
 
 if __name__ == "__main__":
     unittest.main()

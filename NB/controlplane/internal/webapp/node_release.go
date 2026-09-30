@@ -21,7 +21,7 @@ import (
 	"nb-controlplane/internal/central"
 )
 
-const maxNodeSourceArchive = 1024 << 20
+const maxNodeSourceArchive = (1024 << 20) + (1 << 20) // 1 GiB file plus multipart framing.
 
 var fullGitCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
