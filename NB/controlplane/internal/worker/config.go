@@ -122,8 +122,8 @@ func LoadRegistry(path string) (Registry, error) {
 		line.SecurityDir = resolve(line.SecurityDir)
 		line.ClientSecretFile = resolve(line.ClientSecretFile)
 		line.WhitelistFile = resolve(line.WhitelistFile)
-		line.StateDir = filepath.Join(registry.StateDir, "lines", line.LineID)
 		if line.WhitelistSourceEnv != "" {
+			line.StateDir = filepath.Join(registry.StateDir, "lines", line.LineID)
 			if line.SingBox == "" {
 				line.SingBox = registry.Dynamic.SingBox
 			} else if strings.ContainsAny(line.SingBox, `/\\`) {

@@ -253,10 +253,12 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		"NB_SOCKS_UDP_PORT_MAX": strconv.Itoa(udpPortMax),
 		"NB_MIDDLE_PORT":        strconv.Itoa(middlePort),
 		"NB_EXIT_PORT":          strconv.Itoa(exitPort),
-		"NB_LINE_OPEN_FAST":     "1",
 	}
 	for key, value := range line.ExtraEnvironment {
 		values[key] = value
+	}
+	if line.StateDir != "" {
+		values["NB_LINE_OPEN_FAST"] = "1"
 	}
 	credentials, err := loadJSON(line.SourceMachinesFile)
 	if err != nil && line.SourceMachinesFile != "" {
