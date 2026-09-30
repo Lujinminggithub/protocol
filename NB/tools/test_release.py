@@ -38,6 +38,18 @@ def main() -> None:
         assert loaded["deployment_id"].startswith(loaded["release_id"] + "-")
         assert loaded["node_version"] == {"product": "V200R001C00", "semantic": "2.1.0"}
 
+        # Manifests from before the input split may contain deployment Python;
+        # changing that orchestration code must not invalidate the Node binary.
+        legacy_runtime = root / "tools" / "deploy_shard_runtime.py"
+        legacy_runtime.write_bytes(b"old orchestration\n")
+        legacy = dict(manifest)
+        legacy["inputs"] = manifest["inputs"] + [nb_release._file_record(root, legacy_runtime)]
+        legacy["source_digest"] = nb_release._source_digest(legacy["inputs"])
+        legacy_path = root / "build" / "legacy-release-manifest.json"
+        nb_release.write_manifest(legacy_path, legacy)
+        legacy_runtime.write_bytes(b"new orchestration\n")
+        assert nb_release.load_and_validate_manifest(legacy_path, root, binary)["release_id"] == loaded["release_id"]
+
         with tempfile.TemporaryDirectory(prefix="nb-line-state-") as external:
             external_root = pathlib.Path(external)
             external_topology = external_root / "bootstrap-hosts.json"

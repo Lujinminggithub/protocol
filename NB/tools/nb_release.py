@@ -17,6 +17,14 @@ NODE_SEMANTIC_VERSION = "2.1.0"
 RELEASE_NAME_RE = re.compile(r"^(?:[0-9a-f]{16}(?:-[0-9a-f]{12})?|legacy-[0-9a-f]{16})$")
 
 
+def is_binary_input(path: str) -> bool:
+    """Return whether a release input can change the nb_node binary."""
+    normalized = str(path).replace("\\", "/")
+    if normalized in {"VERSION", "CMakeLists.txt", "third_party/picoquic/build_libs.sh"}:
+        return True
+    return pathlib.PurePosixPath(normalized).suffix in {".c", ".h", ".inc", ".a"}
+
+
 def sha256_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -175,14 +183,21 @@ def load_and_validate_manifest(
     records = manifest.get("inputs")
     if not isinstance(records, list) or not records:
         raise ValueError("发布清单缺少构建输入")
-    for record in records:
+    binary_records = [record for record in records if is_binary_input(record.get("path", ""))]
+    if not binary_records:
+        raise ValueError("发布清单缺少 Node 二进制构建输入")
+    for record in binary_records:
         source = root / record["path"]
         if not source.is_file():
             raise ValueError(f"构建输入已缺失: {record['path']}")
         if sha256_file(source) != record.get("sha256") or source.stat().st_size != record.get("size"):
             raise ValueError(f"构建输入已变化，请重新构建: {record['path']}")
-    if manifest.get("source_digest") != _source_digest(records):
-        raise ValueError("构建输入摘要无效")
+    # Older manifests also recorded deployment Python/config files. Keep them
+    # readable during migration, but never let those files force a Node
+    # rebuild or invalidate an otherwise matching binary.
+    if all(is_binary_input(record.get("path", "")) for record in records):
+        if manifest.get("source_digest") != _source_digest(records):
+            raise ValueError("构建输入摘要无效")
     configuration_paths = {"topology": topology, "line_profile": line_profile}
     for key in ("topology", "line_profile"):
         record = manifest.get(key)

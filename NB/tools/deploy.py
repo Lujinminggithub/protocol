@@ -224,6 +224,13 @@ RELEASE_INPUTS["tools/security_rotate.py"] = ROOT / "tools" / "security_rotate.p
 RELEASE_INPUTS["tools/nb_shard_deploy.py"] = ROOT / "tools" / "nb_shard_deploy.py"
 RELEASE_INPUTS["tools/deploy_shard_runtime.py"] = ROOT / "tools" / "deploy_shard_runtime.py"
 RELEASE_INPUTS["tools/deploy_transfer.py"] = ROOT / "tools" / "deploy_transfer.py"
+# Keep orchestration files in the source snapshot, but exclude them from the
+# Node artifact identity. Changing control-plane Python must not rebuild and
+# restart shared shards when the native binary is unchanged.
+NODE_RELEASE_INPUTS = {
+    name: path for name, path in RELEASE_INPUTS.items()
+    if nb_release.is_binary_input(name)
+}
 RUNTIME_CONFIGURATION_INPUTS = {
     "tools/nb_supervisor.py": ROOT / "tools" / "nb_supervisor.py",
     "tools/tiktok_flow_rules.conf": ROOT / "tools" / "tiktok_flow_rules.conf",
@@ -300,7 +307,7 @@ def act_build(roles):
     if "MISSING:" in deps:
         c.close()
         raise RuntimeError(f"构建机 {h['name']} 缺少依赖: {', '.join(x.split(':', 1)[1] for x in deps.splitlines() if x.startswith('MISSING:'))}")
-    build_input_snapshot = nb_release.snapshot_inputs(ROOT, RELEASE_INPUTS)
+    build_input_snapshot = nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS)
     run(c, f"rm -rf {COMPILE_WORK}/src {COMPILE_WORK}/third_party {COMPILE_WORK}/CMakeLists.txt {COMPILE_WORK}/build; mkdir -p {COMPILE_WORK}")
     put_tar(c, BUILD_FILES, COMPILE_WORK)
     build_timeout = max(60, min(3600, int(os.environ.get("NB_REMOTE_BUILD_TIMEOUT_SECONDS", "900"))))
@@ -313,7 +320,7 @@ def act_build(roles):
     print(ok)
     if "BUILD_OK" not in ok:
         c.close(); sys.exit("编译失败, 中止")
-    if nb_release.snapshot_inputs(ROOT, RELEASE_INPUTS) != build_input_snapshot:
+    if nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS) != build_input_snapshot:
         c.close()
         raise RuntimeError("构建期间源码或运行时输入发生变化，产物已废弃，请重新构建")
     BUILD_DIR.mkdir(exist_ok=True)
@@ -327,7 +334,7 @@ def act_build(roles):
                 c, f"{COMPILE_WORK}/third_party/picoquic/prebuilt/{PLATFORM}/{archive}"))
         PICOQUIC_STAMP.write_text(PICOQUIC_SOURCE_DIGEST, encoding="ascii")
     manifest = nb_release.create_manifest(
-        ROOT, BUILD_DIR / "nb_node", PLATFORM, RELEASE_INPUTS, LAB_FILE,
+        ROOT, BUILD_DIR / "nb_node", PLATFORM, NODE_RELEASE_INPUTS, LAB_FILE,
         LINE_PROFILE if LINE_PROFILE.is_file() else None,
         RUNTIME_CONFIGURATION_INPUTS, git_info,
     )
@@ -358,19 +365,24 @@ def act_prepare_release():
     records = existing.get("inputs")
     if not isinstance(records, list) or not records:
         raise RuntimeError("release manifest has no build inputs")
-    for record in records:
+    binary_records = [record for record in records
+                      if nb_release.is_binary_input(record.get("path", ""))]
+    if not binary_records:
+        raise RuntimeError("release manifest has no Node binary inputs")
+    for record in binary_records:
         source = ROOT / record["path"]
         if (not source.is_file() or nb_release.sha256_file(source) != record.get("sha256") or
                 source.stat().st_size != record.get("size")):
             raise RuntimeError("local source differs from the binary build inputs")
-    if existing.get("source_digest") != nb_release._source_digest(records):
+    if (all(nb_release.is_binary_input(record.get("path", "")) for record in records) and
+            existing.get("source_digest") != nb_release._source_digest(records)):
         raise RuntimeError("release source digest is invalid")
     recorded_git = existing.get("git") or {}
     if recorded_git and (recorded_git.get("commit") != git_info.get("commit") or recorded_git.get("tree") != git_info.get("tree") or
                          recorded_git.get("project_path", ".") != git_info.get("project_path", ".")):
         raise RuntimeError("local Git commit/tree differs from the binary build inputs")
     manifest = nb_release.create_manifest(
-        ROOT, binary, PLATFORM, RELEASE_INPUTS, LAB_FILE,
+        ROOT, binary, PLATFORM, NODE_RELEASE_INPUTS, LAB_FILE,
         LINE_PROFILE if LINE_PROFILE.is_file() else None, RUNTIME_CONFIGURATION_INPUTS, git_info)
     nb_release.write_manifest(RELEASE_MANIFEST, manifest)
     print(f">>> prepared existing binary release={manifest['release_id']} deployment={manifest['deployment_id']}")
