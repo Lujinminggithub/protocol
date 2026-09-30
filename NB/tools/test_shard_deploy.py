@@ -126,6 +126,47 @@ def main() -> None:
     assert same_binary_started
     assert not any("restart nb-middle-shard" in item for item in same_binary_commands)
 
+    busy_previous = os.environ.get("NB_ALLOW_BINARY_REUSE_WHEN_BUSY")
+    os.environ["NB_ALLOW_BINARY_REUSE_WHEN_BUSY"] = "1"
+    busy_commands = []
+    try:
+        def busy_run(_client, command, **_kwargs):
+            busy_commands.append(command)
+            if "responses.append" in command:
+                return "4\n"
+            if command.startswith("readlink -f "):
+                return "/etc/xgw/shards/releases/old/nb_node\n"
+            if command.startswith("if test -x "):
+                return "PRESENT\n"
+            if command.startswith("sha256sum "):
+                return "old-sha\n" if "releases/old/" in command else "new-sha\n"
+            if "echo STAGED" in command:
+                return "REUSED\n"
+            if "SHARD_CONTROLS_OK" in command:
+                return "SHARD_CONTROLS_OK 2\n"
+            if command.startswith("systemctl is-active "):
+                return "inactive\n"
+            if command.startswith("systemctl enable "):
+                return "active\n"
+            if command.startswith("if test -f "):
+                return "ABSENT\n"
+            return ""
+
+        result = runtime.install_role(
+            None, "middle", command, {}, "deploy-busy", "new", 0,
+            work="/etc/xgw", instance_work="/etc/xgw/instances/line-a",
+            deploy_instance="line-a", lab={}, run=busy_run,
+            push_bytes=lambda *_args, **_kwargs: None,
+            effective_workers=lambda _role: 2,
+            legacy_service_name=lambda role: f"nb-{role}.service")
+        assert "binary_changed=false binary_reused=true" in result
+        assert not any("restart nb-middle-shard" in item for item in busy_commands)
+    finally:
+        if busy_previous is None:
+            os.environ.pop("NB_ALLOW_BINARY_REUSE_WHEN_BUSY", None)
+        else:
+            os.environ["NB_ALLOW_BINARY_REUSE_WHEN_BUSY"] = busy_previous
+
     for invalid in ("bad id", "../escape", ""):
         try:
             shard.render_instance_config(invalid, "entry", 0, command, {}, 1, 1024 * 1024)

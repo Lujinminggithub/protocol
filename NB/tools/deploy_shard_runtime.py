@@ -58,6 +58,17 @@ def require_idle_for_binary_change(c, role, *, work, run) -> None:
         time.sleep(2)
 
 
+def _reuse_current_binary_when_busy(c, role, *, work, run) -> bool:
+    """Keep the active shard binary when a line open must not disrupt traffic."""
+    if os.environ.get("NB_ALLOW_BINARY_REUSE_WHEN_BUSY") != "1":
+        return False
+    sessions = active_sessions(c, role, work=work, run=run)
+    if sessions <= 0:
+        return False
+    print(f">>> {role} shard has {sessions} active sessions; reuse current binary and apply instance config")
+    return True
+
+
 def _memory_limits(lab, role):
     defaults = {"entry": (640, 896), "middle": (512, 768), "exit": (640, 896)}
     configured = lab.get("shards", {}).get(role, {})
@@ -99,10 +110,17 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
         ).strip()
     shared_sha = run(c, f"sha256sum {shlex.quote(shared_release)} | awk '{{print $1}}'").strip()
     binary_changed = not previous_target_exists or previous_sha != shared_sha
+    binary_reused = False
+    effective_binary_release_id = binary_release_id
     if previous_target_exists and binary_changed:
-        require_idle_for_binary_change(c, role, work=work, run=run)
+        if _reuse_current_binary_when_busy(c, role, work=work, run=run):
+            binary_changed = False
+            binary_reused = True
+            effective_binary_release_id = pathlib.PurePosixPath(previous_target).parent.name
+        else:
+            require_idle_for_binary_change(c, role, work=work, run=run)
     high, maximum = _memory_limits(lab, role)
-    unit = nb_shard_deploy.render_systemd_unit(work, role, binary_release_id, high, maximum)
+    unit = nb_shard_deploy.render_systemd_unit(work, role, effective_binary_release_id, high, maximum)
     push_bytes(c, unit.encode("utf-8"), f"/etc/systemd/system/nb-{role}-shard@.service", mode=0o644)
     for worker in range(workers):
         run(c, f"mkdir -p {shlex.quote(nb_shard_deploy.shard_config_dir(work, role, worker))}")
@@ -151,7 +169,7 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
             saved = nb_shard_deploy.saved_instance_config(instance_work, release_id, role, worker)
             run(c, f"cp -p {shlex.quote(path)} {shlex.quote(saved)}")
         marker = nb_shard_deploy.saved_binary_release(instance_work, release_id, role)
-        run(c, f"printf '%s\\n' {shlex.quote(binary_release_id)} > {shlex.quote(marker)}; "
+        run(c, f"printf '%s\\n' {shlex.quote(effective_binary_release_id)} > {shlex.quote(marker)}; "
             f"chmod 0600 {shlex.quote(marker)}")
     except Exception:
         for path, backup, existed in backups:
@@ -167,4 +185,5 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
     finally:
         for _path, backup, _existed in backups:
             run(c, f"rm -f {shlex.quote(backup)}")
-    return f"shard workers={workers} binary_changed={str(binary_changed).lower()} controls=ok"
+    reused = " binary_reused=true" if binary_reused else ""
+    return f"shard workers={workers} binary_changed={str(binary_changed).lower()}{reused} controls=ok"

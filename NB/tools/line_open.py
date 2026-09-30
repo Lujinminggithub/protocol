@@ -566,6 +566,9 @@ def main() -> None:
                  "NB_MIDDLE_PORT": str(args.middle_port),
                 "NB_EXIT_PORT": str(args.exit_port),
                 "NB_OPEN_CLIENT_PASSWORD": client_password,
+                # Opening a new line must not interrupt existing shared-shard
+                # traffic; defer a binary rollout to a maintenance operation.
+                "NB_ALLOW_BINARY_REUSE_WHEN_BUSY": "1",
                 "NB_SSH_INSECURE": "1"})
     ensure_security_material(security, env)
     if reconcile_socks_user(security / "socks.users", args.client_username, client_password):
