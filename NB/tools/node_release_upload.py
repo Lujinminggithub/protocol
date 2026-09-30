@@ -43,6 +43,17 @@ def safe_extract(archive_path: pathlib.Path, destination: pathlib.Path) -> pathl
     raise RuntimeError("上传内容必须是包含 .git 的完整 Git 仓库")
 
 
+def project_root(repository: pathlib.Path) -> pathlib.Path:
+    required = ("CMakeLists.txt", "src/nb_node.c", "controlplane/go.mod", "tools/deploy.py")
+    if all((repository / path).is_file() for path in required):
+        return repository
+    candidates = [path for path in repository.iterdir() if path.is_dir() and
+                  all((path / required_path).is_file() for required_path in required)]
+    if len(candidates) != 1:
+        raise RuntimeError("Git 仓库中必须且只能包含一个完整 NB 项目目录")
+    return candidates[0]
+
+
 def validate_git(root: pathlib.Path, expected_commit: str) -> dict:
     commit = run(["git", "rev-parse", "HEAD"], root)
     if commit != expected_commit:
@@ -90,8 +101,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix=args.operation_id + "-", dir=staging_parent) as temporary:
         extracted = pathlib.Path(temporary) / "extract"
         extracted.mkdir()
-        candidate = safe_extract(args.archive, extracted)
-        git_info = validate_git(candidate, args.git_commit)
+        repository = safe_extract(args.archive, extracted)
+        git_info = validate_git(repository, args.git_commit)
+        candidate = project_root(repository)
+        git_info["project_path"] = candidate.relative_to(repository).as_posix()
         preserve_private_runtime(args.current_root, candidate)
         environment = os.environ.copy()
         environment["NB_FORCE_REMOTE_BUILD"] = "1"
@@ -110,6 +123,7 @@ def main() -> None:
         recorded_git = manifest.get("git") or {}
         if recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"]:
             raise RuntimeError("构建产物 Git 信息与上传仓库不一致")
+        (candidate / ".nb-git.json").write_text(json.dumps(git_info, separators=(",", ":")) + "\n", encoding="utf-8")
         final_candidate = staging_parent / f"ready-{args.operation_id}"
         if final_candidate.exists():
             shutil.rmtree(final_candidate)

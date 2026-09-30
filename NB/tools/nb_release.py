@@ -55,8 +55,10 @@ def git_metadata(root: pathlib.Path, expected_commit: str | None = None) -> dict
         return result.stdout.strip()
 
     top = pathlib.Path(git("rev-parse", "--show-toplevel")).resolve()
-    if top != root:
-        raise ValueError(f"源码目录不是 Git 根目录: {root}")
+    try:
+        project_path = root.relative_to(top).as_posix()
+    except ValueError as error:
+        raise ValueError(f"源码目录不在 Git 工作树内: {root}") from error
     commit = git("rev-parse", "HEAD")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Git HEAD 不是完整 commit")
@@ -70,7 +72,8 @@ def git_metadata(root: pathlib.Path, expected_commit: str | None = None) -> dict
     if submodules and any(line[:1] in {"+", "-", "U"} for line in submodules.splitlines()):
         raise ValueError("Git 子模块未固定在提交记录指定版本")
     tree = git("rev-parse", "HEAD^{tree}")
-    return {"commit": commit, "tree": tree, "submodules": submodules.splitlines() if submodules else []}
+    return {"commit": commit, "tree": tree, "project_path": project_path,
+            "submodules": submodules.splitlines() if submodules else []}
 
 
 def snapshot_inputs(root: pathlib.Path, inputs: Mapping[str, pathlib.Path]) -> list[dict]:
@@ -117,6 +120,7 @@ def create_manifest(
         manifest["git"] = {
             "commit": git_info["commit"],
             "tree": git_info["tree"],
+            "project_path": git_info.get("project_path", "."),
             "submodules": git_info.get("submodules", []),
         }
     if line_profile is not None and line_profile.is_file():

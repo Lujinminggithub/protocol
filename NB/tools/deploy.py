@@ -337,7 +337,13 @@ def act_prepare_release():
     if not binary.is_file() or not RELEASE_MANIFEST.is_file():
         raise RuntimeError("local binary and release manifest are required")
     existing = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
-    git_info = nb_release.git_metadata(ROOT)
+    try:
+        git_info = nb_release.git_metadata(ROOT)
+    except ValueError:
+        marker = ROOT / ".nb-git.json"
+        if not marker.is_file():
+            raise RuntimeError("active source has no verified Git metadata")
+        git_info = json.loads(marker.read_text(encoding="utf-8"))
     artifact = existing.get("artifact") or {}
     digest = nb_release.sha256_file(binary)
     if (existing.get("schema_version") != nb_release.SCHEMA_VERSION or
@@ -355,7 +361,8 @@ def act_prepare_release():
     if existing.get("source_digest") != nb_release._source_digest(records):
         raise RuntimeError("release source digest is invalid")
     recorded_git = existing.get("git") or {}
-    if recorded_git and (recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"]):
+    if recorded_git and (recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"] or
+                         recorded_git.get("project_path", ".") != git_info.get("project_path", ".")):
         raise RuntimeError("local Git commit/tree differs from the binary build inputs")
     manifest = nb_release.create_manifest(
         ROOT, binary, PLATFORM, RELEASE_INPUTS, LAB_FILE,
