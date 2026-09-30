@@ -170,6 +170,8 @@ def main() -> None:
         if result.returncode:
             raise RuntimeError((result.stdout + result.stderr).strip()[-8000:])
         manifest_path = candidate / "build" / "release-manifest.json"
+        binary_path = candidate / "build" / "nb_node"
+        binary_path.chmod(0o755)
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         recorded_git = manifest.get("git") or {}
         if recorded_git and (recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"]):
