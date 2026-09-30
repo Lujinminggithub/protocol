@@ -38,8 +38,9 @@ func main() {
 	}
 	defer database.Close()
 	secretsFile := env("NB_WEB_DEVICE_SECRETS_FILE", filepath.Join(stateDir, "device-secrets.json"))
+	uploadDir := env("NB_NODE_SOURCE_UPLOAD_DIR", filepath.Join(filepath.Dir(stateDir), "source-uploads"))
 	service := webapp.New(database, webapp.Config{AdminToken: os.Getenv("NB_WEB_ADMIN_TOKEN"),
-		AgentToken: os.Getenv("NB_WEB_AGENT_TOKEN"), DeviceSecretsFile: secretsFile})
+		AgentToken: os.Getenv("NB_WEB_AGENT_TOKEN"), DeviceSecretsFile: secretsFile, NodeSourceUploadDir: uploadDir})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {

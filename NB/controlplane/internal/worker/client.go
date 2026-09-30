@@ -147,6 +147,7 @@ func (c *Client) heartbeat(ctx context.Context) error {
 	if c.registry.Dynamic.Enabled {
 		lines = append(lines, lineCapability{LineID: "*", Operations: append([]string(nil), c.registry.Dynamic.Operations...)})
 	}
+	lines = append(lines, lineCapability{LineID: "__node_release__", Operations: []string{"node.release.build"}})
 	payload := map[string]any{"worker_id": c.registry.WorkerID, "status": "ready", "version": c.cfg.Version,
 		"lines": lines, "observed_at": time.Now().UTC().Format(time.RFC3339Nano)}
 	return c.request(ctx, http.MethodPost, "/agent/v1/executors/heartbeat", payload, nil)
@@ -369,6 +370,7 @@ func (c *Client) poll(ctx context.Context) error {
 	if c.registry.Dynamic.Enabled {
 		lines = append(lines, LineSpec{LineID: "*"})
 	}
+	lines = append(lines, LineSpec{LineID: "__node_release__"})
 	for _, line := range lines {
 		operations, err := c.claim(ctx, line.LineID)
 		if err != nil {

@@ -5,7 +5,7 @@ import {lineDeletionAction} from "./line-actions.js";
 
 const state = {
   token: sessionStorage.getItem("nbSessionToken") || "",
-  dashboard: null, devices: [], lines: [], details: {}, topology: {devices:[],links:[]}, operations: [], incidents: [], executors: [], view: "overview", openOperationID: "",
+  dashboard: null, devices: [], lines: [], details: {}, topology: {devices:[],links:[]}, operations: [], incidents: [], executors: [], nodeRelease: null, view: "overview", openOperationID: "",
   trafficCharts: null, overviewTopology: null, deviceTopology: null,
   pendingDeviceHostKey: null, selectedOperations: new Set(), mustChangePassword: false
 };
@@ -21,13 +21,14 @@ const deviceStatusText = {ready:"已启用",provisioning:"初始化",maintenance
 const environmentText = {production:"生产",test:"测试"};
 function environmentBadge(value) { const env=value||"production"; return `<span class="badge ${env === "test" ? "warning" : "active"}">${escapeHTML(environmentText[env]||env)}</span>`; }
 function healthState(value) { return value === "ok" ? "healthy" : (value || "unknown"); }
-const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优"};
+const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优","node.release.build":"构建 Node Release"};
 const roleText = {entry:"Entry",relay:"Relay",exit:"Exit"};
 const stageText = {prepare:"准备",build:"构建",provision:"开线部署",validate:"线路验证",deploy:"部署",rollback:"回滚",stop:"停用",whitelist:"白名单下发","whitelist-fetch":"白名单更新"};
 const legacyMessageText = {"preparing operation":"正在准备任务","operation prepared":"任务准备完成","step started":"步骤开始执行","step completed":"步骤执行完成","operation completed":"任务执行完成","dynamic plan exceeds assigned port limits":"线路端口超出 worker 授权范围"};
 function operationMessage(value) { return legacyMessageText[value] || value; }
 
 async function api(path, options = {}) {
+  if(path==="/api/v1/operations"&&options.method==="POST"&&options.body&&state.nodeRelease){const payload=JSON.parse(options.body);if(payload.kind==="line.open"&&!payload.request?.node_release_ack){const ack=confirmNodeRelease();if(ack===null)throw new Error("已取消使用候选 Node Release 开线");payload.request={...(payload.request||{}),node_release_ack:ack};options={...options,body:JSON.stringify(payload)};}}
   const headers = new Headers(options.headers || {});
   headers.set("Authorization", `Bearer ${state.token}`);
   if (options.body) headers.set("Content-Type", "application/json");
@@ -240,11 +241,11 @@ function renderIncidents() { $("#incidentsTable").innerHTML = state.incidents.le
 
 async function loadAll() {
   try {
-    const [dashboard,devices,lines,topologyData,operations,incidents,executors] = await Promise.all([api("/api/v1/dashboard"),api("/api/v1/devices"),api("/api/v1/lines"),api("/api/v1/topology"),api("/api/v1/operations?limit=100"),api("/api/v1/incidents?limit=100"),api("/api/v1/executors")]);
-    state.dashboard=dashboard; state.devices=devices.devices||[]; state.lines=lines.lines||[]; state.topology=topologyData||{devices:[],links:[]}; state.operations=operations.operations||[]; state.incidents=incidents.incidents||[]; state.executors=executors.executors||[];
+    const [dashboard,devices,lines,topologyData,operations,incidents,executors,nodeRelease] = await Promise.all([api("/api/v1/dashboard"),api("/api/v1/devices"),api("/api/v1/lines"),api("/api/v1/topology"),api("/api/v1/operations?limit=100"),api("/api/v1/incidents?limit=100"),api("/api/v1/executors"),api("/api/v1/node-releases/status")]);
+    state.dashboard=dashboard; state.devices=devices.devices||[]; state.lines=lines.lines||[]; state.topology=topologyData||{devices:[],links:[]}; state.operations=operations.operations||[]; state.incidents=incidents.incidents||[]; state.executors=executors.executors||[]; state.nodeRelease=nodeRelease.available?nodeRelease.release:null;
     const details = await Promise.all(state.lines.map((line) => api(`/api/v1/lines/${encodeURIComponent(line.id)}/detail`).catch(() => ({line}))));
     state.details = Object.fromEntries(details.map((detail) => [detail.line.id,detail]));
-    renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview(); renderDeviceTopology();
+    renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview(); renderDeviceTopology(); if($("#nodeReleaseStatus"))$("#nodeReleaseStatus").textContent=state.nodeRelease?`候选 Node ${state.nodeRelease.release_id} · ${String(state.nodeRelease.git_commit||"").slice(0,12)}`:"尚无 Web 构建的 Node Release";
     $("#updatedAt").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`; setConnected(true); $("#authModal").classList.add("hidden");
   } catch (error) { setConnected(false); if (error.status === 401) { state.token=""; sessionStorage.removeItem("nbSessionToken"); $("#authModal").classList.remove("hidden"); } else toast(error.message); throw error; }
 }
@@ -252,6 +253,7 @@ async function loadAll() {
 const viewMeta = {overview:["运营总览","线路拓扑、节点健康与执行任务"],devices:["设备管理","服务器库存、管理端口和健康状态"],lines:["线路管理","设备角色、容量、端口与部署状态"],operations:["操作任务","构建、上传、分发、启动和验证进度"],incidents:["告警中心","线路和设备异常汇总"]};
 function switchView(name) { state.view=name; $$(".nav-item").forEach((item) => item.classList.toggle("active",item.dataset.view===name)); $$(".view").forEach((view) => view.classList.toggle("active",view.id===`${name}View`)); [$("#viewTitle").textContent,$("#viewSubtitle").textContent]=viewMeta[name]; const action=$("#contextAction"); action.hidden=!['devices','lines','overview'].includes(name); action.textContent=name==='devices'?"录入设备":"新增线路"; }
 
+function confirmNodeRelease() { if(!state.nodeRelease)return "";const release=state.nodeRelease.release_id,commit=String(state.nodeRelease.git_commit||"").slice(0,12);return confirm(`检测到已验证的 Node 代码更新\nRelease: ${release}\nGit: ${commit}\n\n本次开线将使用该候选版本，是否继续？`)?release:null; }
 function openOperation(lineID,kind) { const line=state.lines.find((x)=>x.id===lineID),form=$("#operationForm"); form.reset(); form.elements.line_id.value=lineID; form.elements.kind.value=kind; form.elements.requested_by.value="operator"; $("#operationTitle").textContent=kindText[kind]||"创建任务"; $("#operationTarget").textContent=line?`${line.name} · ${line.id}`:lineID; $("#operationError").textContent=""; $("#operationModal").classList.remove("hidden"); }
 function bindDetails() { $$('[data-line-detail]').forEach((b) => b.onclick=()=>showLineDetail(b.dataset.lineDetail)); $$('[data-operation-detail]').forEach((b) => b.onclick=()=>showOperationDetail(b.dataset.operationDetail)); }
 function showDeviceDetail(id) { const item=state.devices.find((x)=>x.id===id); if(!item)return; state.openOperationID=""; $("#detailTitle").textContent=item.name; $("#detailSubtitle").textContent=item.id; $("#detailBody").innerHTML=`<div class="detail-grid"><dl><dt>环境</dt><dd>${environmentBadge(item.environment)}</dd><dt>SSH</dt><dd class="mono">${escapeHTML(item.ssh_user)}@${escapeHTML(item.host)}:${item.ssh_port}</dd><dt>内网地址</dt><dd>${escapeHTML(item.private_ip||"--")}</dd><dt>区域 / 运营商</dt><dd>${escapeHTML(item.region||"--")} / ${escapeHTML(item.provider||"--")}</dd></dl><dl><dt>管理状态</dt><dd><span class="badge ${escapeHTML(item.status)}">${escapeHTML(deviceStatusText[item.status]||item.status||"未知")}</span></dd><dt>连通状态</dt><dd>${badge(item.last_health||"unknown")}</dd><dt>系统</dt><dd>${escapeHTML(item.os||"--")} · ${escapeHTML(item.arch||"--")}</dd><dt>最近成功连通</dt><dd>${formatTime(item.last_seen_at)}</dd></dl></div>`; $("#detailModal").classList.remove("hidden"); }
@@ -356,11 +358,13 @@ $("#forceDeleteLineForm").addEventListener("submit",async(event)=>{
   }catch(error){$("#forceDeleteLineError").textContent=error.message;}finally{button.disabled=false;}
 });
 $("#lineEnvironmentForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,v=Object.fromEntries(new FormData(form)),submit=form.querySelector("[type=submit]");submit.disabled=true;try{await api(`/api/v1/lines/${encodeURIComponent(v.line_id)}`,{method:"PATCH",body:JSON.stringify({environment:v.environment})});$("#lineEnvironmentModal").classList.add("hidden");await loadAll();toast("线路环境已更新");}catch(error){$("#lineEnvironmentError").textContent=error.message;}finally{submit.disabled=false;}});
+$("#nodeSourceForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,submit=form.querySelector("[type=submit]"),data=new FormData(form);submit.disabled=true;$("#nodeSourceError").textContent="";try{const headers=new Headers({Authorization:`Bearer ${state.token}`}),response=await fetch("/api/v1/node-releases/uploads",{method:"POST",headers,body:data}),payload=await response.json();if(!response.ok)throw new Error(payload.error||`上传失败（HTTP ${response.status}）`);$("#nodeSourceModal").classList.add("hidden");form.reset();await loadAll();switchView("operations");toast(`Node 源码已上传，构建任务 ${payload.operation.id} 已排队`);}catch(error){$("#nodeSourceError").textContent=error.message;}finally{submit.disabled=false;}});
 
 $$('.nav-item').forEach((item)=>item.addEventListener("click",()=>switchView(item.dataset.view)));
 $("#contextAction").addEventListener("click",()=>{if(state.view==="devices"){const form=$("#deviceForm");form.reset();delete form.dataset.originalHost;delete form.dataset.originalPort;delete form.dataset.hostKeyStatus;clearDeviceHostKeyConfirmation();form.elements.id.readOnly=false;form.elements.password.required=true;$("#devicePasswordLabel").textContent="SSH 密码";$("#devicePasswordHint").textContent="首次登记必须输入，保存后不会回显";$("#scanDeviceHostKey").textContent="扫描主机密钥";$("#deviceError").textContent="";$("#deviceModal").classList.remove("hidden");}else{$("#lineError").textContent="";$("#lineModal").classList.remove("hidden");}});
 $("#refreshButton").addEventListener("click",()=>loadAll().catch(()=>{}));
 $$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-line-environment').forEach((x)=>x.addEventListener("click",()=>$("#lineEnvironmentModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-force-delete-line').forEach((x)=>x.addEventListener("click",()=>$("#forceDeleteLineModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
+$("#uploadNodeSource").addEventListener("click",()=>{$("#nodeSourceError").textContent="";$("#nodeSourceModal").classList.remove("hidden");});$$('.close-node-source').forEach((x)=>x.addEventListener("click",()=>$("#nodeSourceModal").classList.add("hidden")));
 $("#deviceSearch").addEventListener("input",filterDevices);$("#deviceEnvironment").addEventListener("change",filterDevices);$("#deviceStatus").addEventListener("change",filterDevices);$("#exportDevices").addEventListener("click",async()=>{try{const response=await fetch("/api/v1/devices/export",{headers:{Authorization:`Bearer ${state.token}`}});if(!response.ok)throw new Error(`导出失败（HTTP ${response.status}）`);const blob=await response.blob(),url=URL.createObjectURL(blob),anchor=document.createElement("a");anchor.href=url;anchor.download="nb-devices.csv";anchor.click();URL.revokeObjectURL(url);toast("设备信息已导出");}catch(error){toast(error.message);}});$("#lineSearch").addEventListener("input",filterLines);$("#lineEnvironment").addEventListener("change",filterLines);$("#lineStatus").addEventListener("change",filterLines);$("#topologyLine").addEventListener("change",renderOverviewTopology);
 for(const selector of ["#deviceTopologyLine","#deviceTopologyRegion","#deviceTopologyRole","#deviceTopologyHealth"])$(selector).addEventListener("change",renderDeviceTopology);
 const resetTopologyButton=document.createElement("button");

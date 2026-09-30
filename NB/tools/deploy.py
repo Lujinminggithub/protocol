@@ -258,6 +258,7 @@ def act_build(roles):
     """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
     if BUILD_HOST != "entry":
         raise RuntimeError("production builds must run on the entry role")
+    git_info = nb_release.git_metadata(ROOT)
     missing = missing_build_inputs()
     if missing:
         preview = ", ".join(missing[:12])
@@ -323,7 +324,7 @@ def act_build(roles):
     manifest = nb_release.create_manifest(
         ROOT, BUILD_DIR / "nb_node", PLATFORM, RELEASE_INPUTS, LAB_FILE,
         LINE_PROFILE if LINE_PROFILE.is_file() else None,
-        RUNTIME_CONFIGURATION_INPUTS,
+        RUNTIME_CONFIGURATION_INPUTS, git_info,
     )
     nb_release.write_manifest(RELEASE_MANIFEST, manifest)
     print(f"产物 -> {BUILD_DIR}: nb_node, release-manifest.json deployment={_deployment_id(manifest)}")
@@ -336,6 +337,7 @@ def act_prepare_release():
     if not binary.is_file() or not RELEASE_MANIFEST.is_file():
         raise RuntimeError("local binary and release manifest are required")
     existing = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
+    git_info = nb_release.git_metadata(ROOT)
     artifact = existing.get("artifact") or {}
     digest = nb_release.sha256_file(binary)
     if (existing.get("schema_version") != nb_release.SCHEMA_VERSION or
@@ -352,9 +354,12 @@ def act_prepare_release():
             raise RuntimeError("local source differs from the binary build inputs")
     if existing.get("source_digest") != nb_release._source_digest(records):
         raise RuntimeError("release source digest is invalid")
+    recorded_git = existing.get("git") or {}
+    if recorded_git and (recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"]):
+        raise RuntimeError("local Git commit/tree differs from the binary build inputs")
     manifest = nb_release.create_manifest(
         ROOT, binary, PLATFORM, RELEASE_INPUTS, LAB_FILE,
-        LINE_PROFILE if LINE_PROFILE.is_file() else None, RUNTIME_CONFIGURATION_INPUTS)
+        LINE_PROFILE if LINE_PROFILE.is_file() else None, RUNTIME_CONFIGURATION_INPUTS, git_info)
     nb_release.write_manifest(RELEASE_MANIFEST, manifest)
     print(f">>> prepared existing binary release={manifest['release_id']} deployment={manifest['deployment_id']}")
 

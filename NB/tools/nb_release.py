@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import re
+import subprocess
 from typing import Iterable, Mapping
 
 
@@ -43,6 +44,35 @@ def _source_digest(records: Iterable[dict]) -> str:
     return digest.hexdigest()
 
 
+def git_metadata(root: pathlib.Path, expected_commit: str | None = None) -> dict:
+    root = root.resolve()
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", "-C", str(root), *args], check=False,
+                                capture_output=True, text=True, encoding="utf-8")
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise ValueError(f"Git 操作失败: {' '.join(args)}: {detail}")
+        return result.stdout.strip()
+
+    top = pathlib.Path(git("rev-parse", "--show-toplevel")).resolve()
+    if top != root:
+        raise ValueError(f"源码目录不是 Git 根目录: {root}")
+    commit = git("rev-parse", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Git HEAD 不是完整 commit")
+    if expected_commit and commit != expected_commit.lower():
+        raise ValueError(f"Git commit 不匹配: expected={expected_commit} actual={commit}")
+    dirty = git("status", "--porcelain", "--untracked-files=all")
+    if dirty:
+        preview = "\\n".join(dirty.splitlines()[:20])
+        raise ValueError(f"Git 工作区不是 clean，拒绝构建:\n{preview}")
+    submodules = git("submodule", "status", "--recursive")
+    if submodules and any(line[:1] in {"+", "-", "U"} for line in submodules.splitlines()):
+        raise ValueError("Git 子模块未固定在提交记录指定版本")
+    tree = git("rev-parse", "HEAD^{tree}")
+    return {"commit": commit, "tree": tree, "submodules": submodules.splitlines() if submodules else []}
+
+
 def snapshot_inputs(root: pathlib.Path, inputs: Mapping[str, pathlib.Path]) -> list[dict]:
     return [
         _file_record(root.resolve(), path, logical_path)
@@ -68,6 +98,7 @@ def create_manifest(
     topology: pathlib.Path,
     line_profile: pathlib.Path | None = None,
     configuration_inputs: Mapping[str, pathlib.Path] | None = None,
+    git_info: dict | None = None,
 ) -> dict:
     root = root.resolve()
     artifact = _file_record(root, binary)
@@ -82,6 +113,12 @@ def create_manifest(
         "inputs": input_records,
         "topology": _file_record(root, topology),
     }
+    if git_info:
+        manifest["git"] = {
+            "commit": git_info["commit"],
+            "tree": git_info["tree"],
+            "submodules": git_info.get("submodules", []),
+        }
     if line_profile is not None and line_profile.is_file():
         manifest["line_profile"] = _file_record(root, line_profile)
     runtime_configuration = snapshot_inputs(root, configuration_inputs or {})
@@ -106,6 +143,7 @@ def load_and_validate_manifest(
     binary: pathlib.Path,
     topology: pathlib.Path | None = None,
     line_profile: pathlib.Path | None = None,
+    expected_git_commit: str | None = None,
 ) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != SCHEMA_VERSION:
@@ -117,6 +155,11 @@ def load_and_validate_manifest(
         raise ValueError("发布清单与 nb_node 二进制不一致")
     if manifest.get("release_id") != actual_hash[:16]:
         raise ValueError("发布编号与二进制哈希不一致")
+    git_info = manifest.get("git") or {}
+    if git_info:
+        current_git = git_metadata(root, expected_git_commit)
+        if git_info.get("commit") != current_git["commit"] or git_info.get("tree") != current_git["tree"]:
+            raise ValueError("Git commit/tree 与发布清单不一致")
 
     records = manifest.get("inputs")
     if not isinstance(records, list) or not records:

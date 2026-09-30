@@ -10,6 +10,7 @@ import os
 import pathlib
 import shlex
 import tarfile
+import nb_release
 
 import paramiko
 
@@ -27,6 +28,7 @@ ORCHESTRATION_FILES = (
     "tools/line_probe.py",
     "tools/line_provision.py",
     "tools/nb_release.py",
+    "tools/node_release_upload.py",
     "tools/nb_shard_deploy.py",
     "tools/nb_observe.py",
     "tools/security_setup.py",
@@ -69,6 +71,20 @@ def deployment_source_files(root: pathlib.Path = ROOT) -> dict[str, pathlib.Path
     for name in ("controlplane/go.mod", "controlplane/go.sum"):
         files[name] = root.joinpath(*pathlib.PurePosixPath(name).parts)
     return files
+
+
+def validate_node_release(root: pathlib.Path = ROOT) -> dict:
+    root = root.resolve()
+    manifest = root / "build" / "release-manifest.json"
+    binary = root / "build" / "nb_node"
+    if not manifest.is_file() or not binary.is_file():
+        raise RuntimeError("源码同步前必须存在匹配的 build/nb_node 和 build/release-manifest.json")
+    git_info = nb_release.git_metadata(root)
+    checked = nb_release.load_and_validate_manifest(manifest, root, binary, expected_git_commit=git_info["commit"])
+    recorded = checked.get("git") or {}
+    if recorded.get("commit") != git_info["commit"] or recorded.get("tree") != git_info["tree"]:
+        raise RuntimeError("源码同步拒绝：Git commit/tree 与 node release manifest 不一致")
+    return checked
 
 
 def source_archive(files: dict[str, pathlib.Path]) -> bytes:
@@ -200,8 +216,13 @@ def main() -> None:
     parser.add_argument("--known-hosts", required=True, type=pathlib.Path)
     parser.add_argument("--role", choices=tuple(ROLE_KEYS), default="middle")
     parser.add_argument("--target", default="/opt/nb-controlplane/repo")
+    parser.add_argument("--allow-source-only", action="store_true",
+                        help="仅同步源码，不校验 node release；仅允许本地开发使用")
     args = parser.parse_args()
     inventory = json.loads(args.inventory.read_text(encoding="utf-8"))
+    if not args.allow_source_only:
+        release = validate_node_release()
+        print(f"NODE_RELEASE_OK release={release['release_id']} git={release.get('git', {}).get('commit', '')}")
     files = deployment_source_files()
     manifest = source_manifest(files)
     client = connect(inventory_device(inventory, args.role), args.known_hosts)

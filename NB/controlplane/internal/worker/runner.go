@@ -3,6 +3,8 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +39,7 @@ type Result struct {
 	TransportProfile    *transportprofile.Profile `json:"transport_profile,omitempty"`
 	TransportRollout    *transportRolloutResult   `json:"transport_rollout,omitempty"`
 	Failure             *FailureDetail            `json:"failure,omitempty"`
+	NodeRelease         json.RawMessage           `json:"node_release,omitempty"`
 }
 
 type FailureDetail struct {
@@ -68,6 +71,10 @@ type requestValues struct {
 	Note               string                   `json:"note"`
 	Plan               dynamicPlan              `json:"plan"`
 	DeleteAfterCleanup bool                     `json:"delete_after_cleanup"`
+	UploadID           string                   `json:"upload_id"`
+	Archive            string                   `json:"archive"`
+	ArchiveSHA256      string                   `json:"archive_sha256"`
+	GitCommit          string                   `json:"git_commit"`
 	TransportProfile   transportprofile.Profile `json:"transport_profile"`
 }
 
@@ -382,6 +389,62 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 	return deployment, nil
 }
 
+func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, request requestValues) (Result, error) {
+	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
+	if !safeID.MatchString(request.UploadID) || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(request.GitCommit) {
+		return Result{}, errors.New("Node 源码上传标识或 Git commit 无效")
+	}
+	uploadRoot := filepath.Clean(filepath.Join(filepath.Dir(r.registry.StateDir), "source-uploads"))
+	archive := filepath.Clean(request.Archive)
+	if filepath.Dir(archive) != uploadRoot || filepath.Base(archive) != request.UploadID+".tar.gz" {
+		return Result{}, errors.New("Node 源码包路径不在受限上传目录")
+	}
+	archiveFile, err := os.Open(archive)
+	if err != nil {
+		return Result{}, errors.New("Node 源码包不可读取")
+	}
+	hasher := sha256.New()
+	_, hashErr := io.Copy(hasher, archiveFile)
+	closeErr := archiveFile.Close()
+	if hashErr != nil || closeErr != nil {
+		return Result{}, errors.New("Node 源码包 SHA256 计算失败")
+	}
+	if !strings.EqualFold(hex.EncodeToString(hasher.Sum(nil)), request.ArchiveSHA256) {
+		return Result{}, errors.New("Node 源码包 SHA256 不匹配")
+	}
+	if err := os.MkdirAll(operationDir, 0700); err != nil {
+		return Result{}, err
+	}
+	logPath := filepath.Join(operationDir, "worker.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return Result{}, err
+	}
+	defer logFile.Close()
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "source-verify", Status: "running", Message: "正在校验上传 Git 仓库"})
+	step := commandStep{Name: r.registry.Python, Stage: "node-build", Args: []string{filepath.Join(r.registry.Root, "tools", "node_release_upload.py"),
+		"--archive", archive, "--git-commit", request.GitCommit, "--current-root", r.registry.Root, "--operation-id", operation.ID}}
+	var captured bytes.Buffer
+	if err = r.execute(ctx, step, nil, io.MultiWriter(logFile, &captured)); err != nil {
+		summary := commandFailureSummary(err, logPath)
+		failure := operationFailure("node-build", fmt.Errorf("Node Release 构建失败：%s", summary), logPath)
+		_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "node-build", Status: "failed", Message: failure.Summary})
+		return Result{LogFile: logPath, Message: failure.Summary, Failure: failure}, err
+	}
+	marker := "NODE_RELEASE_JSON="
+	index := strings.LastIndex(captured.String(), marker)
+	if index < 0 {
+		return Result{LogFile: logPath}, errors.New("Node Release 构建未返回发布元数据")
+	}
+	line := strings.SplitN(captured.String()[index+len(marker):], "\n", 2)[0]
+	if !json.Valid([]byte(line)) {
+		return Result{LogFile: logPath}, errors.New("Node Release 发布元数据无效")
+	}
+	_ = os.Remove(archive)
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "node-build", Status: "succeeded", Message: "Node Release 构建并激活完成"})
+	return Result{LogFile: logPath, Message: "Node Release 构建并激活完成", NodeRelease: json.RawMessage(line)}, nil
+}
+
 func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "正在准备任务"})
 	failPreparation := func(err error, result Result) (Result, error) {
@@ -394,6 +457,9 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	var request requestValues
 	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
 		return failPreparation(errors.New("任务请求无效"), Result{})
+	}
+	if operation.Kind == "node.release.build" {
+		return r.runNodeReleaseBuild(ctx, operation, request)
 	}
 	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
 	line, ok := r.registry.Line(operation.LineID)

@@ -1056,6 +1056,20 @@ func TestPrepareRuntimePortsUploadsClaimsBeforePreflight(t *testing.T) {
 	}
 }
 
+func TestNodeReleaseBuildRejectsArchiveOutsideUploadDirectory(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "data", "worker")
+	root := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{registry: Registry{Root: root, StateDir: stateDir, Python: "python3"}}
+	request := requestValues{UploadID: "source-test", Archive: filepath.Join(t.TempDir(), "source-test.tar.gz"),
+		ArchiveSHA256: strings.Repeat("0", 64), GitCommit: strings.Repeat("a", 40)}
+	if _, err := runner.runNodeReleaseBuild(t.Context(), Operation{ID: "op-source", Kind: "node.release.build"}, request); err == nil || !strings.Contains(err.Error(), "受限上传目录") {
+		t.Fatalf("outside archive was not rejected: %v", err)
+	}
+}
+
 type fakeCleanupPortRunner struct{ residual bool }
 
 func (*fakeCleanupPortRunner) Run(context.Context, Operation) (Result, error) { return Result{}, nil }

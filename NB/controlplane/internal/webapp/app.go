@@ -63,9 +63,10 @@ func (a *App) planTransportProfile(r *http.Request, lineID string, bandwidthMbps
 var assets embed.FS
 
 type Config struct {
-	AdminToken        string
-	AgentToken        string
-	DeviceSecretsFile string
+	AdminToken          string
+	AgentToken          string
+	DeviceSecretsFile   string
+	NodeSourceUploadDir string
 }
 
 type App struct {
@@ -129,6 +130,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/operations/{id}/client-qr", a.admin(a.clientQR))
 	mux.HandleFunc("POST /api/v1/operations/{id}/cancel", a.admin(a.cancelOperation))
 	mux.HandleFunc("GET /api/v1/executors", a.admin(a.executors))
+	mux.HandleFunc("POST /api/v1/node-releases/uploads", a.admin(a.uploadNodeSource))
+	mux.HandleFunc("GET /api/v1/node-releases/status", a.admin(a.nodeReleaseStatus))
 	mux.HandleFunc("POST /agent/v1/snapshots", a.agent(a.snapshot))
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
@@ -503,7 +506,7 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.upgrade": true, "line.rollback": true, "line.disable": true, "line.tune": true}
+	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.upgrade": true, "line.rollback": true, "line.disable": true, "line.tune": true, "node.release.build": true}
 	if !safeID.MatchString(req.ID) || !safeID.MatchString(req.LineID) || !allowed[req.Kind] || !safeID.MatchString(req.RequestedBy) {
 		problem(w, 400, "任务参数无效")
 		return
@@ -525,7 +528,19 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "线路不存在")
 		return
 	}
-	if spec, specErr := a.store.LineSpec(r.Context(), req.LineID); specErr == nil {
+	if req.Kind == "node.release.build" {
+		var values map[string]any
+		if len(req.Request) == 0 || json.Unmarshal(req.Request, &values) != nil {
+			problem(w, 400, "Node 源码构建请求无效")
+			return
+		}
+		commit, _ := values["git_commit"].(string)
+		uploadID, _ := values["upload_id"].(string)
+		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) || !safeID.MatchString(uploadID) {
+			problem(w, 400, "Node 源码 Git commit 或上传标识无效")
+			return
+		}
+	} else if spec, specErr := a.store.LineSpec(r.Context(), req.LineID); specErr == nil {
 		if specErr = validLineSpec(spec); specErr != nil {
 			problem(w, 409, "线路部署参数无效："+specErr.Error())
 			return
@@ -536,6 +551,17 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		}
 		values["plan"] = spec
 		values["deployment_id"] = lineRecord.ActiveDeployment
+		if req.Kind == "line.open" {
+			if release, releaseErr := a.latestNodeRelease(r.Context()); releaseErr == nil {
+				acknowledged, _ := values["node_release_ack"].(string)
+				releaseID, _ := release["release_id"].(string)
+				if releaseID != "" && acknowledged != releaseID {
+					problem(w, http.StatusConflict, "检测到已验证的 Node 代码更新，请确认候选 Release 后重新提交开线")
+					return
+				}
+				values["node_release"] = release
+			}
+		}
 		if req.Kind == "line.tune" {
 			profile, planErr := a.planTransportProfile(r, req.LineID, spec.BandwidthMbps)
 			if planErr != nil {
@@ -639,7 +665,7 @@ func (a *App) executors(w http.ResponseWriter, r *http.Request) {
 
 func validOperationKind(kind string) bool {
 	return kind == "line.open" || kind == "line.validate" || kind == "line.upgrade" ||
-		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune"
+		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune" || kind == "node.release.build"
 }
 
 func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {

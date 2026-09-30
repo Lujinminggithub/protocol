@@ -1,7 +1,9 @@
 package webapp
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -9,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -642,6 +645,59 @@ func TestDeviceExportIncludesEnvironmentAndExcludesSecrets(t *testing.T) {
 	text := string(body)
 	if !strings.Contains(text, "id,name,environment") || !strings.Contains(text, "test-device,Test device,test") || strings.Contains(text, "device:test-device") {
 		t.Fatalf("unexpected export: %s", text)
+	}
+}
+
+func TestNodeSourceUploadCreatesBuildOperation(t *testing.T) {
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	uploadDir := filepath.Join(directory, "source-uploads")
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent", NodeSourceUploadDir: uploadDir}).Handler())
+	defer server.Close()
+	var archive bytes.Buffer
+	gzipWriter := gzip.NewWriter(&archive)
+	tarWriter := tar.NewWriter(gzipWriter)
+	content := []byte("ref: refs/heads/main\n")
+	if err = tarWriter.WriteHeader(&tar.Header{Name: "repo/.git/HEAD", Mode: 0600, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tarWriter.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	_ = tarWriter.Close()
+	_ = gzipWriter.Close()
+	var requestBody bytes.Buffer
+	multipartWriter := multipart.NewWriter(&requestBody)
+	_ = multipartWriter.WriteField("git_commit", strings.Repeat("a", 40))
+	_ = multipartWriter.WriteField("requested_by", "operator")
+	part, err := multipartWriter.CreateFormFile("archive", "repo.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write(archive.Bytes())
+	_ = multipartWriter.Close()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/node-releases/uploads", &requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer admin")
+	request.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"kind":"node.release.build"`)) {
+		t.Fatalf("upload status=%d body=%s", response.StatusCode, body)
+	}
+	items, err := database.Operations(t.Context(), "__node_release__", 10)
+	if err != nil || len(items) != 1 || items[0].Kind != "node.release.build" {
+		t.Fatalf("operations=%+v err=%v", items, err)
 	}
 }
 

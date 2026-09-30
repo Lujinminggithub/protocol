@@ -18,7 +18,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/opt/nb-controlplane/data/web /opt/nb-controlplane/data/secrets
+ReadWritePaths=/opt/nb-controlplane/data/web /opt/nb-controlplane/data/secrets /opt/nb-controlplane/data/source-uploads
 
 [Install]
 WantedBy=multi-user.target
