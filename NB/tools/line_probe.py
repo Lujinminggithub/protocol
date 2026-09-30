@@ -750,6 +750,8 @@ def main() -> None:
                         default="entry-local",
                         help="generate qualification traffic on Entry by default")
     parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument("--cache", type=pathlib.Path,
+                        help="reuse a matching active probe candidate cache")
     args = parser.parse_args()
     if args.via_entry_ssh:
         os.environ["NB_PROBE_VIA_ENTRY_SSH"] = "1"
@@ -768,6 +770,27 @@ def main() -> None:
         raise SystemExit("探针目标速率必须在 0.1..2000 Mbps")
     if args.duration < 10 or args.duration > 600:
         raise SystemExit("--duration 必须在 10..600")
+
+    cache_key_payload = {
+        "hosts_sha256": hashlib.sha256(deploy.LAB_FILE.read_bytes()).hexdigest(),
+        "profile_sha256": hashlib.sha256(deploy.LINE_PROFILE.read_bytes()).hexdigest() if deploy.LINE_PROFILE.is_file() else None,
+        "package_mbps": package_mbps, "upstream_mbps": args.upstream_mbps if args.upstream_mbps is not None else (package_mbps or target_mbps),
+        "downstream_mbps": args.downstream_mbps if args.downstream_mbps is not None else (package_mbps or target_mbps),
+        "headroom_ratio": args.headroom_ratio, "duration": args.duration,
+        "ping_samples": args.ping_samples, "probe_origin": args.probe_origin, "policy_version": 1,
+    }
+    cache_key = hashlib.sha256(json.dumps(cache_key_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if args.active and args.cache and args.output and args.cache.is_file():
+        try:
+            cached = json.loads(args.cache.read_text(encoding="utf-8"))
+            candidate = cached.get("candidate") if isinstance(cached, dict) else None
+            if isinstance(candidate, dict) and candidate.get("_probe_cache_key") == cache_key:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                print(f"PROBE_CACHE_HIT key={cache_key[:16]}")
+                return
+        except (OSError, ValueError, TypeError):
+            pass
 
     middle = deploy._role_host("middle")
     exit_host = deploy._role_host("exit")

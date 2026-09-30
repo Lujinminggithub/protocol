@@ -26,6 +26,18 @@ func duration(name string, fallback time.Duration) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func positiveInt(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 || parsed > 32 {
+		log.Fatalf("%s must be an integer between 1 and 32", name)
+	}
+	return parsed
+}
+
 func main() {
 	registryPath := os.Getenv("NB_WEB_WORKER_REGISTRY")
 	if registryPath == "" {
@@ -37,15 +49,16 @@ func main() {
 	}
 	runner := worker.NewRunner(registry)
 	client, err := worker.NewClient(registry, runner, worker.ClientConfig{
-		BaseURL:          os.Getenv("NB_WEB_BASE_URL"),
-		Token:            os.Getenv("NB_WEB_AGENT_TOKEN"),
-		Version:          version,
-		PollEvery:        duration("NB_WEB_WORKER_POLL_SECONDS", 2*time.Second),
-		HeartbeatEvery:   duration("NB_WEB_WORKER_HEARTBEAT_SECONDS", 10*time.Second),
-		OperationTimeout: duration("NB_WEB_WORKER_OPERATION_TIMEOUT_SECONDS", 45*time.Minute),
-		MaintenanceEvery: duration("NB_WEB_WORKER_MAINTENANCE_SECONDS", 5*time.Minute),
-		SnapshotEvery:    duration("NB_WEB_WORKER_SNAPSHOT_SECONDS", 15*time.Second),
-		SnapshotTimeout:  duration("NB_WEB_WORKER_SNAPSHOT_TIMEOUT_SECONDS", 30*time.Second),
+		BaseURL:              os.Getenv("NB_WEB_BASE_URL"),
+		Token:                os.Getenv("NB_WEB_AGENT_TOKEN"),
+		Version:              version,
+		PollEvery:            duration("NB_WEB_WORKER_POLL_SECONDS", 2*time.Second),
+		HeartbeatEvery:       duration("NB_WEB_WORKER_HEARTBEAT_SECONDS", 10*time.Second),
+		OperationTimeout:     duration("NB_WEB_WORKER_OPERATION_TIMEOUT_SECONDS", 45*time.Minute),
+		MaintenanceEvery:     duration("NB_WEB_WORKER_MAINTENANCE_SECONDS", 5*time.Minute),
+		SnapshotEvery:        duration("NB_WEB_WORKER_SNAPSHOT_SECONDS", 15*time.Second),
+		SnapshotTimeout:      duration("NB_WEB_WORKER_SNAPSHOT_TIMEOUT_SECONDS", 30*time.Second),
+		OperationConcurrency: positiveInt("NB_WEB_WORKER_OPERATION_CONCURRENCY", 4),
 	})
 	if err != nil {
 		log.Fatal(err)

@@ -618,15 +618,24 @@ def main() -> None:
             else:
                 print(f">>> resume: bootstrap deployment {bootstrap_deployment} already active")
 
-            run([sys.executable, "tools/line_provision.py", str(inventory_path),
-                 "--output-dir", str(provision_dir),
-                 "--allow-conservative-fallback"], env)
+            provision_command = [sys.executable, "tools/line_provision.py", str(inventory_path),
+                                 "--output-dir", str(provision_dir),
+                                 "--allow-conservative-fallback"]
+            if env.get("NB_LINE_OPEN_FAST") == "1":
+                provision_command.append("--skip-active-probe")
+            run(provision_command, env)
             if not all(path.is_file() for path in qualified_paths.values()):
                 raise RuntimeError("qualification completed without stable artifacts")
             save_checkpoint(checkpoint_path, checkpoint, "qualification", {
                 "status": "complete",
                 "sha256": {name: sha256_file(path) for name, path in qualified_paths.items()},
             })
+            if env.get("NB_LINE_OPEN_FAST") == "1":
+                write_json(output / "qualification-pending.json", {
+                    "schema_version": 1, "line_id": args.line_id,
+                    "inventory": str(inventory_path),
+                    "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }, private=True)
             qualification_valid = True
         else:
             print(">>> resume: qualification artifacts verified; skip active probe")

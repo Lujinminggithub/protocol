@@ -17,15 +17,16 @@ import (
 )
 
 type ClientConfig struct {
-	BaseURL          string
-	Token            string
-	Version          string
-	PollEvery        time.Duration
-	HeartbeatEvery   time.Duration
-	OperationTimeout time.Duration
-	MaintenanceEvery time.Duration
-	SnapshotEvery    time.Duration
-	SnapshotTimeout  time.Duration
+	BaseURL              string
+	Token                string
+	Version              string
+	PollEvery            time.Duration
+	HeartbeatEvery       time.Duration
+	OperationTimeout     time.Duration
+	MaintenanceEvery     time.Duration
+	SnapshotEvery        time.Duration
+	SnapshotTimeout      time.Duration
+	OperationConcurrency int
 }
 
 type operationRunner interface {
@@ -40,6 +41,7 @@ type Client struct {
 	snapshots            sync.Map
 	runtimeScanMu        sync.Mutex
 	runtimeScanCooldowns map[string]time.Time
+	operationLocks       sync.Map
 }
 
 type persistedResult struct {
@@ -88,6 +90,9 @@ func NewClient(registry Registry, runner operationRunner, cfg ClientConfig) (*Cl
 	}
 	if cfg.SnapshotTimeout <= 0 {
 		cfg.SnapshotTimeout = 30 * time.Second
+	}
+	if cfg.OperationConcurrency <= 0 {
+		cfg.OperationConcurrency = 4
 	}
 	return &Client{registry: registry, runner: runner, cfg: cfg, runtimeScanCooldowns: map[string]time.Time{},
 		http: &http.Client{Timeout: 20 * time.Second}}, nil
@@ -371,73 +376,110 @@ func (c *Client) poll(ctx context.Context) error {
 		lines = append(lines, LineSpec{LineID: "*"})
 	}
 	lines = append(lines, LineSpec{LineID: "__node_release__"})
+	var operations []Operation
 	for _, line := range lines {
-		operations, err := c.claim(ctx, line.LineID)
+		claimed, err := c.claim(ctx, line.LineID)
 		if err != nil {
 			return err
 		}
-		for _, operation := range operations {
-			resultPath := filepath.Join(c.registry.StateDir, operation.ID, "result.json")
-			var persisted persistedResult
-			if data, readErr := os.ReadFile(resultPath); readErr == nil && json.Unmarshal(data, &persisted) == nil && !persisted.Acknowledged {
-				if err = c.completeWithRetry(ctx, operation, persisted.Status, persisted.Result); err != nil {
-					return err
-				}
-				if err = acknowledgePersistedResult(resultPath); err != nil {
-					return err
-				}
-				continue
+		operations = append(operations, claimed...)
+	}
+	if len(operations) == 0 {
+		return nil
+	}
+	limit := c.cfg.OperationConcurrency
+	if limit > len(operations) {
+		limit = len(operations)
+	}
+	semaphore := make(chan struct{}, limit)
+	errorsCh := make(chan error, len(operations))
+	var group sync.WaitGroup
+	for _, operation := range operations {
+		operation := operation
+		semaphore <- struct{}{}
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			defer func() { <-semaphore }()
+			if err := c.processOperation(ctx, operation); err != nil {
+				errorsCh <- err
 			}
-			prepared, prepareErr := c.prepareRuntimePorts(ctx, operation)
-			if prepareErr != nil {
-				failure := operationFailure("prepare", prepareErr, "")
-				payload := Result{Message: failure.Summary, Failure: failure}
-				if err = c.completeWithRetry(ctx, operation, "failed", payload); err != nil {
-					return err
-				}
-				continue
-			}
-			operation = prepared
-			operationCtx, cancel := context.WithTimeout(ctx, c.cfg.OperationTimeout)
-			operationCtx = context.WithValue(operationCtx, eventContextKey{}, eventEmitter(func(eventCtx context.Context, event OperationEvent) error { return c.event(eventCtx, operation, event) }))
-			result, runErr := c.runner.Run(operationCtx, operation)
-			if runErr == nil {
-				runErr = c.confirmRuntimeCleanup(operationCtx, operation)
-			}
-			cancel()
-			status := "succeeded"
-			var payload any = result
-			if runErr != nil {
-				status = "failed"
-				if result.Failure == nil {
-					result.Failure = operationFailure(operation.Kind, runErr, result.LogFile)
-				}
-				result.Message = result.Failure.Summary
-				values := map[string]any{}
-				if encodedResult, encodeErr := json.Marshal(result); encodeErr == nil {
-					_ = json.Unmarshal(encodedResult, &values)
-				}
-				values["message"], values["log_file"], values["failure"] = result.Failure.Summary, result.LogFile, result.Failure
-				payload = values
-			}
-			encoded, marshalErr := json.Marshal(payload)
-			if marshalErr != nil {
-				return marshalErr
-			}
-			persisted = persistedResult{LineID: operation.LineID, Status: status, Result: encoded}
-			persistedData, _ := json.Marshal(persisted)
-			if err = writePrivateFile(resultPath, persistedData); err != nil {
-				return err
-			}
-			if err = c.completeWithRetry(ctx, operation, status, json.RawMessage(encoded)); err != nil {
-				return err
-			}
-			if err = acknowledgePersistedResult(resultPath); err != nil {
-				return err
-			}
-		}
+		}()
+	}
+	group.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		return err
 	}
 	return nil
+}
+
+func (c *Client) processOperation(ctx context.Context, operation Operation) error {
+	lockKey := operation.LineID
+	if lockKey == "*" && len(operation.Request) > 0 {
+		var request requestValues
+		if json.Unmarshal(operation.Request, &request) == nil && request.Plan.LineID != "" {
+			lockKey = request.Plan.LineID
+		}
+	}
+	if lockKey == "" {
+		lockKey = operation.ID
+	}
+	lockValue, _ := c.operationLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	resultPath := filepath.Join(c.registry.StateDir, operation.ID, "result.json")
+	var persisted persistedResult
+	if data, readErr := os.ReadFile(resultPath); readErr == nil && json.Unmarshal(data, &persisted) == nil && !persisted.Acknowledged {
+		if err := c.completeWithRetry(ctx, operation, persisted.Status, persisted.Result); err != nil {
+			return err
+		}
+		return acknowledgePersistedResult(resultPath)
+	}
+	prepared, prepareErr := c.prepareRuntimePorts(ctx, operation)
+	if prepareErr != nil {
+		failure := operationFailure("prepare", prepareErr, "")
+		payload := Result{Message: failure.Summary, Failure: failure}
+		return c.completeWithRetry(ctx, operation, "failed", payload)
+	}
+	operation = prepared
+	operationCtx, cancel := context.WithTimeout(ctx, c.cfg.OperationTimeout)
+	operationCtx = context.WithValue(operationCtx, eventContextKey{}, eventEmitter(func(eventCtx context.Context, event OperationEvent) error { return c.event(eventCtx, operation, event) }))
+	result, runErr := c.runner.Run(operationCtx, operation)
+	if runErr == nil {
+		runErr = c.confirmRuntimeCleanup(operationCtx, operation)
+	}
+	cancel()
+	status := "succeeded"
+	var payload any = result
+	if runErr != nil {
+		status = "failed"
+		if result.Failure == nil {
+			result.Failure = operationFailure(operation.Kind, runErr, result.LogFile)
+		}
+		result.Message = result.Failure.Summary
+		values := map[string]any{}
+		if encodedResult, encodeErr := json.Marshal(result); encodeErr == nil {
+			_ = json.Unmarshal(encodedResult, &values)
+		}
+		values["message"], values["log_file"], values["failure"] = result.Failure.Summary, result.LogFile, result.Failure
+		payload = values
+	}
+	encoded, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	persisted = persistedResult{LineID: operation.LineID, Status: status, Result: encoded}
+	persistedData, _ := json.Marshal(persisted)
+	if err := writePrivateFile(resultPath, persistedData); err != nil {
+		return err
+	}
+	if err := c.completeWithRetry(ctx, operation, status, json.RawMessage(encoded)); err != nil {
+		return err
+	}
+	return acknowledgePersistedResult(resultPath)
 }
 
 func (c *Client) runHeartbeat(ctx context.Context) {

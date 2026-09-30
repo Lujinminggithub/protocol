@@ -253,6 +253,7 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		"NB_SOCKS_UDP_PORT_MAX": strconv.Itoa(udpPortMax),
 		"NB_MIDDLE_PORT":        strconv.Itoa(middlePort),
 		"NB_EXIT_PORT":          strconv.Itoa(exitPort),
+		"NB_LINE_OPEN_FAST":     "1",
 	}
 	for key, value := range line.ExtraEnvironment {
 		values[key] = value
@@ -319,7 +320,8 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64),
 			"--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
-			"--socks-port", socks, "--via-entry-ssh", "--output", filepath.Join(operationDir, "validation.json")}}}, nil
+			"--socks-port", socks, "--via-entry-ssh", "--cache", filepath.Join(line.StateDir, "provision", line.LineID, "probe-cache.json"),
+			"--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.tune":
 		return nil, nil
 	case "line.upgrade":

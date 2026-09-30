@@ -255,8 +255,21 @@ def write_json(path: pathlib.Path, value: dict, private: bool = False) -> None:
     temporary.replace(path)
 
 
+def probe_cache_key(hosts_path: pathlib.Path, profile_path: pathlib.Path,
+                    package: float, upstream: float, downstream: float,
+                    headroom: float, duration: int, ping_samples: int,
+                    probe_origin: str = "entry-local") -> str:
+    payload = {
+        "hosts_sha256": sha256(hosts_path), "profile_sha256": sha256(profile_path),
+        "package_mbps": package, "upstream_mbps": upstream, "downstream_mbps": downstream,
+        "headroom_ratio": headroom, "duration": duration, "ping_samples": ping_samples,
+        "probe_origin": probe_origin, "policy_version": 1,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def run_probe(line: dict, inventory_dir: pathlib.Path, output: pathlib.Path,
-              defaults: dict) -> tuple[dict, dict, dict]:
+               defaults: dict, cache_path: pathlib.Path | None = None) -> tuple[dict, dict, dict]:
     hosts_path = resolve_path(line["hosts_file"], inventory_dir)
     profile_path = resolve_path(line["baseline_profile"], inventory_dir)
     if not hosts_path.is_file() or not profile_path.is_file():
@@ -264,12 +277,27 @@ def run_probe(line: dict, inventory_dir: pathlib.Path, output: pathlib.Path,
     package = float(line["package_mbps"])
     headroom = float(line.get("headroom_ratio", defaults.get("headroom_ratio", 1.25)))
     probe = {**defaults.get("probe", {}), **line.get("probe", {})}
+    duration = int(probe.get("duration", 90))
+    ping_samples = int(probe.get("ping_samples", 30))
+    cache_key = probe_cache_key(hosts_path, profile_path, package, float(line.get("upstream_mbps", package)),
+                                float(line.get("downstream_mbps", package)), headroom, duration, ping_samples)
+    if cache_path and cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            candidate = cached.get("candidate") if isinstance(cached, dict) else None
+            if isinstance(candidate, dict) and candidate.get("_probe_cache_key") == cache_key:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                print(f"PROBE_CACHE_HIT key={cache_key[:16]}")
+                return candidate, json.loads(hosts_path.read_text(encoding="utf-8")), \
+                    json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            pass
     command = [sys.executable, str(ROOT / "tools" / "line_probe.py"), "--active",
                "--package-mbps", str(package), "--headroom-ratio", str(headroom),
                "--upstream-mbps", str(float(line.get("upstream_mbps",package))),
                "--downstream-mbps", str(float(line.get("downstream_mbps",package))),
-               "--duration", str(int(probe.get("duration", 90))),
-               "--ping-samples", str(int(probe.get("ping_samples", 30))),
+               "--duration", str(duration), "--ping-samples", str(ping_samples),
                "--socks-port", str(int(line["client"].get("port", 1080))),
                "--output", str(output)]
     env = os.environ.copy()
@@ -296,6 +324,10 @@ def run_probe(line: dict, inventory_dir: pathlib.Path, output: pathlib.Path,
         raise ValueError("探针报告与当前 hosts 文件不匹配")
     if candidate.get("baseline_profile_sha256") != sha256(profile_path):
         raise ValueError("探针报告与当前基线 profile 不匹配")
+    candidate["_probe_cache_key"] = cache_key
+    if cache_path:
+        write_json(cache_path, {"schema_version": 1, "cache_key": cache_key,
+                                "candidate": candidate})
     return candidate, json.loads(hosts_path.read_text(encoding="utf-8")), \
         json.loads(profile_path.read_text(encoding="utf-8"))
 
@@ -308,6 +340,8 @@ def main() -> None:
                         help="只执行指定 line_id，可重复")
     parser.add_argument("--allow-conservative-fallback", action="store_true",
                         help="探针不足时沿用基线参数并标记待复验；仅供开线流程使用")
+    parser.add_argument("--skip-active-probe", action="store_true",
+                        help="快速开线：立即生成保守基线，将完整资格探测交给后台维护")
     args = parser.parse_args()
     inventory_path = args.inventory.resolve()
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -329,24 +363,39 @@ def main() -> None:
                 raise ValueError(f"重复 line_id: {line_id}")
             seen.add(line_id)
             candidate_path = line_dir / "probe-candidate.json"
-            try:
-                candidate, hosts, baseline = run_probe(
-                    line, inventory_path.parent, candidate_path, inventory.get("defaults", {}))
-            except Exception as error:
-                if not args.allow_conservative_fallback:
-                    raise
+            if args.skip_active_probe:
                 hosts_path = resolve_path(line["hosts_file"], inventory_path.parent)
                 profile_path = resolve_path(line["baseline_profile"], inventory_path.parent)
                 if not hosts_path.is_file() or not profile_path.is_file():
-                    raise
+                    raise ValueError(f"拓扑或基线 profile 不存在: {hosts_path}, {profile_path}")
                 hosts = json.loads(hosts_path.read_text(encoding="utf-8"))
                 baseline = json.loads(profile_path.read_text(encoding="utf-8"))
                 headroom = float(line.get("headroom_ratio",
                                          inventory.get("defaults", {}).get("headroom_ratio", 1.25)))
                 candidate = conservative_candidate(
-                    hosts_path, profile_path, float(line["package_mbps"]), headroom, str(error))
-                print(f"[{line_id}] WARNING: 主动探针未完成，使用保守基线并标记待复验: {error}",
-                      file=sys.stderr)
+                    hosts_path, profile_path, float(line["package_mbps"]), headroom,
+                    "fast-open qualification deferred")
+                print(f"[{line_id}] 快速开线：跳过主动探测，后台等待资格验证")
+            else:
+                try:
+                    candidate, hosts, baseline = run_probe(
+                        line, inventory_path.parent, candidate_path, inventory.get("defaults", {}),
+                        line_dir / "probe-cache.json")
+                except Exception as error:
+                    if not args.allow_conservative_fallback:
+                        raise
+                    hosts_path = resolve_path(line["hosts_file"], inventory_path.parent)
+                    profile_path = resolve_path(line["baseline_profile"], inventory_path.parent)
+                    if not hosts_path.is_file() or not profile_path.is_file():
+                        raise
+                    hosts = json.loads(hosts_path.read_text(encoding="utf-8"))
+                    baseline = json.loads(profile_path.read_text(encoding="utf-8"))
+                    headroom = float(line.get("headroom_ratio",
+                                             inventory.get("defaults", {}).get("headroom_ratio", 1.25)))
+                    candidate = conservative_candidate(
+                        hosts_path, profile_path, float(line["package_mbps"]), headroom, str(error))
+                    print(f"[{line_id}] WARNING: 主动探针未完成，使用保守基线并标记待复验: {error}",
+                          file=sys.stderr)
             password = os.environ[str(line["client"]["password_env"])]
             headroom = float(line.get("headroom_ratio",
                                      inventory.get("defaults", {}).get("headroom_ratio", 1.25)))

@@ -4,7 +4,7 @@ import pathlib
 import tempfile
 
 from line_provision import (assert_qualified, build_artifacts, conservative_candidate,
-                            qualification_rate, transient_probe_failure,
+                            probe_cache_key, qualification_rate, transient_probe_failure,
                             validate_line)
 
 
@@ -122,6 +122,10 @@ def main() -> None:
                                           "probe unavailable")
         assert fallback["admission"]["status"] == "pending-validation"
         assert fallback["fallback_reason"] == "probe unavailable"
+        key_a = probe_cache_key(hosts_path, profile_path, 10, 8, 12, 1.25, 90, 30)
+        key_b = probe_cache_key(hosts_path, profile_path, 10, 8, 12, 1.25, 90, 30)
+        key_c = probe_cache_key(hosts_path, profile_path, 10, 8, 12, 1.25, 120, 30)
+        assert key_a == key_b and key_a != key_c
     print("line_provision tests passed")
 
 
