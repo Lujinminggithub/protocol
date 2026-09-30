@@ -121,6 +121,12 @@ int nb_udp_control_grace_expired(uint64_t control_closed_at, uint64_t last_activ
     return now_us>reference&&now_us-reference>=grace_us;
 }
 
+int nb_udp_session_drain_expired(uint64_t close_at, uint64_t last_active,
+    uint64_t now_us){
+    return nb_udp_control_grace_expired(close_at,last_active,now_us,
+        NB_UDP_SESSION_DRAIN_US);
+}
+
 int nb_socks_udp_parse(const uint8_t* data, size_t length, char* host, size_t host_cap,
     int* port, const uint8_t** payload, size_t* payload_length){
     if(data==NULL||host==NULL||host_cap==0||port==NULL||payload==NULL||payload_length==NULL||

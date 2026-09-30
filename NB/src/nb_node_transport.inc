@@ -452,13 +452,18 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
         if(p==NULL)return 0;
         picoquic_cnx_t* opposite=p->up_cnx==cnx?p->down_cnx:p->up_cnx;
         if(opposite!=NULL)(void)udp_lifecycle_schedule(opposite,NB_UDP_TYPE_CLOSE,p->udp_session_id,p->route);
-        p->udp_close_received=1;ps_teardown_reason(p,"udp-peer-close");return 0;
+        p->udp_close_received=1;
+        p->udp_close_received_at=picoquic_current_time();
+        ps_set_close_reason(p,"udp-peer-close");
+        ps_touch(p);
+        return 0;
     }
     if(view->type==NB_UDP_TYPE_C2S){
         if(G.role==ROLE_MIDDLE){
             proxy_stream_t* p=ps_find_udp_up(cnx,view->session_id);char rest[NB_UDP_ROUTE_MAX];
             if(p==NULL)p=udp_middle_open(cnx,view,route,rest,sizeof(rest));
             else snprintf(rest,sizeof(rest),"%s",p->route);
+            udp_reopen_if_needed(p);
             if(p!=NULL&&p->udp_first_c2s_rx_at==0){p->udp_first_c2s_rx_at=picoquic_current_time();
                 log4c_info("middle udp trace id=%u usid=%u stage=c2s-first-rx age=%.1fms seq=%u frag=%u/%u bytes=%u target=%s:%d",
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_c2s_rx_at,p->created_at),view->sequence,
@@ -490,6 +495,7 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
         }
         if(G.role==ROLE_EXIT){
             proxy_stream_t* p=ps_find_udp_up(cnx,view->session_id);if(p==NULL)p=udp_exit_open(cnx,view,route);
+            udp_reopen_if_needed(p);
             if(p==NULL)return -5;
             if(p->udp_first_c2s_rx_at==0){p->udp_first_c2s_rx_at=picoquic_current_time();
                 log4c_info("exit udp trace id=%u usid=%u stage=c2s-first-rx age=%.1fms seq=%u frag=%u/%u bytes=%u target=%s:%d",

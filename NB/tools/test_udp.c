@@ -83,5 +83,9 @@ int main(void){
         NB_UDP_CONTROL_GRACE_US));
     CHECK(!nb_udp_control_grace_expired(100,1000+NB_UDP_CONTROL_GRACE_US/2,
         1000+NB_UDP_CONTROL_GRACE_US,NB_UDP_CONTROL_GRACE_US));
+    CHECK(!nb_udp_session_drain_expired(100,100,100+NB_UDP_SESSION_DRAIN_US-1));
+    CHECK(nb_udp_session_drain_expired(100,100,100+NB_UDP_SESSION_DRAIN_US));
+    CHECK(!nb_udp_session_drain_expired(100,1000,1000+NB_UDP_SESSION_DRAIN_US-1));
+    CHECK(nb_udp_session_drain_expired(100,1000,1000+NB_UDP_SESSION_DRAIN_US));
     puts("nb_udp_test: ok");return 0;
 }

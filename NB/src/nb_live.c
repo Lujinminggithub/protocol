@@ -8,9 +8,6 @@
 #define CTRL_RATE_BYTES_PER_SEC 125000.0
 #define CTRL_BURST_BYTES (32.0 * KIB)
 #define QUEUE_SEGMENT_COALESCE_US 5000ULL
-#define MEDIA_DOWNLINK_BULK_KBPS 512.0
-#define MEDIA_DOWNLINK_DOMINANCE 4.0
-#define MEDIA_DOWNLINK_WINDOWS 2
 nb_live_queue_limits_t nb_live_queue_limits(nb_flow_class_t flow_class, int udp_mode){
     nb_live_queue_limits_t limits;
     if(flow_class==NB_FLOW_CLASS_CTRL){
@@ -113,16 +110,24 @@ nb_live_flow_action_t nb_live_flow_observe(nb_live_flow_runtime_t* runtime,
     runtime->high_ctrl_windows=0;
     if(flow_class==NB_FLOW_CLASS_MEDIA){
         runtime->high_uplink_windows=0;
-        if(sk>=MEDIA_DOWNLINK_BULK_KBPS&&sk>=ck*MEDIA_DOWNLINK_DOMINANCE)
+        if(sk>=NB_LIVE_MEDIA_DOWNLINK_BULK_KBPS&&sk>=ck*NB_LIVE_MEDIA_DOWNLINK_DOMINANCE)
             runtime->high_downlink_windows++;
         else runtime->high_downlink_windows=0;
-        return runtime->high_downlink_windows>=MEDIA_DOWNLINK_WINDOWS&&total_s2c>=256*KIB?
+        return runtime->high_downlink_windows>=NB_LIVE_MEDIA_DOWNLINK_WINDOWS&&total_s2c>=256*KIB?
             NB_LIVE_FLOW_DEMOTE_DOWNLINK:NB_LIVE_FLOW_KEEP;
     }
-    runtime->high_downlink_windows=0;
-    if(ck>=256.0)runtime->high_uplink_windows++;
-    else runtime->high_uplink_windows=0;
-    return runtime->high_uplink_windows>=2?NB_LIVE_FLOW_PROMOTE_MEDIA:NB_LIVE_FLOW_KEEP;
+    if(ck>=256.0){
+        runtime->high_uplink_windows++;
+        runtime->high_downlink_windows=0;
+    }else if(sk>=NB_LIVE_MEDIA_DOWNLINK_BULK_KBPS&&sk>=ck*NB_LIVE_MEDIA_DOWNLINK_DOMINANCE){
+        runtime->high_downlink_windows++;
+        runtime->high_uplink_windows=0;
+    }else{
+        runtime->high_uplink_windows=0;
+    }
+    if(runtime->high_uplink_windows>=2)return NB_LIVE_FLOW_PROMOTE_MEDIA;
+    return runtime->high_downlink_windows>=NB_LIVE_MEDIA_DOWNLINK_WINDOWS&&total_s2c>=256*KIB?
+        NB_LIVE_FLOW_PROMOTE_MEDIA:NB_LIVE_FLOW_KEEP;
 }
 
 static int rule_preserves_latency(const char* rule_name){

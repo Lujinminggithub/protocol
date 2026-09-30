@@ -20,6 +20,7 @@
  * while either UDP direction is active, then reclaim it on the normal idle
  * horizon. */
 #define NB_UDP_CONTROL_GRACE_US 120000000ULL
+#define NB_UDP_SESSION_DRAIN_US 3000000ULL
 
 typedef struct {
     uint8_t type;
@@ -73,6 +74,8 @@ int nb_udp_reassembly_feed(nb_udp_reassembly_t* state, const nb_udp_wire_view_t*
     uint64_t now_us, nb_udp_reassembled_t* out);
 int nb_udp_control_grace_expired(uint64_t control_closed_at, uint64_t last_active,
     uint64_t now_us, uint64_t grace_us);
+int nb_udp_session_drain_expired(uint64_t close_at, uint64_t last_active,
+    uint64_t now_us);
 
 int nb_socks_udp_parse(const uint8_t* data, size_t length, char* host, size_t host_cap,
     int* port, const uint8_t** payload, size_t* payload_length);

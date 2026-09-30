@@ -170,6 +170,13 @@ static proxy_stream_t* ps_find_udp_down(picoquic_cnx_t* cnx,uint32_t session_id)
     return NULL;
 }
 
+static void udp_reopen_if_needed(proxy_stream_t* p){
+    if(p==NULL||!p->udp_close_received)return;
+    p->udp_close_received=0;
+    p->udp_close_received_at=0;
+    p->close_reason[0]=0;
+}
+
 static proxy_stream_t* ps_find_udp_child(uint32_t parent_id,const char* host,int port){
     proxy_stream_t* indexed=nb_session_index_find(&g_session_index,NB_SESSION_KEY_UDP_CHILD,parent_id,
         nb_session_index_hash_text(host),(uint64_t)(unsigned)port);

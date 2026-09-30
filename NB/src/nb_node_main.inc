@@ -663,7 +663,13 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
         /* 空闲超时兜底: 无数据活动超 IDLE_TIMEOUT 的流强制拆除(防僵尸流累积拖死复用连接; 半开/对端不关 FIN 亦兜住) */
         { uint64_t tnow=picoquic_current_time();
           for(i=0;i<MAX_CONN;i++){ proxy_stream_t*p=&G.streams[i];
-            if(p->in_use&&p->udp_association&&p->udp_control_closed_at&&
+            if(p->in_use&&p->udp_mode&&!p->udp_association&&p->udp_close_received&&
+                nb_udp_session_drain_expired(p->udp_close_received_at,p->last_active,tnow)){
+                log4c_info("%s UDP session drain expired id=%u usid=%u idle=%.1fms route=%s",
+                    role_name(G.role),p->id,p->udp_session_id,
+                    (tnow-p->last_active)/1000.0,p->route);
+                ps_teardown_reason(p,"udp-peer-close-drain-expired");
+            }else if(p->in_use&&p->udp_association&&p->udp_control_closed_at&&
                 nb_udp_control_grace_expired(p->udp_control_closed_at,p->last_active,tnow,g_udp_control_grace_us)){
                 log4c_info("entry UDP ASSOCIATE grace expired id=%u idle=%.1fms raw_rx=%llu peer=%s",
                     p->id,(tnow-p->last_active)/1000.0,(unsigned long long)p->udp_assoc_raw_rx,p->peer_addr);

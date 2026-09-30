@@ -43,6 +43,11 @@ int main(void){
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,80000,0,3000000,&c2s,&s2c)==NB_LIVE_FLOW_PROMOTE_MEDIA);
 
     runtime=(nb_live_flow_runtime_t){0};
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,1000,100000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
+    assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_BULK,2000,300000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_PROMOTE_MEDIA);
+
+    runtime=(nb_live_flow_runtime_t){0};
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,0,0,1000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,8000,150000,2000000,&c2s,&s2c)==NB_LIVE_FLOW_KEEP);
     assert(nb_live_flow_observe(&runtime,NB_FLOW_CLASS_MEDIA,16000,300000,3000000,&c2s,&s2c)==NB_LIVE_FLOW_DEMOTE_DOWNLINK);

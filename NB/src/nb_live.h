@@ -6,6 +6,10 @@
 
 #include "nb_policy.h"
 
+#define NB_LIVE_MEDIA_DOWNLINK_BULK_KBPS 512.0
+#define NB_LIVE_MEDIA_DOWNLINK_DOMINANCE 4.0
+#define NB_LIVE_MEDIA_DOWNLINK_WINDOWS 2
+
 typedef struct {
     size_t high_bytes;
     size_t low_bytes;

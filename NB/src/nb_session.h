@@ -192,6 +192,7 @@ typedef struct proxy_stream {
     uint32_t udp_parent_id;
     uint32_t udp_tx_sequence;
     int udp_close_received;
+    uint64_t udp_close_received_at;
     char udp_target_host[256];
     int udp_target_port;
     struct sockaddr_storage udp_tcp_peer;

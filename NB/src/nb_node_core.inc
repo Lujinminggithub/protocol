@@ -850,11 +850,15 @@ static void ps_demote_downlink_bulk(proxy_stream_t* p,double c2s_kbps,double s2c
 
 static void ps_update_runtime_policy(proxy_stream_t* p,uint64_t now){
     if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);p->tenant_accounted_up=p->bytes_c2s;p->tenant_accounted_down=p->bytes_s2c;}
-    if(p->udp_mode)return;
     double c2s=0,s2c=0;
     nb_live_flow_action_t action=nb_live_flow_observe_rule(&p->live_runtime,p->flow_class,
         p->flow_rule,p->bytes_c2s,p->bytes_s2c,now,&c2s,&s2c);
-    if(action==NB_LIVE_FLOW_PROMOTE_MEDIA)ps_promote_media(p,"auto-high-uplink",c2s);
+    if(action==NB_LIVE_FLOW_PROMOTE_MEDIA){
+        int downlink=c2s<256.0&&s2c>=NB_LIVE_MEDIA_DOWNLINK_BULK_KBPS&&
+            s2c>=c2s*NB_LIVE_MEDIA_DOWNLINK_DOMINANCE;
+        ps_promote_media(p,downlink?"auto-high-downlink":"auto-high-uplink",
+            downlink?s2c:c2s);
+    }
     else if(action==NB_LIVE_FLOW_DEMOTE_BULK)
         ps_demote_bulk(p,"auto-high-throughput-ctrl",c2s,s2c);
     else if(action==NB_LIVE_FLOW_DEMOTE_DOWNLINK)
