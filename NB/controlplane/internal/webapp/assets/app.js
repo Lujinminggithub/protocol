@@ -46,13 +46,25 @@ async function api(path, options = {}) {
   return body;
 }
 
-function uploadNodeArchive(data, onProgress) {
+function uploadNodeChunk(path, offset, chunk) {
   return new Promise((resolve, reject) => {
-    const request=new XMLHttpRequest();state.nodeUploadRequest=request;request.open("POST","/api/v1/node-releases/uploads");request.setRequestHeader("Authorization",`Bearer ${state.token}`);
-    request.upload.onprogress=(event)=>onProgress(event.lengthComputable?Math.min(100,Math.round(event.loaded/event.total*100)):null,event.loaded,event.total);
-    request.onload=()=>{state.nodeUploadRequest=null;let payload={};try{payload=JSON.parse(request.responseText||"{}");}catch{}if(request.status>=200&&request.status<300)resolve(payload);else reject(new Error(payload.error||`上传失败（HTTP ${request.status}）`));};
-    request.onerror=()=>{state.nodeUploadRequest=null;reject(new Error("源码包上传网络失败"));};request.onabort=()=>{state.nodeUploadRequest=null;reject(new Error("源码包上传已取消"));};request.send(data);
+    const request=new XMLHttpRequest();state.nodeUploadRequest=request;request.open("PUT",path);request.setRequestHeader("Authorization",`Bearer ${state.token}`);request.setRequestHeader("Content-Type","application/octet-stream");request.setRequestHeader("X-Upload-Offset",String(offset));
+    request.onload=()=>{state.nodeUploadRequest=null;let payload={};try{payload=JSON.parse(request.responseText||"{}");}catch{}if(request.status>=200&&request.status<300)resolve(payload);else{const error=new Error(payload.error||`分块上传失败（HTTP ${request.status}）`);error.status=request.status;error.received=payload.received;reject(error);}};
+    request.onerror=()=>{state.nodeUploadRequest=null;const error=new Error("源码分块上传网络失败");error.network=true;reject(error);};request.onabort=()=>{state.nodeUploadRequest=null;const error=new Error("源码包上传已取消");error.aborted=true;reject(error);};request.send(chunk);
   });
+}
+
+async function uploadNodeArchive(data, onProgress) {
+  const file=data.get("archive"),gitCommit=String(data.get("git_commit")||"").trim(),requestedBy=String(data.get("requested_by")||"operator");
+  if(!(file instanceof File)||!file.size)throw new Error("请选择源码包");
+  const uploadKey=`${file.name}:${file.size}:${file.lastModified}`,initialized=await api("/api/v1/node-releases/uploads",{method:"POST",body:JSON.stringify({filename:file.name,size:file.size,upload_key:uploadKey})});
+  let offset=Number(initialized.received||0);const chunkSize=4*1024*1024;onProgress(offset,file.size,"正在恢复上传状态");
+  while(offset<file.size){const end=Math.min(file.size,offset+chunkSize),chunk=file.slice(offset,end);let failure;
+    for(let attempt=0;attempt<5;attempt++){try{const result=await uploadNodeChunk(`/api/v1/node-releases/uploads/${encodeURIComponent(initialized.upload_id)}`,offset,chunk);offset=Number(result.received);failure=null;break;}catch(error){failure=error;if(error.aborted)throw error;if(error.status===409&&Number.isFinite(Number(error.received))){offset=Number(error.received);failure=null;break;}await new Promise((resolve)=>setTimeout(resolve,Math.min(8000,1000*2**attempt)));}}
+    if(failure&&offset<end)throw failure;onProgress(offset,file.size,"正在上传源码分块");
+  }
+  onProgress(file.size,file.size,"上传完成，正在校验并创建构建任务");
+  return api(`/api/v1/node-releases/uploads/${encodeURIComponent(initialized.upload_id)}/complete`,{method:"POST",body:JSON.stringify({git_commit:gitCommit,requested_by:requestedBy})});
 }
 
 function badge(value) { return `<span class="badge ${escapeHTML(value)}">${escapeHTML(statusText[value] || value || "未知")}</span>`; }
@@ -367,7 +379,7 @@ $("#forceDeleteLineForm").addEventListener("submit",async(event)=>{
   }catch(error){$("#forceDeleteLineError").textContent=error.message;}finally{button.disabled=false;}
 });
 $("#lineEnvironmentForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,v=Object.fromEntries(new FormData(form)),submit=form.querySelector("[type=submit]");submit.disabled=true;try{await api(`/api/v1/lines/${encodeURIComponent(v.line_id)}`,{method:"PATCH",body:JSON.stringify({environment:v.environment})});$("#lineEnvironmentModal").classList.add("hidden");await loadAll();toast("线路环境已更新");}catch(error){$("#lineEnvironmentError").textContent=error.message;}finally{submit.disabled=false;}});
-$("#nodeSourceForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,submit=form.querySelector("[type=submit]"),data=new FormData(form),panel=$("#nodeSourceProgress"),bar=$("#nodeSourceProgressBar"),text=$("#nodeSourceProgressText"),percent=$("#nodeSourceProgressPercent");submit.disabled=true;$("#nodeSourceError").textContent="";panel.classList.remove("hidden");bar.value=0;text.textContent="正在上传源码包";percent.textContent="0%";try{const payload=await uploadNodeArchive(data,(value,loaded,total)=>{if(value===null){bar.removeAttribute("value");text.textContent=`已上传 ${number(loaded/1048576,1)} MiB`;percent.textContent="--";return;}bar.value=value;percent.textContent=`${value}%`;text.textContent=value===100?"上传完成，正在校验并创建构建任务":`正在上传 ${number(loaded/1048576,1)} / ${number(total/1048576,1)} MiB`;});bar.value=100;percent.textContent="100%";$("#nodeSourceModal").classList.add("hidden");form.reset();panel.classList.add("hidden");await loadAll();switchView("operations");toast(`Node 源码已上传，构建任务 ${payload.operation.id} 已排队`);}catch(error){$("#nodeSourceError").textContent=error.message;text.textContent="上传失败";}finally{submit.disabled=false;}});
+$("#nodeSourceForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,submit=form.querySelector("[type=submit]"),data=new FormData(form),panel=$("#nodeSourceProgress"),bar=$("#nodeSourceProgressBar"),text=$("#nodeSourceProgressText"),percent=$("#nodeSourceProgressPercent");submit.disabled=true;$("#nodeSourceError").textContent="";panel.classList.remove("hidden");bar.value=0;text.textContent="正在初始化分块上传";percent.textContent="0%";try{const payload=await uploadNodeArchive(data,(loaded,total,status)=>{const value=total?Math.min(100,Math.round(loaded/total*100)):0;bar.value=value;percent.textContent=`${value}%`;text.textContent=`${status} · ${number(loaded/1048576,1)} / ${number(total/1048576,1)} MiB`;});bar.value=100;percent.textContent="100%";$("#nodeSourceModal").classList.add("hidden");form.reset();panel.classList.add("hidden");await loadAll();switchView("operations");toast(`Node 源码已上传，构建任务 ${payload.operation.id} 已排队`);}catch(error){$("#nodeSourceError").textContent=error.message;text.textContent=error.message;}finally{submit.disabled=false;}});
 
 $$('.nav-item').forEach((item)=>item.addEventListener("click",()=>switchView(item.dataset.view)));
 $("#contextAction").addEventListener("click",()=>{if(state.view==="devices"){const form=$("#deviceForm");form.reset();delete form.dataset.originalHost;delete form.dataset.originalPort;delete form.dataset.hostKeyStatus;clearDeviceHostKeyConfirmation();form.elements.id.readOnly=false;form.elements.password.required=true;$("#devicePasswordLabel").textContent="SSH 密码";$("#devicePasswordHint").textContent="首次登记必须输入，保存后不会回显";$("#scanDeviceHostKey").textContent="扫描主机密钥";$("#deviceError").textContent="";$("#deviceModal").classList.remove("hidden");}else{$("#lineError").textContent="";$("#lineModal").classList.remove("hidden");}});

@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -399,7 +400,7 @@ func TestNodeSourceUploadUIExposesArchiveFormatsAndProgress(t *testing.T) {
 			t.Fatalf("Node upload UI is missing %s", expected)
 		}
 	}
-	for _, expected := range []string{"XMLHttpRequest", "request.upload.onprogress", "nodeUploadRequest.abort()"} {
+	for _, expected := range []string{"XMLHttpRequest", "X-Upload-Offset", "file.slice", "attempt<5", "nodeUploadRequest.abort()"} {
 		if !bytes.Contains(script, []byte(expected)) {
 			t.Fatalf("Node upload progress is missing %s", expected)
 		}
@@ -784,6 +785,58 @@ func TestNodeSourceUploadAcceptsZipAndTar(t *testing.T) {
 				t.Fatalf("status=%d body=%s", response.StatusCode, responseBody)
 			}
 		})
+	}
+}
+
+func TestNodeSourceChunkedUploadResumesAndCreatesBuildOperation(t *testing.T) {
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent", NodeSourceUploadDir: filepath.Join(directory, "uploads")}).Handler())
+	defer server.Close()
+	var source bytes.Buffer
+	archive := zip.NewWriter(&source)
+	file, _ := archive.Create("repo/.git/HEAD")
+	_, _ = file.Write([]byte("ref: refs/heads/main\n"))
+	_ = archive.Close()
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/node-releases/uploads", "admin", "", map[string]any{
+		"filename": "repo.zip", "size": source.Len(), "upload_key": "repo-zip-test",
+	})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("init status=%d body=%s", response.StatusCode, body)
+	}
+	var initialized struct {
+		UploadID string `json:"upload_id"`
+		Received int64  `json:"received"`
+	}
+	if json.Unmarshal(body, &initialized) != nil || initialized.UploadID == "" || initialized.Received != 0 {
+		t.Fatalf("invalid init body=%s", body)
+	}
+	cut := source.Len() / 2
+	uploadChunk := func(offset int, data []byte, want int) {
+		request, _ := http.NewRequest(http.MethodPut, server.URL+"/api/v1/node-releases/uploads/"+initialized.UploadID, bytes.NewReader(data))
+		request.Header.Set("Authorization", "Bearer admin")
+		request.Header.Set("X-Upload-Offset", strconv.Itoa(offset))
+		response, requestErr := server.Client().Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		responseBody, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || !bytes.Contains(responseBody, []byte(`"received":`+strconv.Itoa(want))) {
+			t.Fatalf("chunk status=%d body=%s", response.StatusCode, responseBody)
+		}
+	}
+	uploadChunk(0, source.Bytes()[:cut], cut)
+	uploadChunk(cut, source.Bytes()[cut:], source.Len())
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/node-releases/uploads/"+initialized.UploadID+"/complete", "admin", "", map[string]any{
+		"git_commit": strings.Repeat("c", 40), "requested_by": "operator",
+	})
+	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"kind":"node.release.build"`)) {
+		t.Fatalf("complete status=%d body=%s", response.StatusCode, body)
 	}
 }
 

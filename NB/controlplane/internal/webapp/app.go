@@ -74,6 +74,7 @@ type App struct {
 	cfg                  Config
 	operationMu          sync.Mutex
 	lineMu               sync.Mutex
+	nodeUploadMu         sync.Mutex
 	deviceSecrets        deviceSecretStore
 	hostKeyTokenKey      [32]byte
 	verifySSHCredentials func(context.Context, string, int, string, string, ssh.PublicKey) error
@@ -131,6 +132,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/operations/{id}/cancel", a.admin(a.cancelOperation))
 	mux.HandleFunc("GET /api/v1/executors", a.admin(a.executors))
 	mux.HandleFunc("POST /api/v1/node-releases/uploads", a.admin(a.uploadNodeSource))
+	mux.HandleFunc("PUT /api/v1/node-releases/uploads/{id}", a.admin(a.uploadNodeSourceChunk))
+	mux.HandleFunc("POST /api/v1/node-releases/uploads/{id}/complete", a.admin(a.completeNodeSourceUpload))
 	mux.HandleFunc("GET /api/v1/node-releases/status", a.admin(a.nodeReleaseStatus))
 	mux.HandleFunc("POST /agent/v1/snapshots", a.agent(a.snapshot))
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
