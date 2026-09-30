@@ -46,11 +46,13 @@ async function api(path, options = {}) {
   return body;
 }
 
-function uploadNodeChunk(path, offset, chunk) {
+function uploadNodeChunk(path, offset, chunk, total, onProgress) {
   return new Promise((resolve, reject) => {
-    const request=new XMLHttpRequest();state.nodeUploadRequest=request;request.open("PUT",path);request.setRequestHeader("Authorization",`Bearer ${state.token}`);request.setRequestHeader("Content-Type","application/octet-stream");request.setRequestHeader("X-Upload-Offset",String(offset));
+    const request=new XMLHttpRequest();state.nodeUploadRequest=request;request.open("PUT",path);request.timeout=30000;request.setRequestHeader("Authorization",`Bearer ${state.token}`);request.setRequestHeader("Content-Type","application/octet-stream");request.setRequestHeader("X-Upload-Offset",String(offset));
+    request.upload.onprogress=(event)=>{if(event.lengthComputable&&onProgress)onProgress(offset+event.loaded,total,"正在上传源码分块");};
     request.onload=()=>{state.nodeUploadRequest=null;let payload={};try{payload=JSON.parse(request.responseText||"{}");}catch{}if(request.status>=200&&request.status<300)resolve(payload);else{const error=new Error(payload.error||`分块上传失败（HTTP ${request.status}）`);error.status=request.status;error.received=payload.received;reject(error);}};
     request.onerror=()=>{state.nodeUploadRequest=null;const error=new Error("源码分块上传网络失败");error.network=true;reject(error);};request.onabort=()=>{state.nodeUploadRequest=null;const error=new Error("源码包上传已取消");error.aborted=true;reject(error);};request.send(chunk);
+    request.ontimeout=()=>{state.nodeUploadRequest=null;const error=new Error("源码分块上传超时，正在重试");error.network=true;reject(error);};
   });
 }
 
@@ -60,7 +62,7 @@ async function uploadNodeArchive(data, onProgress) {
   const uploadKey=`${file.name}:${file.size}:${file.lastModified}`,initialized=await api("/api/v1/node-releases/uploads",{method:"POST",body:JSON.stringify({filename:file.name,size:file.size,upload_key:uploadKey})});
   let offset=Number(initialized.received||0);const chunkSize=4*1024*1024;onProgress(offset,file.size,"正在恢复上传状态");
   while(offset<file.size){const end=Math.min(file.size,offset+chunkSize),chunk=file.slice(offset,end);let failure;
-    for(let attempt=0;attempt<5;attempt++){try{const result=await uploadNodeChunk(`/api/v1/node-releases/uploads/${encodeURIComponent(initialized.upload_id)}`,offset,chunk);offset=Number(result.received);failure=null;break;}catch(error){failure=error;if(error.aborted)throw error;if(error.status===409&&Number.isFinite(Number(error.received))){offset=Number(error.received);failure=null;break;}await new Promise((resolve)=>setTimeout(resolve,Math.min(8000,1000*2**attempt)));}}
+    for(let attempt=0;attempt<5;attempt++){try{const result=await uploadNodeChunk(`/api/v1/node-releases/uploads/${encodeURIComponent(initialized.upload_id)}`,offset,chunk,file.size,onProgress);offset=Number(result.received);failure=null;break;}catch(error){failure=error;if(error.aborted)throw error;if(error.status===409&&Number.isFinite(Number(error.received))){offset=Number(error.received);failure=null;break;}await new Promise((resolve)=>setTimeout(resolve,Math.min(8000,1000*2**attempt)));}}
     if(failure&&offset<end)throw failure;onProgress(offset,file.size,"正在上传源码分块");
   }
   onProgress(file.size,file.size,"上传完成，正在校验并创建构建任务");
