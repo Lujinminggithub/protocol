@@ -257,9 +257,7 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 	for key, value := range line.ExtraEnvironment {
 		values[key] = value
 	}
-	if line.StateDir != "" {
-		values["NB_LINE_OPEN_FAST"] = "1"
-	}
+	values["NB_LINE_OPEN_FAST"] = "1"
 	credentials, err := loadJSON(line.SourceMachinesFile)
 	if err != nil && line.SourceMachinesFile != "" {
 		return nil, err

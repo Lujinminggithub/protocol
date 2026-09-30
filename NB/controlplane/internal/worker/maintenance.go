@@ -118,7 +118,23 @@ func (r *Runner) maintainWhitelist(ctx context.Context, line LineSpec) error {
 func (r *Runner) maintainQualification(ctx context.Context, line LineSpec) error {
 	lineState := line.StateDir
 	if lineState == "" {
-		lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
+		candidates, _ := filepath.Glob(filepath.Join(r.registry.StateDir, "*", "line-open", "qualification-pending.json"))
+		for _, candidate := range candidates {
+			data, readErr := os.ReadFile(candidate)
+			if readErr != nil {
+				continue
+			}
+			var marker struct {
+				LineID string `json:"line_id"`
+			}
+			if json.Unmarshal(data, &marker) == nil && marker.LineID == line.LineID {
+				lineState = filepath.Dir(candidate)
+				break
+			}
+		}
+		if lineState == "" {
+			return nil
+		}
 	}
 	pending := filepath.Join(lineState, "qualification-pending.json")
 	if _, err := os.Stat(pending); errors.Is(err, os.ErrNotExist) {
