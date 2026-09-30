@@ -696,7 +696,7 @@ def _push_exit_routes(c, remote_path=None):
             raise ValueError(f"出口路由越过固定 exit: {item}")
         if host!=str(_role_host("exit")["host"]) or port!=EXIT_PORT:
             raise ValueError(f"exit route/listener drift: route={host}:{port} listener={_role_host('exit')['host']}:{EXIT_PORT}")
-        if not name.replace("-","").replace("_","").isalnum() or not 1<=port<=65535 or not 1<=weight<=1000:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or not 1<=port<=65535 or not 1<=weight<=1000:
             raise ValueError(f"非法出口路由配置: {item}")
         capacity=int(item.get("capacity",0))
         if not 0<=capacity<=100000: raise ValueError(f"非法出口容量: {item}")
