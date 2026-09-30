@@ -112,9 +112,8 @@ func TestRoleRenderProducesMiddleIngressAndEgress(t *testing.T) {
 		t.Fatalf("render failed: %v", err)
 	}
 	text := string(data)
-	for _, expected := range []string{"schema=2", "role=middle", "ingress.cc=", "egress.cc=", "generation=9",
+	for _, expected := range []string{"schema=1", "role=middle", "ingress.cc=", "egress.cc=", "generation=9",
 		"egress.udp_fec_adaptive=false", "egress.udp_fec_k=8", "egress.udp_fec_hold_us=2000",
-		"egress.udp_fec_mode=nb-yfe2-optional",
 		"egress.target_rate_bps=5000000", "egress.seed_rtt_us=250000",
 		"egress.startup_cwin_bytes=393216"} {
 		if !strings.Contains(text, expected) {
@@ -131,6 +130,9 @@ func TestRoleRenderProducesMiddleIngressAndEgress(t *testing.T) {
 	}
 	if strings.Contains(string(entryData), "nb-yfe2-optional") {
 		t.Fatalf("entry unexpectedly enabled YFE2: %s", entryData)
+	}
+	if strings.Contains(text, "udp_fec_mode=") {
+		t.Fatalf("schema-1 wire profile contains schema-2 FEC mode: %s", text)
 	}
 }
 
@@ -183,5 +185,22 @@ func TestGenerateRejectsUnversionedOrInvalidEvidence(t *testing.T) {
 	probe.Segments["middle_exit"] = SegmentEvidence{QUIC: QUICEvidence{EffectiveLossP95Pct: 101}, Candidate: candidate("bbr", 0, 1404, 8, 20000)}
 	if _, err := Generate("line-1", 1, 5, probe); err == nil {
 		t.Fatal("invalid loss evidence was accepted")
+	}
+}
+
+func TestRenderUsesBackwardCompatibleWireSchema(t *testing.T) {
+	profile, fingerprint, err := Render(RoleProfile{
+		SchemaVersion: 2, LineID: "line-1", Generation: 3, Role: "middle",
+		Ingress: &Link{CC: "cubic", MTUMax: 1404, ReorderGap: 8, ReorderDelayUS: 20000,
+			FECObserve: true, UDPFECAdaptive: true, UDPFECMode: "off", CWinMaxBytes: 262144},
+		Egress: &Link{CC: "bbr", MTUMax: 1404, ReorderGap: 8, ReorderDelayUS: 20000,
+			FECObserve: true, UDPFECAdaptive: true, UDPFECMode: "nb-yfe2-optional"},
+	})
+	if err != nil || fingerprint == 0 {
+		t.Fatalf("render failed: err=%v fingerprint=%x", err, fingerprint)
+	}
+	text := string(profile)
+	if !strings.HasPrefix(text, "schema=1\n") || strings.Contains(text, "udp_fec_mode=") {
+		t.Fatalf("wire profile was not downgraded safely: %s", text)
 	}
 }
