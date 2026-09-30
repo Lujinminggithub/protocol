@@ -578,9 +578,13 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             _activate_release(client, deployment_id)
             activated.append(role)
             _append_deploy_audit(client, role, "activated", manifest, previous[role])
-            _install_and_restart_role(client,role,commands[role],release_id=deployment_id,
+            rollout = _install_and_restart_role(client,role,commands[role],release_id=deployment_id,
                 binary_release_id=manifest["release_id"])
-            health = _verify_release_health(client, role, manifest)
+            if "binary_reused=true" in rollout:
+                print(f">>> {role}: online binary reused; defer candidate hash rollout")
+                health = _verify_deployment_health(client, role, deployment_id, warmup=8)
+            else:
+                health = _verify_release_health(client, role, manifest)
             _append_deploy_audit(client, role, "healthy", manifest, previous[role], health)
             print(f"{role}: {health}")
             print(run(client, f"tail -4 {_log_path(role)} 2>/dev/null"))
