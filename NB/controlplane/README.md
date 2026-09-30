@@ -101,7 +101,7 @@ shape, bandwidth and assigned port ranges before resolving local secret refs.
 ### Node source releases
 
 Administrators can create a candidate Node Release from the task view. Upload a
-`tar.gz` containing a complete, clean Git repository (including `.git`) and
+ZIP, TAR, TAR.GZ or TGZ archive containing a complete, clean Git repository (including `.git`) and
 enter its full 40-character commit SHA. The build worker verifies the archive
 SHA256, Git HEAD/tree, clean worktree and recursive submodule state before it
 runs the existing CMake, CTest and P0 build gates. Uploaded `build/` artifacts

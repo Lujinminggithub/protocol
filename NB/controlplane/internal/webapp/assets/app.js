@@ -7,7 +7,7 @@ const state = {
   token: sessionStorage.getItem("nbSessionToken") || "",
   dashboard: null, devices: [], lines: [], details: {}, topology: {devices:[],links:[]}, operations: [], incidents: [], executors: [], nodeRelease: null, view: "overview", openOperationID: "",
   trafficCharts: null, overviewTopology: null, deviceTopology: null,
-  pendingDeviceHostKey: null, selectedOperations: new Set(), mustChangePassword: false
+  pendingDeviceHostKey: null, selectedOperations: new Set(), mustChangePassword: false, nodeUploadRequest: null
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -44,6 +44,15 @@ async function api(path, options = {}) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) { const error = new Error(body.error || `请求失败 (${response.status})`); error.status = response.status; throw error; }
   return body;
+}
+
+function uploadNodeArchive(data, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request=new XMLHttpRequest();state.nodeUploadRequest=request;request.open("POST","/api/v1/node-releases/uploads");request.setRequestHeader("Authorization",`Bearer ${state.token}`);
+    request.upload.onprogress=(event)=>onProgress(event.lengthComputable?Math.min(100,Math.round(event.loaded/event.total*100)):null,event.loaded,event.total);
+    request.onload=()=>{state.nodeUploadRequest=null;let payload={};try{payload=JSON.parse(request.responseText||"{}");}catch{}if(request.status>=200&&request.status<300)resolve(payload);else reject(new Error(payload.error||`上传失败（HTTP ${request.status}）`));};
+    request.onerror=()=>{state.nodeUploadRequest=null;reject(new Error("源码包上传网络失败"));};request.onabort=()=>{state.nodeUploadRequest=null;reject(new Error("源码包上传已取消"));};request.send(data);
+  });
 }
 
 function badge(value) { return `<span class="badge ${escapeHTML(value)}">${escapeHTML(statusText[value] || value || "未知")}</span>`; }
@@ -358,13 +367,13 @@ $("#forceDeleteLineForm").addEventListener("submit",async(event)=>{
   }catch(error){$("#forceDeleteLineError").textContent=error.message;}finally{button.disabled=false;}
 });
 $("#lineEnvironmentForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,v=Object.fromEntries(new FormData(form)),submit=form.querySelector("[type=submit]");submit.disabled=true;try{await api(`/api/v1/lines/${encodeURIComponent(v.line_id)}`,{method:"PATCH",body:JSON.stringify({environment:v.environment})});$("#lineEnvironmentModal").classList.add("hidden");await loadAll();toast("线路环境已更新");}catch(error){$("#lineEnvironmentError").textContent=error.message;}finally{submit.disabled=false;}});
-$("#nodeSourceForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,submit=form.querySelector("[type=submit]"),data=new FormData(form);submit.disabled=true;$("#nodeSourceError").textContent="";try{const headers=new Headers({Authorization:`Bearer ${state.token}`}),response=await fetch("/api/v1/node-releases/uploads",{method:"POST",headers,body:data}),payload=await response.json();if(!response.ok)throw new Error(payload.error||`上传失败（HTTP ${response.status}）`);$("#nodeSourceModal").classList.add("hidden");form.reset();await loadAll();switchView("operations");toast(`Node 源码已上传，构建任务 ${payload.operation.id} 已排队`);}catch(error){$("#nodeSourceError").textContent=error.message;}finally{submit.disabled=false;}});
+$("#nodeSourceForm").addEventListener("submit",async(event)=>{event.preventDefault();const form=event.currentTarget,submit=form.querySelector("[type=submit]"),data=new FormData(form),panel=$("#nodeSourceProgress"),bar=$("#nodeSourceProgressBar"),text=$("#nodeSourceProgressText"),percent=$("#nodeSourceProgressPercent");submit.disabled=true;$("#nodeSourceError").textContent="";panel.classList.remove("hidden");bar.value=0;text.textContent="正在上传源码包";percent.textContent="0%";try{const payload=await uploadNodeArchive(data,(value,loaded,total)=>{if(value===null){bar.removeAttribute("value");text.textContent=`已上传 ${number(loaded/1048576,1)} MiB`;percent.textContent="--";return;}bar.value=value;percent.textContent=`${value}%`;text.textContent=value===100?"上传完成，正在校验并创建构建任务":`正在上传 ${number(loaded/1048576,1)} / ${number(total/1048576,1)} MiB`;});bar.value=100;percent.textContent="100%";$("#nodeSourceModal").classList.add("hidden");form.reset();panel.classList.add("hidden");await loadAll();switchView("operations");toast(`Node 源码已上传，构建任务 ${payload.operation.id} 已排队`);}catch(error){$("#nodeSourceError").textContent=error.message;text.textContent="上传失败";}finally{submit.disabled=false;}});
 
 $$('.nav-item').forEach((item)=>item.addEventListener("click",()=>switchView(item.dataset.view)));
 $("#contextAction").addEventListener("click",()=>{if(state.view==="devices"){const form=$("#deviceForm");form.reset();delete form.dataset.originalHost;delete form.dataset.originalPort;delete form.dataset.hostKeyStatus;clearDeviceHostKeyConfirmation();form.elements.id.readOnly=false;form.elements.password.required=true;$("#devicePasswordLabel").textContent="SSH 密码";$("#devicePasswordHint").textContent="首次登记必须输入，保存后不会回显";$("#scanDeviceHostKey").textContent="扫描主机密钥";$("#deviceError").textContent="";$("#deviceModal").classList.remove("hidden");}else{$("#lineError").textContent="";$("#lineModal").classList.remove("hidden");}});
 $("#refreshButton").addEventListener("click",()=>loadAll().catch(()=>{}));
 $$('.close-device').forEach((x)=>x.addEventListener("click",()=>{clearDeviceHostKeyConfirmation();$("#deviceModal").classList.add("hidden");}));$$('.close-line').forEach((x)=>x.addEventListener("click",()=>$("#lineModal").classList.add("hidden")));$$('.close-line-environment').forEach((x)=>x.addEventListener("click",()=>$("#lineEnvironmentModal").classList.add("hidden")));$$('.close-operation').forEach((x)=>x.addEventListener("click",()=>$("#operationModal").classList.add("hidden")));$$('.close-force-delete-line').forEach((x)=>x.addEventListener("click",()=>$("#forceDeleteLineModal").classList.add("hidden")));$$('.close-detail').forEach((x)=>x.addEventListener("click",()=>{state.openOperationID="";if(state.trafficCharts){state.trafficCharts.destroy();state.trafficCharts=null;}$("#detailModal").classList.add("hidden");}));
-$("#uploadNodeSource").addEventListener("click",()=>{$("#nodeSourceError").textContent="";$("#nodeSourceModal").classList.remove("hidden");});$$('.close-node-source').forEach((x)=>x.addEventListener("click",()=>$("#nodeSourceModal").classList.add("hidden")));
+$("#uploadNodeSource").addEventListener("click",()=>{$("#nodeSourceError").textContent="";$("#nodeSourceProgress").classList.add("hidden");$("#nodeSourceModal").classList.remove("hidden");});$$('.close-node-source').forEach((x)=>x.addEventListener("click",()=>{if(state.nodeUploadRequest)state.nodeUploadRequest.abort();$("#nodeSourceModal").classList.add("hidden");}));
 $("#deviceSearch").addEventListener("input",filterDevices);$("#deviceEnvironment").addEventListener("change",filterDevices);$("#deviceStatus").addEventListener("change",filterDevices);$("#exportDevices").addEventListener("click",async()=>{try{const response=await fetch("/api/v1/devices/export",{headers:{Authorization:`Bearer ${state.token}`}});if(!response.ok)throw new Error(`导出失败（HTTP ${response.status}）`);const blob=await response.blob(),url=URL.createObjectURL(blob),anchor=document.createElement("a");anchor.href=url;anchor.download="nb-devices.csv";anchor.click();URL.revokeObjectURL(url);toast("设备信息已导出");}catch(error){toast(error.message);}});$("#lineSearch").addEventListener("input",filterLines);$("#lineEnvironment").addEventListener("change",filterLines);$("#lineStatus").addEventListener("change",filterLines);$("#topologyLine").addEventListener("change",renderOverviewTopology);
 for(const selector of ["#deviceTopologyLine","#deviceTopologyRegion","#deviceTopologyRole","#deviceTopologyHealth"])$(selector).addEventListener("change",renderDeviceTopology);
 const resetTopologyButton=document.createElement("button");

@@ -7,10 +7,12 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
 import time
+import zipfile
 
 
 def run(command: list[str], cwd: pathlib.Path) -> str:
@@ -21,20 +23,41 @@ def run(command: list[str], cwd: pathlib.Path) -> str:
 
 
 def safe_extract(archive_path: pathlib.Path, destination: pathlib.Path) -> pathlib.Path:
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = archive.getmembers()
-        if len(members) > 200000:
-            raise RuntimeError("源码包文件数量超过限制")
-        total = sum(member.size for member in members if member.isfile())
-        if total > 4 * 1024 * 1024 * 1024:
-            raise RuntimeError("源码包解压后超过 4 GiB")
-        for member in members:
-            target = (destination / member.name).resolve()
-            if destination.resolve() not in target.parents and target != destination.resolve():
-                raise RuntimeError("源码包包含路径穿越")
-            if member.issym() or member.islnk() or member.isdev():
-                raise RuntimeError("源码包不允许链接或设备文件")
-        archive.extractall(destination)
+    def validate_target(name: str) -> None:
+        target = (destination / name).resolve()
+        if destination.resolve() not in target.parents and target != destination.resolve():
+            raise RuntimeError("源码包包含路径穿越")
+
+    if zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            if len(members) > 200000:
+                raise RuntimeError("源码包文件数量超过限制")
+            if sum(member.file_size for member in members) > 4 * 1024 * 1024 * 1024:
+                raise RuntimeError("源码包解压后超过 4 GiB")
+            for member in members:
+                validate_target(member.filename)
+                mode = member.external_attr >> 16
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError("源码包不允许符号链接")
+            archive.extractall(destination)
+    else:
+        try:
+            archive = tarfile.open(archive_path, "r:*")
+        except tarfile.TarError as error:
+            raise RuntimeError("源码包必须是 ZIP、TAR 或 TAR.GZ") from error
+        with archive:
+            members = archive.getmembers()
+            if len(members) > 200000:
+                raise RuntimeError("源码包文件数量超过限制")
+            total = sum(member.size for member in members if member.isfile())
+            if total > 4 * 1024 * 1024 * 1024:
+                raise RuntimeError("源码包解压后超过 4 GiB")
+            for member in members:
+                validate_target(member.name)
+                if member.issym() or member.islnk() or member.isdev():
+                    raise RuntimeError("源码包不允许链接或设备文件")
+            archive.extractall(destination)
     roots = [item for item in destination.iterdir() if item.is_dir()]
     if (destination / ".git").is_dir():
         return destination

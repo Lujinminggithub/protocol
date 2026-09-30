@@ -1,6 +1,9 @@
 package webapp
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -21,6 +24,43 @@ import (
 const maxNodeSourceArchive = 1024 << 20
 
 var fullGitCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func validateNodeSourceArchive(path, filename string) (string, error) {
+	name := strings.ToLower(filename)
+	allowed := strings.HasSuffix(name, ".zip") || strings.HasSuffix(name, ".tar") ||
+		strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tgz")
+	if !allowed {
+		return "", errors.New("源码包必须是 zip、tar、tar.gz 或 tgz")
+	}
+	if archive, err := zip.OpenReader(path); err == nil {
+		defer archive.Close()
+		if len(archive.File) == 0 {
+			return "", errors.New("ZIP 源码包为空")
+		}
+		return "zip", nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	reader := io.Reader(file)
+	if strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tgz") {
+		compressed, gzipErr := gzip.NewReader(file)
+		if gzipErr != nil {
+			return "", errors.New("TAR.GZ 源码包无效")
+		}
+		defer compressed.Close()
+		reader = compressed
+	}
+	if _, err = tar.NewReader(reader).Next(); err != nil {
+		return "", errors.New("TAR 源码包无效或为空")
+	}
+	if strings.HasSuffix(name, ".tar") {
+		return "tar", nil
+	}
+	return "tar.gz", nil
+}
 
 func (a *App) latestNodeRelease(ctx context.Context) (map[string]any, error) {
 	operation, err := a.store.LatestSuccessfulOperation(ctx, "__node_release__", "node.release.build")
@@ -64,15 +104,10 @@ func (a *App) uploadNodeSource(w http.ResponseWriter, r *http.Request) {
 	}
 	file, header, err := r.FormFile("archive")
 	if err != nil {
-		problem(w, http.StatusBadRequest, "必须上传包含 .git 的 tar.gz 源码包")
+		problem(w, http.StatusBadRequest, "必须上传包含 .git 的 ZIP、TAR 或 TAR.GZ 源码包")
 		return
 	}
 	defer file.Close()
-	name := strings.ToLower(header.Filename)
-	if !strings.HasSuffix(name, ".tar.gz") && !strings.HasSuffix(name, ".tgz") {
-		problem(w, http.StatusBadRequest, "源码包必须是 tar.gz 或 tgz")
-		return
-	}
 	uploadID, err := operationID()
 	if err != nil {
 		problem(w, 500, err.Error())
@@ -88,7 +123,7 @@ func (a *App) uploadNodeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	temporary := filepath.Join(directory, uploadID+".part")
-	target := filepath.Join(directory, uploadID+".tar.gz")
+	target := filepath.Join(directory, uploadID+".archive")
 	output, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		problem(w, 500, "无法保存源码上传")
@@ -107,15 +142,10 @@ func (a *App) uploadNodeSource(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, "无法发布源码上传")
 		return
 	}
-	headerBytes := make([]byte, 2)
-	headerFile, headerErr := os.Open(target)
-	if headerErr == nil {
-		_, headerErr = io.ReadFull(headerFile, headerBytes)
-		_ = headerFile.Close()
-	}
-	if headerErr != nil || headerBytes[0] != 0x1f || headerBytes[1] != 0x8b {
+	archiveFormat, validationErr := validateNodeSourceArchive(target, header.Filename)
+	if validationErr != nil {
 		_ = os.Remove(target)
-		problem(w, 400, "源码包不是有效的 gzip 文件")
+		problem(w, 400, validationErr.Error())
 		return
 	}
 	lineID := "__node_release__"
@@ -129,7 +159,7 @@ func (a *App) uploadNodeSource(w http.ResponseWriter, r *http.Request) {
 	if !safeID.MatchString(requestedBy) {
 		requestedBy = "operator"
 	}
-	request, _ := json.Marshal(map[string]string{"upload_id": uploadID, "archive": target, "archive_sha256": hex.EncodeToString(hash.Sum(nil)), "git_commit": commit})
+	request, _ := json.Marshal(map[string]string{"upload_id": uploadID, "archive": target, "archive_format": archiveFormat, "archive_sha256": hex.EncodeToString(hash.Sum(nil)), "git_commit": commit})
 	opID, err := operationID()
 	if err != nil {
 		_ = os.Remove(target)

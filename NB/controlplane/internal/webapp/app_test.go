@@ -2,6 +2,7 @@ package webapp
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -384,6 +385,27 @@ func TestDeviceFormRequiresVisibleHostKeyConfirmation(t *testing.T) {
 	}
 }
 
+func TestNodeSourceUploadUIExposesArchiveFormatsAndProgress(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{".zip", ".tar", ".tar.gz", "nodeSourceProgressBar", "nodeSourceProgressPercent"} {
+		if !bytes.Contains(index, []byte(expected)) {
+			t.Fatalf("Node upload UI is missing %s", expected)
+		}
+	}
+	for _, expected := range []string{"XMLHttpRequest", "request.upload.onprogress", "nodeUploadRequest.abort()"} {
+		if !bytes.Contains(script, []byte(expected)) {
+			t.Fatalf("Node upload progress is missing %s", expected)
+		}
+	}
+}
+
 func TestClientConfigurationAndQRCode(t *testing.T) {
 	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -698,6 +720,70 @@ func TestNodeSourceUploadCreatesBuildOperation(t *testing.T) {
 	items, err := database.Operations(t.Context(), "__node_release__", 10)
 	if err != nil || len(items) != 1 || items[0].Kind != "node.release.build" {
 		t.Fatalf("operations=%+v err=%v", items, err)
+	}
+}
+
+func TestNodeSourceUploadAcceptsZipAndTar(t *testing.T) {
+	formats := map[string]func(*bytes.Buffer) error{
+		"repo.zip": func(output *bytes.Buffer) error {
+			archive := zip.NewWriter(output)
+			file, err := archive.Create("repo/.git/HEAD")
+			if err == nil {
+				_, err = file.Write([]byte("ref: refs/heads/main\n"))
+			}
+			if closeErr := archive.Close(); err == nil {
+				err = closeErr
+			}
+			return err
+		},
+		"repo.tar": func(output *bytes.Buffer) error {
+			archive := tar.NewWriter(output)
+			content := []byte("ref: refs/heads/main\n")
+			err := archive.WriteHeader(&tar.Header{Name: "repo/.git/HEAD", Mode: 0600, Size: int64(len(content))})
+			if err == nil {
+				_, err = archive.Write(content)
+			}
+			if closeErr := archive.Close(); err == nil {
+				err = closeErr
+			}
+			return err
+		},
+	}
+	for filename, build := range formats {
+		t.Run(filename, func(t *testing.T) {
+			directory := t.TempDir()
+			database, err := central.Open(filepath.Join(directory, "central.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent", NodeSourceUploadDir: filepath.Join(directory, "uploads")}).Handler())
+			defer server.Close()
+			var source, body bytes.Buffer
+			if err = build(&source); err != nil {
+				t.Fatal(err)
+			}
+			writer := multipart.NewWriter(&body)
+			_ = writer.WriteField("git_commit", strings.Repeat("b", 40))
+			part, createErr := writer.CreateFormFile("archive", filename)
+			if createErr != nil {
+				t.Fatal(createErr)
+			}
+			_, _ = part.Write(source.Bytes())
+			_ = writer.Close()
+			request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/node-releases/uploads", &body)
+			request.Header.Set("Authorization", "Bearer admin")
+			request.Header.Set("Content-Type", writer.FormDataContentType())
+			response, requestErr := server.Client().Do(request)
+			if requestErr != nil {
+				t.Fatal(requestErr)
+			}
+			responseBody, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusAccepted {
+				t.Fatalf("status=%d body=%s", response.StatusCode, responseBody)
+			}
+		})
 	}
 }
 

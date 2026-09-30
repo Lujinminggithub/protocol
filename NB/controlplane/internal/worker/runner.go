@@ -396,7 +396,7 @@ func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, r
 	}
 	uploadRoot := filepath.Clean(filepath.Join(filepath.Dir(r.registry.StateDir), "source-uploads"))
 	archive := filepath.Clean(request.Archive)
-	if filepath.Dir(archive) != uploadRoot || filepath.Base(archive) != request.UploadID+".tar.gz" {
+	if filepath.Dir(archive) != uploadRoot || filepath.Base(archive) != request.UploadID+".archive" {
 		return Result{}, errors.New("Node 源码包路径不在受限上传目录")
 	}
 	archiveFile, err := os.Open(archive)
