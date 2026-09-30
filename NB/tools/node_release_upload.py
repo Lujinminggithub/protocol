@@ -114,6 +114,12 @@ def main() -> None:
             environment["NB_HOSTS_FILE"] = str(inventory)
         if known_hosts.is_file():
             environment["NB_KNOWN_HOSTS"] = str(known_hosts)
+        else:
+            installed_known_hosts = args.current_root.parent / "etc" / "known_hosts"
+            if installed_known_hosts.is_file():
+                environment["NB_KNOWN_HOSTS"] = str(installed_known_hosts)
+        if not environment.get("NB_KNOWN_HOSTS"):
+            raise RuntimeError("Node Release 构建缺少受信任的 known_hosts")
         result = subprocess.run([environment.get("PYTHON", "python3"), "tools/deploy.py", "build"], cwd=candidate,
                                 env=environment, check=False, capture_output=True, text=True, encoding="utf-8")
         if result.returncode:
