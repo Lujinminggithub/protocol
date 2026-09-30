@@ -416,10 +416,17 @@ func (c *Client) poll(ctx context.Context) error {
 
 func (c *Client) processOperation(ctx context.Context, operation Operation) error {
 	lockKey := operation.LineID
+	var request requestValues
 	if lockKey == "*" && len(operation.Request) > 0 {
-		var request requestValues
 		if json.Unmarshal(operation.Request, &request) == nil && request.Plan.LineID != "" {
 			lockKey = request.Plan.LineID
+		}
+	}
+	if operation.Kind != "line.validate" {
+		if line, ok := c.registry.Line(lockKey); ok && line.ResourceGroup != "" {
+			lockKey = "resource:" + line.ResourceGroup
+		} else if request.Plan.ResourceGroup != "" {
+			lockKey = "resource:" + request.Plan.ResourceGroup
 		}
 	}
 	if lockKey == "" {
