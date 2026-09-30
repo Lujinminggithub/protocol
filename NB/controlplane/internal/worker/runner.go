@@ -577,6 +577,14 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		if err != nil {
 			return result, err
 		}
+		lineState := line.StateDir
+		if lineState == "" {
+			lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
+		}
+		if _, pendingErr := os.Stat(filepath.Join(lineState, "qualification-pending.json")); pendingErr == nil {
+			result.Message = "线路已可用，资格探测后台进行中"
+			result.Evidence = json.RawMessage(`{"qualification":"pending"}`)
+		}
 	}
 	return result, nil
 }
