@@ -96,6 +96,14 @@ def preserve_private_runtime(current: pathlib.Path, candidate: pathlib.Path) -> 
             shutil.copytree(source, target)
 
 
+def overlay_controlplane_orchestration(current: pathlib.Path, candidate: pathlib.Path) -> None:
+    """Keep uploaded Node sources while using the control plane's fixed deploy harness."""
+    relative = pathlib.Path("tools/deploy.py")
+    source, target = current / relative, candidate / relative
+    if source.is_file() and target.is_file():
+        shutil.copy2(source, target)
+
+
 def apply_build_credentials(current_root: pathlib.Path, candidate: pathlib.Path, environment: dict[str, str]) -> None:
     inventory_path = pathlib.Path(environment.get("NB_HOSTS_FILE", str(candidate / "tools" / "lab-hosts.json")))
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -149,6 +157,7 @@ def main() -> None:
         candidate = project_root(repository)
         git_info["project_path"] = candidate.relative_to(repository).as_posix()
         preserve_private_runtime(args.current_root, candidate)
+        overlay_controlplane_orchestration(args.current_root, candidate)
         environment = os.environ.copy()
         environment["NB_FORCE_REMOTE_BUILD"] = "1"
         environment["NB_ALLOW_UNVERSIONED_SOURCE"] = "1"
