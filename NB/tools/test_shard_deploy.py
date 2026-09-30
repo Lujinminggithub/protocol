@@ -58,6 +58,8 @@ def main() -> None:
             return "/etc/xgw/shards/releases/old/nb_node\n"
         if command.startswith("if test -x "):
             return "ABSENT\n"
+        if command.startswith("sha256sum "):
+            return "new-binary-sha\n"
         if "SHARD_CONTROLS_OK" in command:
             if len(started_workers) != 2:
                 raise AssertionError("all controls were checked before both cold-start workers ran")
@@ -84,6 +86,45 @@ def main() -> None:
     assert started_workers == {0, 1}
     assert any(path == "/etc/systemd/system/nb-middle-shard@.service" for path, _, _ in pushed)
     assert not any("responses.append" in item for item in commands)
+
+    # A new deployment ID with the same binary must not require a session
+    # drain or restart the shared shard.
+    same_binary_commands = []
+    same_binary_started = []
+
+    def same_binary_run(_client, command, **_kwargs):
+        same_binary_commands.append(command)
+        if "responses.append" in command:
+            raise AssertionError("identical binary rollout queried active sessions")
+        if command.startswith("readlink -f "):
+            return "/etc/xgw/shards/releases/old/nb_node\n"
+        if command.startswith("if test -x "):
+            return "PRESENT\n"
+        if command.startswith("sha256sum "):
+            return "same-binary-sha\n"
+        if "echo STAGED" in command:
+            return "REUSED\n"
+        if "SHARD_CONTROLS_OK" in command:
+            return "SHARD_CONTROLS_OK 2\n"
+        if command.startswith("systemctl is-active "):
+            return "inactive\n"
+        if command.startswith("systemctl enable "):
+            same_binary_started.append(command)
+            return "active\n"
+        if command.startswith("if test -f "):
+            return "ABSENT\n"
+        return ""
+
+    result = runtime.install_role(
+        None, "middle", command, {}, "deploy-same", "new", 0,
+        work="/etc/xgw", instance_work="/etc/xgw/instances/line-a",
+        deploy_instance="line-a", lab={}, run=same_binary_run,
+        push_bytes=lambda *_args, **_kwargs: None,
+        effective_workers=lambda _role: 2,
+        legacy_service_name=lambda role: f"nb-{role}.service")
+    assert "binary_changed=false" in result
+    assert same_binary_started
+    assert not any("restart nb-middle-shard" in item for item in same_binary_commands)
 
     for invalid in ("bad id", "../escape", ""):
         try:

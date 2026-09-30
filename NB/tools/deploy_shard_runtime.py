@@ -89,7 +89,16 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
     previous_target_exists = bool(previous_target) and "PRESENT" in run(
         c, f"if test -x {shlex.quote(previous_target)}; then echo PRESENT; else echo ABSENT; fi"
     )
-    binary_changed = previous_target != shared_release
+    # Deployment IDs are intentionally unique per operation. Compare the binary
+    # contents instead of the release path so an identical binary does not
+    # restart shared shards or trip the active-session isolation gate.
+    previous_sha = ""
+    if previous_target_exists:
+        previous_sha = run(
+            c, f"sha256sum {shlex.quote(previous_target)} | awk '{{print $1}}'"
+        ).strip()
+    shared_sha = run(c, f"sha256sum {shlex.quote(shared_release)} | awk '{{print $1}}'").strip()
+    binary_changed = not previous_target_exists or previous_sha != shared_sha
     if previous_target_exists and binary_changed:
         require_idle_for_binary_change(c, role, work=work, run=run)
     high, maximum = _memory_limits(lab, role)
