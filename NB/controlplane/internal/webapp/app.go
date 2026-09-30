@@ -537,10 +537,9 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			problem(w, 400, "Node 源码构建请求无效")
 			return
 		}
-		commit, _ := values["git_commit"].(string)
 		uploadID, _ := values["upload_id"].(string)
-		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) || !safeID.MatchString(uploadID) {
-			problem(w, 400, "Node 源码 Git commit 或上传标识无效")
+		if !safeID.MatchString(uploadID) {
+			problem(w, 400, "Node 源码上传标识无效")
 			return
 		}
 	} else if spec, specErr := a.store.LineSpec(r.Context(), req.LineID); specErr == nil {

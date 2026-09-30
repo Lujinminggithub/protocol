@@ -55,7 +55,7 @@ function uploadNodeChunk(path, offset, chunk) {
 }
 
 async function uploadNodeArchive(data, onProgress) {
-  const file=data.get("archive"),gitCommit=String(data.get("git_commit")||"").trim(),requestedBy=String(data.get("requested_by")||"operator");
+  const file=data.get("archive"),requestedBy=String(data.get("requested_by")||"operator");
   if(!(file instanceof File)||!file.size)throw new Error("请选择源码包");
   const uploadKey=`${file.name}:${file.size}:${file.lastModified}`,initialized=await api("/api/v1/node-releases/uploads",{method:"POST",body:JSON.stringify({filename:file.name,size:file.size,upload_key:uploadKey})});
   let offset=Number(initialized.received||0);const chunkSize=4*1024*1024;onProgress(offset,file.size,"正在恢复上传状态");
@@ -64,7 +64,7 @@ async function uploadNodeArchive(data, onProgress) {
     if(failure&&offset<end)throw failure;onProgress(offset,file.size,"正在上传源码分块");
   }
   onProgress(file.size,file.size,"上传完成，正在校验并创建构建任务");
-  return api(`/api/v1/node-releases/uploads/${encodeURIComponent(initialized.upload_id)}/complete`,{method:"POST",body:JSON.stringify({git_commit:gitCommit,requested_by:requestedBy})});
+  return api(`/api/v1/node-releases/uploads/${encodeURIComponent(initialized.upload_id)}/complete`,{method:"POST",body:JSON.stringify({requested_by:requestedBy})});
 }
 
 function badge(value) { return `<span class="badge ${escapeHTML(value)}">${escapeHTML(statusText[value] || value || "未知")}</span>`; }
@@ -266,7 +266,7 @@ async function loadAll() {
     state.dashboard=dashboard; state.devices=devices.devices||[]; state.lines=lines.lines||[]; state.topology=topologyData||{devices:[],links:[]}; state.operations=operations.operations||[]; state.incidents=incidents.incidents||[]; state.executors=executors.executors||[]; state.nodeRelease=nodeRelease.available?nodeRelease.release:null;
     const details = await Promise.all(state.lines.map((line) => api(`/api/v1/lines/${encodeURIComponent(line.id)}/detail`).catch(() => ({line}))));
     state.details = Object.fromEntries(details.map((detail) => [detail.line.id,detail]));
-    renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview(); renderDeviceTopology(); if($("#nodeReleaseStatus"))$("#nodeReleaseStatus").textContent=state.nodeRelease?`候选 Node ${state.nodeRelease.release_id} · ${String(state.nodeRelease.git_commit||"").slice(0,12)}`:"尚无 Web 构建的 Node Release";
+    renderMetrics(); renderDevices(); renderLines(); renderOperations(); renderIncidents(); renderOverview(); renderDeviceTopology(); if($("#nodeReleaseStatus"))$("#nodeReleaseStatus").textContent=state.nodeRelease?`候选 Node ${state.nodeRelease.node_version?.product||""} (${state.nodeRelease.node_version?.semantic||""}) · ${state.nodeRelease.release_id}`:"尚无 Web 构建的 Node Release";
     $("#updatedAt").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`; setConnected(true); $("#authModal").classList.add("hidden");
   } catch (error) { setConnected(false); if (error.status === 401) { state.token=""; sessionStorage.removeItem("nbSessionToken"); $("#authModal").classList.remove("hidden"); } else toast(error.message); throw error; }
 }
@@ -274,7 +274,7 @@ async function loadAll() {
 const viewMeta = {overview:["运营总览","线路拓扑、节点健康与执行任务"],devices:["设备管理","服务器库存、管理端口和健康状态"],lines:["线路管理","设备角色、容量、端口与部署状态"],operations:["操作任务","构建、上传、分发、启动和验证进度"],incidents:["告警中心","线路和设备异常汇总"]};
 function switchView(name) { state.view=name; $$(".nav-item").forEach((item) => item.classList.toggle("active",item.dataset.view===name)); $$(".view").forEach((view) => view.classList.toggle("active",view.id===`${name}View`)); [$("#viewTitle").textContent,$("#viewSubtitle").textContent]=viewMeta[name]; const action=$("#contextAction"); action.hidden=!['devices','lines','overview'].includes(name); action.textContent=name==='devices'?"录入设备":"新增线路"; }
 
-function confirmNodeRelease() { if(!state.nodeRelease)return "";const release=state.nodeRelease.release_id,commit=String(state.nodeRelease.git_commit||"").slice(0,12);return confirm(`检测到已验证的 Node 代码更新\nRelease: ${release}\nGit: ${commit}\n\n本次开线将使用该候选版本，是否继续？`)?release:null; }
+function confirmNodeRelease() { if(!state.nodeRelease)return "";const release=state.nodeRelease.release_id,version=state.nodeRelease.node_version||{};return confirm(`检测到已验证的 Node 代码更新\n版本: ${version.product||"--"} (${version.semantic||"--"})\nRelease: ${release}\n\n本次开线将使用该候选版本，是否继续？`)?release:null; }
 function openOperation(lineID,kind) { const line=state.lines.find((x)=>x.id===lineID),form=$("#operationForm"); form.reset(); form.elements.line_id.value=lineID; form.elements.kind.value=kind; form.elements.requested_by.value="operator"; $("#operationTitle").textContent=kindText[kind]||"创建任务"; $("#operationTarget").textContent=line?`${line.name} · ${line.id}`:lineID; $("#operationError").textContent=""; $("#operationModal").classList.remove("hidden"); }
 function bindDetails() { $$('[data-line-detail]').forEach((b) => b.onclick=()=>showLineDetail(b.dataset.lineDetail)); $$('[data-operation-detail]').forEach((b) => b.onclick=()=>showOperationDetail(b.dataset.operationDetail)); }
 function showDeviceDetail(id) { const item=state.devices.find((x)=>x.id===id); if(!item)return; state.openOperationID=""; $("#detailTitle").textContent=item.name; $("#detailSubtitle").textContent=item.id; $("#detailBody").innerHTML=`<div class="detail-grid"><dl><dt>环境</dt><dd>${environmentBadge(item.environment)}</dd><dt>SSH</dt><dd class="mono">${escapeHTML(item.ssh_user)}@${escapeHTML(item.host)}:${item.ssh_port}</dd><dt>内网地址</dt><dd>${escapeHTML(item.private_ip||"--")}</dd><dt>区域 / 运营商</dt><dd>${escapeHTML(item.region||"--")} / ${escapeHTML(item.provider||"--")}</dd></dl><dl><dt>管理状态</dt><dd><span class="badge ${escapeHTML(item.status)}">${escapeHTML(deviceStatusText[item.status]||item.status||"未知")}</span></dd><dt>连通状态</dt><dd>${badge(item.last_health||"unknown")}</dd><dt>系统</dt><dd>${escapeHTML(item.os||"--")} · ${escapeHTML(item.arch||"--")}</dd><dt>最近成功连通</dt><dd>${formatTime(item.last_seen_at)}</dd></dl></div>`; $("#detailModal").classList.remove("hidden"); }

@@ -24,8 +24,10 @@ with tempfile.TemporaryDirectory(prefix="nb-release-git-") as directory:
     assert len(metadata["tree"]) == 40
 
     (root / "untracked.txt").write_text("must fail\n", encoding="utf-8")
+    metadata = nb_release.git_metadata(root, require_clean=False)
+    assert metadata["dirty"] is True
     try:
-        nb_release.git_metadata(root)
+        nb_release.git_metadata(root, require_clean=True)
     except ValueError as error:
         assert "clean" in str(error)
     else:

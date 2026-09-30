@@ -101,27 +101,25 @@ shape, bandwidth and assigned port ranges before resolving local secret refs.
 ### Node source releases
 
 Administrators can create a candidate Node Release from the task view. Upload a
-ZIP, TAR, TAR.GZ or TGZ archive containing a complete, clean Git repository (including `.git`) and
-enter its full 40-character commit SHA. The build worker verifies the archive
-SHA256, Git HEAD/tree, clean worktree and recursive submodule state before it
-runs the existing CMake, CTest and P0 build gates. Uploaded `build/` artifacts
-are never trusted as the release result.
+ZIP, TAR, TAR.GZ or TGZ source archive. Dirty Git worktrees, untracked files and
+archives without Git metadata are accepted; the uploaded file content is the
+build input. Git HEAD/tree and dirty state are retained only as optional audit
+metadata. The build worker runs the existing CMake, CTest and P0 build gates,
+and uploaded `build/` artifacts are never trusted as the release result.
 
-For example, create an upload from a clean clone instead of archiving a working
-directory that may contain local files:
+For example:
 
 ```bash
 git clone --no-hardlinks /path/to/Newbility node-source
-test -z "$(git -C node-source status --porcelain --untracked-files=all)"
-git -C node-source rev-parse HEAD
 tar -czf node-source.tar.gz node-source
 ```
 
 Only a successful `node.release.build` operation activates the uploaded source
-tree and exposes its immutable `release_id`, Git commit/tree, source digest and
-binary SHA256. Failed validation or build leaves the active source unchanged.
+tree and exposes its immutable `release_id`, Node version, source digest and
+binary SHA256. Git information is included when available. Failed validation or build leaves the active source unchanged.
 When a verified candidate exists, every `line.open` request must acknowledge
-that exact release; the browser shows the release and commit before submission.
+that exact release; the browser shows `V200R001C00` (`2.1.0`) and the release ID
+before submission.
 
 Existing lines can remain fixed in the worker's ignored private registry
 (`tools/private/nb-web-worker.json`). New lines select registered devices in the

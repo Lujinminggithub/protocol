@@ -12,6 +12,8 @@ from typing import Iterable, Mapping
 
 
 SCHEMA_VERSION = 2
+NODE_PRODUCT_VERSION = "V200R001C00"
+NODE_SEMANTIC_VERSION = "2.1.0"
 RELEASE_NAME_RE = re.compile(r"^(?:[0-9a-f]{16}(?:-[0-9a-f]{12})?|legacy-[0-9a-f]{16})$")
 
 
@@ -44,7 +46,7 @@ def _source_digest(records: Iterable[dict]) -> str:
     return digest.hexdigest()
 
 
-def git_metadata(root: pathlib.Path, expected_commit: str | None = None) -> dict:
+def git_metadata(root: pathlib.Path, expected_commit: str | None = None, require_clean: bool = True) -> dict:
     root = root.resolve()
     def git(*args: str) -> str:
         result = subprocess.run(["git", "-C", str(root), *args], check=False,
@@ -65,14 +67,15 @@ def git_metadata(root: pathlib.Path, expected_commit: str | None = None) -> dict
     if expected_commit and commit != expected_commit.lower():
         raise ValueError(f"Git commit 不匹配: expected={expected_commit} actual={commit}")
     dirty = git("status", "--porcelain", "--untracked-files=all")
-    if dirty:
+    if dirty and require_clean:
         preview = "\\n".join(dirty.splitlines()[:20])
         raise ValueError(f"Git 工作区不是 clean，拒绝构建:\n{preview}")
     submodules = git("submodule", "status", "--recursive")
     if submodules and any(line[:1] in {"+", "-", "U"} for line in submodules.splitlines()):
         raise ValueError("Git 子模块未固定在提交记录指定版本")
     tree = git("rev-parse", "HEAD^{tree}")
-    return {"commit": commit, "tree": tree, "project_path": project_path,
+    return {"commit": commit, "tree": tree, "project_path": project_path, "dirty": bool(dirty),
+            "changes": dirty.splitlines()[:100] if dirty else [],
             "submodules": submodules.splitlines() if submodules else []}
 
 
@@ -111,16 +114,18 @@ def create_manifest(
         "release_id": artifact["sha256"][:16],
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "platform": platform,
+        "node_version": {"product": NODE_PRODUCT_VERSION, "semantic": NODE_SEMANTIC_VERSION},
         "artifact": artifact,
         "source_digest": _source_digest(input_records),
         "inputs": input_records,
         "topology": _file_record(root, topology),
     }
-    if git_info:
+    if git_info and git_info.get("commit") and git_info.get("tree"):
         manifest["git"] = {
             "commit": git_info["commit"],
             "tree": git_info["tree"],
             "project_path": git_info.get("project_path", "."),
+            "dirty": bool(git_info.get("dirty")),
             "submodules": git_info.get("submodules", []),
         }
     if line_profile is not None and line_profile.is_file():
@@ -152,6 +157,8 @@ def load_and_validate_manifest(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"不支持的发布清单版本: {manifest.get('schema_version')}")
+    if manifest.get("node_version") != {"product": NODE_PRODUCT_VERSION, "semantic": NODE_SEMANTIC_VERSION}:
+        raise ValueError("Node 版本信息无效或不受支持")
     artifact = manifest.get("artifact") or {}
     actual_hash = sha256_file(binary)
     actual_size = binary.stat().st_size
@@ -161,7 +168,7 @@ def load_and_validate_manifest(
         raise ValueError("发布编号与二进制哈希不一致")
     git_info = manifest.get("git") or {}
     if git_info:
-        current_git = git_metadata(root, expected_git_commit)
+        current_git = git_metadata(root, expected_git_commit, require_clean=False)
         if git_info.get("commit") != current_git["commit"] or git_info.get("tree") != current_git["tree"]:
             raise ValueError("Git commit/tree 与发布清单不一致")
 

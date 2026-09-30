@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,8 +23,6 @@ import (
 
 const maxNodeSourceArchive = (1024 << 20) + (1 << 20) // 1 GiB file plus multipart framing.
 const maxNodeSourceChunk = 8 << 20
-
-var fullGitCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 type nodeSourceUploadMetadata struct {
 	UploadID  string `json:"upload_id"`
@@ -120,7 +117,7 @@ func hashFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func (a *App) createNodeReleaseOperation(r *http.Request, uploadID, archivePath, archiveSHA256, commit, requestedBy string) (central.Operation, error) {
+func (a *App) createNodeReleaseOperation(r *http.Request, uploadID, archivePath, archiveSHA256, requestedBy string) (central.Operation, error) {
 	lineID := "__node_release__"
 	if _, err := a.store.UpsertLine(r.Context(), central.Line{ID: lineID, Name: "Node Release", Status: "archived",
 		Environment: "production", Provider: "controlplane"}); err != nil {
@@ -131,7 +128,7 @@ func (a *App) createNodeReleaseOperation(r *http.Request, uploadID, archivePath,
 		requestedBy = "operator"
 	}
 	request, _ := json.Marshal(map[string]string{"upload_id": uploadID, "archive": archivePath,
-		"archive_sha256": archiveSHA256, "git_commit": commit})
+		"archive_sha256": archiveSHA256})
 	opID, err := operationID()
 	if err != nil {
 		return central.Operation{}, err
@@ -286,7 +283,6 @@ func (a *App) uploadNodeSourceChunk(w http.ResponseWriter, r *http.Request) {
 func (a *App) completeNodeSourceUpload(w http.ResponseWriter, r *http.Request) {
 	uploadID := r.PathValue("id")
 	var request struct {
-		GitCommit   string `json:"git_commit"`
 		RequestedBy string `json:"requested_by"`
 	}
 	if !safeID.MatchString(uploadID) || !strings.HasPrefix(uploadID, "source-") {
@@ -294,11 +290,6 @@ func (a *App) completeNodeSourceUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !decode(w, r, &request) {
-		return
-	}
-	request.GitCommit = strings.ToLower(strings.TrimSpace(request.GitCommit))
-	if !fullGitCommit.MatchString(request.GitCommit) {
-		problem(w, 400, "必须填写完整的 40 位 Git commit")
 		return
 	}
 	directory := a.nodeSourceUploadDirectory()
@@ -335,7 +326,7 @@ func (a *App) completeNodeSourceUpload(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, "无法发布源码上传")
 		return
 	}
-	created, err := a.createNodeReleaseOperation(r, uploadID, target, hash, request.GitCommit, request.RequestedBy)
+	created, err := a.createNodeReleaseOperation(r, uploadID, target, hash, request.RequestedBy)
 	if err != nil {
 		_ = os.Rename(target, partPath)
 		problem(w, http.StatusConflict, err.Error())
@@ -354,11 +345,6 @@ func (a *App) uploadNodeSource(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxNodeSourceArchive)
 	if err := r.ParseMultipartForm(16 << 20); err != nil {
 		problem(w, http.StatusBadRequest, "Node 源码包无效或超过 1 GiB")
-		return
-	}
-	commit := strings.ToLower(strings.TrimSpace(r.FormValue("git_commit")))
-	if !fullGitCommit.MatchString(commit) {
-		problem(w, http.StatusBadRequest, "必须填写完整的 40 位 Git commit")
 		return
 	}
 	file, header, err := r.FormFile("archive")
@@ -418,7 +404,7 @@ func (a *App) uploadNodeSource(w http.ResponseWriter, r *http.Request) {
 	if !safeID.MatchString(requestedBy) {
 		requestedBy = "operator"
 	}
-	request, _ := json.Marshal(map[string]string{"upload_id": uploadID, "archive": target, "archive_format": archiveFormat, "archive_sha256": hex.EncodeToString(hash.Sum(nil)), "git_commit": commit})
+	request, _ := json.Marshal(map[string]string{"upload_id": uploadID, "archive": target, "archive_format": archiveFormat, "archive_sha256": hex.EncodeToString(hash.Sum(nil))})
 	opID, err := operationID()
 	if err != nil {
 		_ = os.Remove(target)

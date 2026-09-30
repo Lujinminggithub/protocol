@@ -61,9 +61,9 @@ def safe_extract(archive_path: pathlib.Path, destination: pathlib.Path) -> pathl
     roots = [item for item in destination.iterdir() if item.is_dir()]
     if (destination / ".git").is_dir():
         return destination
-    if len(roots) == 1 and (roots[0] / ".git").is_dir():
+    if len(roots) == 1:
         return roots[0]
-    raise RuntimeError("上传内容必须是包含 .git 的完整 Git 仓库")
+    return destination
 
 
 def project_root(repository: pathlib.Path) -> pathlib.Path:
@@ -77,18 +77,15 @@ def project_root(repository: pathlib.Path) -> pathlib.Path:
     return candidates[0]
 
 
-def validate_git(root: pathlib.Path, expected_commit: str) -> dict:
+def collect_git_metadata(root: pathlib.Path) -> dict:
+    if not (root / ".git").exists():
+        return {"commit": "", "tree": "", "dirty": True, "changes": [], "submodules": []}
     commit = run(["git", "rev-parse", "HEAD"], root)
-    if commit != expected_commit:
-        raise RuntimeError(f"Git commit 不匹配: expected={expected_commit} actual={commit}")
-    dirty = run(["git", "status", "--porcelain", "--untracked-files=all"], root)
-    if dirty:
-        raise RuntimeError("上传的 Git 仓库不是 clean 工作区")
     tree = run(["git", "rev-parse", "HEAD^{tree}"], root)
+    dirty = run(["git", "status", "--porcelain", "--untracked-files=all"], root)
     submodules = run(["git", "submodule", "status", "--recursive"], root)
-    if submodules and any(line[:1] in {"+", "-", "U"} for line in submodules.splitlines()):
-        raise RuntimeError("Git 子模块状态不一致")
-    return {"commit": commit, "tree": tree, "submodules": submodules.splitlines() if submodules else []}
+    return {"commit": commit, "tree": tree, "dirty": bool(dirty), "changes": dirty.splitlines()[:100] if dirty else [],
+            "submodules": submodules.splitlines() if submodules else []}
 
 
 def preserve_private_runtime(current: pathlib.Path, candidate: pathlib.Path) -> None:
@@ -137,7 +134,6 @@ def activate(current: pathlib.Path, candidate: pathlib.Path, operation_id: str) 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True, type=pathlib.Path)
-    parser.add_argument("--git-commit", required=True)
     parser.add_argument("--current-root", required=True, type=pathlib.Path)
     parser.add_argument("--operation-id", required=True)
     args = parser.parse_args()
@@ -149,12 +145,13 @@ def main() -> None:
         extracted = pathlib.Path(temporary) / "extract"
         extracted.mkdir()
         repository = safe_extract(args.archive, extracted)
-        git_info = validate_git(repository, args.git_commit)
+        git_info = collect_git_metadata(repository)
         candidate = project_root(repository)
         git_info["project_path"] = candidate.relative_to(repository).as_posix()
         preserve_private_runtime(args.current_root, candidate)
         environment = os.environ.copy()
         environment["NB_FORCE_REMOTE_BUILD"] = "1"
+        environment["NB_ALLOW_UNVERSIONED_SOURCE"] = "1"
         inventory = candidate / "tools" / "private" / "kz-machines.json"
         known_hosts = candidate / "tools" / "private" / "kz-known_hosts"
         if inventory.is_file():
@@ -175,7 +172,7 @@ def main() -> None:
         manifest_path = candidate / "build" / "release-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         recorded_git = manifest.get("git") or {}
-        if recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"]:
+        if recorded_git and (recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"]):
             raise RuntimeError("构建产物 Git 信息与上传仓库不一致")
         (candidate / ".nb-git.json").write_text(json.dumps(git_info, separators=(",", ":")) + "\n", encoding="utf-8")
         final_candidate = staging_parent / f"ready-{args.operation_id}"
@@ -186,7 +183,8 @@ def main() -> None:
         print("NODE_RELEASE_JSON=" + json.dumps({
             "release_id": manifest["release_id"], "deployment_id": manifest["deployment_id"],
             "binary_sha256": manifest["artifact"]["sha256"], "source_digest": manifest["source_digest"],
-            "git_commit": git_info["commit"], "git_tree": git_info["tree"], "backup": str(backup),
+            "node_version": manifest["node_version"], "git_commit": git_info["commit"], "git_tree": git_info["tree"],
+            "git_dirty": git_info["dirty"], "backup": str(backup),
         }, separators=(",", ":")))
 
 

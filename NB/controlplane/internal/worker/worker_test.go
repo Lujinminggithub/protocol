@@ -1064,7 +1064,7 @@ func TestNodeReleaseBuildRejectsArchiveOutsideUploadDirectory(t *testing.T) {
 	}
 	runner := &Runner{registry: Registry{Root: root, StateDir: stateDir, Python: "python3"}}
 	request := requestValues{UploadID: "source-test", Archive: filepath.Join(t.TempDir(), "source-test.tar.gz"),
-		ArchiveSHA256: strings.Repeat("0", 64), GitCommit: strings.Repeat("a", 40)}
+		ArchiveSHA256: strings.Repeat("0", 64)}
 	if _, err := runner.runNodeReleaseBuild(t.Context(), Operation{ID: "op-source", Kind: "node.release.build"}, request); err == nil || !strings.Contains(err.Error(), "受限上传目录") {
 		t.Fatalf("outside archive was not rejected: %v", err)
 	}

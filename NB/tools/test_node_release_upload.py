@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 import tarfile
 import tempfile
 import zipfile
@@ -58,3 +59,18 @@ with tempfile.TemporaryDirectory(prefix="node-release-archives-") as directory:
         assert (repository / ".git" / "HEAD").is_file(), archive_path
 
 print("node release archive formats passed")
+
+
+with tempfile.TemporaryDirectory(prefix="node-release-dirty-") as directory:
+    repository = pathlib.Path(directory)
+    subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "initial"],
+                   cwd=repository, check=True, capture_output=True)
+    (repository / "uploaded-change.txt").write_text("build this content\n", encoding="utf-8")
+    metadata = node_release_upload.collect_git_metadata(repository)
+    assert metadata["dirty"] is True
+    assert any("uploaded-change.txt" in line for line in metadata["changes"])
+
+print("dirty Git upload metadata accepted")

@@ -258,7 +258,12 @@ def act_build(roles):
     """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
     if BUILD_HOST != "entry":
         raise RuntimeError("production builds must run on the entry role")
-    git_info = nb_release.git_metadata(ROOT)
+    try:
+        git_info = nb_release.git_metadata(ROOT, require_clean=False)
+    except ValueError:
+        if os.environ.get("NB_ALLOW_UNVERSIONED_SOURCE") != "1":
+            raise
+        git_info = None
     missing = missing_build_inputs()
     if missing:
         preview = ", ".join(missing[:12])
@@ -338,7 +343,7 @@ def act_prepare_release():
         raise RuntimeError("local binary and release manifest are required")
     existing = json.loads(RELEASE_MANIFEST.read_text(encoding="utf-8"))
     try:
-        git_info = nb_release.git_metadata(ROOT)
+        git_info = nb_release.git_metadata(ROOT, require_clean=False)
     except ValueError:
         marker = ROOT / ".nb-git.json"
         if not marker.is_file():
@@ -361,7 +366,7 @@ def act_prepare_release():
     if existing.get("source_digest") != nb_release._source_digest(records):
         raise RuntimeError("release source digest is invalid")
     recorded_git = existing.get("git") or {}
-    if recorded_git and (recorded_git.get("commit") != git_info["commit"] or recorded_git.get("tree") != git_info["tree"] or
+    if recorded_git and (recorded_git.get("commit") != git_info.get("commit") or recorded_git.get("tree") != git_info.get("tree") or
                          recorded_git.get("project_path", ".") != git_info.get("project_path", ".")):
         raise RuntimeError("local Git commit/tree differs from the binary build inputs")
     manifest = nb_release.create_manifest(

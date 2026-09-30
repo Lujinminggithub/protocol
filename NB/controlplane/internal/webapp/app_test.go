@@ -400,6 +400,9 @@ func TestNodeSourceUploadUIExposesArchiveFormatsAndProgress(t *testing.T) {
 			t.Fatalf("Node upload UI is missing %s", expected)
 		}
 	}
+	if bytes.Contains(index, []byte(`name="git_commit"`)) {
+		t.Fatal("Node upload UI still requires a Git commit")
+	}
 	for _, expected := range []string{"XMLHttpRequest", "X-Upload-Offset", "file.slice", "attempt<5", "nodeUploadRequest.abort()"} {
 		if !bytes.Contains(script, []byte(expected)) {
 			t.Fatalf("Node upload progress is missing %s", expected)
@@ -833,7 +836,7 @@ func TestNodeSourceChunkedUploadResumesAndCreatesBuildOperation(t *testing.T) {
 	uploadChunk(0, source.Bytes()[:cut], cut)
 	uploadChunk(cut, source.Bytes()[cut:], source.Len())
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/node-releases/uploads/"+initialized.UploadID+"/complete", "admin", "", map[string]any{
-		"git_commit": strings.Repeat("c", 40), "requested_by": "operator",
+		"requested_by": "operator",
 	})
 	if response.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte(`"kind":"node.release.build"`)) {
 		t.Fatalf("complete status=%d body=%s", response.StatusCode, body)

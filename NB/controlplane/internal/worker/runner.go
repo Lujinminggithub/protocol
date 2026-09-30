@@ -74,7 +74,6 @@ type requestValues struct {
 	UploadID           string                   `json:"upload_id"`
 	Archive            string                   `json:"archive"`
 	ArchiveSHA256      string                   `json:"archive_sha256"`
-	GitCommit          string                   `json:"git_commit"`
 	TransportProfile   transportprofile.Profile `json:"transport_profile"`
 }
 
@@ -391,8 +390,8 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 
 func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, request requestValues) (Result, error) {
 	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
-	if !safeID.MatchString(request.UploadID) || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(request.GitCommit) {
-		return Result{}, errors.New("Node 源码上传标识或 Git commit 无效")
+	if !safeID.MatchString(request.UploadID) {
+		return Result{}, errors.New("Node 源码上传标识无效")
 	}
 	uploadRoot := filepath.Clean(filepath.Join(filepath.Dir(r.registry.StateDir), "source-uploads"))
 	archive := filepath.Clean(request.Archive)
@@ -423,7 +422,7 @@ func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, r
 	defer logFile.Close()
 	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "source-verify", Status: "running", Message: "正在校验上传 Git 仓库"})
 	step := commandStep{Name: r.registry.Python, Stage: "node-build", Args: []string{filepath.Join(r.registry.Root, "tools", "node_release_upload.py"),
-		"--archive", archive, "--git-commit", request.GitCommit, "--current-root", r.registry.Root, "--operation-id", operation.ID}}
+		"--archive", archive, "--current-root", r.registry.Root, "--operation-id", operation.ID}}
 	var captured bytes.Buffer
 	if err = r.execute(ctx, step, nil, io.MultiWriter(logFile, &captured)); err != nil {
 		summary := commandFailureSummary(err, logPath)
