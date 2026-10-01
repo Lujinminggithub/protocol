@@ -370,7 +370,8 @@ func (r *Runner) resolveWhitelistSource(ref string) (string, map[string]string, 
 
 func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) error {
 	cfg := r.registry.Dynamic
-	if !cfg.Enabled || !contains(operation.Kind, cfg.Operations) {
+	if !cfg.Enabled || !(contains(operation.Kind, cfg.Operations) ||
+		operation.Kind == "line.optimize" && contains("line.validate", cfg.Operations) && contains("line.tune", cfg.Operations)) {
 		return errors.New("当前动态操作未启用")
 	}
 	if plan.LineID != operation.LineID || !safeID.MatchString(plan.LineID) || !contains(plan.ResourceGroup, cfg.ResourceGroups) {

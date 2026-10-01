@@ -1132,7 +1132,7 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 			if err != nil {
 				return err
 			}
-		case "line.tune":
+		case "line.tune", "line.optimize":
 			if values.Profile == "" {
 				return errors.New("successful transport tuning requires a profile result")
 			}

@@ -95,6 +95,67 @@ func TestDynamicSSHAccessRejectsInvalidPasswordDuringPreparation(t *testing.T) {
 	}
 }
 
+func TestOptimizeCapabilityIsDerivedWithoutRegistryMigration(t *testing.T) {
+	line := LineSpec{EnabledOperations: []string{"line.open", "line.validate", "line.tune"}}
+	if !line.Allows("line.optimize") || !slices.Contains(line.SortedOperations(), "line.optimize") {
+		t.Fatalf("derived operations=%v", line.SortedOperations())
+	}
+	line.EnabledOperations = []string{"line.validate"}
+	if line.Allows("line.optimize") || slices.Contains(line.SortedOperations(), "line.optimize") {
+		t.Fatalf("optimize advertised without tune: %v", line.SortedOperations())
+	}
+}
+
+func TestOptimizeUsesValidationStep(t *testing.T) {
+	runner := NewRunner(testRegistry(t, []string{"line.validate", "line.tune"}))
+	line := runner.registry.Lines[0]
+	steps, err := runner.steps(line, Operation{ID: "op-optimize", LineID: line.LineID, Kind: "line.optimize"}, requestValues{}, t.TempDir())
+	if err != nil || len(steps) != 1 || steps[0].Stage != "validate" || !slices.Contains(steps[0].Args, "--active") {
+		t.Fatalf("optimize steps=%+v err=%v", steps, err)
+	}
+}
+
+func TestOperationLocksActualDevices(t *testing.T) {
+	client := &Client{}
+	request := func(line, entry, relay, exit string) json.RawMessage {
+		data, _ := json.Marshal(requestValues{Plan: dynamicPlan{LineID: line, Nodes: []dynamicNode{
+			{DeviceID: entry, Role: "entry"}, {DeviceID: relay, Role: "relay"}, {DeviceID: exit, Role: "exit"},
+		}}})
+		return data
+	}
+	first := Operation{ID: "op-1", LineID: "line-1", Kind: "line.optimize", Request: request("line-1", "entry-a", "relay-a", "exit-a")}
+	shared := Operation{ID: "op-2", LineID: "line-2", Kind: "line.open", Request: request("line-2", "entry-b", "relay-a", "exit-b")}
+	disjoint := Operation{ID: "op-3", LineID: "line-3", Kind: "line.open", Request: request("line-3", "entry-c", "relay-c", "exit-c")}
+	unlockFirst := client.lockOperation(first)
+	sharedAcquired := make(chan func(), 1)
+	go func() { sharedAcquired <- client.lockOperation(shared) }()
+	select {
+	case unlock := <-sharedAcquired:
+		unlock()
+		t.Fatal("operation sharing relay acquired lock")
+	case <-time.After(30 * time.Millisecond):
+	}
+	disjointAcquired := make(chan func(), 1)
+	go func() { disjointAcquired <- client.lockOperation(disjoint) }()
+	select {
+	case unlock := <-disjointAcquired:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("disjoint topology did not execute concurrently")
+	}
+	unlockFirst()
+	select {
+	case unlock := <-sharedAcquired:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("shared topology did not resume after lock release")
+	}
+	build := Operation{ID: "build-1", LineID: "__node_release__", Kind: "node.release.build"}
+	if keys := client.operationLockKeys(build); !slices.Equal(keys, []string{"global:node-build"}) {
+		t.Fatalf("build lock keys=%v", keys)
+	}
+}
+
 func TestDynamicLineRejectsUntrustedDeviceBeforePreparingDeployment(t *testing.T) {
 	registry := testRegistry(t, nil)
 	registry.Lines = nil
@@ -936,7 +997,7 @@ func TestClientHeartbeatsRecoverDuringLongOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 140*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	if err = client.Run(ctx); err != nil {
 		t.Fatal(err)

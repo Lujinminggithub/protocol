@@ -509,7 +509,7 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.upgrade": true, "line.rollback": true, "line.disable": true, "line.tune": true, "node.release.build": true}
+	allowed := map[string]bool{"line.open": true, "line.validate": true, "line.optimize": true, "line.upgrade": true, "line.rollback": true, "line.disable": true, "line.tune": true, "node.release.build": true}
 	if !safeID.MatchString(req.ID) || !safeID.MatchString(req.LineID) || !allowed[req.Kind] || !safeID.MatchString(req.RequestedBy) {
 		problem(w, 400, "任务参数无效")
 		return
@@ -667,7 +667,8 @@ func (a *App) executors(w http.ResponseWriter, r *http.Request) {
 
 func validOperationKind(kind string) bool {
 	return kind == "line.open" || kind == "line.validate" || kind == "line.upgrade" ||
-		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune" || kind == "node.release.build"
+		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune" ||
+		kind == "line.optimize" || kind == "node.release.build"
 }
 
 func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {

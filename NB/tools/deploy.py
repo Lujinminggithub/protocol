@@ -2,6 +2,7 @@
 """NB deployment build, rollout, and command orchestration."""
 
 import re
+import shutil
 
 from deploy_core import *  # noqa: F403 - deploy_core publishes the CLI integration surface.
 
@@ -261,86 +262,98 @@ def act_recon(roles):
         c.close()
 
 
+def controlplane_build_root() -> pathlib.Path:
+    return pathlib.Path(COMPILE_WORK)
+
+
+def build_execution_mode() -> str:
+    return "control-plane"
+
+
+def _prepare_local_compile_workspace():
+    """Populate the control-plane build workspace from the checked-out source."""
+    root = controlplane_build_root()
+    for name in ("src", "third_party", "CMakeLists.txt", "VERSION", "scripts", "tools", "test-build", "build"):
+        path = root / name
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    root.mkdir(parents=True, exist_ok=True)
+    for arcname, source in BUILD_FILES.items():
+        destination = root / pathlib.PurePosixPath(arcname)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    return root
+
+
+def _act_build_local(git_info):
+    """Build nb_node on the control-plane host, never on a line node."""
+    missing = missing_build_inputs()
+    if missing:
+        preview = ", ".join(missing[:12])
+        raise RuntimeError(f"控制面构建源码快照不完整，缺少: {preview}")
+    undeclared = undeclared_cmake_inputs()
+    if undeclared:
+        raise RuntimeError("远程构建输入未覆盖 CMake 依赖: " + ", ".join(undeclared))
+    for test in ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
+                 "test_deploy_transfer.py", "test_line_control.py", "test_diag_bundle.py",
+                 "test_line_probe.py", "test_line_provision.py", "test_line_open.py",
+                 "test_supervisor.py", "test_shard_deploy.py", "test_media_reserve_deploy.py",
+                 "test_worker_snapshot.py", "test_yfe2_canary.py", "test_netem_matrix.py"]:
+        result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"本地 P0 发布门禁失败: {test}")
+    for command in ("gcc", "g++", "cmake", "pkg-config"):
+        if shutil.which(command) is None:
+            raise RuntimeError(f"控制面构建机缺少依赖: {command}")
+    if not pathlib.Path("/usr/include/openssl/ssl.h").is_file():
+        raise RuntimeError("控制面构建机缺少依赖: libssl-dev")
+    snapshot = nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS)
+    root = _prepare_local_compile_workspace()
+    timeout = max(60, min(3600, int(os.environ.get("NB_LOCAL_BUILD_TIMEOUT_SECONDS", "900"))))
+    result = subprocess.run(["bash", "-lc", BUILD_CMD], cwd=ROOT, check=False,
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=timeout)
+    output = (result.stdout or "") + (result.stderr or "")
+    print(output[-6000:])
+    if result.returncode != 0 or "NB_BUILD_GATE_RC=0" not in output:
+        raise RuntimeError("控制面本地正式构建或三跳回归未通过")
+    binary = pathlib.Path(COMPILE_WORK) / "build" / "nb_node"
+    if not binary.is_file():
+        raise RuntimeError("控制面本地构建未生成 nb_node")
+    BUILD_DIR.mkdir(exist_ok=True)
+    shutil.copy2(binary, BUILD_DIR / "nb_node")
+    if REBUILD_PICOQUIC:
+        local_prebuilt = ROOT / "third_party" / "picoquic" / "prebuilt" / PLATFORM
+        local_prebuilt.mkdir(parents=True, exist_ok=True)
+        for archive in ("libpicoquic-core.a", "libpicoquic-log.a", "libpicotls-openssl.a",
+                        "libpicotls-core.a", "libpicotls-minicrypto.a"):
+            shutil.copy2(root / "third_party" / "picoquic" / "prebuilt" / PLATFORM / archive,
+                         local_prebuilt / archive)
+        PICOQUIC_STAMP.write_text(PICOQUIC_SOURCE_DIGEST, encoding="ascii")
+    if nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS) != snapshot:
+        raise RuntimeError("控制面构建期间源码发生变化，产物已废弃")
+    manifest = nb_release.create_manifest(ROOT, BUILD_DIR / "nb_node", PLATFORM,
+        NODE_RELEASE_INPUTS, LAB_FILE, LINE_PROFILE if LINE_PROFILE.is_file() else None,
+        RUNTIME_CONFIGURATION_INPUTS, git_info)
+    nb_release.write_manifest(RELEASE_MANIFEST, manifest)
+    print(f"控制面本地构建完成: release={manifest['release_id']} deployment={manifest['deployment_id']}")
+
+
 def act_build(roles):
-    """CMake + vendored 构建；证书由 security_setup.py 独立管理。"""
-    if BUILD_HOST != "entry":
-        raise RuntimeError("production builds must run on the entry role")
+    """Build exclusively on the control plane; line nodes only receive artifacts."""
     try:
         git_info = nb_release.git_metadata(ROOT, require_clean=False)
     except ValueError:
         if os.environ.get("NB_ALLOW_UNVERSIONED_SOURCE") != "1":
             raise
         git_info = None
-    missing = missing_build_inputs()
-    if missing:
-        preview = ", ".join(missing[:12])
-        suffix = f"（另有 {len(missing) - 12} 个）" if len(missing) > 12 else ""
-        raise RuntimeError(f"控制面构建源码快照不完整，缺少: {preview}{suffix}")
-    undeclared = undeclared_cmake_inputs()
-    if undeclared:
-        raise RuntimeError("远程构建输入未覆盖 CMake 依赖: " + ", ".join(undeclared))
-    tests = ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
-             "test_deploy_transfer.py",
-             "test_line_control.py", "test_diag_bundle.py", "test_line_probe.py",
-             "test_line_provision.py", "test_line_open.py", "test_supervisor.py",
-             "test_shard_deploy.py", "test_media_reserve_deploy.py",
-             "test_worker_snapshot.py", "test_yfe2_canary.py", "test_netem_matrix.py"]
-    for test in tests:
-        result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"本地 P0 发布门禁失败: {test}")
-    if os.environ.get("NB_FORCE_REMOTE_BUILD") != "1":
-        try:
-            act_prepare_release()
-            print(">>> verified binary build inputs unchanged; remote rebuild skipped")
-            return
-        except RuntimeError as reuse_error:
-            print(f">>> verified binary cannot be reused: {reuse_error}")
     node_source = "\n".join(path.read_text(encoding="utf-8") for path in (
         SRC / "nb_node.c", *sorted(SRC.glob("nb_node_*.inc"))))
     if "picoquic_add_to_stream(" in node_source:
         raise RuntimeError("主节点仍存在 picoquic_add_to_stream 调用")
-    c = connect(BUILD_HOST); h = _role_host(BUILD_HOST)
-    print(f"### build on {BUILD_HOST}({h['name']}) in {COMPILE_WORK} via CMake + vendored picoquic ...")
-    deps = run(c, "for x in gcc g++ make cmake pkg-config; do command -v $x >/dev/null 2>&1 || echo MISSING:$x; done; "
-                  "test -f /usr/include/openssl/ssl.h || echo MISSING:libssl-dev")
-    if "MISSING:" in deps:
-        c.close()
-        raise RuntimeError(f"构建机 {h['name']} 缺少依赖: {', '.join(x.split(':', 1)[1] for x in deps.splitlines() if x.startswith('MISSING:'))}")
-    build_input_snapshot = nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS)
-    run(c, f"rm -rf {COMPILE_WORK}/src {COMPILE_WORK}/third_party {COMPILE_WORK}/CMakeLists.txt {COMPILE_WORK}/build; mkdir -p {COMPILE_WORK}")
-    put_tar(c, BUILD_FILES, COMPILE_WORK)
-    build_timeout = max(60, min(3600, int(os.environ.get("NB_REMOTE_BUILD_TIMEOUT_SECONDS", "900"))))
-    out = run(c, BUILD_CMD, tmo=build_timeout)
-    print(out.strip()[-600:] if out.strip() else "(no output)")
-    if "NB_BUILD_GATE_RC=0" not in out:
-        c.close()
-        raise RuntimeError("正式构建或三跳回归未通过，拒绝生成部署产物")
-    ok = run(c, f"ls -l {COMPILE_WORK}/build/nb_node 2>/dev/null && echo BUILD_OK || echo BUILD_FAIL")
-    print(ok)
-    if "BUILD_OK" not in ok:
-        c.close(); sys.exit("编译失败, 中止")
-    if nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS) != build_input_snapshot:
-        c.close()
-        raise RuntimeError("构建期间源码或运行时输入发生变化，产物已废弃，请重新构建")
-    BUILD_DIR.mkdir(exist_ok=True)
-    (BUILD_DIR / "nb_node").write_bytes(fetch_bytes(c, f"{COMPILE_WORK}/build/nb_node"))
-    if REBUILD_PICOQUIC:
-        local_prebuilt = ROOT / "third_party" / "picoquic" / "prebuilt" / PLATFORM
-        local_prebuilt.mkdir(parents=True, exist_ok=True)
-        for archive in ("libpicoquic-core.a", "libpicoquic-log.a", "libpicotls-openssl.a",
-                        "libpicotls-core.a", "libpicotls-minicrypto.a"):
-            (local_prebuilt / archive).write_bytes(fetch_bytes(
-                c, f"{COMPILE_WORK}/third_party/picoquic/prebuilt/{PLATFORM}/{archive}"))
-        PICOQUIC_STAMP.write_text(PICOQUIC_SOURCE_DIGEST, encoding="ascii")
-    manifest = nb_release.create_manifest(
-        ROOT, BUILD_DIR / "nb_node", PLATFORM, NODE_RELEASE_INPUTS, LAB_FILE,
-        LINE_PROFILE if LINE_PROFILE.is_file() else None,
-        RUNTIME_CONFIGURATION_INPUTS, git_info,
-    )
-    nb_release.write_manifest(RELEASE_MANIFEST, manifest)
-    print(f"产物 -> {BUILD_DIR}: nb_node, release-manifest.json deployment={_deployment_id(manifest)}")
-    c.close()
+    _act_build_local(git_info)
 
 
 def act_prepare_release():
@@ -517,13 +530,10 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
             run(clients[role], f"mkdir -p {INSTANCE_WORK}/logs")
 
         previous["entry"] = _stage_entry_release(clients["entry"], manifest, bindata)
+        print("control-plane -> entry: release staged and verified")
         _copy_release_between_nodes(clients["entry"], "entry", clients["middle"], "middle", manifest)
         previous["middle"] = _stage_release(clients["middle"], "middle", manifest)
-        try:
-            _copy_release_between_nodes(clients["entry"], "entry", clients["exit"], "exit", manifest)
-        except Exception as direct_error:
-            print(f"entry -> exit direct transfer failed; retrying through middle: {direct_error}")
-            _copy_release_between_nodes(clients["middle"], "middle", clients["exit"], "exit", manifest)
+        _copy_release_between_nodes(clients["middle"], "middle", clients["exit"], "exit", manifest)
         previous["exit"] = _stage_release(clients["exit"], "exit", manifest)
 
         for role in roles:

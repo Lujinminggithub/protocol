@@ -410,6 +410,24 @@ func TestNodeSourceUploadUIExposesArchiveFormatsAndProgress(t *testing.T) {
 	}
 }
 
+func TestLineActionsExposeCompositeOptimize(t *testing.T) {
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{`"line.optimize":"验证并调优"`, `[["line.optimize","验证并调优","primary-action"]`} {
+		if !bytes.Contains(script, []byte(expected)) {
+			t.Fatalf("composite optimize UI is missing %s", expected)
+		}
+	}
+	if bytes.Contains(script, []byte(`[["line.validate","验证",""] ,["line.tune","协议调优",""]`)) {
+		t.Fatal("active line still renders separate validation and tuning actions")
+	}
+	if !bytes.Contains(script, []byte(`operation.kind!=="line.tune"&&operation.kind!=="line.optimize"`)) {
+		t.Fatal("optimize detail does not render tuning result")
+	}
+}
+
 func TestClientConfigurationAndQRCode(t *testing.T) {
 	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

@@ -875,9 +875,18 @@ def main() -> None:
             "MTU 推荐同时参考 IPv4 DF 与运行中 QUIC payload，证据不足时保留当前配置。",
         ],
     }
+    if args.active:
+        result["_probe_cache_key"] = cache_key
     output = args.output or pathlib.Path("build") / "line-profile-candidate.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.active and args.cache:
+        args.cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.cache.with_suffix(args.cache.suffix + ".tmp")
+        temporary.write_text(json.dumps({"schema_version": 1, "cache_key": cache_key,
+                                         "candidate": result}, ensure_ascii=False, indent=2) + "\n",
+                             encoding="utf-8")
+        temporary.replace(args.cache)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"候选参数已写入: {output}")
 

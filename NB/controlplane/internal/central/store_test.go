@@ -747,6 +747,38 @@ func TestSuccessfulTuneAdvancesTransportGenerationFloor(t *testing.T) {
 	}
 }
 
+func TestSuccessfulOptimizeUpdatesProfileAndGeneration(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-optimize", Name: "test", Status: "active",
+		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	op := Operation{ID: "op-optimize", LineID: "line-optimize", Kind: "line.optimize", RequestedBy: "test",
+		IdempotencyKey: "optimize", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(t.Context(), op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ClaimOperations(t.Context(), op.LineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompleteOperation(t.Context(), op.ID, op.LineID, "succeeded",
+		json.RawMessage(`{"profile":"line-optimize:4","transport_generation":4}`)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := store.Line(t.Context(), op.LineID)
+	if err != nil || line.Profile != "line-optimize:4" {
+		t.Fatalf("line=%+v err=%v", line, err)
+	}
+	generation, err := store.AllocateTransportGeneration(t.Context(), op.LineID)
+	if err != nil || generation != 5 {
+		t.Fatalf("generation=%d err=%v", generation, err)
+	}
+}
+
 func TestOpenCreatesLatestSnapshotIndex(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

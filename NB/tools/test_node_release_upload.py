@@ -74,3 +74,16 @@ with tempfile.TemporaryDirectory(prefix="node-release-dirty-") as directory:
     assert any("uploaded-change.txt" in line for line in metadata["changes"])
 
 print("dirty Git upload metadata accepted")
+
+
+with tempfile.TemporaryDirectory(prefix="node-release-overlay-") as directory:
+    base = pathlib.Path(directory)
+    current, candidate = base / "current", base / "candidate"
+    for repository in (current, candidate):
+        (repository / "tools").mkdir(parents=True)
+    (current / "tools" / "deploy.py").write_text("trusted\n", encoding="utf-8")
+    (candidate / "tools" / "deploy.py").write_text("uploaded\n", encoding="utf-8")
+    node_release_upload.overlay_controlplane_orchestration(current, candidate)
+    assert (candidate / "tools" / "deploy.py").read_text(encoding="utf-8") == "trusted\n"
+
+print("node release orchestration overlay passed")

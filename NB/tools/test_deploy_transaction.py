@@ -164,7 +164,6 @@ def main() -> None:
         assert [item for item in events if item[0] == "restore"] == [("restore", "entry")]
         assert [item for item in events if item[0] == "copy"] == [
             ("copy", "entry", "middle"),
-            ("copy", "entry", "exit"),
             ("copy", "middle", "exit"),
         ]
         assert [item for item in events if item[0] == "bind-ip"] == [("bind-ip", "exit")]

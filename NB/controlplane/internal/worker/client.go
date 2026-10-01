@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -150,7 +152,7 @@ func (c *Client) heartbeat(ctx context.Context) error {
 		lines = append(lines, lineCapability{LineID: line.LineID, Operations: line.SortedOperations(), Reason: line.DisabledReason})
 	}
 	if c.registry.Dynamic.Enabled {
-		lines = append(lines, lineCapability{LineID: "*", Operations: append([]string(nil), c.registry.Dynamic.Operations...)})
+		lines = append(lines, lineCapability{LineID: "*", Operations: derivedOperations(c.registry.Dynamic.Operations)})
 	}
 	lines = append(lines, lineCapability{LineID: "__node_release__", Operations: []string{"node.release.build"}})
 	payload := map[string]any{"worker_id": c.registry.WorkerID, "status": "ready", "version": c.cfg.Version,
@@ -158,11 +160,11 @@ func (c *Client) heartbeat(ctx context.Context) error {
 	return c.request(ctx, http.MethodPost, "/agent/v1/executors/heartbeat", payload, nil)
 }
 
-func (c *Client) claim(ctx context.Context, lineID string) ([]Operation, error) {
+func (c *Client) claim(ctx context.Context, lineID string, limit int) ([]Operation, error) {
 	var response struct {
 		Operations []Operation `json:"operations"`
 	}
-	path := "/agent/v1/operations?line_id=" + url.QueryEscape(lineID) + "&limit=1"
+	path := "/agent/v1/operations?line_id=" + url.QueryEscape(lineID) + "&limit=" + strconv.Itoa(limit)
 	err := c.request(ctx, http.MethodGet, path, nil, &response)
 	return response.Operations, err
 }
@@ -378,7 +380,11 @@ func (c *Client) poll(ctx context.Context) error {
 	lines = append(lines, LineSpec{LineID: "__node_release__"})
 	var operations []Operation
 	for _, line := range lines {
-		claimed, err := c.claim(ctx, line.LineID)
+		limit := 1
+		if line.LineID == "*" {
+			limit = c.cfg.OperationConcurrency
+		}
+		claimed, err := c.claim(ctx, line.LineID, limit)
 		if err != nil {
 			return err
 		}
@@ -414,28 +420,56 @@ func (c *Client) poll(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) processOperation(ctx context.Context, operation Operation) error {
-	lockKey := operation.LineID
+func (c *Client) operationLockKeys(operation Operation) []string {
+	if operation.Kind == "node.release.build" {
+		return []string{"global:node-build"}
+	}
 	var request requestValues
-	if lockKey == "*" && len(operation.Request) > 0 {
-		if json.Unmarshal(operation.Request, &request) == nil && request.Plan.LineID != "" {
-			lockKey = request.Plan.LineID
+	if len(operation.Request) > 0 {
+		_ = json.Unmarshal(operation.Request, &request)
+	}
+	keys := make([]string, 0, len(request.Plan.Nodes))
+	seen := map[string]bool{}
+	for _, node := range request.Plan.Nodes {
+		if node.DeviceID == "" || node.Role == "" {
+			continue
+		}
+		key := "device:" + node.DeviceID + ":" + node.Role
+		if !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
 		}
 	}
-	if operation.Kind != "line.validate" {
-		if line, ok := c.registry.Line(lockKey); ok && line.ResourceGroup != "" {
-			lockKey = "resource:" + line.ResourceGroup
-		} else if request.Plan.ResourceGroup != "" {
-			lockKey = "resource:" + request.Plan.ResourceGroup
+	if len(keys) == 0 {
+		if line, ok := c.registry.Line(operation.LineID); ok && line.ResourceGroup != "" {
+			keys = append(keys, "resource:"+line.ResourceGroup)
+		} else {
+			keys = append(keys, "line:"+operation.LineID)
 		}
 	}
-	if lockKey == "" {
-		lockKey = operation.ID
+	sort.Strings(keys)
+	return keys
+}
+
+func (c *Client) lockOperation(operation Operation) func() {
+	keys := c.operationLockKeys(operation)
+	locks := make([]*sync.Mutex, 0, len(keys))
+	for _, key := range keys {
+		value, _ := c.operationLocks.LoadOrStore(key, &sync.Mutex{})
+		lock := value.(*sync.Mutex)
+		lock.Lock()
+		locks = append(locks, lock)
 	}
-	lockValue, _ := c.operationLocks.LoadOrStore(lockKey, &sync.Mutex{})
-	lock := lockValue.(*sync.Mutex)
-	lock.Lock()
-	defer lock.Unlock()
+	return func() {
+		for index := len(locks) - 1; index >= 0; index-- {
+			locks[index].Unlock()
+		}
+	}
+}
+
+func (c *Client) processOperation(ctx context.Context, operation Operation) error {
+	unlock := c.lockOperation(operation)
+	defer unlock()
 
 	resultPath := filepath.Join(c.registry.StateDir, operation.ID, "result.json")
 	var persisted persistedResult

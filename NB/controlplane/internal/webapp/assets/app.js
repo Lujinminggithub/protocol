@@ -21,7 +21,7 @@ const deviceStatusText = {ready:"已启用",provisioning:"初始化",maintenance
 const environmentText = {production:"生产",test:"测试"};
 function environmentBadge(value) { const env=value||"production"; return `<span class="badge ${env === "test" ? "warning" : "active"}">${escapeHTML(environmentText[env]||env)}</span>`; }
 function healthState(value) { return value === "ok" ? "healthy" : (value || "unknown"); }
-const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优","node.release.build":"构建 Node Release"};
+const kindText = {"line.open":"开通线路","line.validate":"验证线路","line.optimize":"验证并调优","line.upgrade":"升级","line.rollback":"回滚","line.disable":"停用","line.tune":"协议调优","node.release.build":"构建 Node Release"};
 const roleText = {entry:"Entry",relay:"Relay",exit:"Exit"};
 const stageText = {prepare:"准备",build:"构建",provision:"开线部署",validate:"线路验证",deploy:"部署",rollback:"回滚",stop:"停用",whitelist:"白名单下发","whitelist-fetch":"白名单更新"};
 const legacyMessageText = {"preparing operation":"正在准备任务","operation prepared":"任务准备完成","step started":"步骤开始执行","step completed":"步骤执行完成","operation completed":"任务执行完成","dynamic plan exceeds assigned port limits":"线路端口超出 worker 授权范围"};
@@ -197,7 +197,7 @@ function lineRow(line) {
   const detail = state.details[line.id];
   const nodes = detail?.spec?.nodes || [];
   const route = nodes.map((n) => n.device?.name || n.device_id).join(" → ") || `${line.entry_region} → ${line.exit_region}`;
-  const definitions = line.status === "deleting" ? [] : line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.validate","验证",""] ,["line.tune","协议调优",""] ,["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
+  const definitions = line.status === "deleting" ? [] : line.status === "draft" || line.status === "disabled" ? [["line.open","开线","primary-action"]] : [["line.optimize","验证并调优","primary-action"],["line.upgrade","升级",""] ,["line.rollback","回滚",""] ,["line.disable","停用","danger-action"]];
   const actions = definitions.map(([kind,label,style]) => { const a = operationAvailability(line.id,kind); return `<button class="action-button ${style}" ${a.enabled ? `data-action="${kind}" data-line="${escapeHTML(line.id)}"` : `disabled title="${escapeHTML(a.reason)}"`}>${label}</button>`; }).join("");
   const hasActiveOperation=state.operations.some((item)=>item.line_id===line.id&&["queued","dispatched","running"].includes(item.status));
   const hasFailedDisable=state.operations.some((item)=>item.line_id===line.id&&item.kind==="line.disable"&&item.status==="failed");
@@ -300,7 +300,7 @@ function operationTimeline(operation, events) {
   return `<div class="topology-empty">任务等待执行器领取</div>`;
 }
 function tuneResultSection(operation) {
-  if(operation.kind!=="line.tune")return "";
+  if(operation.kind!=="line.tune"&&operation.kind!=="line.optimize")return "";
   const result=operation.result||{},profile=result.transport_profile||operation.request?.transport_profile;
   const rollout=result.transport_rollout||{},generation=result.transport_generation||profile?.generation;
   if(!profile&&!generation)return `<div class="detail-section"><h3>调优结果</h3><div class="topology-empty">任务尚未生成协议参数</div></div>`;

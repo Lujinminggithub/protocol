@@ -39,7 +39,7 @@ if (DEPLOY_INSTANCE and (len(DEPLOY_INSTANCE) > 48 or
         any(ch not in _SAFE_INSTANCE for ch in DEPLOY_INSTANCE))):
     raise ValueError("NB_DEPLOY_INSTANCE must use 1..48 safe identifier characters")
 INSTANCE_WORK = f"{WORK}/instances/{DEPLOY_INSTANCE}" if DEPLOY_INSTANCE else WORK
-COMPILE_WORK = LAB["paths"].get("compile_dir", "/opt/compile")
+COMPILE_WORK = os.environ.get("NB_CONTROLPLANE_BUILD_DIR", "/opt/nb-controlplane/data/build")
 DEPLOY_CERTS = f"{INSTANCE_WORK}/certs"
 BUILD_HOST = LAB.get("build_host", "entry")                 # 独立构建机角色，默认使用广州 entry
 BUILD_DIR = ROOT / "build"

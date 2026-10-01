@@ -19,7 +19,7 @@ var (
 var allowedKinds = map[string]bool{
 	"line.open": true, "line.validate": true, "line.upgrade": true,
 	"line.rollback": true, "line.disable": true, "line.tune": true,
-	"node.release.build": true,
+	"line.optimize": true, "node.release.build": true,
 }
 
 const transportWorkerLanes = 2
@@ -308,6 +308,9 @@ func (r Registry) Line(lineID string) (LineSpec, bool) {
 }
 
 func (line LineSpec) Allows(kind string) bool {
+	if kind == "line.optimize" {
+		return contains("line.validate", line.EnabledOperations) && contains("line.tune", line.EnabledOperations)
+	}
 	for _, allowed := range line.EnabledOperations {
 		if allowed == kind {
 			return true
@@ -318,6 +321,14 @@ func (line LineSpec) Allows(kind string) bool {
 
 func (line LineSpec) SortedOperations() []string {
 	result := append([]string(nil), line.EnabledOperations...)
+	if line.Allows("line.optimize") && !contains("line.optimize", result) {
+		result = append(result, "line.optimize")
+	}
 	sort.Strings(result)
 	return result
+}
+
+func derivedOperations(operations []string) []string {
+	line := LineSpec{EnabledOperations: operations}
+	return line.SortedOperations()
 }

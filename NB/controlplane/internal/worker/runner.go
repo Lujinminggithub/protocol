@@ -258,6 +258,7 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		values[key] = value
 	}
 	values["NB_LINE_OPEN_FAST"] = "1"
+	values["NB_BUILD_LOCAL"] = "1"
 	credentials, err := loadJSON(line.SourceMachinesFile)
 	if err != nil && line.SourceMachinesFile != "" {
 		return nil, err
@@ -295,6 +296,10 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 	python, tools := r.registry.Python, filepath.Join(r.registry.Root, "tools")
 	deploy := filepath.Join(tools, "deploy.py")
 	socks := strconv.Itoa(line.SocksPort)
+	lineState := line.StateDir
+	if lineState == "" {
+		lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
+	}
 	switch operation.Kind {
 	case "line.open":
 		outputDir := filepath.Join(operationDir, "line-open")
@@ -315,12 +320,12 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 			result = append(result, commandStep{Name: python, Stage: "whitelist", Args: []string{deploy, "wl-push", "--whitelist", line.WhitelistFile}})
 		}
 		return result, nil
-	case "line.validate":
+	case "line.validate", "line.optimize":
 		return []commandStep{{Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64),
 			"--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
-			"--socks-port", socks, "--via-entry-ssh", "--cache", filepath.Join(line.StateDir, "provision", line.LineID, "probe-cache.json"),
+			"--socks-port", socks, "--via-entry-ssh", "--cache", filepath.Join(lineState, "provision", line.LineID, "probe-cache.json"),
 			"--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.tune":
 		return nil, nil
@@ -530,7 +535,35 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		sequence++
 	}
 	result := Result{LogFile: logPath, Profile: line.LineID, Message: "任务执行完成"}
-	if operation.Kind == "line.tune" {
+	if operation.Kind == "line.optimize" {
+		evidence, readErr := os.ReadFile(filepath.Join(operationDir, "validation.json"))
+		if readErr != nil || !json.Valid(evidence) {
+			optimizeErr := errors.New("线路验证未生成有效调优证据")
+			result.Failure = operationFailure("validation", optimizeErr, logPath)
+			result.Message = result.Failure.Summary
+			return result, optimizeErr
+		}
+		var probe transportprofile.Probe
+		if json.Unmarshal(evidence, &probe) != nil {
+			optimizeErr := errors.New("线路验证证据格式无效")
+			result.Failure = operationFailure("profile-generate", optimizeErr, logPath)
+			result.Message = result.Failure.Summary
+			return result, optimizeErr
+		}
+		profile, generateErr := transportprofile.Generate(line.LineID, 1, line.PackageMbps, probe)
+		if generateErr != nil {
+			result.Failure = operationFailure("profile-generate", generateErr, logPath)
+			result.Message = result.Failure.Summary
+			return result, generateErr
+		}
+		request.TransportProfile = profile
+		result.Evidence = json.RawMessage(evidence)
+		_ = atomicJSON(filepath.Join(operationDir, "optimize-checkpoint.json"), map[string]any{
+			"line_id": line.LineID, "deployment_id": request.DeploymentID,
+			"stage": "profile-generated", "evidence": json.RawMessage(evidence), "profile": profile,
+		})
+	}
+	if operation.Kind == "line.tune" || operation.Kind == "line.optimize" {
 		generation, profilePath, rolloutErr := r.applyPlannedProfile(ctx, line, request.DeploymentID, request.TransportProfile, environment, logFile, &sequence)
 		result.TransportGeneration = generation
 		request.TransportProfile.Generation = generation
@@ -550,8 +583,15 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 				Message: result.Failure.Summary, Parameters: map[string]any{"failure": result.Failure}})
 			return result, rolloutErr
 		}
+		if operation.Kind == "line.optimize" {
+			result.Message = "线路验证与协议调优完成"
+			_ = atomicJSON(filepath.Join(operationDir, "optimize-checkpoint.json"), map[string]any{
+				"line_id": line.LineID, "deployment_id": request.DeploymentID,
+				"stage": "committed", "generation": generation,
+			})
+		}
 	}
-	if operation.Kind == "line.validate" {
+	if operation.Kind == "line.validate" || operation.Kind == "line.optimize" {
 		if evidence, readErr := os.ReadFile(filepath.Join(operationDir, "validation.json")); readErr == nil && json.Valid(evidence) {
 			result.Evidence = json.RawMessage(evidence)
 		}
@@ -559,13 +599,13 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 	if operation.Kind == "line.rollback" {
 		result.Deployment = request.Deployment
 	}
-	if operation.Kind != "line.validate" && operation.Kind != "line.disable" && operation.Kind != "line.tune" {
+	if operation.Kind != "line.validate" && operation.Kind != "line.disable" && operation.Kind != "line.tune" && operation.Kind != "line.optimize" {
 		result.Deployment, err = r.currentDeployment(ctx, line, environment, logFile)
 		if err != nil {
 			return result, err
 		}
 	}
-	if operation.Kind != "line.tune" {
+	if operation.Kind != "line.tune" && operation.Kind != "line.optimize" {
 		if profile, loadErr := loadJSON(line.LineProfileFile); loadErr == nil {
 			if schema, ok := profile["schema_version"].(float64); ok {
 				result.Profile = fmt.Sprintf("%s:%d", line.LineID, int(schema))

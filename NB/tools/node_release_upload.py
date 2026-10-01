@@ -160,6 +160,7 @@ def main() -> None:
         overlay_controlplane_orchestration(args.current_root, candidate)
         environment = os.environ.copy()
         environment["NB_FORCE_REMOTE_BUILD"] = "1"
+        environment["NB_BUILD_LOCAL"] = "1"
         environment["NB_ALLOW_UNVERSIONED_SOURCE"] = "1"
         inventory = candidate / "tools" / "private" / "kz-machines.json"
         known_hosts = candidate / "tools" / "private" / "kz-known_hosts"
