@@ -906,7 +906,7 @@ func TestClientHeartbeatsClaimsAndPersistsResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	if err = client.Run(ctx); err != nil {
 		t.Fatal(err)

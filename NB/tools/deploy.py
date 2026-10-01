@@ -270,6 +270,20 @@ def build_execution_mode() -> str:
     return "control-plane"
 
 
+def local_build_environment(source=None) -> dict[str, str]:
+    environment = dict(os.environ if source is None else source)
+    for name in (
+        "NB_HOSTS_FILE", "NB_LINE_PROFILE_FILE", "NB_SECURITY_DIR", "NB_KNOWN_HOSTS",
+        "NB_DEPLOY_INSTANCE", "NB_SOCKS_PORT", "NB_SOCKS_UDP_PORT_MIN",
+        "NB_SOCKS_UDP_PORT_MAX", "NB_MIDDLE_PORT", "NB_EXIT_PORT",
+        "NB_SOCKS_USERNAME", "NB_SOCKS_PASSWORD", "NB_WHITELIST_FILE",
+        "NB_LINE_OPEN_FAST", "NB_BUILD_LOCAL", "NB_SSH_PASSWORD_ENTRY",
+        "NB_SSH_PASSWORD_MIDDLE", "NB_SSH_PASSWORD_EXIT",
+    ):
+        environment.pop(name, None)
+    return environment
+
+
 def _prepare_local_compile_workspace():
     """Populate the control-plane build workspace from the checked-out source."""
     root = controlplane_build_root()
@@ -300,7 +314,8 @@ def _act_build_local(git_info):
                  "test_deploy_transfer.py", "test_line_control.py", "test_diag_bundle.py",
                  "test_line_probe.py", "test_line_provision.py", "test_line_open.py",
                  "test_supervisor.py", "test_shard_deploy.py", "test_media_reserve_deploy.py",
-                 "test_worker_snapshot.py", "test_yfe2_canary.py", "test_netem_matrix.py"]:
+                 "test_worker_snapshot.py", "test_yfe2_canary.py", "test_netem_matrix.py",
+                 "test_controlplane_local_build.py", "test_node_release_upload.py"]:
         result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"本地 P0 发布门禁失败: {test}")
@@ -314,7 +329,7 @@ def _act_build_local(git_info):
     timeout = max(60, min(3600, int(os.environ.get("NB_LOCAL_BUILD_TIMEOUT_SECONDS", "900"))))
     result = subprocess.run(["bash", "-lc", BUILD_CMD], cwd=ROOT, check=False,
                             capture_output=True, text=True, encoding="utf-8", errors="replace",
-                            timeout=timeout)
+                            timeout=timeout, env=local_build_environment())
     output = (result.stdout or "") + (result.stderr or "")
     print(output[-6000:])
     if result.returncode != 0 or "NB_BUILD_GATE_RC=0" not in output:

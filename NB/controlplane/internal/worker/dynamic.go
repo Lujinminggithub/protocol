@@ -161,7 +161,7 @@ func resolvedPassword(secret localSecret) string {
 	return os.Getenv(secret.PasswordEnv)
 }
 
-func dialDynamicSSH(ctx context.Context, node dynamicNode, password string, jump *ssh.Client) (*ssh.Client, error) {
+func dialDynamicSSHOnce(ctx context.Context, node dynamicNode, password string, jump *ssh.Client) (*ssh.Client, error) {
 	raw, err := base64.StdEncoding.DecodeString(node.Device.SSHHostKey)
 	if err != nil {
 		return nil, errDynamicSSHHostKey
@@ -211,6 +211,30 @@ func dialDynamicSSH(ctx context.Context, node dynamicNode, password string, jump
 	}
 	_ = connection.SetDeadline(time.Time{})
 	return ssh.NewClient(clientConnection, channels, requests), nil
+}
+
+func dialDynamicSSH(ctx context.Context, node dynamicNode, password string, jump *ssh.Client) (*ssh.Client, error) {
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		client, err := dialDynamicSSHOnce(ctx, node, password, jump)
+		if err == nil {
+			return client, nil
+		}
+		if errors.Is(err, errDynamicSSHAuthentication) || errors.Is(err, errDynamicSSHHostKey) {
+			return nil, err
+		}
+		last = err
+		if attempt == 4 {
+			break
+		}
+		delay := time.Duration(1<<attempt) * 250 * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, last
 }
 
 func (r *Runner) verifyDynamicSSHAccess(ctx context.Context, plan dynamicPlan) error {

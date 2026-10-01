@@ -115,83 +115,8 @@ func (r *Runner) maintainWhitelist(ctx context.Context, line LineSpec) error {
 	return nil
 }
 
-func (r *Runner) maintainQualification(ctx context.Context, line LineSpec) error {
-	lineState := line.StateDir
-	if lineState == "" {
-		candidates, _ := filepath.Glob(filepath.Join(r.registry.StateDir, "*", "line-open", "qualification-pending.json"))
-		for _, candidate := range candidates {
-			data, readErr := os.ReadFile(candidate)
-			if readErr != nil {
-				continue
-			}
-			var marker struct {
-				LineID string `json:"line_id"`
-			}
-			if json.Unmarshal(data, &marker) == nil && marker.LineID == line.LineID {
-				lineState = filepath.Dir(candidate)
-				break
-			}
-		}
-		if lineState == "" {
-			return nil
-		}
-	}
-	pending := filepath.Join(lineState, "qualification-pending.json")
-	if _, err := os.Stat(pending); errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	lockPath := pending + ".lock"
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil
-		}
-		return err
-	}
-	_ = lock.Close()
-	defer os.Remove(lockPath)
-
-	environment, err := r.environment(line)
-	if err != nil {
-		return err
-	}
-	inventory := filepath.Join(lineState, "provision-inventory.json")
-	provision := commandStep{Name: r.registry.Python, Stage: "qualification",
-		Args: []string{filepath.Join(r.registry.Root, "tools", "line_provision.py"), inventory,
-			"--output-dir", filepath.Join(lineState, "provision"), "--line", line.LineID}}
-	logPath := filepath.Join(lineState, "qualification-maintenance.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	if err = r.execute(ctx, provision, environment, logFile); err != nil {
-		return fmt.Errorf("qualification failed for %s: %w", line.LineID, err)
-	}
-	qualifiedHosts := filepath.Join(lineState, "provision", line.LineID, "deployment-hosts.json")
-	qualifiedProfile := filepath.Join(lineState, "provision", line.LineID, "stable-profile.json")
-	if _, err = os.Stat(qualifiedHosts); err != nil {
-		return err
-	}
-	if _, err = os.Stat(qualifiedProfile); err != nil {
-		return err
-	}
-	environment["NB_HOSTS_FILE"] = qualifiedHosts
-	environment["NB_LINE_PROFILE_FILE"] = qualifiedProfile
-	deploy := commandStep{Name: r.registry.Python, Stage: "qualification-deploy",
-		Args: []string{filepath.Join(r.registry.Root, "tools", "deploy.py"), "deploy-socks",
-			"--socks-port", strconv.Itoa(line.SocksPort)}}
-	if err = r.execute(ctx, deploy, environment, logFile); err != nil {
-		return fmt.Errorf("qualified profile deploy failed for %s: %w", line.LineID, err)
-	}
-	return os.Rename(pending, filepath.Join(lineState, "qualification-complete.json"))
-}
-
 func (r *Runner) Maintain(ctx context.Context) error {
 	for _, line := range r.registry.Lines {
-		if err := r.maintainQualification(ctx, line); err != nil {
-			return err
-		}
 		if err := r.maintainTransportProfile(ctx, line); err != nil {
 			return err
 		}

@@ -690,7 +690,7 @@ func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, line := range item.Lines {
-		if (line.LineID != "*" && !safeID.MatchString(line.LineID)) || len(line.Reason) > 300 || len(line.Operations) > 6 {
+		if (line.LineID != "*" && !safeID.MatchString(line.LineID)) || len(line.Reason) > 300 || len(line.Operations) > 8 {
 			problem(w, 400, "invalid executor line")
 			return
 		}

@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import shlex
+import time
 
 
 def _transfer_candidates(host: dict) -> list[str]:
@@ -85,27 +86,30 @@ def copy_release(source_c, source_role, target_c, target_role, manifest, *,
                    f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(known_hosts)} "
                    f"-o ConnectTimeout=10 -p {port} {shlex.quote(endpoint)}")
             part = f"{destination}.part.{expected[:16]}"
-            try:
-                parent = str(pathlib.PurePosixPath(destination).parent)
-                checked_run(source_c, f"{ssh} {shlex.quote('mkdir -p ' + shlex.quote(parent))}", tmo=30)
-                size_cmd = f"test -f {shlex.quote(part)} && stat -c %s {shlex.quote(part)} || echo 0"
-                offset = int(checked_run(source_c, f"{ssh} {shlex.quote(size_cmd)}", tmo=30).strip().splitlines()[-1])
-                if offset > size:
-                    checked_run(source_c, f"{ssh} {shlex.quote('rm -f ' + shlex.quote(part))}", tmo=30)
-                    offset = 0
-                if offset < size:
-                    append = shlex.quote("cat >> " + shlex.quote(part))
-                    checked_run(source_c, f"tail -c +{offset + 1} {shlex.quote(source)} | {ssh} {append}", tmo=timeout)
-                publish = (f"test \"$(sha256sum {shlex.quote(part)} | awk '{{print $1}}')\" = "
-                           f"{shlex.quote(expected)} && chmod 0755 {shlex.quote(part)} && "
-                           f"mv -f {shlex.quote(part)} {shlex.quote(destination)} && echo VERIFIED")
-                result = checked_run(source_c, f"{ssh} {shlex.quote(publish)}", tmo=60)
-                if "VERIFIED" not in result:
-                    raise RuntimeError("remote checksum verification failed")
-                print(f"{source_role} -> {target_role}: release={release_id} transferred via {address}:{port}")
-                return address
-            except Exception as error:
-                failures.append(f"{address}:{port}: {error}")
+            for attempt in range(5):
+                try:
+                    parent = str(pathlib.PurePosixPath(destination).parent)
+                    checked_run(source_c, f"{ssh} {shlex.quote('mkdir -p ' + shlex.quote(parent))}", tmo=30)
+                    size_cmd = f"test -f {shlex.quote(part)} && stat -c %s {shlex.quote(part)} || echo 0"
+                    offset = int(checked_run(source_c, f"{ssh} {shlex.quote(size_cmd)}", tmo=30).strip().splitlines()[-1])
+                    if offset > size:
+                        checked_run(source_c, f"{ssh} {shlex.quote('rm -f ' + shlex.quote(part))}", tmo=30)
+                        offset = 0
+                    if offset < size:
+                        append = shlex.quote("cat >> " + shlex.quote(part))
+                        checked_run(source_c, f"tail -c +{offset + 1} {shlex.quote(source)} | {ssh} {append}", tmo=timeout)
+                    publish = (f"test \"$(sha256sum {shlex.quote(part)} | awk '{{print $1}}')\" = "
+                               f"{shlex.quote(expected)} && chmod 0755 {shlex.quote(part)} && "
+                               f"mv -f {shlex.quote(part)} {shlex.quote(destination)} && echo VERIFIED")
+                    result = checked_run(source_c, f"{ssh} {shlex.quote(publish)}", tmo=60)
+                    if "VERIFIED" not in result:
+                        raise RuntimeError("remote checksum verification failed")
+                    print(f"{source_role} -> {target_role}: release={release_id} transferred via {address}:{port}")
+                    return address
+                except Exception as error:
+                    failures.append(f"{address}:{port} attempt={attempt + 1}: {error}")
+                    if attempt < 4:
+                        time.sleep(min(8, 1 << attempt))
         raise RuntimeError(f"{source_role} -> {target_role} transfer failed: {'; '.join(failures)}")
     finally:
         try:

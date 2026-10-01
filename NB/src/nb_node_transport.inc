@@ -514,6 +514,9 @@ static int udp_on_quic_datagram(picoquic_cnx_t* cnx,const nb_udp_wire_view_t* vi
     }else if(view->type==NB_UDP_TYPE_S2C){
         if(G.role==ROLE_MIDDLE){
             proxy_stream_t* p=ps_find_udp_down(cnx,view->session_id);
+            /* CLOSE keeps the relay session alive briefly for lifecycle ACK
+             * and in-flight cleanup, but the Entry child is already gone. */
+            if(p!=NULL&&p->udp_close_received)return 0;
             if(p!=NULL&&p->udp_first_s2c_rx_at==0){p->udp_first_s2c_rx_at=picoquic_current_time();
                 log4c_info("middle udp trace id=%u usid=%u stage=s2c-first-rx age=%.1fms seq=%u frag=%u/%u bytes=%u target=%s:%d",
                     p->id,p->udp_session_id,trace_delta_ms(p->udp_first_s2c_rx_at,p->created_at),view->sequence,

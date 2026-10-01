@@ -584,6 +584,27 @@ def run_entry_local_probe(mode: str, socks_port: int, *, size: int = 256 * 1024,
     return result
 
 
+def run_probe_pair(uplink_call, downlink_call) -> tuple[dict, dict]:
+    results: dict[str, dict] = {}
+    failures: list[BaseException] = []
+
+    def execute(name: str, call) -> None:
+        try:
+            results[name] = call()
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=execute, args=("uplink", uplink_call)),
+               threading.Thread(target=execute, args=("downlink", downlink_call))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if failures:
+        raise failures[0]
+    return results["uplink"], results["downlink"]
+
+
 def remote_log_path(connection, role: str) -> str:
     command = (
         f"bin=$(readlink -f {deploy.INSTANCE_WORK}/nb_node 2>/dev/null); "
@@ -813,16 +834,17 @@ def main() -> None:
         try:
             if args.probe_origin == "entry-local":
                 integrity = run_entry_local_probe("integrity", args.socks_port)
-                uplink = run_entry_local_probe("load", args.socks_port,
-                    target_mbps=shaping_up, duration_s=args.duration)
-                downlink = run_entry_local_probe("downlink", args.socks_port,
-                    target_mbps=shaping_down, duration_s=args.duration)
+                uplink, downlink = run_probe_pair(
+                    lambda: run_entry_local_probe("load", args.socks_port,
+                        target_mbps=shaping_up, duration_s=args.duration),
+                    lambda: run_entry_local_probe("downlink", args.socks_port,
+                        target_mbps=shaping_down, duration_s=args.duration))
             else:
                 integrity = run_integrity_probe(deploy._role_host("entry")["host"], args.socks_port)
-                uplink = run_load_probe(deploy._role_host("entry")["host"], args.socks_port,
-                    shaping_up, args.duration)
-                downlink = run_downlink_probe(deploy._role_host("entry")["host"], args.socks_port,
-                    shaping_down, args.duration)
+                entry_host = deploy._role_host("entry")["host"]
+                uplink, downlink = run_probe_pair(
+                    lambda: run_load_probe(entry_host, args.socks_port, shaping_up, args.duration),
+                    lambda: run_downlink_probe(entry_host, args.socks_port, shaping_down, args.duration))
         finally:
             sample_stop.set()
             for thread in sample_threads:

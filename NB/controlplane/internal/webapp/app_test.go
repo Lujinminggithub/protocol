@@ -1158,7 +1158,7 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		t.Fatalf("internal resources were not independently allocated: %+v", allocated)
 	}
 	heartbeat := map[string]any{"worker_id": "worker-1", "status": "ready", "version": "test", "observed_at": time.Now().UTC(),
-		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open", "line.validate", "line.upgrade", "line.rollback", "line.disable", "line.tune"}}}}
+		"lines": []map[string]any{{"line_id": "*", "operations": []string{"line.open", "line.validate", "line.optimize", "line.upgrade", "line.rollback", "line.disable", "line.tune"}}}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/agent/v1/executors/heartbeat", "agent", "", heartbeat)
 	if response.StatusCode != 200 {
 		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)

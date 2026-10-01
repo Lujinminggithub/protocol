@@ -299,9 +299,16 @@ if host=="0.0.0.0":host="127.0.0.1"
 udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.settimeout(5);payload=b"NB_UDP_LIFECYCLE"
 packet=b"\x00\x00\x00\x01"+socket.inet_aton("127.0.0.1")+struct.pack("!H",target_port)+payload
 udp.sendto(packet,(host,port));reply,_=udp.recvfrom(65535);assert reply.endswith(payload),reply
-tcp.close();udp.close();time.sleep(5)
+tcp.close();udp.close()
 print("RESULT PASS: SOCKS UDP lifecycle trigger")
 PY
+for _ in $(seq 1 120); do
+  if grep -q 'middle udp flow close.*reason=udp-peer-close' "$TMP/nb-middle.log" &&
+     grep -q 'exit udp flow close.*reason=udp-peer-close' "$TMP/nb-exit.log"; then
+    break
+  fi
+  sleep .1
+done
 grep -q 'middle udp flow close.*reason=udp-peer-close' "$TMP/nb-middle.log"
 grep -q 'exit udp flow close.*reason=udp-peer-close' "$TMP/nb-exit.log"
 if grep -q 'udp datagram reject stage=handler rc=-10' "$TMP/nb-entry.log"; then

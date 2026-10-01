@@ -36,6 +36,8 @@ ORCHESTRATION_FILES = (
     "tools/worker_snapshot.py",
     "tools/test_deploy_transaction.py",
     "tools/test_deploy_transfer.py",
+    "tools/test_controlplane_local_build.py",
+    "tools/test_node_release_upload.py",
     "tools/test_diag_bundle.py",
     "tools/test_line_control.py",
     "tools/test_line_open.py",
@@ -68,6 +70,9 @@ def deployment_source_files(root: pathlib.Path = ROOT) -> dict[str, pathlib.Path
     controlplane = root / "controlplane"
     for path in sorted(controlplane.rglob("*.go")):
         files[path.relative_to(root).as_posix()] = path
+    for path in sorted((controlplane / "internal" / "webapp" / "assets").rglob("*")):
+        if path.is_file():
+            files[path.relative_to(root).as_posix()] = path
     for name in ("controlplane/go.mod", "controlplane/go.sum"):
         files[name] = root.joinpath(*pathlib.PurePosixPath(name).parts)
     return files

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import json
 import os
+import threading
 
 import line_probe
 from line_probe import (ENTRY_LOCAL_PROBE_SCRIPT, evaluate_admission, fnv1a64,
                         control_link_sample, parse_entry_probe_output, parse_linkq, parse_ping,
                         recommend, recommend_mtu,
-                        run_entry_local_probe, run_load_probe, summarize_linkq)
+                        run_entry_local_probe, run_load_probe, run_probe_pair, summarize_linkq)
 
 
 class FakeChannel:
@@ -232,6 +233,12 @@ def main() -> None:
         "downlink": {"integrity": "count-ok", "achieved_mbps": 8.9}}, 10.0)
     assert rejected["status"] == "rejected"
     assert rejected["reasons"] == ["insufficient-downlink"]
+    barrier = threading.Barrier(2)
+    def direction(name):
+        barrier.wait(timeout=1)
+        return {"direction": name}
+    uplink, downlink = run_probe_pair(lambda: direction("up"), lambda: direction("down"))
+    assert uplink["direction"] == "up" and downlink["direction"] == "down"
     print("line_probe tests passed")
 
 

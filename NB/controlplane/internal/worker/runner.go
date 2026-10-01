@@ -585,6 +585,15 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 		}
 		if operation.Kind == "line.optimize" {
 			result.Message = "线路验证与协议调优完成"
+			lineState := line.StateDir
+			if lineState == "" {
+				lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
+			}
+			_ = os.Remove(filepath.Join(lineState, "qualification-pending.json"))
+			_ = atomicJSON(filepath.Join(lineState, "qualification-complete.json"), map[string]any{
+				"line_id": line.LineID, "deployment_id": request.DeploymentID,
+				"generation": generation, "completed_at": time.Now().UTC().Format(time.RFC3339Nano),
+			})
 			_ = atomicJSON(filepath.Join(operationDir, "optimize-checkpoint.json"), map[string]any{
 				"line_id": line.LineID, "deployment_id": request.DeploymentID,
 				"stage": "committed", "generation": generation,
@@ -622,7 +631,7 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 			lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
 		}
 		if _, pendingErr := os.Stat(filepath.Join(lineState, "qualification-pending.json")); pendingErr == nil {
-			result.Message = "线路已可用，资格探测后台进行中"
+			result.Message = "线路已可用，等待验证并调优"
 			result.Evidence = json.RawMessage(`{"qualification":"pending"}`)
 		}
 	}
