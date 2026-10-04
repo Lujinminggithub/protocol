@@ -734,6 +734,8 @@ static int nb_node_instance_loop(int argc,char**argv,nb_instance_t* instance){
                     cnx_pool_t* pool=&G.pools[pool_id];if(!pool->cnx[k])continue;
                     picoquic_path_quality_t q; memset(&q,0,sizeof(q));
                     picoquic_get_default_path_quality(pool->cnx[k], &q);
+                    q.max_reorder_delay=nb_path_sanitize_reorder_delay(q.max_reorder_delay);
+                    q.max_reorder_gap=nb_path_sanitize_reorder_gap(q.max_reorder_gap);
                     uint64_t delta_sent = (q.sent >= pool->last_sent_total[k]) ? (q.sent - pool->last_sent_total[k]) : q.sent;
                     uint64_t delta_lost = (q.lost >= pool->last_lost_total[k]) ? (q.lost - pool->last_lost_total[k]) : q.lost;
                     uint64_t delta_timer = (q.timer_losses >= pool->last_timer_total[k])

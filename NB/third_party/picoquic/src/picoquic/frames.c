@@ -2662,8 +2662,10 @@ picoquic_packet_t* picoquic_check_spurious_retransmission(picoquic_cnx_t* cnx,
         if ( p->sequence_number <= end_of_range) {
 
             uint64_t spurious_rtt = current_time - p->send_time;
-            uint64_t reorder_delay = pkt_ctx->latest_time_acknowledged - p->send_time;
-            uint64_t reorder_gap = pkt_ctx->highest_acknowledged - p->sequence_number;
+            uint64_t reorder_delay = pkt_ctx->latest_time_acknowledged >= p->send_time
+                ? pkt_ctx->latest_time_acknowledged - p->send_time : 0;
+            uint64_t reorder_gap = pkt_ctx->highest_acknowledged >= p->sequence_number
+                ? pkt_ctx->highest_acknowledged - p->sequence_number : 0;
             picoquic_path_t * old_path = p->send_path;
 
             /* If the packet contained an ACK frame, perform the ACK of ACK pruning logic.

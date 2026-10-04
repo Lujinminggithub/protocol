@@ -388,6 +388,8 @@ static void yfe2_adaptive_tick(uint64_t now_us){
             (runtime->yfe2_sample_at&&now_us-runtime->yfe2_sample_at<200000ULL))continue;
         picoquic_path_quality_t quality;memset(&quality,0,sizeof(quality));
         picoquic_get_default_path_quality(runtime->cnx,&quality);
+        quality.max_reorder_delay=nb_path_sanitize_reorder_delay(quality.max_reorder_delay);
+        quality.max_reorder_gap=nb_path_sanitize_reorder_gap(quality.max_reorder_gap);
         picoquic_nb_limit_state_t limit={0};
         (void)picoquic_get_nb_limit_state(runtime->cnx,&limit);
         nb_yfe2_loss_sample_t sample={0};

@@ -699,10 +699,23 @@ def collect_segment(source_role: str, target: str, samples: int, target_mbps: fl
     }
 
 
-def control_link_sample(records: list[dict]) -> dict:
+def control_link_sample(records: list[dict], previous_bytes: int = 0) -> dict:
     links = [record.get("link", {}) for record in records if isinstance(record, dict)]
+    current_bytes = sum(
+        int((record.get("bytes") or {}).get(direction, 0) or 0)
+        for record in records if isinstance(record, dict)
+        for direction in ("c2s", "s2c"))
+    bytes_delta = max(0, current_bytes - int(previous_bytes or 0))
+    raw_sent = sum(int(link.get("sent_packets", 0) or 0) for link in links)
+    # Some runtimes expose path-quality sent_packets as a tiny per-tick sample
+    # while bytes remains cumulative. Estimate packets from byte deltas so a
+    # busy probe is not discarded as an empty linkq window.
+    estimated_sent = (bytes_delta + 1199) // 1200 if bytes_delta else 0
     return {
-        "sent": sum(int(link.get("sent_packets", 0) or 0) for link in links),
+        "sent": max(raw_sent, estimated_sent),
+        "raw_sent": raw_sent,
+        "bytes_delta": bytes_delta,
+        "quality_samples": sum(int(link.get("samples", 0) or 0) for link in links),
         "spurious": sum(int(link.get("spurious_total", 0) or 0) for link in links),
         "rtt": max((float(link.get("rtt_max_us", 0) or 0) / 1000.0 for link in links), default=0.0),
         "jitter": max((float(link.get("jitter_max_us", 0) or 0) / 1000.0 for link in links), default=0.0),
@@ -733,12 +746,15 @@ for path in paths:
 print(json.dumps(metrics,separators=(',',':')))
 """
     connection = None
+    previous_bytes = 0
     try:
         connection = deploy.connect(role)
         while not stop_event.is_set():
             raw = deploy.checked_run(connection, "python3 -c " + shlex.quote(script), tmo=20).strip()
             records = json.loads(raw)
-            output.append(control_link_sample(records))
+            sample = control_link_sample(records, previous_bytes)
+            previous_bytes += sample["bytes_delta"]
+            output.append(sample)
             ready_event.set()
             if stop_event.wait(interval_s):
                 break

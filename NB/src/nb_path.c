@@ -1,5 +1,13 @@
 #include "nb_path.h"
 
+uint64_t nb_path_sanitize_reorder_delay(uint64_t value){
+    return value>UINT64_MAX/2?0:value;
+}
+
+uint64_t nb_path_sanitize_reorder_gap(uint64_t value){
+    return value>UINT64_MAX/2?0:value;
+}
+
 int nb_path_quality_fresh(const nb_path_quality_t* sample,uint64_t now,uint64_t max_age){
     return sample&&sample->sampled_at_us&&now>=sample->sampled_at_us&&now-sample->sampled_at_us<=max_age;
 }

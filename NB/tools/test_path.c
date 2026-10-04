@@ -9,5 +9,9 @@ int main(void){
     assert(nb_path_quality_better(&a,&b,2000,3000,20,2.0));
     a.effective_loss_pct=b.effective_loss_pct;assert(nb_path_quality_better(&b,&a,2000,3000,20,2.0));
     assert(nb_path_loss_score(&(nb_path_quality_t){4.0,0,0,10,1,0},20,2.0)==3.0);
+    assert(nb_path_sanitize_reorder_delay(123456)==123456);
+    assert(nb_path_sanitize_reorder_delay(UINT64_MAX)==0);
+    assert(nb_path_sanitize_reorder_gap(64)==64);
+    assert(nb_path_sanitize_reorder_gap(UINT64_MAX)==0);
     puts("RESULT PASS");return 0;
 }

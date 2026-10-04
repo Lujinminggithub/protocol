@@ -97,7 +97,7 @@ void nb_metrics_snapshot_add_stream(nb_metrics_snapshot_t* s,int flow_class,int 
 
 void nb_metrics_snapshot_add_link(nb_metrics_snapshot_t* s,double loss,uint64_t rtt,uint64_t jitter,uint64_t sent){
     if(s==NULL||sent==0)return;
-    s->link_samples++;s->link_sent_packets+=sent;
+    add_saturated(&s->link_samples,1);add_saturated(&s->link_sent_packets,sent);
     if(loss>s->link_effective_loss_max_pct)s->link_effective_loss_max_pct=loss;
     if(rtt>s->link_rtt_max_us)s->link_rtt_max_us=rtt;
     if(jitter>s->link_jitter_max_us)s->link_jitter_max_us=jitter;
@@ -107,13 +107,15 @@ void nb_metrics_snapshot_add_transport(nb_metrics_snapshot_t* s,const char* cc,u
     uint64_t lost,uint64_t spurious,uint64_t timer,uint64_t gap,uint64_t delay,
     uint64_t cwin,uint64_t inflight,uint64_t pacing,int blocked){
     if(s==NULL)return;
-    s->link_lost_total+=lost;s->link_spurious_total+=spurious;s->link_timer_loss_total+=timer;
+    add_saturated(&s->link_lost_total,lost);
+    add_saturated(&s->link_spurious_total,spurious);
+    add_saturated(&s->link_timer_loss_total,timer);
     if(gap>s->link_reorder_gap_max)s->link_reorder_gap_max=gap;
     if(delay>s->link_reorder_delay_max_us)s->link_reorder_delay_max_us=delay;
     if(cwin>s->link_cwin_max_bytes)s->link_cwin_max_bytes=cwin;
     if(inflight>s->link_bytes_in_flight_max)s->link_bytes_in_flight_max=inflight;
     if(pacing>s->link_pacing_rate_max)s->link_pacing_rate_max=pacing;
-    s->link_blocked_connections+=blocked!=0;
+    add_saturated(&s->link_blocked_connections,blocked!=0);
     if(s->link_cc[0]==0&&cc){snprintf(s->link_cc,sizeof(s->link_cc),"%s",cc);s->link_cc_state=state;}
 }
 

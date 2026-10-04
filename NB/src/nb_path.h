@@ -16,5 +16,7 @@ int nb_path_quality_sampled(const nb_path_quality_t* sample,uint64_t now_us,uint
 double nb_path_loss_score(const nb_path_quality_t* sample,uint64_t minimum_packets,double prior_pct);
 int nb_path_quality_better(const nb_path_quality_t* candidate,const nb_path_quality_t* current,
     uint64_t now_us,uint64_t max_age_us,uint64_t minimum_packets,double prior_pct);
+uint64_t nb_path_sanitize_reorder_delay(uint64_t value);
+uint64_t nb_path_sanitize_reorder_gap(uint64_t value);
 
 #endif

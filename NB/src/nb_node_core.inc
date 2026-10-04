@@ -631,7 +631,10 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
                 cp->recent_loss[slot],cp->recent_rtt[slot],cp->recent_rtt_var[slot],cp->recent_sent[slot]);
             if(cp->cnx[slot]){
                 picoquic_cnx_t* cnx=cp->cnx[slot];picoquic_path_quality_t quality;memset(&quality,0,sizeof(quality));
-                picoquic_get_default_path_quality(cnx,&quality);uint64_t cc_state=0,cc_parameter=0;
+                picoquic_get_default_path_quality(cnx,&quality);
+                quality.max_reorder_delay=nb_path_sanitize_reorder_delay(quality.max_reorder_delay);
+                quality.max_reorder_gap=nb_path_sanitize_reorder_gap(quality.max_reorder_gap);
+                uint64_t cc_state=0,cc_parameter=0;
                 picoquic_path_t* path=(cnx->nb_paths>0)?cnx->path[0]:NULL;
                 if(path&&path->congestion_alg_state&&cnx->congestion_alg&&cnx->congestion_alg->alg_observe)
                     cnx->congestion_alg->alg_observe(path,&cc_state,&cc_parameter);

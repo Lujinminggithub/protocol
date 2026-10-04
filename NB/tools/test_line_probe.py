@@ -103,6 +103,19 @@ def main() -> None:
     ])
     assert control_sample["sent"] == 1300 and control_sample["rtt"] == 5.1
     assert control_sample["reorder_gap"] == 4 and control_sample["block"] == 1
+    byte_fallback = control_link_sample([
+        {"link": {"samples": 1, "sent_packets": 2, "rtt_max_us": 4500,
+                  "jitter_max_us": 600, "effective_loss_max_pct": 0.1,
+                  "spurious_total": 0, "reorder_gap_max": 1,
+                  "reorder_delay_max_us": 12000}},
+        {"bytes": {"c2s": 1200000, "s2c": 0},
+         "link": {"samples": 1, "sent_packets": 2, "rtt_max_us": 4500,
+                  "jitter_max_us": 600, "effective_loss_max_pct": 0.1,
+                  "spurious_total": 0, "reorder_gap_max": 1,
+                  "reorder_delay_max_us": 12000}},
+    ], previous_bytes=0)
+    assert byte_fallback["sent"] >= 1000
+    assert byte_fallback["bytes_delta"] == 1200000
     remote = parse_entry_probe_output([
         'NBPROBE_PROGRESS {"elapsed_s":5,"sent_bytes":625000,"achieved_mbps":1}',
         'NBPROBE_RESULT {"bytes":625000,"elapsed_s":5,"achieved_mbps":1,'

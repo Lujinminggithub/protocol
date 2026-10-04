@@ -41,6 +41,17 @@ int main(void){
     nb_metrics_snapshot_add_transport(&snapshot,"bbr",2,10,4,2,24,100000,1000,500,9000,1);
     nb_metrics_snapshot_add_seed(&snapshot,1,281000,393216);
     assert(snapshot.link_samples==1&&snapshot.link_effective_loss_max_pct==3.5);
+    nb_metrics_snapshot_t saturated_snapshot={0};
+    nb_metrics_snapshot_add_link(&saturated_snapshot,0,0,0,UINT64_MAX);
+    nb_metrics_snapshot_add_link(&saturated_snapshot,0,0,0,1);
+    nb_metrics_snapshot_add_transport(&saturated_snapshot,"bbr",0,UINT64_MAX,UINT64_MAX,UINT64_MAX,
+        UINT64_MAX,UINT64_MAX,0,0,0,1);
+    nb_metrics_snapshot_add_transport(&saturated_snapshot,"bbr",0,1,1,1,0,0,0,0,0,1);
+    assert(saturated_snapshot.link_samples==2&&saturated_snapshot.link_sent_packets==UINT64_MAX);
+    assert(saturated_snapshot.link_lost_total==UINT64_MAX&&
+        saturated_snapshot.link_spurious_total==UINT64_MAX&&
+        saturated_snapshot.link_timer_loss_total==UINT64_MAX&&
+        saturated_snapshot.link_blocked_connections==2);
     assert(state.close_total==4&&state.close_timeout==1&&state.close_error==1&&state.close_reset==1&&state.close_normal==1);
     nb_metrics_fec_t fec={.observe=1,.active=0,.tx_blocks=2,.rx_blocks=3,
         .recovered=4,.nack=5,.retx=6};char json[4096];
