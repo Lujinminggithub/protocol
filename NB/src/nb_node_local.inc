@@ -40,6 +40,8 @@ static int entry_accept_one(void){
       int parsed = (parse_target_from_route(G.route_str, thost, sizeof(thost), &tport) == 0);
       if(parsed) flow_policy_for_host(thost, tport, &pol);
       else nb_flow_policy_default(&pol);
+      if(parsed&&ps_internal_probe_target(thost,tport)){p->probe_traffic=1;p->probe_mode=3;}
+      else ps_metrics_business_open(p);
       int prio = pol.prio;
       log4c_info("entry id=%u classify fixed route=%s host=%s port=%d class=%s lane=%s fec=%s rule=%s prio=%d",
         p->id, G.route_str, parsed ? thost : "-", parsed ? tport : 0,
@@ -184,6 +186,7 @@ static void socks_handshake(proxy_stream_t* p){
                 uint8_t r[10]={0x05,0x01,0,0x01,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);
                 ps_set_close_reason(p,"udp-associate-epoll-fail");ps_free(p);return;
             }
+            ps_metrics_business_open(p);
             uint16_t relay_port=ntohs(bind_addr.sin_port);struct in_addr relay_addr={0};
             if(g_socks_udp_advertise_configured)relay_addr=g_socks_udp_advertise_addr;
             else {struct sockaddr_in local;socklen_t local_len=sizeof(local);memset(&local,0,sizeof(local));
@@ -209,6 +212,7 @@ static void socks_handshake(proxy_stream_t* p){
                 p->id,p->peer_addr,socks_cmd_name(cmd),cmd,socks_atyp_name(atyp),atyp,host,port);
             uint8_t r[10]={0x05,0x07,0,0x01,0,0,0,0,0,0}; (void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);
             ps_set_close_reason(p,"socks-unsupported-command");ps_free(p);return; }
+        if(ps_internal_probe_target(host,port))p->probe_traffic=1;
         if(g_tenants_enabled&&nb_tenant_acquire(&g_tenants,p->tenant_index,0,picoquic_current_time())!=0){uint8_t r[10]={5,2,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"tenant-tcp-quota");ps_free(p);return;}p->tenant_acquired=g_tenants_enabled;
         if(!whitelist_allowed(host,port)){ /* 白名单外 -> 拒绝(0x02 not allowed by ruleset), 不占三跳线路 */
             log4c_debug("entry id=%u BLOCKED %s:%d (not in whitelist)",p->id,host,port);
@@ -216,9 +220,9 @@ static void socks_handshake(proxy_stream_t* p){
         nb_flow_policy_t pol; flow_policy_for_host(host, port, &pol);
         const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(p->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
         if(G.exit_routes_enabled&&!selected){uint8_t r[10]={5,1,0,1,0,0,0,0,0,0};(void)send(p->tcp_fd,r,10,MSG_NOSIGNAL);ps_set_close_reason(p,"no-healthy-route");ps_free(p);return;}if(selected){p->route_index=nb_routes_acquire(&G.exit_routes,selected);if(p->route_index<0){ps_free(p);return;}}
-        if(port==NB_PROBE_PORT&&(!strcasecmp(host,NB_PROBE_SINK_HOST)||!strcasecmp(host,NB_PROBE_ECHO_HOST)||
-            !strcasecmp(host,NB_PROBE_SOURCE_HOST)))
+        if(p->probe_traffic){
             p->probe_mode=3; /* entry 等待探针响应 FIN，不能在客户端半关闭后立即拆流 */
+        }else ps_metrics_business_open(p);
         uint8_t rep[10]={0x05,0x00,0x00,0x01,0,0,0,0,0,0}; /* 成功, BND 全 0 */
         (void)send(p->tcp_fd,rep,10,MSG_NOSIGNAL);
         memmove(p->socks_buf,p->socks_buf+need,p->socks_len-need); p->socks_len-=need;
@@ -347,6 +351,7 @@ static proxy_stream_t* udp_entry_child_get(proxy_stream_t* parent,const char* ho
     p->udp_session_id=udp_session_id_new();p->down_pool_id=0;
     if(p->udp_session_id==0||G.pool_count<=0||udp_reassembly_ensure(p)!=0){if(reject_reason!=NULL)*reject_reason="child-init";ps_set_close_reason(p,"udp-child-init-fail");ps_free(p);return NULL;}
     snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);p->udp_target_port=port;
+    if(nb_udp_probe_echo_target(host,port))p->probe_traffic=1;else ps_metrics_business_open(p);
     ps_index_refresh(p);
     const nb_route_entry_t* selected=G.exit_routes_enabled?nb_routes_pick_key(&G.exit_routes,nb_routes_hash(parent->tenant_name,host,(uint16_t)port),picoquic_current_time()):NULL;
     if(G.exit_routes_enabled&&!selected){if(reject_reason!=NULL)*reject_reason="no-healthy-route";ps_set_close_reason(p,"udp-no-healthy-route");ps_free(p);return NULL;}if(selected){p->route_index=nb_routes_acquire(&G.exit_routes,selected);if(p->route_index<0){if(reject_reason!=NULL)*reject_reason="route-capacity";ps_set_close_reason(p,"udp-route-capacity");ps_free(p);return NULL;}}

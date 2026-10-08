@@ -118,7 +118,7 @@ Only a successful `node.release.build` operation activates the uploaded source
 tree and exposes its immutable `release_id`, Node version, source digest and
 binary SHA256. Git information is included when available. Failed validation or build leaves the active source unchanged.
 When a verified candidate exists, every `line.open` request must acknowledge
-that exact release; the browser shows `V200R001C00` (`2.1.0`) and the release ID
+that exact release; the browser shows `V200R001C01` (`2.1.1`) and the release ID
 before submission.
 
 Existing lines can remain fixed in the worker's ignored private registry

@@ -7,10 +7,10 @@
 
 int main(int argc,char** argv){
 #ifndef NB_VERSION_PRODUCT
-#define NB_VERSION_PRODUCT "V200R001C00"
+#define NB_VERSION_PRODUCT "V200R001C01"
 #endif
 #ifndef NB_VERSION_SEMANTIC
-#define NB_VERSION_SEMANTIC "2.1.0"
+#define NB_VERSION_SEMANTIC "2.1.1"
 #endif
     if(argc==2&&(!strcmp(argv[1],"--version")||!strcmp(argv[1],"-V"))){
         printf("Newbility Node %s (%s)\n",NB_VERSION_PRODUCT,NB_VERSION_SEMANTIC);return 0;

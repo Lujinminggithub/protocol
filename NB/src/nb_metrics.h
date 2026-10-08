@@ -9,6 +9,11 @@
 typedef struct {
     uint64_t bytes_c2s;
     uint64_t bytes_s2c;
+    uint64_t probe_bytes_c2s;
+    uint64_t probe_bytes_s2c;
+    uint64_t probe_close_total;
+    uint64_t business_sessions_active;
+    uint64_t business_sessions_peak;
     uint64_t close_total;
     uint64_t close_normal;
     uint64_t close_timeout;
@@ -58,6 +63,9 @@ typedef struct {
     uint64_t first_s2c_wait_max_us;
     uint64_t bytes_c2s;
     uint64_t bytes_s2c;
+    uint64_t probe_sessions;
+    uint64_t probe_bytes_c2s;
+    uint64_t probe_bytes_s2c;
     uint64_t queue_down_bytes;
     uint64_t queue_up_bytes;
     uint64_t queue_q2t_bytes;
@@ -106,6 +114,11 @@ typedef struct {
 void nb_metrics_note_close(nb_metrics_state_t* state, const char* reason);
 void nb_metrics_note_traffic(nb_metrics_state_t* state, uint64_t bytes_c2s,
     uint64_t bytes_s2c);
+void nb_metrics_note_probe_traffic(nb_metrics_state_t* state, uint64_t bytes_c2s,
+    uint64_t bytes_s2c);
+void nb_metrics_note_probe_close(nb_metrics_state_t* state);
+void nb_metrics_note_business_open(nb_metrics_state_t* state);
+void nb_metrics_note_business_close(nb_metrics_state_t* state);
 void nb_metrics_note_loop(nb_metrics_state_t* state, uint64_t busy_us, uint64_t wake_late_us);
 void nb_metrics_note_udp_error(nb_metrics_state_t* state, int transmit);
 void nb_metrics_note_udp_rxq_overflow(nb_metrics_state_t* state, uint64_t dropped);
@@ -124,6 +137,8 @@ void nb_metrics_snapshot_add_stream(nb_metrics_snapshot_t* snapshot, int flow_cl
     size_t queue_down, size_t queue_up, size_t queue_q2t,
     uint64_t age_down_us, uint64_t age_up_us, uint64_t age_q2t_us,
     uint64_t first_c2s_wait_us, uint64_t first_s2c_wait_us);
+void nb_metrics_snapshot_add_probe(nb_metrics_snapshot_t* snapshot,
+    uint64_t bytes_c2s, uint64_t bytes_s2c);
 void nb_metrics_snapshot_add_link(nb_metrics_snapshot_t* snapshot, double effective_loss_pct,
     uint64_t rtt_us, uint64_t jitter_us, uint64_t sent_packets);
 void nb_metrics_snapshot_add_transport(nb_metrics_snapshot_t* snapshot,const char* cc,uint64_t cc_state,

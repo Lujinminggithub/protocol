@@ -22,6 +22,18 @@ static proxy_stream_t* ps_alloc(void){
     return NULL;
 }
 static void ps_touch(proxy_stream_t* p){ p->last_active=picoquic_current_time(); }
+static int ps_internal_probe_target(const char* host,int port){
+    return port==NB_PROBE_PORT&&host!=NULL&&(!strcasecmp(host,NB_PROBE_SINK_HOST)||
+        !strcasecmp(host,NB_PROBE_ECHO_HOST)||!strcasecmp(host,NB_PROBE_SOURCE_HOST));
+}
+static void ps_metrics_business_open(proxy_stream_t* p){
+    if(p!=NULL&&!p->probe_traffic&&!p->metrics_business_open){
+        p->metrics_business_open=1;nb_metrics_note_business_open(&g_metrics_state);}
+}
+static void ps_metrics_business_close(proxy_stream_t* p){
+    if(p!=NULL&&p->metrics_business_open){
+        p->metrics_business_open=0;nb_metrics_note_business_close(&g_metrics_state);}
+}
 static void instance_queue_release(size_t length){
     if((uint64_t)length>=nb_current_instance->queue_bytes)nb_current_instance->queue_bytes=0;
     else nb_current_instance->queue_bytes-=(uint64_t)length;
@@ -120,6 +132,7 @@ static int logical_entry_init(proxy_stream_t* p){
 
 static void ps_release_rebind_shell(proxy_stream_t* shell){
     if(shell==NULL||!shell->in_use)return;
+    ps_metrics_business_close(shell);
     g_memory_released_pending+=ps_dynamic_capacity(shell);
     nb_session_index_remove_value(&g_session_index,shell);
     nb_ring_dispose(&shell->down_tx);nb_ring_dispose(&shell->up_tx);nb_ring_dispose(&shell->q2t);
@@ -231,8 +244,11 @@ static void ps_free(proxy_stream_t* p){
     if(g_tenants_enabled&&p->tenant_index>=0){nb_tenant_account(&g_tenants,p->tenant_index,p->bytes_c2s-p->tenant_accounted_up,p->bytes_s2c-p->tenant_accounted_down);if(p->tenant_acquired)nb_tenant_release(&g_tenants,p->tenant_index,p->tenant_udp);}
     /* Business-session lifetime is not a route-health signal. Active probes own health updates. */
     if(G.role==ROLE_ENTRY&&p->route_index>=0)nb_routes_finish_session(&G.exit_routes,(size_t)p->route_index);
-    nb_metrics_note_traffic(&g_metrics_state,p->bytes_c2s,p->bytes_s2c);
-    nb_metrics_note_close(&g_metrics_state,p->close_reason);
+    if(p->probe_traffic){nb_metrics_note_probe_traffic(&g_metrics_state,p->bytes_c2s,p->bytes_s2c);
+        nb_metrics_note_probe_close(&g_metrics_state);}
+    else{nb_metrics_note_traffic(&g_metrics_state,p->bytes_c2s,p->bytes_s2c);
+        nb_metrics_note_close(&g_metrics_state,p->close_reason);}
+    ps_metrics_business_close(p);
     if(p->udp_mode && !p->udp_association){
         log4c_info("%s udp flow close id=%u usid=%u reason=%s age=%.1fms packets=%llu/%llu bytes=%llu/%llu pressure_drop=%llu milestones_ms=local_c2s:%.1f,c2s_rx:%.1f,c2s_prepare:%.1f,target_ready:%.1f,target_send:%.1f,target_rx:%.1f,s2c_rx:%.1f,s2c_prepare:%.1f,local_s2c:%.1f target=%s:%d route=%s",
             role_name(G.role),p->id,p->udp_session_id,p->close_reason,

@@ -15,6 +15,25 @@ void nb_metrics_note_traffic(nb_metrics_state_t* state,uint64_t bytes_c2s,uint64
     add_saturated(&state->bytes_s2c,bytes_s2c);
 }
 
+void nb_metrics_note_probe_traffic(nb_metrics_state_t* state,uint64_t bytes_c2s,uint64_t bytes_s2c){
+    if(state==NULL)return;
+    add_saturated(&state->probe_bytes_c2s,bytes_c2s);
+    add_saturated(&state->probe_bytes_s2c,bytes_s2c);
+}
+
+void nb_metrics_note_probe_close(nb_metrics_state_t* state){if(state)add_saturated(&state->probe_close_total,1);}
+
+void nb_metrics_note_business_open(nb_metrics_state_t* state){
+    if(state==NULL)return;
+    add_saturated(&state->business_sessions_active,1);
+    if(state->business_sessions_active>state->business_sessions_peak)
+        state->business_sessions_peak=state->business_sessions_active;
+}
+
+void nb_metrics_note_business_close(nb_metrics_state_t* state){
+    if(state&&state->business_sessions_active>0)state->business_sessions_active--;
+}
+
 void nb_metrics_note_close(nb_metrics_state_t* state,const char* reason){
     if(state==NULL)return;
     state->close_total++;
@@ -71,7 +90,15 @@ void nb_metrics_snapshot_init(nb_metrics_snapshot_t* snapshot,const nb_metrics_s
     snapshot->sessions=sessions;snapshot->sessions_peak=sessions_peak;
     snapshot->pools=pools;snapshot->exit_routes=exit_routes;
     if(state){snapshot->lifetime=*state;snapshot->bytes_c2s=state->bytes_c2s;
-        snapshot->bytes_s2c=state->bytes_s2c;}
+        snapshot->bytes_s2c=state->bytes_s2c;snapshot->probe_bytes_c2s=state->probe_bytes_c2s;
+        snapshot->probe_bytes_s2c=state->probe_bytes_s2c;}
+}
+
+void nb_metrics_snapshot_add_probe(nb_metrics_snapshot_t* s,uint64_t bytes_c2s,uint64_t bytes_s2c){
+    if(s==NULL)return;
+    add_saturated(&s->probe_sessions,1);
+    add_saturated(&s->probe_bytes_c2s,bytes_c2s);
+    add_saturated(&s->probe_bytes_s2c,bytes_s2c);
 }
 
 void nb_metrics_snapshot_add_stream(nb_metrics_snapshot_t* s,int flow_class,int udp_mode,
@@ -141,6 +168,7 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         "\"exit_connectivity\":{\"dns_requests\":%llu,\"dns_failures\":%llu,\"dns_private_rejected\":%llu,\"dns_latency_max_us\":%llu,\"target_connect_timeouts\":%llu,\"target_connect_latency_max_us\":%llu},"
         "\"first_byte_wait_max_us\":{\"c2s\":%llu,\"s2c\":%llu},"
         "\"bytes\":{\"c2s\":%llu,\"s2c\":%llu},"
+        "\"probe\":{\"sessions\":%llu,\"closed\":%llu,\"bytes\":{\"c2s\":%llu,\"s2c\":%llu}},"
         "\"queue_bytes\":{\"down\":%llu,\"up\":%llu,\"q2t\":%llu},"
         "\"queue_age_max_us\":{\"down\":%llu,\"up\":%llu,\"q2t\":%llu},"
         "\"link\":{\"samples\":%llu,\"sent_packets\":%llu,\"effective_loss_max_pct\":%.3f,\"rtt_max_us\":%llu,\"jitter_max_us\":%llu,"
@@ -167,6 +195,9 @@ int nb_metrics_render_json(char* out,size_t cap,const char* role,const char* wor
         (unsigned long long)s->lifetime.target_connect_timeouts,(unsigned long long)s->lifetime.target_connect_latency_max_us,
         (unsigned long long)s->first_c2s_wait_max_us,(unsigned long long)s->first_s2c_wait_max_us,
         (unsigned long long)s->bytes_c2s,(unsigned long long)s->bytes_s2c,
+        (unsigned long long)s->probe_sessions,(unsigned long long)s->lifetime.probe_close_total,
+        (unsigned long long)s->probe_bytes_c2s,
+        (unsigned long long)s->probe_bytes_s2c,
         (unsigned long long)s->queue_down_bytes,(unsigned long long)s->queue_up_bytes,(unsigned long long)s->queue_q2t_bytes,
         (unsigned long long)s->queue_down_age_max_us,(unsigned long long)s->queue_up_age_max_us,(unsigned long long)s->queue_q2t_age_max_us,
         (unsigned long long)s->link_samples,(unsigned long long)s->link_sent_packets,s->link_effective_loss_max_pct,

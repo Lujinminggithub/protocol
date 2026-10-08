@@ -17,9 +17,10 @@ static proxy_stream_t* udp_exit_open(picoquic_cnx_t* cnx,const nb_udp_wire_view_
     snprintf(p->route,sizeof(p->route),"%s",routed);snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",host);
     p->udp_target_port=port;p->target_port=port;nb_flow_policy_t pol;flow_policy_for_host(host,port,&pol);apply_flow_policy(p,&pol);
     if(internal_echo){
-        p->probe_mode=2;p->target_connect_state=2;p->udp_target_ready_at=picoquic_current_time();
+        p->probe_traffic=1;p->probe_mode=2;p->target_connect_state=2;p->udp_target_ready_at=picoquic_current_time();
         log4c_info("exit UDP 内部回显就绪 id=%u usid=%u target=%s:%d",p->id,p->udp_session_id,host,port);
     }else{
+        ps_metrics_business_open(p);
         if(dns_submit(p->id,host,port)!=0){ps_set_close_reason(p,"udp-dns-queue-full");ps_free(p);return NULL;}
         p->dns_pending=1;
     }
@@ -265,7 +266,7 @@ static void yfe2_receive_parity(picoquic_cnx_t* cnx,const uint8_t* wire,size_t l
         log4c_warn("exit NB YFE2 parity 拒绝 length=%zu",length);return;
     }
     proxy_stream_t* p=ps_find_udp_up(cnx,parity.session_id);if(p==NULL||
-        p->flow_class!=NB_FLOW_CLASS_MEDIA||p->probe_mode)return;
+        p->flow_class!=NB_FLOW_CLASS_MEDIA||p->probe_traffic)return;
     if(p->yfe2_rx==NULL)p->yfe2_rx=nb_yfe2_rx_create();
     if(p->yfe2_rx==NULL)return;
     nb_yfe2_recovered_t recovered[NB_YFE2_BURST_PARITY];size_t count=0;
@@ -718,17 +719,18 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
             if(c==NULL||thost[0]==0||tport<=0||tport>65535){log4c_error("id=%u malformed target route",p->id);ps_teardown(p);return -1;}
             { nb_flow_policy_t target_pol; flow_policy_for_host(thost,tport,&target_pol); apply_flow_policy(p,&target_pol); }
             if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_SINK_HOST)){
-                p->probe_mode=1;p->probe_hash=NB_PROBE_HASH_INITIAL;p->target_connect_state=2;
+                p->probe_traffic=1;p->probe_mode=1;p->probe_hash=NB_PROBE_HASH_INITIAL;p->target_connect_state=2;
                 log4c_info("exit internal probe start id=%u mode=sink",p->id);
             }else if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_ECHO_HOST)){
-                p->probe_mode=2;p->target_connect_state=2;
+                p->probe_traffic=1;p->probe_mode=2;p->target_connect_state=2;
             }else if(tport==NB_PROBE_PORT&&!strcasecmp(thost,NB_PROBE_SOURCE_HOST)){
-                p->probe_mode=4;p->probe_hash=NB_PROBE_HASH_INITIAL;p->target_connect_state=2;
+                p->probe_traffic=1;p->probe_mode=4;p->probe_hash=NB_PROBE_HASH_INITIAL;p->target_connect_state=2;
                 log4c_info("exit internal probe start id=%u mode=downlink-source",p->id);
             }else if(!whitelist_allowed(thost,tport)){ /* 白名单外 -> 拒绝(reset stream), 出口访问控制 */
                 log4c_debug("exit id=%u BLOCKED %s:%d (not in whitelist)",p->id,thost,tport);
                 ps_teardown(p); return -1; }
             if(!p->probe_mode){
+                ps_metrics_business_open(p);
                 if(dns_submit(p->id,thost,tport)!=0){ log4c_error("id=%u dns queue full %s:%d",p->id,thost,tport);
                     ps_teardown(p); return -1; }
                 p->dns_pending=1; p->target_port=tport;
@@ -743,9 +745,11 @@ static int on_up_data(proxy_stream_t** stream, uint8_t* bytes, size_t len, int f
             nport=worker_lane_port(nport);if(nport<1){ps_teardown_reason(p,"worker-lane-port");return -1;}
             struct sockaddr_storage naddr; int is_name=0;
             nb_flow_policy_t pol;
-            char thost[256]; int tport=0;
-            if(parse_target_from_route(rest[0]?rest:"", thost, sizeof(thost), &tport) == 0) flow_policy_for_host(thost, tport, &pol);
-            else nb_flow_policy_default(&pol);
+            char thost[256]={0}; int tport=0;
+            int target_ok=parse_target_from_route(rest[0]?rest:"", thost, sizeof(thost), &tport)==0;
+            if(target_ok)flow_policy_for_host(thost, tport, &pol);else nb_flow_policy_default(&pol);
+            if(target_ok&&ps_internal_probe_target(thost,tport))p->probe_traffic=1;
+            else ps_metrics_business_open(p);
             if(!pol.matched) pol.prio = prio; /* 未命中 TikTok 规则时，回退使用上游携带的优先级 */
             if(picoquic_get_server_address(nhost,nport,&naddr,&is_name)!=0){
                 log4c_error("id=%u resolve nexthop %s:%d fail",p->id,nhost,nport);
@@ -1120,7 +1124,7 @@ static int relay_quic_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t*
                             if(p->udp_fec_rx!=NULL)(void)nb_udp_fec_rx_note(p->udp_fec_rx,&view,picoquic_current_time());
                             yfe2_runtime=runtime_for_cnx(cnx,0);
                             if(!yfe2_source_noted&&G.role==ROLE_EXIT&&yfe2_runtime&&
-                                yfe2_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED&&!p->probe_mode){
+                                yfe2_runtime->yfe2_negotiation.state==NB_YFE2_NEG_ACCEPTED&&!p->probe_traffic){
                                 if(p->yfe2_rx==NULL)p->yfe2_rx=nb_yfe2_rx_create();
                                 if(p->yfe2_rx)(void)nb_yfe2_rx_note_source(p->yfe2_rx,
                                     yfe2_runtime->yfe2_generation,&view,picoquic_current_time());

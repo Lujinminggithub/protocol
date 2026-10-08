@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,13 +111,23 @@ func TestOptimizeUsesValidationStep(t *testing.T) {
 	runner := NewRunner(testRegistry(t, []string{"line.validate", "line.tune"}))
 	line := runner.registry.Lines[0]
 	steps, err := runner.steps(line, Operation{ID: "op-optimize", LineID: line.LineID, Kind: "line.optimize"}, requestValues{}, t.TempDir())
-	if err != nil || len(steps) != 1 || steps[0].Stage != "validate" || !slices.Contains(steps[0].Args, "--active") {
+	if err != nil || len(steps) != 2 || steps[0].Stage != "probe-preflight" ||
+		!slices.Contains(steps[0].Args, "--preflight") || steps[1].Stage != "validate" ||
+		!slices.Contains(steps[1].Args, "--active") {
 		t.Fatalf("optimize steps=%+v err=%v", steps, err)
 	}
-	if !slices.Contains(steps[0].Args, "--minimum-throughput-ratio") ||
-		!slices.Contains(steps[0].Args, "0.95") || !slices.Contains(steps[0].Args, "--duration") ||
-		!slices.Contains(steps[0].Args, "90") {
-		t.Fatalf("optimize qualification contract=%v", steps[0].Args)
+	if !slices.Contains(steps[1].Args, "--minimum-throughput-ratio") ||
+		!slices.Contains(steps[1].Args, "0.95") || !slices.Contains(steps[1].Args, "--duration") ||
+		!slices.Contains(steps[1].Args, "90") {
+		t.Fatalf("optimize qualification contract=%v", steps[1].Args)
+	}
+	for _, kind := range []string{"line.open", "line.validate", "line.optimize"} {
+		if !operationNeedsProbeCleanup(kind) {
+			t.Fatalf("%s did not require probe cleanup", kind)
+		}
+	}
+	if operationNeedsProbeCleanup("line.tune") {
+		t.Fatal("profile-only tune unexpectedly requires probe cleanup")
 	}
 }
 
@@ -130,6 +141,13 @@ with open(output,"w",encoding="utf-8") as handle:
 	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(script), 0600); err != nil {
 		t.Fatal(err)
 	}
+	cleanupMarker := filepath.Join(registry.StateDir, "probe-cleanup-rejected")
+	cleanupScript := `import pathlib
+pathlib.Path(` + strconv.Quote(cleanupMarker) + `).write_text("cleaned",encoding="utf-8")
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "probe_cleanup.py"), []byte(cleanupScript), 0600); err != nil {
+		t.Fatal(err)
+	}
 	runner := NewRunner(registry)
 	result, err := runner.Run(t.Context(), Operation{ID: "op-rejected", LineID: "line-1", Kind: "line.optimize"})
 	if err == nil || !strings.Contains(err.Error(), "insufficient-downlink") {
@@ -141,6 +159,56 @@ with open(output,"w",encoding="utf-8") as handle:
 	}
 	if _, statErr := os.Stat(filepath.Join(registry.StateDir, "op-rejected", "optimize-checkpoint.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("rejected validation created a tune checkpoint: %v", statErr)
+	}
+	if _, statErr := os.Stat(cleanupMarker); statErr != nil {
+		t.Fatalf("rejected validation did not clean probe sessions: %v", statErr)
+	}
+}
+
+func TestValidateCleansProbeSessionsAfterSuccess(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate"})
+	probe := `import json,sys
+output=sys.argv[sys.argv.index("--output")+1]
+with open(output,"w",encoding="utf-8") as handle: json.dump({"schema_version":2},handle)
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(probe), 0600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(registry.StateDir, "probe-cleanup-success")
+	cleanup := `import pathlib
+pathlib.Path(` + strconv.Quote(marker) + `).write_text("cleaned",encoding="utf-8")
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "probe_cleanup.py"), []byte(cleanup), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRunner(registry).Run(t.Context(), Operation{ID: "op-validate-cleanup", LineID: "line-1", Kind: "line.validate"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("successful validation did not clean probe sessions: %v", err)
+	}
+}
+
+func TestValidateFailsWhenProbeCleanupCannotBeConfirmed(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate"})
+	probe := `import json,sys
+output=sys.argv[sys.argv.index("--output")+1]
+with open(output,"w",encoding="utf-8") as handle: json.dump({"schema_version":2},handle)
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(probe), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := `import sys
+if "--preflight" not in sys.argv:
+ raise RuntimeError("probe sessions remain")
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "probe_cleanup.py"), []byte(cleanup), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewRunner(registry).Run(t.Context(), Operation{ID: "op-cleanup-failed", LineID: "line-1", Kind: "line.validate"})
+	if err == nil || result.Failure == nil || result.Failure.Stage != "probe-cleanup" ||
+		!strings.Contains(result.Failure.LogExcerpt, "probe sessions remain") {
+		t.Fatalf("cleanup failure was not enforced: err=%v result=%+v", err, result)
 	}
 }
 
@@ -674,15 +742,16 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 		t.Fatalf("dynamic line did not reject an out-of-range port in Chinese: %v", err)
 	}
 	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
-	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
+	if err != nil || len(steps) < 4 || steps[0].Stage != "probe-preflight" ||
+		steps[1].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
 		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)
 	}
-	for _, argument := range steps[0].Args {
+	for _, argument := range steps[1].Args {
 		if strings.Contains(argument, "private-key") {
 			t.Fatal("whitelist URL leaked into the command line")
 		}
 	}
-	provisionArgs := strings.Join(steps[1].Args, " ")
+	provisionArgs := strings.Join(steps[2].Args, " ")
 	if !strings.Contains(provisionArgs, "--upstream-mbps 6") || !strings.Contains(provisionArgs, "--downstream-mbps 14") {
 		t.Fatalf("provision command lost directional rates: %s", provisionArgs)
 	}

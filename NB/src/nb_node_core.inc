@@ -336,6 +336,7 @@ static int transport_outbound_pools_current(void);
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol);
 static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now);
 static int pool_udp_fec_refresh(cnx_pool_t* pool,uint64_t now);
+static void ps_teardown_reason(proxy_stream_t* p,const char* reason);
 #define parse_port_strict nb_bridge_parse_port
 #define parse_target_from_route nb_bridge_parse_target
 #define fec_parse_target_route nb_bridge_parse_target_exact
@@ -538,6 +539,19 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
         return snprintf(out,cap,"{\"error\":\"transport generation transition pending\"}\n");
     if(!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))
         return nb_transport_profile_render_status(&nb_current_instance->transport_profiles,out,cap);
+    if(!strcmp(command,"probe status")||!strcmp(command,"GET /probe")){
+        unsigned active=0;for(int i=0;i<MAX_CONN;i++)active+=G.streams[i].in_use&&G.streams[i].probe_traffic;
+        return snprintf(out,cap,"{\"status\":\"ok\",\"active\":%u}\n",active);
+    }
+    if(!strcmp(command,"probe cleanup")){
+        unsigned before=0,cleaned=0;
+        for(int i=0;i<MAX_CONN;i++)before+=G.streams[i].in_use&&G.streams[i].probe_traffic;
+        for(int i=0;i<MAX_CONN;i++)if(G.streams[i].in_use&&G.streams[i].probe_traffic){
+            ps_teardown_reason(&G.streams[i],"probe-cleanup");cleaned++;}
+        unsigned active=0;for(int i=0;i<MAX_CONN;i++)active+=G.streams[i].in_use&&G.streams[i].probe_traffic;
+        return snprintf(out,cap,"{\"status\":\"cleaned\",\"before\":%u,\"cleaned\":%u,\"active\":%u}\n",
+            before,cleaned,active);
+    }
     unsigned long long generation=0,fingerprint=0;char line_id[65],path[768];
     if(!strcmp(command,"tenant status")||!strcmp(command,"GET /tenant-policy")){
         char tenants[30000];int length=nb_tenants_render_json(&g_tenants,tenants,sizeof(tenants));
@@ -620,7 +634,8 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
     }
     if(!strcmp(command,"metrics")||!strcmp(command,"GET /metrics")){
         uint64_t now=picoquic_current_time();nb_metrics_snapshot_t snapshot;
-        nb_metrics_snapshot_init(&snapshot,&g_metrics_state,(uint64_t)g_ps_inuse,(uint64_t)g_ps_peak,
+        nb_metrics_snapshot_init(&snapshot,&g_metrics_state,g_metrics_state.business_sessions_active,
+            g_metrics_state.business_sessions_peak,
             (uint64_t)G.pool_count,(uint64_t)G.exit_routes.count);
         snapshot.sessions_limit=nb_current_instance->session_limit;
         snapshot.queue_bytes_used=nb_current_instance->queue_bytes;
@@ -649,6 +664,7 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
         }
         nb_fec_metrics_t fm=g_fec_metrics_done;
         uint64_t udp_fec_source=0,udp_fec_sent=0,udp_fec_received=0,udp_fec_recovered=0;
+        uint64_t business_queue_bytes=0;
         for(int i=0;i<MAX_CONN;i++){
             proxy_stream_t* p=&G.streams[i];if(!p->in_use)continue;
             size_t down=p->udp_mode?p->udp_down_tx_len:p->down_tx.len;
@@ -662,14 +678,21 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
                 nb_live_queue_age_us(&p->queue_clocks->q2t,p->q2t.len,now);
             uint64_t c2s_wait=(p->first_c2s_at?p->first_c2s_at:now)-p->created_at;
             uint64_t s2c_wait=(p->first_s2c_at?p->first_s2c_at:now)-p->created_at;
-            nb_metrics_snapshot_add_stream(&snapshot,(int)p->flow_class,p->udp_mode,p->tcp_connecting,
+            if(p->probe_traffic)nb_metrics_snapshot_add_probe(&snapshot,p->bytes_c2s,p->bytes_s2c);
+            else if(p->metrics_business_open)nb_metrics_snapshot_add_stream(&snapshot,(int)p->flow_class,p->udp_mode,p->tcp_connecting,
                 p->tcp_read_paused,p->upstream_fc_blocked,p->target_connect_state==3,p->bytes_c2s,p->bytes_s2c,
                 down,up,q2t,down_age,up_age,q2t_age,c2s_wait,s2c_wait);
+            if(p->metrics_business_open)business_queue_bytes+=(uint64_t)p->down_tx.len+(uint64_t)p->up_tx.len+
+                (uint64_t)p->q2t.len+(uint64_t)p->logical_tx.replay_length+(uint64_t)p->fec_dg_tx_len+
+                (uint64_t)p->fec_stage_tx_len+(uint64_t)p->udp_down_tx_len+(uint64_t)p->udp_up_tx_len+
+                (uint64_t)p->udp_pending_tx_len+(uint64_t)p->yfe2_parity_tx_len;
             if(p->fec_engine!=NULL)fec_metrics_add(&fm,nb_fec_metrics(p->fec_engine));
             udp_fec_source+=p->udp_fec_source_packets;udp_fec_sent+=p->udp_fec_repairs_sent;
             udp_fec_received+=p->udp_fec_repairs_received;udp_fec_recovered+=p->udp_fec_recovered;
         }
         int udp_fec_active=0;
+        snapshot.sessions_peak=g_metrics_state.business_sessions_peak;
+        snapshot.queue_bytes_used=business_queue_bytes;
         for(int pool=0;pool<G.pool_count;pool++)udp_fec_active|=G.pools[pool].udp_fec.active;
         nb_metrics_fec_t fec={.observe=g_fec_v15_observe,.active=g_fec_v15_active,
             .tx_blocks=fm.blocks_encoded,.rx_blocks=fm.blocks_delivered,

@@ -300,13 +300,16 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 	if lineState == "" {
 		lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
 	}
+	probePreflight := commandStep{Name: python, Stage: "probe-preflight", Args: []string{
+		filepath.Join(tools, "probe_cleanup.py"), "--preflight",
+	}}
 	switch operation.Kind {
 	case "line.open":
 		outputDir := filepath.Join(operationDir, "line-open")
 		if line.StateDir != "" {
 			outputDir = line.StateDir
 		}
-		result := []commandStep{}
+		result := []commandStep{probePreflight}
 		if line.WhitelistSourceEnv != "" {
 			result = append(result, commandStep{Name: python, Stage: "whitelist-fetch", Args: []string{filepath.Join(tools, "whitelist_sync.py"), "--source-env", line.WhitelistSourceEnv, "--mode", "auto", "--sing-box", line.SingBox, "--state-dir", filepath.Join(line.StateDir, "whitelist-sync"), "--output", line.WhitelistFile}})
 		}
@@ -321,7 +324,7 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 		}
 		return result, nil
 	case "line.validate", "line.optimize":
-		return []commandStep{{Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
+		return []commandStep{probePreflight, {Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64),
 			"--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
@@ -452,7 +455,79 @@ func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, r
 	return Result{LogFile: logPath, Message: "Node Release 构建并激活完成", NodeRelease: json.RawMessage(line)}, nil
 }
 
-func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
+func operationNeedsProbeCleanup(kind string) bool {
+	return kind == "line.open" || kind == "line.validate" || kind == "line.optimize"
+}
+
+func (r *Runner) cleanupProbes(operation Operation, logPath string) error {
+	var request requestValues
+	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
+		return errors.New("任务请求无效，无法清理主动探针")
+	}
+	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
+	line, ok := r.registry.Line(operation.LineID)
+	if !ok {
+		var err error
+		line, err = r.dynamicLine(operation, request, operationDir)
+		if err != nil {
+			return err
+		}
+	}
+	environment, err := r.environment(line)
+	if err != nil {
+		return err
+	}
+	args := []string{filepath.Join(r.registry.Root, "tools", "probe_cleanup.py")}
+	output := io.Discard
+	var logFile *os.File
+	if logPath != "" {
+		logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+		defer logFile.Close()
+		output = logFile
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return r.execute(cleanupCtx, commandStep{Name: r.registry.Python, Stage: "probe-cleanup", Args: args}, environment, output)
+}
+
+func appendCleanupDiagnostic(result *Result, cleanupErr error) {
+	line := redactFailureText("主动探针清理失败: " + cleanupErr.Error())
+	if result.LogFile != "" {
+		if logFile, err := os.OpenFile(result.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
+			_, _ = fmt.Fprintln(logFile, line)
+			_ = logFile.Close()
+		}
+	}
+	if result.Failure != nil {
+		if result.Failure.LogExcerpt != "" {
+			result.Failure.LogExcerpt += "\n"
+		}
+		result.Failure.LogExcerpt += line
+	}
+}
+
+func (r *Runner) Run(ctx context.Context, operation Operation) (result Result, runErr error) {
+	result, runErr = r.runOperation(ctx, operation)
+	if !operationNeedsProbeCleanup(operation.Kind) {
+		return result, runErr
+	}
+	cleanupErr := r.cleanupProbes(operation, result.LogFile)
+	if cleanupErr == nil {
+		return result, runErr
+	}
+	if runErr != nil {
+		appendCleanupDiagnostic(&result, cleanupErr)
+		return result, runErr
+	}
+	result.Failure = operationFailure("probe-cleanup", cleanupErr, result.LogFile)
+	result.Message = result.Failure.Summary
+	return result, cleanupErr
+}
+
+func (r *Runner) runOperation(ctx context.Context, operation Operation) (Result, error) {
 	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "正在准备任务"})
 	failPreparation := func(err error, result Result) (Result, error) {
 		result.Failure = operationFailure("prepare", err, result.LogFile)

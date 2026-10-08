@@ -311,6 +311,7 @@ def _act_build_local(git_info):
     if undeclared:
         raise RuntimeError("远程构建输入未覆盖 CMake 依赖: " + ", ".join(undeclared))
     for test in ["test_release.py", "test_deploy_transaction.py", "test_observe.py",
+                 "test_probe_cleanup.py",
                  "test_deploy_transfer.py", "test_line_control.py", "test_diag_bundle.py",
                  "test_line_probe.py", "test_line_provision.py", "test_line_open.py",
                  "test_supervisor.py", "test_shard_deploy.py", "test_media_reserve_deploy.py",
@@ -339,6 +340,8 @@ def _act_build_local(git_info):
         raise RuntimeError("控制面本地构建未生成 nb_node")
     BUILD_DIR.mkdir(exist_ok=True)
     shutil.copy2(binary, BUILD_DIR / "nb_node")
+    if nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS) != snapshot:
+        raise RuntimeError("控制面构建期间源码发生变化，产物已废弃")
     if REBUILD_PICOQUIC:
         local_prebuilt = ROOT / "third_party" / "picoquic" / "prebuilt" / PLATFORM
         local_prebuilt.mkdir(parents=True, exist_ok=True)
@@ -347,6 +350,7 @@ def _act_build_local(git_info):
             shutil.copy2(root / "third_party" / "picoquic" / "prebuilt" / PLATFORM / archive,
                          local_prebuilt / archive)
         PICOQUIC_STAMP.write_text(PICOQUIC_SOURCE_DIGEST, encoding="ascii")
+        snapshot = nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS)
     if nb_release.snapshot_inputs(ROOT, NODE_RELEASE_INPUTS) != snapshot:
         raise RuntimeError("控制面构建期间源码发生变化，产物已废弃")
     manifest = nb_release.create_manifest(ROOT, BUILD_DIR / "nb_node", PLATFORM,

@@ -13,6 +13,11 @@ int main(void){
     nb_metrics_note_udp_rxq_overflow(&state,7);
     nb_metrics_note_udp_queue_pressure_drop(&state,3);
     nb_metrics_note_traffic(&state,1000,2000);
+    nb_metrics_note_probe_traffic(&state,700,900);
+    nb_metrics_note_probe_close(&state);
+    nb_metrics_note_business_open(&state);
+    nb_metrics_note_business_open(&state);
+    nb_metrics_note_business_close(&state);
     nb_metrics_note_dns(&state,0,0,1200);
     nb_metrics_note_dns(&state,1,1,3400);
     nb_metrics_note_dns(&state,0,0,100);
@@ -30,11 +35,13 @@ int main(void){
     state.pool_quarantine_total=4;state.pool_mbb_promotions=2;
     state.pmtu_promotions=4;state.pmtu_fallbacks=1;
     nb_metrics_snapshot_t snapshot;
-    nb_metrics_snapshot_init(&snapshot,&state,2,4,1,1);
+    nb_metrics_snapshot_init(&snapshot,&state,2,state.business_sessions_peak,1,1);
     nb_metrics_snapshot_add_stream(&snapshot,2,1,0,1,1,0,100,200,10,20,30,1000,2000,3000,4000,5000);
     nb_metrics_snapshot_add_stream(&snapshot,1,0,1,0,0,1,300,400,5,6,7,500,600,700,1000,2000);
+    nb_metrics_snapshot_add_probe(&snapshot,500,600);
     assert(snapshot.media_sessions==1&&snapshot.ctrl_sessions==1&&snapshot.udp_sessions==1);
     assert(snapshot.bytes_c2s==1400&&snapshot.bytes_s2c==2600);
+    assert(snapshot.probe_sessions==1&&snapshot.probe_bytes_c2s==1200&&snapshot.probe_bytes_s2c==1500);
     assert(snapshot.queue_q2t_bytes==37&&snapshot.queue_q2t_age_max_us==3000);
     assert(snapshot.target_connect_failed==1&&snapshot.first_s2c_wait_max_us==5000);
     nb_metrics_snapshot_add_link(&snapshot,3.5,200000,12000,200);
@@ -63,6 +70,8 @@ int main(void){
     assert(strstr(json,"\"spurious_total\":4")!=NULL&&strstr(json,"\"cc\":\"bbr\"")!=NULL);
     assert(strstr(json,"\"pool_recovery\":{\"retired\":2,\"suppressed\":3,\"quarantined\":4,\"mbb_promotions\":2}")!=NULL);
     assert(strstr(json,"\"pmtu\":{\"promotions\":4,\"fallbacks\":1}")!=NULL);
+    assert(strstr(json,"\"probe\":{\"sessions\":1,\"closed\":1,\"bytes\":{\"c2s\":1200,\"s2c\":1500}}")!=NULL);
+    assert(strstr(json,"\"sessions_peak\":2")!=NULL);
     assert(strstr(json,"\"exit_connectivity\":{\"dns_requests\":3,\"dns_failures\":1,\"dns_private_rejected\":1,\"dns_latency_max_us\":3400,\"target_connect_timeouts\":1,\"target_connect_latency_max_us\":7000000}")!=NULL);
     nb_metrics_state_t empty_state={0};nb_metrics_snapshot_t empty_snapshot;
     nb_metrics_snapshot_init(&empty_snapshot,&empty_state,0,0,0,0);
