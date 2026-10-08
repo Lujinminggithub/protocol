@@ -19,7 +19,7 @@ def main() -> None:
     if args.out.exists() and not args.force:raise SystemExit(f"文件已存在，拒绝覆盖: {args.out}")
     if os.environ.get("NB_SSH_INSECURE")!="1":raise SystemExit("首次固定必须显式设置 NB_SSH_INSECURE=1")
     lines=[]
-    for role in ("entry","middle","exit"):
+    for role in reversed(deploy.deployment_roles()):
         host=deploy.LAB[role];client=deploy.connect(role);key=client.get_transport().get_remote_server_key();client.close()
         marker=host["host"] if int(host["port"])==22 else f"[{host['host']}]:{host['port']}"
         lines.append(f"{marker} {key.get_name()} {key.get_base64()}")

@@ -86,6 +86,18 @@ port 50021
 """
 
 
+def topology_mode():
+    value = str(LAB.get("topology_mode", "trihop") or "trihop")
+    if value not in ("trihop", "single_hk"):
+        raise ValueError("topology_mode 必须为 trihop 或 single_hk")
+    return value
+
+
+def deployment_roles():
+    """Roles in safe activation order."""
+    return ("exit", "entry") if topology_mode() == "single_hk" else ("exit", "middle", "entry")
+
+
 def _role_host(role):  # role -> dict
     return LAB[role]
 
@@ -652,7 +664,7 @@ def _require_local_build():
 
 def _require_security_material():
     required = [SECURITY_DIR / "ca.pem", SECURITY_DIR / "socks.users", SECURITY_DIR / "tenant.conf"]
-    required += [SECURITY_DIR / f"{role}.{ext}" for role in ("entry", "middle", "exit") for ext in ("pem", "key")]
+    required += [SECURITY_DIR / f"{role}.{ext}" for role in reversed(deployment_roles()) for ext in ("pem", "key")]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         sys.exit("缺少安全材料，请先运行 tools/security_setup.py:\n" + "\n".join(missing))
@@ -701,7 +713,8 @@ def _push_exit_routes(c, remote_path=None):
         name=str(item["name"]);host=str(item["host"]);port=int(item.get("port",4443));weight=int(item.get("weight",1))
         if item.get("fixed_exit",_role_host("exit")["name"])!=_role_host("exit")["name"]:
             raise ValueError(f"出口路由越过固定 exit: {item}")
-        if host!=str(_role_host("exit")["host"]) or port!=EXIT_PORT:
+        expected_host = "127.0.0.1" if topology_mode() == "single_hk" else str(_role_host("exit")["host"])
+        if host!=expected_host or port!=EXIT_PORT:
             raise ValueError(f"exit route/listener drift: route={host}:{port} listener={_role_host('exit')['host']}:{EXIT_PORT}")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or not 1<=port<=65535 or not 1<=weight<=1000:
             raise ValueError(f"非法出口路由配置: {item}")
@@ -778,12 +791,17 @@ def _role_fec_enabled(c, role):
 
 
 def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_id=None, exit_routes=None):
-    hk = _role_host("middle")
     kz = _role_host("exit")
     sec = _remote_security(role)
     rules = f"{INSTANCE_WORK}/releases/{release_id}/tiktok_flow_rules.conf" if release_id else _tiktok_rules_remote()
     base = f"{INSTANCE_WORK}/nb_node -r {role} -c {sec['cert']} -k {sec['key']} -a {sec['ca']} -F {rules}"
     if role == "entry":
+        if topology_mode() == "single_hk":
+            if not wl_remote:
+                raise ValueError("entry SOCKS 启动需要 whitelist 路径")
+            return (f"{base} -l {socks_port} -n 127.0.0.1 -N {EXIT_PORT} -S "
+                    f"-U {sec['users']} -Q {sec['tenants']} -W {wl_remote} -M ''")
+        hk = _role_host("middle")
         signal_direct=LAB.get("transport",{}).get("entry",{}).get("signal_direct",False)
         if not isinstance(signal_direct,bool):
             raise ValueError("transport.entry.signal_direct 必须为 true 或 false")
@@ -837,6 +855,10 @@ def _shard_instance_environment(role, release_id):
         "NB_TRANSPORT_LINE_ID": line_id,
         "NB_TRANSPORT_PROFILE_FILE": f"{INSTANCE_WORK}/transport-profiles/{role}-active.conf",
     }
+    if topology_mode() == "single_hk":
+        environment["NB_FEC_V15"] = "off"
+        environment["NB_FEC_V15_ACTIVE"] = "off"
+        environment["NB_TOPOLOGY_MODE"] = "single_hk"
     if cwin_max_bytes:
         environment["NB_CWIN_MAX_BYTES"] = str(cwin_max_bytes)
     if mtu_max:

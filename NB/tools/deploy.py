@@ -533,7 +533,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
         raise RuntimeError("部署前必须设置 NB_SOCKS_USERNAME 和 NB_SOCKS_PASSWORD，以便健康门禁完成端到端冒烟")
     gz = _role_host("entry")
     bindata = (BUILD_DIR / "nb_node").read_bytes()
-    roles = ("exit", "middle", "entry")
+    roles = deployment_roles()
     clients = {}
     previous = {}
     unit_backups = {}
@@ -550,10 +550,13 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
 
         previous["entry"] = _stage_entry_release(clients["entry"], manifest, bindata)
         print("control-plane -> entry: release staged and verified")
-        _copy_release_between_nodes(clients["entry"], "entry", clients["middle"], "middle", manifest)
-        previous["middle"] = _stage_release(clients["middle"], "middle", manifest)
-        _copy_release_between_nodes(clients["middle"], "middle", clients["exit"], "exit", manifest)
-        previous["exit"] = _stage_release(clients["exit"], "exit", manifest)
+        if topology_mode() == "single_hk":
+            previous["exit"] = _stage_release(clients["exit"], "exit", manifest)
+        else:
+            _copy_release_between_nodes(clients["entry"], "entry", clients["middle"], "middle", manifest)
+            previous["middle"] = _stage_release(clients["middle"], "middle", manifest)
+            _copy_release_between_nodes(clients["middle"], "middle", clients["exit"], "exit", manifest)
+            previous["exit"] = _stage_release(clients["exit"], "exit", manifest)
 
         for role in roles:
             unit_backups[role] = _backup_role_unit(clients[role], role, deployment_id)
@@ -587,9 +590,10 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
         print(f"exit: bind IP verified ({verified_exit_ip})")
         commands["exit"] = _node_command("exit", wl_remote=wl_remote, release_id=deployment_id)
 
-        cm = clients["middle"]
-        _push_security(cm, "middle"); _push_tiktok_rules(cm, release_rules)
-        commands["middle"] = _node_command("middle", release_id=deployment_id)
+        if topology_mode() == "trihop":
+            cm = clients["middle"]
+            _push_security(cm, "middle"); _push_tiktok_rules(cm, release_rules)
+            commands["middle"] = _node_command("middle", release_id=deployment_id)
 
         cg = clients["entry"]
         _push_security(cg, "entry"); _push_tiktok_rules(cg, release_rules)
@@ -659,7 +663,7 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
         for client in clients.values():
             client.close()
 
-    print(f"\n>>> 部署 {deployment_id} 已通过三节点健康门禁")
+    print(f"\n>>> 部署 {deployment_id} 已通过角色健康门禁")
     print(f">>> 手机配置: SOCKS5 -> {gz['host']}:{socks_port}，使用 NB_SOCKS_USERNAME 对应凭据")
 
 
@@ -672,7 +676,7 @@ def act_deploy_instance(deployment_id, socks_port=DEFAULT_SOCKS_PORT):
     _require_security_material()
     if not os.environ.get("NB_SOCKS_USERNAME") or not os.environ.get("NB_SOCKS_PASSWORD"):
         raise RuntimeError("线路实例部署需要 SOCKS 凭据完成端到端门禁")
-    roles = ("exit", "middle", "entry")
+    roles = deployment_roles()
     clients = {}
     activated = []
     locked = []
@@ -697,10 +701,11 @@ def act_deploy_instance(deployment_id, socks_port=DEFAULT_SOCKS_PORT):
         print(f"exit: bind IP verified ({verified_exit_ip})")
         commands["exit"] = _node_command("exit", wl_remote=exit_whitelist)
 
-        middle_client = clients["middle"]
-        _push_security(middle_client, "middle")
-        _push_tiktok_rules(middle_client)
-        commands["middle"] = _node_command("middle")
+        if topology_mode() == "trihop":
+            middle_client = clients["middle"]
+            _push_security(middle_client, "middle")
+            _push_tiktok_rules(middle_client)
+            commands["middle"] = _node_command("middle")
 
         entry_client = clients["entry"]
         _push_security(entry_client, "entry")
@@ -836,7 +841,7 @@ def _activate_existing_deployment(c, role, deployment_id):
 
 def act_current_deployment():
     current={}
-    for role in ("entry","middle","exit"):
+    for role in reversed(deployment_roles()):
         c=connect(role)
         try:current[role]=_remote_current_deployment(c,role)
         finally:c.close()
@@ -847,7 +852,7 @@ def act_rollback_socks(deployment_id,socks_port=DEFAULT_SOCKS_PORT):
     if not deployment_id:raise ValueError("rollback-socks 必须提供 --deployment-id")
     if not os.environ.get("NB_SOCKS_USERNAME") or not os.environ.get("NB_SOCKS_PASSWORD"):
         raise RuntimeError("精确回滚需要 SOCKS 凭据完成端到端门禁")
-    roles=("exit","middle","entry");clients={};origins={};locked=[];activated=[]
+    roles=deployment_roles();clients={};origins={};locked=[];activated=[]
     try:
         for role in roles:
             clients[role]=connect(role);origins[role]=_remote_current_deployment(clients[role],role)
@@ -924,6 +929,8 @@ def main():
     ap.add_argument("--ignore-unavailable", action="store_true")
     a = ap.parse_args()
     roles = [r.strip() for r in a.roles.split(",") if r.strip()]
+    if topology_mode() == "single_hk":
+        roles = [role for role in roles if role in ("entry", "exit")]
     if a.action == "recon": act_recon(roles)
     elif a.action == "build": act_build(roles)
     elif a.action == "prepare-release": act_prepare_release()

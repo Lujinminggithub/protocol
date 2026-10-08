@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -39,10 +40,15 @@ def _single(source: dict, key: str) -> dict:
     return copy.deepcopy(values[0])
 
 
-def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str, str]]:
-    """兼容 role 对象、machines[] 和 edges/relays/terminals 三种三机清单。"""
-    if all(isinstance(source.get(role), dict) for role in ROLES):
-        roles = {role: copy.deepcopy(source[role]) for role in ROLES}
+def normalize_hosts(source: dict, exit_port: int = 4443,
+                    topology_mode: str | None = None) -> tuple[dict, dict[str, str]]:
+    """Normalize legacy tri-hop or colocated Hong Kong Entry/Exit inventory."""
+    mode = str(topology_mode or source.get("topology_mode") or "trihop")
+    if mode not in ("trihop", "single_hk"):
+        raise ValueError("topology_mode 必须为 trihop 或 single_hk")
+    active_roles = ("entry", "exit") if mode == "single_hk" else ROLES
+    if all(isinstance(source.get(role), dict) for role in active_roles):
+        roles = {role: copy.deepcopy(source[role]) for role in active_roles}
     elif isinstance(source.get("machines"), list):
         roles = {}
         for machine in source["machines"]:
@@ -50,18 +56,21 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
             if role not in ROLES or role in roles:
                 raise ValueError(f"machines[] role 非法或重复: {role!r}")
             roles[role] = copy.deepcopy(machine)
-        if set(roles) != set(ROLES):
-            raise ValueError("machines[] 必须各包含一台 entry/middle/exit")
+        if set(roles) != set(active_roles):
+            raise ValueError("machines[] 角色与线路拓扑不一致")
     elif any(key in source for key in ("edges", "relays", "terminals")):
-        roles = {"entry": _single(source, "edges"),
-                 "middle": _single(source, "relays"),
-                 "exit": _single(source, "terminals")}
+        roles = {"entry": _single(source, "edges"), "exit": _single(source, "terminals")}
+        if mode == "trihop":
+            roles["middle"] = _single(source, "relays")
     else:
         raise ValueError("清单必须提供 entry/middle/exit、machines[] 或 edges/relays/terminals")
 
     credentials = {}
     normalized = {}
-    for role in ROLES:
+    if mode == "single_hk" and (roles["entry"].get("host"), int(roles["entry"].get("port", 22))) != (
+            roles["exit"].get("host"), int(roles["exit"].get("port", 22))):
+        raise ValueError("香港单节点线路的 Entry 和 Exit 必须是同一台香港设备")
+    for role in active_roles:
         host = roles[role]
         for key in ("host",):
             if not host.get(key):
@@ -80,13 +89,17 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
         host.pop("role", None)
         normalized[role] = host
 
-    result = {role: normalized[role] for role in ROLES}
+    result = {role: normalized[role] for role in active_roles}
+    result["topology_mode"] = mode
+    result["service_profile"] = str(source.get("service_profile") or "general")
+    if result["service_profile"] not in ("general", "tiktok_live"):
+        raise ValueError("service_profile 必须为 general 或 tiktok_live")
     for key in ("build_host", "release_retention", "workers", "transport", "paths", "exits", "client"):
         if key in source:
             result[key] = copy.deepcopy(source[key])
     result.setdefault("build_host", "entry")
     result.setdefault("release_retention", 5)
-    result.setdefault("workers", {"entry": 1, "middle": 1, "exit": 2})
+    result.setdefault("workers", {role: (2 if role == "exit" else 1) for role in active_roles})
     result.setdefault("paths", {"compile_dir": "/opt/compile", "work_dir": "/etc/NB",
                                 "picoquic": "/etc/NB/third_party/picoquic",
                                 "certs": "/etc/NB/certs"})
@@ -95,9 +108,10 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
         "cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1400,
         "udp_gso": False, "udp_port_min": 20000, "udp_port_max": 21023,
         "reorder_gap": 128, "reorder_delay_us": 450000})
-    result["transport"].setdefault("middle", {
-        "cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1400,
-        "udp_gso": False, "reorder_gap": 128, "reorder_delay_us": 450000})
+    if mode == "trihop":
+        result["transport"].setdefault("middle", {
+            "cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1400,
+            "udp_gso": False, "reorder_gap": 128, "reorder_delay_us": 450000})
     result["transport"].setdefault("exit", {
         "cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1400, "udp_gso": False,
         "dns_servers": ["1.1.1.1", "8.8.8.8"]})
@@ -111,12 +125,13 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
         raise ValueError("transport.exit.dns_servers must contain IPv4 addresses") from error
     if not result.get("exits"):
         result["exits"] = [{"name": f"{normalized['exit']['name']}-primary",
-                            "host": normalized["exit"]["host"],
+                            "host": "127.0.0.1" if mode == "single_hk" else normalized["exit"]["host"],
                             "port": exit_port, "weight": 1, "capacity": 512,
                             "fixed_exit": normalized["exit"]["name"]}]
     for route in result["exits"]:
         fixed_exit = route.get("fixed_exit", normalized["exit"]["name"])
-        if fixed_exit != normalized["exit"]["name"] or route.get("host") != normalized["exit"]["host"]:
+        expected_route_host = "127.0.0.1" if mode == "single_hk" else normalized["exit"]["host"]
+        if fixed_exit != normalized["exit"]["name"] or route.get("host") != expected_route_host:
             raise ValueError("exits[] must target the line's fixed exit device")
         route["fixed_exit"] = normalized["exit"]["name"]
         route["port"] = exit_port
@@ -125,12 +140,30 @@ def normalize_hosts(source: dict, exit_port: int = 4443) -> tuple[dict, dict[str
 
 def baseline_profile(hosts: dict, line_id: str, middle_port: int = 4443,
                      exit_port: int = 4443) -> dict:
-    entry, middle, exit_host = (hosts[role] for role in ROLES)
+    entry, exit_host = hosts["entry"], hosts["exit"]
+    mode = hosts.get("topology_mode", "trihop")
     transport = hosts["transport"]
     def selected(role: str) -> dict:
         keys = ("cc", "cwin_max_bytes", "bbr_options", "mtu_max",
                 "reorder_gap", "reorder_delay_us", "dns_servers")
         return {key: transport[role][key] for key in keys if key in transport[role]}
+    if mode == "single_hk":
+        return {
+            "schema_version": 1, "line_id": line_id, "status": "bootstrap-baseline",
+            "topology_mode": mode, "service_profile": hosts.get("service_profile", "general"),
+            "fixed_exit": exit_host["name"], "active_path": [entry["name"], exit_host["name"]],
+            "candidate_entries": [entry["name"]], "candidate_relays": [],
+            "transport": {"pool_size": 1, "workers": copy.deepcopy(hosts["workers"]),
+                "entry_exit": {"address": f"127.0.0.1:{exit_port}", **selected("entry")},
+                "exit": selected("exit"), "pacing": {"media_max_burst_mtu": 2, "gso": False},
+                "udp": {"control_grace_us": 120000000,
+                    "port_min": int(transport["entry"].get("udp_port_min", 20000)),
+                    "port_max": int(transport["entry"].get("udp_port_max", 21023))},
+                "fec": {"observe": False, "active": False, "codec": "off", "k": 0, "r": 0}},
+            "probe_policy": {"minimum_packets": 0, "minimum_valid_windows": 1,
+                "load_factor": 1.0, "auto_apply": False, "requires_canary": False},
+        }
+    middle = hosts["middle"]
     return {
         "schema_version": 1, "line_id": line_id, "status": "bootstrap-baseline",
         "fixed_exit": exit_host["name"],
@@ -319,7 +352,7 @@ def current_deployments(env: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def deployment_matches(env: dict, deployment_id: str) -> bool:
+def deployment_matches(env: dict, deployment_id: str, roles=ROLES) -> bool:
     if not deployment_id:
         return False
     try:
@@ -327,7 +360,7 @@ def deployment_matches(env: dict, deployment_id: str) -> bool:
     except Exception as error:
         print(f"checkpoint verification unavailable: {error}")
         return False
-    return all(current.get(role) == deployment_id for role in ROLES)
+    return all(current.get(role) == deployment_id for role in roles)
 
 
 def release_manifest_for(hosts_path: pathlib.Path, profile_path: pathlib.Path) -> dict | None:
@@ -373,6 +406,8 @@ def checkpoint_fingerprint(hosts_path: pathlib.Path, profile_path: pathlib.Path,
         "udp_port_max": args.udp_port_max,
         "instance_id": os.environ.get("NB_DEPLOY_INSTANCE", ""),
         "build_mode": args.build_mode,
+        "topology_mode": args.topology_mode,
+        "service_profile": args.service_profile,
         "hosts_sha256": sha256_file(hosts_path),
         "profile_sha256": sha256_file(profile_path),
         "source_tree_sha256": source_tree_digest(),
@@ -506,6 +541,8 @@ def main() -> None:
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--middle-port", type=int, default=int(os.environ.get("NB_MIDDLE_PORT", "4443")))
     parser.add_argument("--exit-port", type=int, default=int(os.environ.get("NB_EXIT_PORT", "4443")))
+    parser.add_argument("--topology-mode", choices=("trihop", "single_hk"), default="trihop")
+    parser.add_argument("--service-profile", choices=("general", "tiktok_live"), default="general")
     parser.add_argument("--udp-port-min", type=int, default=int(os.environ.get("NB_SOCKS_UDP_PORT_MIN", "20000")))
     parser.add_argument("--udp-port-max", type=int, default=int(os.environ.get("NB_SOCKS_UDP_PORT_MAX", "21023")))
     parser.add_argument("--client-username", default="nbmobile")
@@ -526,10 +563,13 @@ def main() -> None:
         parser.error("--upstream-mbps and --downstream-mbps must be between 1 and 1000")
     if not 1 <= args.socks_port <= 65535:
         raise SystemExit("--socks-port 非法")
-    if any(port < 1 or port > 65535 for port in (args.socks_port, args.middle_port, args.exit_port)):
+    ports = (args.socks_port, args.exit_port) if args.topology_mode == "single_hk" else (args.socks_port, args.middle_port, args.exit_port)
+    if any(port < 1 or port > 65535 for port in ports):
         raise SystemExit("line port is invalid")
     source = json.loads(args.hosts.resolve().read_text(encoding="utf-8"))
-    hosts, credentials = normalize_hosts(source, args.exit_port)
+    source["topology_mode"] = args.topology_mode
+    source["service_profile"] = args.service_profile
+    hosts, credentials = normalize_hosts(source, args.exit_port, args.topology_mode)
     if args.udp_port_min < 1024 or args.udp_port_max > 65535 or args.udp_port_min > args.udp_port_max:
         raise SystemExit("UDP relay range is invalid")
     hosts["transport"]["entry"]["udp_port_min"] = args.udp_port_min
@@ -561,10 +601,11 @@ def main() -> None:
     write_json(inventory_path, inventory)
     plan = {
         "schema_version": 2, "line_id": args.line_id, "package_mbps": args.package_mbps,
+        "topology_mode": args.topology_mode, "service_profile": args.service_profile,
         "upstream_mbps": args.upstream_mbps, "downstream_mbps": args.downstream_mbps,
         "qualification_mbps": args.package_mbps * 1.25, "socks_port": args.socks_port,
         "instance_id": os.environ.get("NB_DEPLOY_INSTANCE", ""),
-        "middle_port": args.middle_port, "exit_port": args.exit_port,
+        "middle_port": args.middle_port if args.topology_mode == "trihop" else 0, "exit_port": args.exit_port,
         "stages": ["pin-host-keys", "generate-security", "bootstrap-instance-deploy",
                    "active-quic-probe", "stable-instance-deploy", "tenant-policy-apply",
                    "client-output"],
@@ -577,7 +618,8 @@ def main() -> None:
         return
 
     env = os.environ.copy(); env.update(credentials)
-    missing = [hosts[role]["password_env"] for role in ROLES
+    active_roles = ("entry", "exit") if args.topology_mode == "single_hk" else ROLES
+    missing = [hosts[role]["password_env"] for role in active_roles
                if not env.get(hosts[role]["password_env"])]
     if missing:
         raise SystemExit("缺少 SSH 密码环境变量: " + ", ".join(missing))
@@ -587,7 +629,9 @@ def main() -> None:
                  "NB_SOCKS_USERNAME": args.client_username,
                  "NB_SOCKS_PASSWORD": client_password,
                  "NB_SOCKS_PORT": str(args.socks_port),
-                 "NB_MIDDLE_PORT": str(args.middle_port),
+                 "NB_TOPOLOGY_MODE": args.topology_mode,
+                 "NB_SERVICE_PROFILE": args.service_profile,
+                 "NB_MIDDLE_PORT": str(args.middle_port if args.topology_mode == "trihop" else 0),
                 "NB_EXIT_PORT": str(args.exit_port),
                 "NB_OPEN_CLIENT_PASSWORD": client_password,
                 "NB_SSH_INSECURE": "1"})
@@ -612,6 +656,21 @@ def main() -> None:
     fingerprint = checkpoint_fingerprint(bootstrap_hosts, bootstrap_profile, args)
     checkpoint = load_checkpoint(checkpoint_path, fingerprint)
     stages = checkpoint.setdefault("stages", {})
+
+    if args.topology_mode == "single_hk":
+        deployment_id = configuration_deployment_id(bootstrap_hosts, bootstrap_profile)
+        deploy_instance_with_retry(deployment_id, args.socks_port, env)
+        if not deployment_matches(env, deployment_id, active_roles):
+            raise RuntimeError("香港单节点部署完成但角色回读不一致")
+        line_dir = output / "provision" / args.line_id
+        line_dir.mkdir(parents=True, exist_ok=True)
+        authority = (urllib.parse.quote(args.client_username, safe="") + ":" +
+                     urllib.parse.quote(client_password, safe="") + "@" + hosts["entry"]["host"] +
+                     ":" + str(args.socks_port))
+        write_json(line_dir / "client.json", {"shadowrocket_url":
+                   f"socks5://{authority}#{urllib.parse.quote(args.line_id, safe='')}"}, private=True)
+        print(f"香港单节点线路开通完成；客户端配置: {line_dir / 'client.json'}")
+        return
 
     stable_stage = stages.get("stable_deploy") or {}
     stable_deployment = str(stable_stage.get("deployment_id") or "")

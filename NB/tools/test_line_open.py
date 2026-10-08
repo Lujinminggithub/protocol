@@ -33,6 +33,32 @@ def main() -> None:
     assert credentials["NB_SSH_PASSWORD_ENTRY"] == "e"
     assert hosts["exits"][0]["host"] == "192.0.2.3"
     assert hosts["transport"]["exit"]["dns_servers"] == ["1.1.1.1", "8.8.8.8"]
+    single_source = {
+        "topology_mode": "single_hk", "service_profile": "general",
+        "entry": {"name": "hk-1", "host": "192.0.2.20", "password": "same"},
+        "exit": {"name": "hk-1", "host": "192.0.2.20", "password": "same"},
+    }
+    single, single_credentials = normalize_hosts(single_source, exit_port=4450,
+                                                  topology_mode="single_hk")
+    assert single["topology_mode"] == "single_hk"
+    assert set(role for role in ("entry", "middle", "exit") if role in single) == {"entry", "exit"}
+    assert single["exits"][0]["host"] == "127.0.0.1"
+    assert single["exits"][0]["port"] == 4450
+    assert set(single["workers"]) == {"entry", "exit"}
+    assert set(single_credentials) == {"NB_SSH_PASSWORD_ENTRY", "NB_SSH_PASSWORD_EXIT"}
+    single_profile = baseline_profile(single, "hk-single", exit_port=4450)
+    assert single_profile["active_path"] == ["hk-1", "hk-1"]
+    assert "entry_middle" not in single_profile["transport"]
+    assert single_profile["transport"]["entry_exit"]["address"] == "127.0.0.1:4450"
+    assert single_profile["transport"]["fec"]["active"] is False
+    assert single_profile["transport"]["fec"]["observe"] is False
+    try:
+        normalize_hosts({**single_source, "exit": {"name": "hk-2", "host": "192.0.2.21",
+                                                    "password": "other"}}, topology_mode="single_hk")
+    except ValueError as error:
+        assert "同一台香港设备" in str(error)
+    else:
+        raise AssertionError("single_hk accepted different physical devices")
     custom_dns_source = dict(source)
     custom_dns_source["transport"] = {"exit": {"dns_servers": ["9.9.9.9"]}}
     custom_dns, _ = normalize_hosts(custom_dns_source)
