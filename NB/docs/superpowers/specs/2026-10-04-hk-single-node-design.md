@@ -74,12 +74,9 @@ service_profile = "general" | "tiktok_live"
 
 ### FEC
 
-FEC 仅保护客户端到香港节点的公网段。单节点模式不得产生中继方向的 FEC 协商、repair 或 recovered 计数。FEC 策略由 `service_profile` 和线路级配置共同决定：通用线路默认 `observe` 或 `adaptive`，TikTok 严格线路可以在证据满足条件后启用 `active`。控制面和 metrics 必须能区分：
+现有客户端接口是标准 SOCKS5，客户端到香港之间没有 NB QUIC/FEC 协议。因此 `single_hk` 模式强制关闭 NB 链路 FEC，不产生 repair、recovered 或中继丢包指标，也不能声称 FEC 保护客户端公网段。目标协议自身的重传或纠错由目标协议负责。
 
-- `client_path`: 客户端到香港的 FEC、丢包、恢复；
-- `target_path`: 香港到目标服务的连接、响应和目标侧错误。
-
-香港到目标服务的路径不套用 NB 中继 FEC；目标协议自身的重传或纠错由目标协议负责。
+若未来提供原生 NB 客户端，可通过新的、独立设计的客户端传输层增加端到端 FEC；该能力不属于本次实现。
 
 ## 运行时设计
 
@@ -93,9 +90,9 @@ FEC 仅保护客户端到香港节点的公网段。单节点模式不得产生�
 /run/nb-<instance_id>-exit-<worker>.ctl
 ```
 
-Entry 和 Exit 可以由同一节点上的两个 worker 服务提供，也可以由同一服务管理器按现有角色启动；实现必须保证它们共享同一实例配置、证书和租户策略，但不能启动 Middle 服务或生成 Middle socket。
+第一阶段由同一香港设备上的 Entry 和 Exit 两个逻辑服务提供。Entry 通过 `127.0.0.1:<exit_port>` 的 QUIC 连接本机 Exit，复用现有可靠 TCP/UDP、白名单、限速和目标出站实现。该连接不是 Middle：不能启动 Middle 服务、生成 Middle socket 或使用 Middle 端口，也不能启用 FEC。
 
-推荐第一阶段复用现有两个逻辑服务，以减少协议核心改动；路由层必须直接调用本机出站，不得通过 loopback Middle 端口。
+两个逻辑服务共享同一实例配置、租户策略和发布事务，但分别保留 Entry/Exit 证书与控制 socket。公网数据路径仍只有一个香港节点。
 
 ### 端口
 
@@ -177,7 +174,7 @@ Entry 和 Exit 可以由同一节点上的两个 worker 服务提供，也可以
 - 允许通用域名、IP 和端口白名单；
 - 不要求持续 5Mbps 媒体吞吐；
 - 不因低流量或没有媒体数据而判红；
-- FEC 默认 `observe` 或 `adaptive`，不得无证据强制 `active`；
+- NB 链路 FEC 固定关闭；
 - 50000–50030 可以作为线路策略中的默认端口范围，但不能在协议核心中绑定为 TikTok 专属含义；
 - 健康验证以连接建立、目标首包、持续收发和错误率为主。
 
@@ -185,7 +182,7 @@ Entry 和 Exit 可以由同一节点上的两个 worker 服务提供，也可以
 
 - 可加载 TikTok CDN、Teko 和直播媒体端口策略；
 - 对 50000–50030 执行明确的动态媒体端口放行；
-- 额外检查直播首包、上下行吞吐、媒体持续流量、FEC repair/recovered 和观看端卡顿；
+- 额外检查直播首包、上下行吞吐、媒体持续流量和观看端卡顿；
 - 只有该策略要求 5Mbps 资格测试和长时生产观察；
 - 严格策略失败不得改变 `general` 线路的可用性判定。
 
@@ -196,7 +193,7 @@ Entry 和 Exit 可以由同一节点上的两个 worker 服务提供，也可以
 - `topology_mode`；
 - Entry worker 健康和会话数；
 - Exit worker 健康和目标连接数；
-- 客户端路径 RTT、有效丢包、FEC repair/recovered；
+- 客户端 TCP/UDP 会话数和本机 Entry-to-Exit 回环延迟；
 - 目标连接耗时、首包耗时、目标错误；
 - 上下行吞吐、队列年龄、限速状态；
 - `middle_sessions=0` 或不输出 Middle 字段，不能把不存在的 Middle 当成 unhealthy。
@@ -216,7 +213,7 @@ Entry 和 Exit 可以由同一节点上的两个 worker 服务提供，也可以
 - 旧 Worker 读取新计划时若不认识 `topology_mode`，必须拒绝执行并返回明确中文错误，不得按三跳误部署。
 - 客户端 URL 格式保持 `socks5://user:password@host:port`。
 - 白名单中 `50000–50030` 是否默认放行由业务策略决定；协议核心不把它解释为 TikTok 专属端口。
-- 现有 FEC、限速、媒体优先和端口声明功能继续复用，只有路径归属和策略归属改变。
+- 现有限速、媒体优先和端口声明功能继续复用；FEC 在 `single_hk` 中明确关闭。
 
 ## 测试策略
 
@@ -238,7 +235,7 @@ Entry 和 Exit 可以由同一节点上的两个 worker 服务提供，也可以
 - 通用 TCP、UDP、DNS 和自定义目标；
 - `general` 低流量会话不误判红色；
 - `tiktok_live` 的 TikTok CDN/Teko、媒体端口和直播门槛；
-- 客户端方向 FEC 丢包与恢复，以及策略关闭时的 observe-only 行为；
+- 单节点 Entry-to-Exit 回环链路不启用 FEC；
 - 目标 DNS、TCP 建连超时和 UDP 无响应；
 - 节点重启、控制 socket 消失、端口被占用；
 - 事务失败回滚后二次开线；
