@@ -208,11 +208,9 @@ class SystemAdapter:
     @staticmethod
     def _force_restart(service: str) -> float:
         started = time.monotonic()
+        subprocess.run(["systemctl", "restart", "--no-block", service], check=True, timeout=2)
         subprocess.run(["systemctl", "kill", "--kill-who=all", "--signal=SIGKILL", service],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["systemctl", "reset-failed", service], check=False,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["systemctl", "start", "--no-block", service], check=True, timeout=2)
         return started
 
     def switch_controlplane(self, service: str) -> None:
