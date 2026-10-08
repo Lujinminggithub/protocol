@@ -1,8 +1,7 @@
 [Unit]
 Description=NB allowlisted operations worker
 After=network-online.target nb-web.service
-Wants=network-online.target
-Requires=nb-web.service
+Wants=network-online.target nb-web.service
 
 [Service]
 Type=simple

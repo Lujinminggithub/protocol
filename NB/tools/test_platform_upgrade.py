@@ -5,8 +5,12 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import platform_upgrade
 
-source_contract = pathlib.Path(platform_upgrade.__file__).read_text(encoding="utf-8")
-assert '"--kill-who=all", "--signal=SIGKILL"' in source_contract
+repo_root = pathlib.Path(platform_upgrade.__file__).resolve().parents[1]
+for unit in ("nb-web.service", "nb-web-worker.service", "nb-upgrader.service"):
+    assert "TimeoutStopSec=500ms" in (repo_root / "controlplane" / "linux" / unit).read_text(encoding="utf-8")
+worker_unit = (repo_root / "controlplane" / "linux" / "nb-web-worker.service").read_text(encoding="utf-8")
+assert "Requires=nb-web.service" not in worker_unit
+assert "Wants=network-online.target nb-web.service" in worker_unit
 
 
 class FakeAdapter:
