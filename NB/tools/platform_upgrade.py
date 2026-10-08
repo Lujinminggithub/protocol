@@ -205,6 +205,14 @@ class SystemAdapter:
             time.sleep(0.05)
         raise RuntimeError(f"{service} did not recover within {int(deadline * 1000)}ms")
 
+    @staticmethod
+    def _force_restart(service: str) -> float:
+        started = time.monotonic()
+        subprocess.run(["systemctl", "kill", "--kill-who=all", "--signal=SIGKILL", service],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "start", service], check=True, timeout=2)
+        return started
+
     def switch_controlplane(self, service: str) -> None:
         name = service
         source = self.current_root / "build" / "platform" / name
@@ -221,8 +229,7 @@ class SystemAdapter:
         temporary.chmod(0o755)
         os.replace(temporary, destination)
         self.control_backups[service] = backup
-        started = time.monotonic()
-        subprocess.run(["systemctl", "restart", service], check=True, timeout=2)
+        started = self._force_restart(service)
         self._wait_service(service, 2.0, expected, started)
 
     def rollback_controlplane(self, service: str) -> None:
@@ -234,8 +241,7 @@ class SystemAdapter:
         shutil.copy2(backup, temporary)
         temporary.chmod(0o755)
         os.replace(temporary, destination)
-        started = time.monotonic()
-        subprocess.run(["systemctl", "restart", service], check=True, timeout=2)
+        started = self._force_restart(service)
         self._wait_service(service, 2.0, started_at=started)
 
     def _load_deploy(self):

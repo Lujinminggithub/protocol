@@ -5,6 +5,9 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import platform_upgrade
 
+source_contract = pathlib.Path(platform_upgrade.__file__).read_text(encoding="utf-8")
+assert '"--kill-who=all", "--signal=SIGKILL"' in source_contract
+
 
 class FakeAdapter:
     def __init__(self, fail_at=None):
