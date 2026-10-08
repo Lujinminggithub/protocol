@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"nb-controlplane/internal/transportprofile"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -128,6 +131,19 @@ func TestOptimizeUsesValidationStep(t *testing.T) {
 	}
 	if operationNeedsProbeCleanup("line.tune") {
 		t.Fatal("profile-only tune unexpectedly requires probe cleanup")
+	}
+}
+
+func TestSingleHKRoleOrderAndTransportTuneRejection(t *testing.T) {
+	line := LineSpec{LineID: "hk-single", TopologyMode: "single_hk", ServiceProfile: "general"}
+	if !slices.Equal(line.roleOrder(), []string{"entry", "exit"}) ||
+		!slices.Equal(line.activationOrder(), []string{"exit", "entry"}) {
+		t.Fatalf("single-HK role order=%v/%v", line.roleOrder(), line.activationOrder())
+	}
+	_, _, err := NewRunner(testRegistry(t, nil)).applyPlannedProfile(t.Context(), line, "deployment",
+		transportprofile.Profile{}, map[string]string{}, io.Discard, new(int))
+	if err == nil || !strings.Contains(err.Error(), "没有可调优的中继传输链路") {
+		t.Fatalf("single-HK tune error=%v", err)
 	}
 }
 

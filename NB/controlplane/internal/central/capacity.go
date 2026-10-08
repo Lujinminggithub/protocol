@@ -195,8 +195,9 @@ type linkDemand struct {
 
 func lineLinkDemands(ctx context.Context, tx *sql.Tx, lineID string) ([]linkDemand, error) {
 	var up, down int
-	if err := tx.QueryRowContext(ctx, `SELECT upstream_mbps,downstream_mbps FROM line_specs WHERE line_id=?`,
-		lineID).Scan(&up, &down); err != nil {
+	var topologyMode string
+	if err := tx.QueryRowContext(ctx, `SELECT upstream_mbps,downstream_mbps,topology_mode FROM line_specs WHERE line_id=?`,
+		lineID).Scan(&up, &down, &topologyMode); err != nil {
 		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT role,device_id FROM line_nodes WHERE line_id=? ORDER BY
@@ -218,6 +219,12 @@ func lineLinkDemands(ctx context.Context, tx *sql.Tx, lineID string) ([]linkDema
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
+	if topologyMode == "single_hk" {
+		if devices["entry"] == "" || devices["entry"] != devices["exit"] || devices["relay"] != "" {
+			return nil, errors.New("single-HK capacity requires colocated entry and exit without relay")
+		}
+		return []linkDemand{}, nil
+	}
 	if devices["entry"] == "" || devices["relay"] == "" || devices["exit"] == "" {
 		return nil, errors.New("line capacity requires entry, relay and exit")
 	}
@@ -232,7 +239,7 @@ func reservedTopologyLinkIDs(ctx context.Context, tx *sql.Tx, lineID string) ([]
 	if err != nil {
 		return nil, err
 	}
-	if len(demands) != 2 {
+	if len(demands) != 0 && len(demands) != 2 {
 		return nil, errors.New("production qualification requires two physical topology links")
 	}
 	var held int

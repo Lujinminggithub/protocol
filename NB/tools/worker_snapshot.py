@@ -167,7 +167,7 @@ print(json.dumps(results,separators=(',',':')))
 def collect(line_id: str) -> list[dict]:
     observed = dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
     result = []
-    for role in ("entry", "middle", "exit"):
+    for role in reversed(deploy.deployment_roles()):
         try:
             records = query_role(role)
         except Exception:  # A failed role must not suppress healthy roles or create a fake node.

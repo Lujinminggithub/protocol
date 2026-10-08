@@ -93,8 +93,14 @@ func (c *Client) inventoryLines() []inventoryLine {
 		if err != nil || len(source) == 0 {
 			continue
 		}
-		roles := []string{"entry", "middle", "exit"}
-		apiRoles := []string{"entry", "relay", "exit"}
+		roles := line.roleOrder()
+		apiRoles := make([]string, len(roles))
+		for index, role := range roles {
+			apiRoles[index] = role
+			if role == "middle" {
+				apiRoles[index] = "relay"
+			}
+		}
 		devices := make([]inventoryDevice, 0, 3)
 		for index, role := range roles {
 			device, ok := discoveredDevice(line.LineID, apiRoles[index], roleObject(source, role))
@@ -104,13 +110,17 @@ func (c *Client) inventoryLines() []inventoryLine {
 			}
 			devices = append(devices, device)
 		}
-		if len(devices) != 3 {
+		if len(devices) != len(roles) {
 			continue
 		}
-		nodes := []inventoryNode{
-			{DeviceID: devices[0].ID, Role: "entry", NextHopDevice: devices[1].ID, JumpCandidates: []string{}, Config: map[string]any{}},
-			{DeviceID: devices[1].ID, Role: "relay", NextHopDevice: devices[2].ID, JumpCandidates: []string{devices[0].ID}, Config: map[string]any{}},
-			{DeviceID: devices[2].ID, Role: "exit", JumpCandidates: []string{devices[1].ID, devices[0].ID}, Config: map[string]any{}},
+		var nodes []inventoryNode
+		if line.TopologyMode == "single_hk" {
+			nodes = []inventoryNode{{DeviceID: devices[0].ID, Role: "entry", NextHopDevice: devices[1].ID, JumpCandidates: []string{}, Config: map[string]any{}},
+				{DeviceID: devices[1].ID, Role: "exit", JumpCandidates: []string{}, Config: map[string]any{}}}
+		} else {
+			nodes = []inventoryNode{{DeviceID: devices[0].ID, Role: "entry", NextHopDevice: devices[1].ID, JumpCandidates: []string{}, Config: map[string]any{}},
+				{DeviceID: devices[1].ID, Role: "relay", NextHopDevice: devices[2].ID, JumpCandidates: []string{devices[0].ID}, Config: map[string]any{}},
+				{DeviceID: devices[2].ID, Role: "exit", JumpCandidates: []string{devices[1].ID, devices[0].ID}, Config: map[string]any{}}}
 		}
 		result = append(result, inventoryLine{
 			Line: map[string]any{"id": line.LineID, "name": line.LineID, "status": "maintenance",
@@ -118,6 +128,7 @@ func (c *Client) inventoryLines() []inventoryLine {
 				"capacity_mbps": int64(math.Round(line.PackageMbps)), "active_deployment": "", "profile": "", "secret_ref": ""},
 			Devices: devices,
 			Spec: map[string]any{"line_id": line.LineID, "resource_group": line.ResourceGroup,
+				"topology_mode": line.TopologyMode, "service_profile": line.ServiceProfile,
 				"instance_id": line.InstanceID, "bandwidth_mbps": int(math.Round(line.PackageMbps)),
 				"socks_port": line.SocksPort, "udp_port_min": line.UDPPortMin, "udp_port_max": line.UDPPortMax,
 				"relay_port": line.MiddlePort, "exit_port": line.ExitPort, "exit_bind_ip": line.ExitBindIP,

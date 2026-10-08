@@ -271,7 +271,7 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 	if err != nil && line.SourceMachinesFile != "" {
 		return nil, err
 	}
-	for _, role := range []string{"entry", "middle", "exit"} {
+	for _, role := range line.roleOrder() {
 		host := roleObject(credentials, role)
 		if host == nil {
 			continue
@@ -403,7 +403,7 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 		return "", err
 	}
 	deployment := ""
-	for _, role := range []string{"entry", "middle", "exit"} {
+	for _, role := range line.roleOrder() {
 		if roles[role] == "" || (deployment != "" && roles[role] != deployment) {
 			return "", errors.New("各节点角色的 deployment 不一致")
 		}

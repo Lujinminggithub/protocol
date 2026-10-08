@@ -102,10 +102,14 @@ func (s *Store) auditProductionLines(ctx context.Context, lineID string) ([]Gove
 		return nil, err
 	}
 
-	type rates struct{ upstream, downstream int }
+	type rates struct {
+		upstream, downstream int
+		topologyMode         string
+		serviceProfile       string
+	}
 	ratesByLine := map[string]rates{}
 	specQuery := `SELECT s.line_id,CASE WHEN s.upstream_mbps>0 THEN s.upstream_mbps ELSE s.bandwidth_mbps END,
- CASE WHEN s.downstream_mbps>0 THEN s.downstream_mbps ELSE s.bandwidth_mbps END FROM line_specs s
+	CASE WHEN s.downstream_mbps>0 THEN s.downstream_mbps ELSE s.bandwidth_mbps END,s.topology_mode,s.service_profile FROM line_specs s
  JOIN ` + s.linesTable() + ` l ON l.id=s.line_id WHERE l.environment='production' AND l.status<>'archived'`
 	specArgs := []any{}
 	if lineID != "" {
@@ -119,7 +123,7 @@ func (s *Store) auditProductionLines(ctx context.Context, lineID string) ([]Gove
 	for specRows.Next() {
 		var currentLine string
 		var item rates
-		if err = specRows.Scan(&currentLine, &item.upstream, &item.downstream); err != nil {
+		if err = specRows.Scan(&currentLine, &item.upstream, &item.downstream, &item.topologyMode, &item.serviceProfile); err != nil {
 			_ = specRows.Close()
 			return nil, err
 		}
@@ -230,11 +234,13 @@ func (s *Store) auditProductionLines(ctx context.Context, lineID string) ([]Gove
 				ResourceID: node.deviceID, Message: fmt.Sprintf("生产线路引用了 %s 环境设备 %s", node.environment, node.deviceID),
 				RequiredAction: "将线路迁移到生产设备，或把线路明确改为测试环境"})
 		}
-		if counts["entry"] != 1 || counts["relay"] != 1 || counts["exit"] != 1 ||
-			rate.upstream < 1 || rate.downstream < 1 {
+		singleHK := rate.topologyMode == "single_hk" && counts["entry"] == 1 && counts["exit"] == 1 &&
+			counts["relay"] == 0 && nodes["entry"].deviceID == nodes["exit"].deviceID
+		if !singleHK && (counts["entry"] != 1 || counts["relay"] != 1 || counts["exit"] != 1 ||
+			rate.upstream < 1 || rate.downstream < 1) {
 			findings = append(findings, GovernanceFinding{LineID: line.id, Code: "capacity_unknown",
 				Message: "无法从当前三节点拓扑确定两段物理链路", RequiredAction: "修复线路拓扑并登记两段物理链路"})
-		} else {
+		} else if !singleHK {
 			for _, endpoints := range [][4]string{{nodes["entry"].deviceID, "entry", nodes["relay"].deviceID, "relay"},
 				{nodes["relay"].deviceID, "relay", nodes["exit"].deviceID, "exit"}} {
 				identity := endpoints[0] + "\x00" + endpoints[1] + "\x00" + endpoints[2] + "\x00" + endpoints[3]
@@ -269,7 +275,7 @@ func (s *Store) auditProductionLines(ctx context.Context, lineID string) ([]Gove
 			qualification.AchievedUpstreamMbps >= qualification.TargetUpstreamMbps*qualification.RequiredRatio &&
 			qualification.AchievedDownstreamMbps >= qualification.TargetDownstreamMbps*qualification.RequiredRatio &&
 			(line.profile == "" || operationProfiles[qualification.OperationID] == line.profile)
-		if !qualificationCurrent {
+		if !qualificationCurrent && !(singleHK && rate.serviceProfile == "general") {
 			findings = append(findings, GovernanceFinding{LineID: line.id, Code: "qualification_required",
 				ResourceID: line.deployment, Message: "当前 deployment/profile 缺少有效的 90 秒全双工资格证据",
 				RequiredAction: "执行验证并调优，两方向分别达到配置速率的 95%"})

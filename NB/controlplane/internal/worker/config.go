@@ -96,6 +96,20 @@ func (line *LineSpec) normalizeTopology() error {
 	return nil
 }
 
+func (line LineSpec) roleOrder() []string {
+	if line.TopologyMode == "single_hk" {
+		return []string{"entry", "exit"}
+	}
+	return []string{"entry", "middle", "exit"}
+}
+
+func (line LineSpec) activationOrder() []string {
+	if line.TopologyMode == "single_hk" {
+		return []string{"exit", "entry"}
+	}
+	return []string{"exit", "middle", "entry"}
+}
+
 func LoadRegistry(path string) (Registry, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

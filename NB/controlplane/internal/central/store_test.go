@@ -1831,3 +1831,43 @@ func TestLineSpecTopologyDefaultsAndRejectsUnknownValues(t *testing.T) {
 		}
 	}
 }
+
+func TestGeneralSingleHKNeedsNoExternalCapacityReservation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	if _, err = store.UpsertDevice(ctx, Device{ID: "hk-prod", Name: "HK", Status: "ready",
+		Environment: "production", Host: "192.0.2.20", SSHPort: 22, SSHUser: "root",
+		Labels: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.UpsertLine(ctx, Line{ID: "hk-general", Name: "HK general", Status: "draft",
+		Environment: "production", CapacityMbps: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SaveLineSpec(ctx, LineSpec{LineID: "hk-general", Environment: "production",
+		TopologyMode: "single_hk", ServiceProfile: "general", ResourceGroup: "hk",
+		InstanceID: "hk-general_1", BandwidthMbps: 5, UpstreamMbps: 5, DownstreamMbps: 5,
+		SocksPort: 1082, UDPPortMin: 22048, UDPPortMax: 23071, ExitPort: 4443,
+		Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`),
+		BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "direct",
+		Nodes: []LineNode{{DeviceID: "hk-prod", Role: "entry"}, {DeviceID: "hk-prod", Role: "exit"}}}); err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := store.ReserveLineCapacity(ctx, "hk-general", "op-open")
+	if err != nil || len(reservations) != 0 {
+		t.Fatalf("single-HK reservations=%v error=%v", reservations, err)
+	}
+	findings, err := store.ProductionLineFindings(ctx, "hk-general")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, finding := range findings {
+		if finding.Code == "capacity_unknown" || finding.Code == "qualification_required" {
+			t.Fatalf("general single-HK received strict finding: %+v", finding)
+		}
+	}
+}
