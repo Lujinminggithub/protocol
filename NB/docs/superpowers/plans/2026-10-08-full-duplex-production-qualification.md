@@ -284,7 +284,7 @@ git commit -m "增加历史生产线路全双工治理"
 - Consumes Tasks 1-6.
 - Produces deployed gates, audited Spain state, and synchronized commits.
 
-- [ ] **Step 1: Run complete local verification**
+- [x] **Step 1: Run complete local verification**
 
 ```powershell
 Push-Location controlplane
@@ -297,27 +297,27 @@ node --check controlplane/internal/webapp/assets/app.js
 git diff --check
 ```
 
-- [ ] **Step 2: Build and deploy transactionally**
+- [x] **Step 2: Build and deploy transactionally**
 
 Build/hash Linux Web and worker, embed current worker commit, inspect `go version -m`, and back up remote binaries/source/registry. Deploy, restart, and verify migrations, services, health, heartbeat, and logs; roll back all components on failure. Do not build Node unless `src/` changed.
 
-- [ ] **Step 3: Register only authoritative capacities**
+- [x] **Step 3: Register only authoritative capacities**
 
 Enter provider-confirmed links. Do not mark `gz-55 <-> HK-151` independent; record its aggregate behavior or leave unknown until the provider supplies 10 Mbps per direction.
 
-- [ ] **Step 4: Audit Spain without changing generation**
+- [x] **Step 4: Audit Spain without changing generation**
 
 Verify `gz-hk-sp-00001` is flagged for test-device use and unknown/aggregate full-duplex capacity. Preserve generation 5 and current traffic; block new client delivery/upgrades until remediation.
 
-- [ ] **Step 5: Prove hard-gate boundaries**
+- [x] **Step 5: Prove hard-gate boundaries**
 
 On a controlled candidate, prove 9.49 rejects, 9.50 admits, client material stays hidden before admission, active reservation is directional, and deletion releases both directions.
 
-- [ ] **Step 6: Synchronize and test destination**
+- [x] **Step 6: Synchronize and test destination**
 
 Copy only changed files, compare SHA256, run Go source-package tests, worker race, Python probe tests, and JavaScript syntax. Preserve unrelated files.
 
-- [ ] **Step 7: Commit and audit**
+- [x] **Step 7: Commit and audit**
 
 ```powershell
 git add <changed-files>
