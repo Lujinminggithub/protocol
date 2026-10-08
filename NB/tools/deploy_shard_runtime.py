@@ -26,6 +26,31 @@ def verify_all_controls(c, role, *, work, run):
     return result.strip()
 
 
+def restart_worker_with_deadline(c, role, worker, *, work, run, deadline_seconds=2.0):
+    service = nb_shard_deploy.shard_service(role, worker)
+    root = nb_shard_deploy.shard_config_dir(work, role, worker)
+    deadline_ms = int(max(0.5, min(2.0, deadline_seconds)) * 1000)
+    probe = ("import json,pathlib,socket,stat;"
+        f"root=pathlib.Path({root!r});configs=list(root.glob('*.conf'));"
+        "paths=[next(x.split('=',1)[1] for x in p.read_text().splitlines() if x.startswith('control_path=')) for p in configs];"
+        "assert paths;"
+        "responses=[];"
+        "[(lambda s,p:(s.settimeout(.2),s.connect(p),s.sendall(b'health\\n'),responses.append(json.loads(s.recv(8192).decode())),s.close()))"
+        "(socket.socket(socket.AF_UNIX),p) for p in paths];"
+        "assert len(responses)==len(paths) and all(x.get('status') in ('ok','starting') for x in responses)")
+    command = (
+        f"started=$(date +%s%3N); systemctl enable {shlex.quote(service)} >/dev/null; "
+        f"timeout 2s systemctl restart {shlex.quote(service)} || exit 31; "
+        f"for i in $(seq 1 20); do if systemctl is-active --quiet {shlex.quote(service)} && "
+        f"python3 -c {shlex.quote(probe)} 2>/dev/null; then ended=$(date +%s%3N); "
+        f"elapsed=$((ended-started)); test $elapsed -le {deadline_ms} || exit 32; "
+        "echo WORKER_CONTROL_OK elapsed_ms=$elapsed; exit 0; fi; sleep 0.1; done; exit 33")
+    result = run(c, command, tmo=10).strip()
+    if "WORKER_CONTROL_OK" not in result:
+        raise RuntimeError(f"{role}[{worker}] did not recover within {deadline_ms}ms")
+    return result
+
+
 def active_sessions(c, role, *, work, run) -> int:
     root = nb_shard_deploy.shard_root(work)
     script = ("import json,pathlib,socket;"
@@ -238,9 +263,12 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
     shared_sha = run(c, f"sha256sum {shlex.quote(shared_release)} | awk '{{print $1}}'").strip()
     binary_changed = not previous_target_exists or previous_sha != shared_sha
     binary_reused = False
+    interrupted_sessions = 0
     effective_binary_release_id = binary_release_id
     if previous_target_exists and binary_changed:
-        if _reuse_current_binary_when_busy(c, role, work=work, run=run):
+        if os.environ.get("NB_FORCE_SHARED_ROLLOUT") == "1":
+            interrupted_sessions = active_sessions(c, role, work=work, run=run)
+        elif _reuse_current_binary_when_busy(c, role, work=work, run=run):
             binary_changed = False
             binary_reused = True
             effective_binary_release_id = pathlib.PurePosixPath(previous_target).parent.name
@@ -260,9 +288,13 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
         service = nb_shard_deploy.shard_service(role, worker)
         active = run(c, f"systemctl is-active {shlex.quote(service)} 2>/dev/null || true").strip() == "active"
         action = "restart" if active and binary_changed else "start"
-        state = run(c, f"systemctl enable {shlex.quote(service)} >/dev/null; "
-            f"systemctl {action} {shlex.quote(service)}; sleep {warmup}; "
-            f"systemctl is-active {shlex.quote(service)}").strip().splitlines()
+        if binary_changed and os.environ.get("NB_FORCE_SHARED_ROLLOUT") == "1":
+            restart_worker_with_deadline(c, role, worker, work=work, run=run)
+            state = ["active"]
+        else:
+            state = run(c, f"systemctl enable {shlex.quote(service)} >/dev/null; "
+                f"systemctl {action} {shlex.quote(service)}; sleep {warmup}; "
+                f"systemctl is-active {shlex.quote(service)}").strip().splitlines()
         if "active" not in state:
             detail = run(c, f"systemctl status {shlex.quote(service)} --no-pager -l; "
                 f"journalctl -u {shlex.quote(service)} -n 40 --no-pager")
@@ -313,4 +345,5 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
         for _path, backup, _existed in backups:
             run(c, f"rm -f {shlex.quote(backup)}")
     reused = " binary_reused=true" if binary_reused else ""
-    return f"shard workers={workers} binary_changed={str(binary_changed).lower()}{reused} controls=ok"
+    return (f"shard workers={workers} binary_changed={str(binary_changed).lower()}{reused} "
+            f"sessions_interrupted={interrupted_sessions} controls=ok")

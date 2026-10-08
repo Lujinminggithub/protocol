@@ -56,6 +56,17 @@ h2 { font-size: 16px; font-weight: 700; }
 .action-button.danger-action { color: #a43c36; border-color: #e2bbb7; }
 .action-button:disabled { color: #8b979c; border-color: #d8dfe2; background: #f3f5f6; cursor: not-allowed; }
 .executor-note { display: block; margin-top: 6px; color: #8a5b16; font-size: 11px; max-width: 240px; }
+.upgrade-band { padding: 20px 0 24px; border-bottom: 1px solid #dbe4e6; }
+.version-matrix { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; }
+.version-cell { border: 1px solid #d5e0e2; border-radius: 6px; padding: 13px; background: #fff; min-width: 0; }
+.version-cell span,.version-cell small { display:block; color:#64777b; font-size:12px; overflow-wrap:anywhere; }
+.version-cell strong { display:block; margin:5px 0; font-size:14px; }
+.upgrade-controls { display:grid; grid-template-columns: minmax(180px,1fr) minmax(220px,1fr) auto; gap:12px; align-items:end; }
+.upgrade-preview { margin-top:14px; border:1px solid #d5e0e2; border-radius:6px; min-height:76px; padding:14px; background:#fff; }
+.upgrade-preview ul { margin:8px 0 0; padding-left:20px; }
+.upgrade-confirm { display:flex; align-items:center; gap:8px; margin-top:14px; }
+.upgrade-confirm input { width:16px; height:16px; }
+.upgrade-actions { display:flex; justify-content:flex-end; margin-top:12px; }
 .view { display: none; padding-top: 24px; }
 .view.active { display: block; }
 .split-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; align-items: start; }
@@ -211,8 +222,10 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 @media (max-width: 720px) {
   .shell { grid-template-columns: 1fr; padding-bottom: 60px; }
   .sidebar { position: fixed; z-index: 8; inset: auto 0 0; width: 100%; height: 60px; padding: 6px 8px; flex-direction: row; }
-  .brand, .sidebar-foot { display: none; } nav { width: 100%; margin: 0; grid-template-columns: repeat(6, 1fr); gap: 2px; }
+  .brand, .sidebar-foot { display: none; } nav { width: 100%; margin: 0; grid-template-columns: repeat(7, 1fr); gap: 2px; }
   .nav-item { min-height: 48px; justify-content: center; flex-direction: column; gap: 1px; padding: 3px; font-size: 10px; }
+  .version-matrix { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .upgrade-controls { grid-template-columns: 1fr; }
   .nav-icon { font-size: 15px; } main { padding: 0 14px 24px; }
   .topbar { min-height: 82px; }.topbar p, .updated { display: none; } h1 { font-size: 20px; }
   .top-actions { gap: 6px; }.primary { padding: 0 11px; }

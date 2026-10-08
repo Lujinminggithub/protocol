@@ -11,7 +11,7 @@ from source_gate import enforce_source_line_limit, node_source_text
 
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-TESTS=("test_release.py","test_deploy_transaction.py","test_observe.py","test_probe_cleanup.py","test_line_control.py",
+TESTS=("test_release.py","test_deploy_transaction.py","test_observe.py","test_probe_cleanup.py","test_platform_release.py","test_platform_upgrade.py","test_line_control.py",
        "test_diag_bundle.py","test_line_probe.py","test_supervisor.py","test_soak.py")
 REQUIRED_MODULES=("nb_session.h","nb_session_index.c","nb_pool.h","nb_pool_health.c","nb_path.c","nb_dns.c","nb_bridge.c","nb_send.c","nb_metrics.c",
                   "nb_lstream.c","nb_lstream.h","nb_tenant_shared.c","nb_tenant_shared.h")

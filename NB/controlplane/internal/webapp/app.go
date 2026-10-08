@@ -138,6 +138,13 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/node-releases/uploads/{id}", a.admin(a.uploadNodeSourceChunk))
 	mux.HandleFunc("POST /api/v1/node-releases/uploads/{id}/complete", a.admin(a.completeNodeSourceUpload))
 	mux.HandleFunc("GET /api/v1/node-releases/status", a.admin(a.nodeReleaseStatus))
+	mux.HandleFunc("GET /api/v1/platform-releases/status", a.admin(a.platformReleaseStatus))
+	mux.HandleFunc("POST /api/v1/platform-releases/uploads", a.admin(a.uploadNodeSource))
+	mux.HandleFunc("PUT /api/v1/platform-releases/uploads/{id}", a.admin(a.uploadNodeSourceChunk))
+	mux.HandleFunc("POST /api/v1/platform-releases/uploads/{id}/complete", a.admin(a.completeNodeSourceUpload))
+	mux.HandleFunc("GET /api/v1/platform-upgrades/preview", a.admin(a.platformUpgradePreview))
+	mux.HandleFunc("POST /api/v1/platform-upgrades", a.admin(a.createPlatformUpgrade))
+	mux.HandleFunc("POST /api/v1/platform-upgrades/{id}/rollback", a.admin(a.rollbackPlatformUpgrade))
 	mux.HandleFunc("POST /agent/v1/snapshots", a.agent(a.snapshot))
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
@@ -157,7 +164,27 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/nb/v1/billing-periods", a.agent(a.rawEvent))
 	static, _ := fs.Sub(assets, "assets")
 	mux.Handle("/", http.FileServer(http.FS(static)))
-	return requestLog(securityHeaders(mux))
+	return requestLog(securityHeaders(a.platformWriteGuard(mux)))
+}
+
+func (a *App) platformWriteGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutating := r.Method == http.MethodPost || r.Method == http.MethodPut ||
+			r.Method == http.MethodPatch || r.Method == http.MethodDelete
+		exempt := strings.HasPrefix(r.URL.Path, "/api/v1/auth/") || !strings.HasPrefix(r.URL.Path, "/api/v1/")
+		if mutating && !exempt {
+			active, err := a.store.HasActivePlatformOperation(r.Context())
+			if err != nil {
+				problem(w, http.StatusServiceUnavailable, "无法确认平台升级锁")
+				return
+			}
+			if active {
+				problem(w, http.StatusConflict, "平台升级进行中，普通写操作已暂停")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func requestLog(next http.Handler) http.Handler {
@@ -535,6 +562,10 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "任务参数无效")
 		return
 	}
+	if req.Kind == "line.upgrade" {
+		problem(w, http.StatusConflict, "共享 Node 升级必须从版本升级中心发起")
+		return
+	}
 	if existing, existingErr := a.store.OperationByIdempotencyKey(r.Context(), key); existingErr == nil {
 		if existing.LineID != req.LineID || existing.Kind != req.Kind || existing.RequestedBy != req.RequestedBy ||
 			!sameUserOperationRequest(existing.Request, req.Request) {
@@ -738,7 +769,8 @@ func (a *App) executors(w http.ResponseWriter, r *http.Request) {
 func validOperationKind(kind string) bool {
 	return kind == "line.open" || kind == "line.validate" || kind == "line.upgrade" ||
 		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune" ||
-		kind == "line.optimize" || kind == "node.release.build"
+		kind == "line.optimize" || kind == "node.release.build" ||
+		kind == "platform.upgrade" || kind == "platform.rollback"
 }
 
 func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {

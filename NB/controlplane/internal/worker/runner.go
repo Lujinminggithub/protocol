@@ -464,8 +464,8 @@ func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, r
 		return Result{LogFile: logPath}, errors.New("Node Release 发布元数据无效")
 	}
 	_ = os.Remove(archive)
-	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "node-build", Status: "succeeded", Message: "Node Release 构建并激活完成"})
-	return Result{LogFile: logPath, Message: "Node Release 构建并激活完成", NodeRelease: json.RawMessage(line)}, nil
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "node-build", Status: "succeeded", Message: "平台候选构建完成，等待升级"})
+	return Result{LogFile: logPath, Message: "平台候选构建完成，等待升级", NodeRelease: json.RawMessage(line)}, nil
 }
 
 func operationNeedsProbeCleanup(kind string) bool {

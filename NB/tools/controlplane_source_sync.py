@@ -29,6 +29,8 @@ ORCHESTRATION_FILES = (
     "tools/line_provision.py",
     "tools/nb_release.py",
     "tools/node_release_upload.py",
+    "tools/platform_release.py",
+    "tools/platform_upgrade.py",
     "tools/probe_cleanup.py",
     "tools/nb_shard_deploy.py",
     "tools/nb_observe.py",
@@ -39,6 +41,8 @@ ORCHESTRATION_FILES = (
     "tools/test_deploy_transfer.py",
     "tools/test_controlplane_local_build.py",
     "tools/test_node_release_upload.py",
+    "tools/test_platform_release.py",
+    "tools/test_platform_upgrade.py",
     "tools/test_diag_bundle.py",
     "tools/test_line_control.py",
     "tools/test_line_open.py",
@@ -49,6 +53,10 @@ ORCHESTRATION_FILES = (
     "tools/test_release.py",
     "tools/test_shard_deploy.py",
     "tools/test_supervisor.py",
+    "controlplane/linux/install.sh",
+    "controlplane/linux/nb-web.service",
+    "controlplane/linux/nb-web-worker.service",
+    "controlplane/linux/nb-upgrader.service",
 )
 
 

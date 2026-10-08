@@ -11,8 +11,9 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-import time
 import zipfile
+
+import platform_release
 
 
 def run(command: list[str], cwd: pathlib.Path) -> str:
@@ -128,15 +129,13 @@ def apply_build_credentials(current_root: pathlib.Path, candidate: pathlib.Path,
     environment[password_env] = password
 
 
-def activate(current: pathlib.Path, candidate: pathlib.Path, operation_id: str) -> pathlib.Path:
-    backup = current.with_name(f"repo-before-{operation_id}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
-    os.replace(current, backup)
-    try:
-        os.replace(candidate, current)
-    except Exception:
-        os.replace(backup, current)
-        raise
-    return backup
+def stage_candidate(current: pathlib.Path, candidate: pathlib.Path, operation_id: str) -> pathlib.Path:
+    destination = current.parent / "source-candidates" / f"ready-{operation_id}"
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if destination.exists():
+        shutil.rmtree(destination)
+    os.replace(candidate, destination)
+    return destination
 
 
 def main() -> None:
@@ -188,15 +187,21 @@ def main() -> None:
             raise RuntimeError("构建产物 Git 信息与上传仓库不一致")
         (candidate / ".nb-git.json").write_text(json.dumps(git_info, separators=(",", ":")) + "\n", encoding="utf-8")
         final_candidate = staging_parent / f"ready-{args.operation_id}"
-        if final_candidate.exists():
-            shutil.rmtree(final_candidate)
-        os.replace(candidate, final_candidate)
-        backup = activate(args.current_root, final_candidate, args.operation_id)
+        platform_output = candidate / "build" / "platform"
+        web, worker, upgrader = platform_release.build_controlplane(candidate, platform_output, environment)
+        platform_manifest = platform_release.create_platform_manifest(
+            candidate, manifest, web, worker, upgrader,
+            script_paths=platform_release.script_snapshot_paths(candidate),
+            candidate_root=final_candidate,
+        )
+        platform_release.write_manifest(candidate / "build" / "platform-release.json", platform_manifest)
+        final_candidate = stage_candidate(args.current_root, candidate, args.operation_id)
         print("NODE_RELEASE_JSON=" + json.dumps({
             "release_id": manifest["release_id"], "deployment_id": manifest["deployment_id"],
             "binary_sha256": manifest["artifact"]["sha256"], "source_digest": manifest["source_digest"],
             "node_version": manifest["node_version"], "git_commit": git_info["commit"], "git_tree": git_info["tree"],
-            "git_dirty": git_info["dirty"], "backup": str(backup),
+            "git_dirty": git_info["dirty"], "candidate_root": str(final_candidate),
+            "platform_release": platform_manifest,
         }, separators=(",", ":")))
 
 

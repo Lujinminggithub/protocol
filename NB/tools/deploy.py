@@ -316,7 +316,8 @@ def _act_build_local(git_info):
                  "test_line_probe.py", "test_line_provision.py", "test_line_open.py",
                  "test_supervisor.py", "test_shard_deploy.py", "test_media_reserve_deploy.py",
                  "test_worker_snapshot.py", "test_yfe2_canary.py", "test_netem_matrix.py",
-                 "test_controlplane_local_build.py", "test_node_release_upload.py"]:
+                 "test_controlplane_local_build.py", "test_node_release_upload.py",
+                 "test_platform_release.py", "test_platform_upgrade.py"]:
         result = subprocess.run([sys.executable, str(ROOT / "tools" / test)], cwd=ROOT, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"本地 P0 发布门禁失败: {test}")

@@ -1004,7 +1004,7 @@ func TestCentralWebWorkflow(t *testing.T) {
 	}
 	heartbeat := map[string]any{"worker_id": "windows-1", "status": "ready", "version": "test",
 		"observed_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"lines":       []map[string]any{{"line_id": "gz-hk-us", "operations": []string{"line.validate", "line.upgrade"}}}}
+		"lines":       []map[string]any{{"line_id": "gz-hk-us", "operations": []string{"line.validate", "line.rollback"}}}}
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/executors/heartbeat", "agent-secret", "", heartbeat)
 	if response.StatusCode != 200 {
 		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)
@@ -1019,7 +1019,7 @@ func TestCentralWebWorkflow(t *testing.T) {
 		t.Fatalf("raw event status=%d body=%s", response.StatusCode, body)
 	}
 
-	operation := map[string]any{"line_id": "gz-hk-us", "kind": "line.upgrade", "requested_by": "operator", "request": map[string]any{"deployment": "dep-2"}}
+	operation := map[string]any{"line_id": "gz-hk-us", "kind": "line.rollback", "requested_by": "operator", "request": map[string]any{"deployment": "dep-2"}}
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin-secret", "web-op-1", operation)
 	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"status":"queued"`)) {
 		t.Fatalf("operation status=%d body=%s", response.StatusCode, body)
@@ -1278,16 +1278,8 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	upgrade := map[string]any{"line_id": "line-auto", "kind": "line.upgrade", "requested_by": "test",
 		"request": map[string]any{"affected_lines": []string{"forged-line"}}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "upgrade-impact-test", upgrade)
-	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte("forged-line")) ||
-		!bytes.Contains(body, []byte(`"affected_lines":["line-1","line-auto"]`)) {
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("版本升级中心")) {
 		t.Fatalf("upgrade impact status=%d body=%s", response.StatusCode, body)
-	}
-	var upgradeOperation central.Operation
-	if err = json.Unmarshal(body, &upgradeOperation); err != nil {
-		t.Fatal(err)
-	}
-	if err = database.CancelOperation(t.Context(), upgradeOperation.ID, "impact test complete"); err != nil {
-		t.Fatal(err)
 	}
 	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "__node_release__", Name: "Node Release",
 		Status: "active", EntryRegion: "control", ExitRegion: "control", Provider: "internal", CapacityMbps: 1}); err != nil {
@@ -1609,13 +1601,13 @@ func TestGovernanceAPIReportsRemediationAndBlocksUpgrade(t *testing.T) {
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin",
 		"governance-upgrade", map[string]any{"line_id": "governance-line", "kind": "line.upgrade",
 			"requested_by": "operator", "request": map[string]any{}})
-	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("禁止升级")) {
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("版本升级中心")) {
 		t.Fatalf("governance upgrade status=%d body=%s", response.StatusCode, body)
 	}
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin",
 		"governance-shared-upgrade", map[string]any{"line_id": cleanLineID, "kind": "line.upgrade",
 			"requested_by": "operator", "request": map[string]any{}})
-	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("governance-line")) {
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("版本升级中心")) {
 		t.Fatalf("shared governance upgrade status=%d body=%s", response.StatusCode, body)
 	}
 	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/governance-line/spec", "admin", "",
