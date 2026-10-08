@@ -50,12 +50,32 @@ type LinkCandidate struct {
 	ReorderDelayUS int64   `json:"reorder_delay_us"`
 }
 
+type Admission struct {
+	Status                 string   `json:"status"`
+	Reasons                []string `json:"reasons"`
+	AchievedUpstreamMbps   float64  `json:"achieved_upstream_mbps"`
+	AchievedDownstreamMbps float64  `json:"achieved_downstream_mbps"`
+}
+
 type Probe struct {
 	SchemaVersion  int `json:"schema_version"`
 	ServicePackage struct {
 		QualificationMbps float64 `json:"qualification_mbps"`
 	} `json:"service_package"`
+	Admission Admission                  `json:"admission"`
 	Segments map[string]SegmentEvidence `json:"segments"`
+}
+
+func (probe Probe) AdmissionError() error {
+	if probe.Admission.Status != "rejected" {
+		return nil
+	}
+	reasons := strings.Join(probe.Admission.Reasons, ",")
+	if reasons == "" {
+		reasons = "unspecified"
+	}
+	return fmt.Errorf("probe admission rejected: %s (upstream=%.3fMbps downstream=%.3fMbps)",
+		reasons, probe.Admission.AchievedUpstreamMbps, probe.Admission.AchievedDownstreamMbps)
 }
 
 type Link struct {
@@ -250,6 +270,9 @@ func validEvidence(evidence SegmentEvidence) bool {
 func Generate(lineID string, generation uint64, committedMbps float64, probe Probe) (Profile, error) {
 	if !validLineID(lineID) || generation == 0 || committedMbps < 1 || committedMbps > 1000 || probe.SchemaVersion != 2 {
 		return Profile{}, errors.New("invalid transport profile identity or service rate")
+	}
+	if err := probe.AdmissionError(); err != nil {
+		return Profile{}, err
 	}
 	entryEvidence, entryOK := probe.Segments["entry_middle"]
 	middleEvidence, middleOK := probe.Segments["middle_exit"]

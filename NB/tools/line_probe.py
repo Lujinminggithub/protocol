@@ -44,6 +44,7 @@ MTU_SAFETY_MARGIN = 48
 MTU_RECOMMEND_MAX = 1500
 
 ENTRY_LOCAL_PROBE_SCRIPT = r'''
+import hashlib
 import json
 import math
 import re
@@ -68,6 +69,13 @@ def fnv1a64(data):
     for byte in data:
         value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
     return value
+
+PROBE_PATTERN = bytes((index * 13 + 29) & 0xff for index in range(256))
+
+def probe_pattern(offset, length):
+    phase = offset & 0xff
+    repeats = (phase + length + len(PROBE_PATTERN) - 1) // len(PROBE_PATTERN)
+    return (PROBE_PATTERN * repeats)[phase:phase + length]
 
 def connect_socks(target):
     username = request["username"].encode()
@@ -127,25 +135,32 @@ elif mode == "downlink":
     sock = connect_socks("nb-probe-source.internal")
     sock.sendall(struct.pack("!4sQ", b"NBP2", target_bytes))
     started = time.monotonic()
+    deadline = started + duration_s
+    sock.settimeout(min(1.0, request["io_timeout"]))
     received = 0
-    value = 14695981039346656037
-    while received < target_bytes:
-        data = sock.recv(min(64 * 1024, target_bytes - received))
+    ended_early = False
+    digest = hashlib.sha256()
+    while received < target_bytes and time.monotonic() < deadline:
+        try:
+            data = sock.recv(min(64 * 1024, target_bytes - received))
+        except socket.timeout:
+            continue
         if not data:
+            ended_early = True
             break
-        expected = bytes((((received + index) * 13 + 29) & 0xff) for index in range(len(data)))
+        expected = probe_pattern(received, len(data))
         if data != expected:
             raise RuntimeError("downlink integrity mismatch at offset=%d" % received)
-        for byte in data:
-            value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+        digest.update(data)
         received += len(data)
     elapsed = time.monotonic() - started
     sock.close()
-    if received != target_bytes:
-        raise RuntimeError("downlink count mismatch: expected=%d received=%d" % (target_bytes, received))
     result = {"bytes": received, "elapsed_s": elapsed,
-        "planned_duration_s": duration_s, "achieved_mbps": received * 8.0 / max(elapsed, 0.001) / 1000000.0,
-        "integrity": "count-ok", "hash": "%016x" % value, "origin": "entry-local"}
+        "planned_duration_s": duration_s, "expected_bytes": target_bytes,
+        "achieved_mbps": received * 8.0 / max(float(duration_s), 0.001) / 1000000.0,
+        "integrity": "count-ok", "complete": received == target_bytes,
+        "ended_early": ended_early, "hash": digest.hexdigest(),
+        "hash_algorithm": "sha256", "origin": "entry-local"}
 elif mode == "load":
     target_mbps = request["target_mbps"]
     duration_s = request["duration_s"]
@@ -394,6 +409,42 @@ def fnv1a64(data: bytes) -> int:
     return value
 
 
+PROBE_PATTERN = bytes((index * 13 + 29) & 0xff for index in range(256))
+
+
+def probe_pattern(offset: int, length: int) -> bytes:
+    phase = offset & 0xff
+    repeats = (phase + length + len(PROBE_PATTERN) - 1) // len(PROBE_PATTERN)
+    return (PROBE_PATTERN * repeats)[phase:phase + length]
+
+
+def receive_downlink_stream(sock: socket.socket, target_bytes: int, duration_s: int) -> dict:
+    started = time.monotonic()
+    deadline = started + duration_s
+    received = 0
+    ended_early = False
+    digest = hashlib.sha256()
+    while received < target_bytes and time.monotonic() < deadline:
+        try:
+            data = sock.recv(min(64 * 1024, target_bytes - received))
+        except socket.timeout:
+            continue
+        if not data:
+            ended_early = True
+            break
+        if data != probe_pattern(received, len(data)):
+            raise RuntimeError(f"下行探针完整性失败 offset={received}")
+        digest.update(data)
+        received += len(data)
+    elapsed = time.monotonic() - started
+    return {"bytes": received, "elapsed_s": elapsed, "planned_duration_s": duration_s,
+        "expected_bytes": target_bytes,
+        "achieved_mbps": received * 8.0 / max(float(duration_s), 0.001) / 1_000_000.0,
+        "integrity": "count-ok", "complete": received == target_bytes,
+        "ended_early": ended_early, "hash": digest.hexdigest(),
+        "hash_algorithm": "sha256"}
+
+
 class EntrySSHSocket:
     def __init__(self, port: int):
         self.client = deploy.connect("entry")
@@ -502,18 +553,14 @@ def run_downlink_probe(entry_host: str,socks_port: int,target_mbps: float,durati
                        io_timeout: float = 30) -> dict:
     target_bytes=int(target_mbps*1_000_000/8.0*duration_s)
     sock=socks_connect(entry_host,socks_port,PROBE_SOURCE_HOST,max(io_timeout,duration_s+15))
-    sock.sendall(struct.pack("!4sQ",b"NBP2",target_bytes));started=time.monotonic();received=0
-    while received<target_bytes:
-        data=sock.recv(min(64*1024,target_bytes-received))
-        if not data:break
-        expected=bytes((((received+index)*13+29)&0xff) for index in range(len(data)))
-        if data!=expected:raise RuntimeError(f"下行探针完整性失败 offset={received}")
-        received+=len(data)
-    elapsed=time.monotonic()-started;sock.close()
-    if received!=target_bytes:raise RuntimeError(f"下行探针计数失败 expected={target_bytes} received={received}")
-    return {"bytes":received,"elapsed_s":elapsed,
-        "achieved_mbps":received*8.0/max(elapsed,0.001)/1_000_000.0,
-        "integrity":"count-ok","origin":"controller"}
+    sock.settimeout(min(1.0, io_timeout))
+    sock.sendall(struct.pack("!4sQ",b"NBP2",target_bytes))
+    try:
+        result = receive_downlink_stream(sock, target_bytes, duration_s)
+    finally:
+        sock.close()
+    result["origin"] = "controller"
+    return result
 
 
 def parse_entry_probe_line(raw_line: str) -> dict | None:

@@ -550,6 +550,16 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 			result.Message = result.Failure.Summary
 			return result, optimizeErr
 		}
+		result.Evidence = json.RawMessage(evidence)
+		if admissionErr := probe.AdmissionError(); admissionErr != nil {
+			validationErr := fmt.Errorf("线路验证未通过：%w", admissionErr)
+			result.Failure = operationFailure("validation", validationErr, logPath)
+			result.Message = result.Failure.Summary
+			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: "validation", Status: "failed",
+				Message: result.Failure.Summary, Parameters: map[string]any{"failure": result.Failure,
+					"admission": probe.Admission}})
+			return result, validationErr
+		}
 		profile, generateErr := transportprofile.Generate(line.LineID, 1, line.PackageMbps, probe)
 		if generateErr != nil {
 			result.Failure = operationFailure("profile-generate", generateErr, logPath)
@@ -557,7 +567,6 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 			return result, generateErr
 		}
 		request.TransportProfile = profile
-		result.Evidence = json.RawMessage(evidence)
 		_ = atomicJSON(filepath.Join(operationDir, "optimize-checkpoint.json"), map[string]any{
 			"line_id": line.LineID, "deployment_id": request.DeploymentID,
 			"stage": "profile-generated", "evidence": json.RawMessage(evidence), "profile": profile,

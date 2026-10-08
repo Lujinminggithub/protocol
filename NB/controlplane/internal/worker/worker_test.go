@@ -115,6 +115,31 @@ func TestOptimizeUsesValidationStep(t *testing.T) {
 	}
 }
 
+func TestOptimizeStopsAtRejectedValidationAdmission(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate", "line.tune"})
+	script := `import json,sys
+output=sys.argv[sys.argv.index("--output")+1]
+with open(output,"w",encoding="utf-8") as handle:
+ json.dump({"schema_version":2,"admission":{"status":"rejected","reasons":["insufficient-downlink"],"achieved_upstream_mbps":10,"achieved_downstream_mbps":6.5},"segments":{}},handle)
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(registry)
+	result, err := runner.Run(t.Context(), Operation{ID: "op-rejected", LineID: "line-1", Kind: "line.optimize"})
+	if err == nil || !strings.Contains(err.Error(), "insufficient-downlink") {
+		t.Fatalf("rejected validation error=%v result=%+v", err, result)
+	}
+	if result.Failure == nil || result.Failure.Stage != "validation" ||
+		!bytes.Contains(result.Evidence, []byte(`"status": "rejected"`)) {
+		t.Fatalf("rejected validation was not preserved: %+v", result)
+	}
+	if _, statErr := os.Stat(filepath.Join(registry.StateDir, "op-rejected", "optimize-checkpoint.json"));
+		!os.IsNotExist(statErr) {
+		t.Fatalf("rejected validation created a tune checkpoint: %v", statErr)
+	}
+}
+
 func TestOperationLocksActualDevices(t *testing.T) {
 	client := &Client{}
 	request := func(line, entry, relay, exit string) json.RawMessage {
