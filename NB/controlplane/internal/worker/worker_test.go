@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -486,7 +487,11 @@ func testRegistry(t *testing.T, operations []string) Registry {
 			t.Fatal(err)
 		}
 	}
-	registry := Registry{SchemaVersion: 1, WorkerID: "worker-1", Root: directory, Python: "python",
+	python := "python"
+	if _, err := exec.LookPath(python); err != nil {
+		python = "python3"
+	}
+	registry := Registry{SchemaVersion: 1, WorkerID: "worker-1", Root: directory, Python: python,
 		StateDir: filepath.Join(directory, "state"), Lines: []LineSpec{{LineID: "line-1", ResourceGroup: "shared-1",
 			HostsFile: filepath.Join(directory, "hosts.json"), SourceMachinesFile: filepath.Join(directory, "machines.json"),
 			LineProfileFile: filepath.Join(directory, "profile.json"), KnownHostsFile: filepath.Join(directory, "known_hosts"),
