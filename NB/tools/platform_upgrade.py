@@ -134,6 +134,7 @@ class SystemAdapter:
         self.node_manifest = None
         self.node_binary = None
         self.runtime_plan = None
+        self.units_installed = False
 
     def _rollback_record(self, release_id: str | None = None) -> pathlib.Path:
         return self.install_root / "data" / "upgrader" / "releases" / ((release_id or self.release_id) + ".json")
@@ -197,8 +198,9 @@ class SystemAdapter:
                 except OSError:
                     healthy = False
             if active and service == "nb-web":
+                health_url = os.environ.get("NB_WEB_BASE_URL", "http://127.0.0.1:19091").rstrip("/") + "/healthz"
                 healthy = subprocess.run(["curl", "-fsS", "--max-time", ".3",
-                    "http://127.0.0.1:9091/healthz"], stdout=subprocess.DEVNULL,
+                    health_url], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, check=False).returncode == 0
             if healthy:
                 return int((time.monotonic() - started) * 1000)
@@ -208,22 +210,25 @@ class SystemAdapter:
     @staticmethod
     def _force_restart(service: str) -> float:
         started = time.monotonic()
-        subprocess.run(["systemctl", "stop", "--no-block", service], check=True, timeout=2)
-        subprocess.run(["systemctl", "kill", "--kill-who=all", "--signal=SIGKILL", service],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        stop_deadline = started + 0.5
-        while time.monotonic() < stop_deadline:
-            state = subprocess.run(["systemctl", "show", "-p", "ActiveState", "--value", service],
-                check=False, capture_output=True, text=True, encoding="utf-8").stdout.strip()
-            if state in {"inactive", "failed"}:
-                break
-            time.sleep(0.02)
-        subprocess.run(["systemctl", "reset-failed", service], check=False,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "stop", service], check=True, timeout=1)
         subprocess.run(["systemctl", "start", "--no-block", service], check=True, timeout=2)
         return started
 
+    def _install_control_units(self) -> None:
+        if self.units_installed:
+            return
+        for service in ("nb-web", "nb-web-worker", "nb-upgrader"):
+            source = self.current_root / "controlplane" / "linux" / (service + ".service")
+            destination = pathlib.Path("/etc/systemd/system") / (service + ".service")
+            temporary = destination.with_suffix(".service.next")
+            shutil.copy2(source, temporary)
+            temporary.chmod(0o644)
+            os.replace(temporary, destination)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        self.units_installed = True
+
     def switch_controlplane(self, service: str) -> None:
+        self._install_control_units()
         name = service
         source = self.current_root / "build" / "platform" / name
         expected = self.manifest[name.replace("-", "_")]["sha256"]

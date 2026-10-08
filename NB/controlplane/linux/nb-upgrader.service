@@ -15,6 +15,7 @@ Environment=NB_UPGRADER_STATE_DIR=/opt/nb-controlplane/data/upgrader
 ExecStart=/opt/nb-controlplane/bin/nb-upgrader
 Restart=always
 RestartSec=2s
+TimeoutStopSec=500ms
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
