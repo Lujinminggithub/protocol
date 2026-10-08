@@ -248,6 +248,9 @@ func (a *App) deleteDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func validLineSpecRequest(spec central.LineSpec) error {
+	if err := spec.NormalizeTopology(); err != nil {
+		return errors.New("线路拓扑模式或业务策略无效")
+	}
 	if !safeID.MatchString(spec.LineID) || !safeID.MatchString(spec.ResourceGroup) || (spec.InstanceID != "" && !safeID.MatchString(spec.InstanceID)) {
 		return errors.New("invalid line deployment identity")
 	}
@@ -323,14 +326,28 @@ func validLineSpecRequest(spec central.LineSpec) error {
 	if roles["entry"] != 1 || roles["exit"] != 1 {
 		return errors.New("线路必须且只能包含一个 Entry 和一个 Exit")
 	}
+	if spec.TopologyMode == "single_hk" {
+		if roles["relay"] != 0 || len(spec.Nodes) != 2 || lineSpecNodeDevice(spec.Nodes, "entry") != lineSpecNodeDevice(spec.Nodes, "exit") {
+			return errors.New("香港单节点线路必须在同一台香港设备上包含 Entry 和 Exit，且不能包含 Relay")
+		}
+	}
 	return nil
+}
+
+func lineSpecNodeDevice(nodes []central.LineNode, role string) string {
+	for _, node := range nodes {
+		if node.Role == role {
+			return node.DeviceID
+		}
+	}
+	return ""
 }
 
 func validLineSpec(spec central.LineSpec) error {
 	if err := validLineSpecRequest(spec); err != nil {
 		return err
 	}
-	if spec.SocksPort == 0 || spec.RelayPort == 0 || spec.ExitPort == 0 || spec.UDPPortMin == 0 || spec.UDPPortMax == 0 {
+	if spec.SocksPort == 0 || (spec.TopologyMode == "trihop" && spec.RelayPort == 0) || spec.ExitPort == 0 || spec.UDPPortMin == 0 || spec.UDPPortMax == 0 {
 		return errors.New("线路内部端口资源尚未完成分配")
 	}
 	return nil

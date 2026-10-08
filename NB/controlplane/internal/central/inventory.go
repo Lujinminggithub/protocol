@@ -586,8 +586,11 @@ func (s *Store) usedRolePortSpans(ctx context.Context, lineID, instanceID, devic
 // AllocateLineSpec fills control-plane-owned ports without changing an explicitly supplied value.
 func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, error) {
 	spec.NormalizeRates()
+	if err := spec.NormalizeTopology(); err != nil {
+		return LineSpec{}, err
+	}
 	spec.SocksPortAuto = spec.SocksPortAuto || spec.SocksPort == 0
-	spec.RelayPortAuto = spec.RelayPortAuto || spec.RelayPort == 0
+	spec.RelayPortAuto = spec.TopologyMode == "trihop" && (spec.RelayPortAuto || spec.RelayPort == 0)
 	spec.ExitPortAuto = spec.ExitPortAuto || spec.ExitPort == 0
 	spec.UDPPortsAuto = spec.UDPPortsAuto || (spec.UDPPortMin == 0 && spec.UDPPortMax == 0)
 	if spec.InstanceID == "" {
@@ -599,8 +602,11 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 	entryDevice := lineDevice(spec, "entry")
 	relayDevice := lineDevice(spec, "relay")
 	exitDevice := lineDevice(spec, "exit")
-	if entryDevice == "" || relayDevice == "" || exitDevice == "" {
+	if entryDevice == "" || exitDevice == "" || (spec.TopologyMode == "trihop" && relayDevice == "") {
 		return LineSpec{}, errors.New("分配端口前必须指定 Entry、Relay 和 Exit 设备")
+	}
+	if spec.TopologyMode == "single_hk" && entryDevice != exitDevice {
+		return LineSpec{}, errors.New("香港单节点线路的 Entry 和 Exit 必须是同一台香港设备")
 	}
 	if spec.SocksPort == 0 {
 		used, err := s.usedRolePortSpans(ctx, spec.LineID, spec.InstanceID, entryDevice, "entry", "socks", "socks_port", 1)
@@ -611,7 +617,7 @@ func (s *Store) AllocateLineSpec(ctx context.Context, spec LineSpec) (LineSpec, 
 			return LineSpec{}, errors.New("没有可用的入口 SOCKS 端口")
 		}
 	}
-	if spec.RelayPort == 0 {
+	if spec.TopologyMode == "trihop" && spec.RelayPort == 0 {
 		used, err := s.usedRolePortSpans(ctx, spec.LineID, spec.InstanceID, relayDevice, "relay", "transport", "relay_port", transportWorkerLanes)
 		if err != nil {
 			return LineSpec{}, err
@@ -696,6 +702,9 @@ func lineSpecConflict(ctx context.Context, queryer rowQuerier, spec LineSpec) (s
 	}{{"entry", "socks", "socks_port", "入口", spec.SocksPort, 1}, {"relay", "transport", "relay_port", "Relay", spec.RelayPort, transportWorkerLanes}, {"exit", "transport", "exit_port", "Exit", spec.ExitPort, transportWorkerLanes}}
 	for _, check := range checks {
 		deviceID := lineDevice(spec, check.role)
+		if check.port == 0 || deviceID == "" {
+			continue
+		}
 		var conflictingLine string
 		query := fmt.Sprintf(`SELECT s.line_id FROM line_specs s
  JOIN line_nodes n ON n.line_id=s.line_id AND n.role=?

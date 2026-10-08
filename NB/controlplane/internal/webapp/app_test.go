@@ -1120,6 +1120,56 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 	}
 }
 
+func TestSingleHKLineSpecAPI(t *testing.T) {
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	app := New(database, Config{AdminToken: "admin", AgentToken: "agent",
+		DeviceSecretsFile: filepath.Join(directory, "device-secrets.json")})
+	app.verifySSHCredentials = func(context.Context, string, int, string, string, ssh.PublicKey) error { return nil }
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+	device := map[string]any{"id": "hk-1", "name": "Hong Kong", "status": "ready",
+		"host": "192.0.2.20", "ssh_port": 22, "ssh_user": "root", "region": "HK",
+		"environment": "test", "provider": "test", "password": "secret", "labels": map[string]any{}}
+	for key, value := range confirmedDeviceFields(t, app, "192.0.2.20", 22) {
+		device[key] = value
+	}
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create device status=%d body=%s", response.StatusCode, body)
+	}
+	line := map[string]any{"id": "hk-single", "name": "HK single", "status": "draft",
+		"environment": "test", "entry_region": "HK", "exit_region": "HK", "provider": "test",
+		"capacity_mbps": 5, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create line status=%d body=%s", response.StatusCode, body)
+	}
+	nodes := []map[string]any{{"device_id": "hk-1", "role": "entry", "ordinal": 0},
+		{"device_id": "hk-1", "role": "exit", "ordinal": 0}}
+	spec := map[string]any{"topology_mode": "single_hk", "service_profile": "general",
+		"instance_id": "hk-single_1", "environment": "test", "bandwidth_mbps": 5,
+		"upstream_mbps": 5, "downstream_mbps": 5, "socks_port": 0, "relay_port": 0,
+		"exit_port": 0, "udp_port_min": 0, "udp_port_max": 0, "dns_servers": []string{"1.1.1.1"},
+		"whitelist": []string{}, "build_mode": "auto", "source_ref": "repo://current",
+		"jump_policy": "direct", "nodes": nodes}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/hk-single/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"topology_mode":"single_hk"`)) ||
+		!bytes.Contains(body, []byte(`"service_profile":"general"`)) || !bytes.Contains(body, []byte(`"relay_port":0`)) {
+		t.Fatalf("save single-HK status=%d body=%s", response.StatusCode, body)
+	}
+	spec["nodes"] = []map[string]any{{"device_id": "hk-1", "role": "entry", "ordinal": 0},
+		{"device_id": "other", "role": "exit", "ordinal": 0}}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/hk-single/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("同一台香港设备")) {
+		t.Fatalf("different-device status=%d body=%s", response.StatusCode, body)
+	}
+}
+
 func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	directory := t.TempDir()
 	database, err := central.Open(filepath.Join(directory, "central.db"))
