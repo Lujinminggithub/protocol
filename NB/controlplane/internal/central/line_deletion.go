@@ -172,9 +172,15 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 		line.ID, line.Name, request.RequestedBy, request.Reason, audit, now()); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, `UPDATE line_capacity_reservations SET state='released',operation_id=?,updated_at=?
+ WHERE line_id=? AND state<>'released'`, "force-delete", now(), id); err != nil {
+		return err
+	}
 	controlDeletes := []string{
 		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
 		`DELETE FROM operations WHERE line_id=?`,
+		`DELETE FROM line_qualifications WHERE line_id=?`,
+		`DELETE FROM line_capacity_reservations WHERE line_id=?`,
 	}
 	if s.dialect != "mysql" {
 		controlDeletes = append(controlDeletes, `DELETE FROM snapshots WHERE line_id=?`)
@@ -283,9 +289,15 @@ func (s *Store) completeScheduledDeletion(ctx context.Context, tx *sql.Tx, lineI
 		line.ID, line.Name, requestedBy, reason, audit, now()); err != nil {
 		return true, false, err
 	}
+	if _, err = tx.ExecContext(ctx, `UPDATE line_capacity_reservations SET state='released',operation_id=?,updated_at=?
+ WHERE line_id=? AND state<>'released'`, operationID, now(), lineID); err != nil {
+		return true, false, err
+	}
 	queries := []string{
 		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
 		`DELETE FROM operations WHERE line_id=?`,
+		`DELETE FROM line_qualifications WHERE line_id=?`,
+		`DELETE FROM line_capacity_reservations WHERE line_id=?`,
 	}
 	if s.dialect != "mysql" {
 		queries = append(queries, `DELETE FROM snapshots WHERE line_id=?`)

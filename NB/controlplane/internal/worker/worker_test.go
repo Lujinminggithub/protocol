@@ -113,6 +113,11 @@ func TestOptimizeUsesValidationStep(t *testing.T) {
 	if err != nil || len(steps) != 1 || steps[0].Stage != "validate" || !slices.Contains(steps[0].Args, "--active") {
 		t.Fatalf("optimize steps=%+v err=%v", steps, err)
 	}
+	if !slices.Contains(steps[0].Args, "--minimum-throughput-ratio") ||
+		!slices.Contains(steps[0].Args, "0.95") || !slices.Contains(steps[0].Args, "--duration") ||
+		!slices.Contains(steps[0].Args, "90") {
+		t.Fatalf("optimize qualification contract=%v", steps[0].Args)
+	}
 }
 
 func TestOptimizeStopsAtRejectedValidationAdmission(t *testing.T) {
@@ -134,8 +139,7 @@ with open(output,"w",encoding="utf-8") as handle:
 		!bytes.Contains(result.Evidence, []byte(`"status": "rejected"`)) {
 		t.Fatalf("rejected validation was not preserved: %+v", result)
 	}
-	if _, statErr := os.Stat(filepath.Join(registry.StateDir, "op-rejected", "optimize-checkpoint.json"));
-		!os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(filepath.Join(registry.StateDir, "op-rejected", "optimize-checkpoint.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("rejected validation created a tune checkpoint: %v", statErr)
 	}
 }

@@ -303,12 +303,14 @@ def main() -> None:
     assert idle_candidate["auto_apply_allowed"] is False
     assert recommend_mtu(idle, None, current)["confidence"] == "unavailable-keep-current"
     admitted = evaluate_admission({"integrity": {"integrity": "ok"},
-        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.2},
-        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.4}}, 10.0)
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.50},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.50}}, 10.0)
     assert admitted["status"] == "admitted"
+    assert admitted["required_ratio"] == 0.95
+    assert admitted["duration_seconds"] == 90
     rejected = evaluate_admission({"integrity": {"integrity": "ok"},
-        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.1},
-        "downlink": {"integrity": "count-ok", "achieved_mbps": 8.9}}, 10.0)
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.50},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.49}}, 10.0)
     assert rejected["status"] == "rejected"
     assert rejected["reasons"] == ["insufficient-downlink"]
     barrier = threading.Barrier(2)

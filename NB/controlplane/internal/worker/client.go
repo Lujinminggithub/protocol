@@ -572,6 +572,9 @@ func (c *Client) Run(ctx context.Context) error {
 			return nil
 		case <-poll.C:
 			if err := c.poll(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 		case <-maintenance.C:

@@ -325,6 +325,7 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64),
 			"--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
+			"--minimum-throughput-ratio", "0.95", "--duration", "90",
 			"--socks-port", socks, "--via-entry-ssh", "--cache", filepath.Join(lineState, "provision", line.LineID, "probe-cache.json"),
 			"--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.tune":

@@ -366,7 +366,8 @@ def recommend(summary: dict, current: dict, target_mbps: float,
 
 def evaluate_admission(active_probe: dict | None, target_mbps: float,
                        downstream_target_mbps: float | None = None,
-                       min_throughput_ratio: float = 0.90) -> dict:
+                       min_throughput_ratio: float = 0.95,
+                       duration_seconds: int = 90) -> dict:
     reasons = []
     active_probe = active_probe or {}
     integrity = active_probe.get("integrity") or {}
@@ -391,6 +392,8 @@ def evaluate_admission(active_probe: dict | None, target_mbps: float,
         "throughput_ratio": min(achieved_up/target_mbps if target_mbps>0 else 0,
             achieved_down/down_target if down_target>0 else 0),
         "minimum_throughput_ratio": min_throughput_ratio,
+        "required_ratio": min_throughput_ratio,
+        "duration_seconds": duration_seconds,
     }
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
@@ -827,6 +830,8 @@ def main() -> None:
     parser.add_argument("--upstream-mbps",type=float,help="业务上行平均限速验证目标")
     parser.add_argument("--downstream-mbps",type=float,help="业务下行平均限速验证目标")
     parser.add_argument("--duration", type=int, default=90, help="主动负载持续秒数")
+    parser.add_argument("--minimum-throughput-ratio", type=float, default=0.95,
+                        help="每个方向最低达标比例，默认 0.95")
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--via-entry-ssh", action="store_true",
                         help="reach the Entry-local SOCKS listener through the pinned SSH connection")
@@ -854,6 +859,8 @@ def main() -> None:
         raise SystemExit("探针目标速率必须在 0.1..2000 Mbps")
     if args.duration < 10 or args.duration > 600:
         raise SystemExit("--duration 必须在 10..600")
+    if args.minimum_throughput_ratio < 0.5 or args.minimum_throughput_ratio > 1.0:
+        raise SystemExit("--minimum-throughput-ratio 必须在 0.5..1.0")
 
     cache_key_payload = {
         "hosts_sha256": hashlib.sha256(deploy.LAB_FILE.read_bytes()).hexdigest(),
@@ -861,6 +868,7 @@ def main() -> None:
         "package_mbps": package_mbps, "upstream_mbps": args.upstream_mbps if args.upstream_mbps is not None else (package_mbps or target_mbps),
         "downstream_mbps": args.downstream_mbps if args.downstream_mbps is not None else (package_mbps or target_mbps),
         "headroom_ratio": args.headroom_ratio, "duration": args.duration,
+        "minimum_throughput_ratio": args.minimum_throughput_ratio,
         "ping_samples": args.ping_samples, "probe_origin": args.probe_origin, "policy_version": 1,
     }
     cache_key = hashlib.sha256(json.dumps(cache_key_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -944,7 +952,8 @@ def main() -> None:
             "qualification_mbps": target_mbps,
             "headroom_ratio": args.headroom_ratio if package_mbps is not None else None,
         },
-        "admission": evaluate_admission(active_result, shaping_up, shaping_down) if args.active else {
+        "admission": evaluate_admission(active_result, shaping_up, shaping_down,
+            args.minimum_throughput_ratio, args.duration) if args.active else {
             "status": "not-evaluated",
             "reasons": ["active-quic-required"],
             "target_mbps": min(shaping_up,shaping_down),

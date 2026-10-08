@@ -15,6 +15,7 @@
         <button class="nav-item active" data-view="overview"><span class="nav-icon">⌂</span>总览</button>
         <button class="nav-item" data-view="devices"><span class="nav-icon">▣</span>设备</button>
         <button class="nav-item" data-view="lines"><span class="nav-icon">⇄</span>线路</button>
+        <button class="nav-item" data-view="links"><span class="nav-icon">↔</span>链路</button>
         <button class="nav-item" data-view="operations"><span class="nav-icon">≡</span>任务</button>
         <button class="nav-item" data-view="incidents"><span class="nav-icon">!</span>告警</button>
       </nav>
@@ -49,8 +50,13 @@
       </section>
 
       <section class="view" id="linesView">
-        <div class="toolbar"><input id="lineSearch" type="search" placeholder="搜索线路、区域或运营商"><select id="lineEnvironment"><option value="">全部环境</option><option value="production">生产</option><option value="test">测试</option></select><select id="lineStatus"><option value="">全部状态</option><option value="active">运行中</option><option value="draft">草稿</option><option value="validating">验证中</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></div>
-        <div class="table-wrap"><table><thead><tr><th>线路</th><th>环境</th><th>状态</th><th>拓扑</th><th>带宽</th><th>接入端口</th><th>Profile</th><th>操作</th></tr></thead><tbody id="linesTable"></tbody></table></div>
+        <div class="toolbar"><input id="lineSearch" type="search" placeholder="搜索线路、区域或运营商"><select id="lineEnvironment"><option value="">全部环境</option><option value="production">生产</option><option value="test">测试</option></select><select id="lineStatus"><option value="">全部状态</option><option value="active">运行中</option><option value="draft">草稿</option><option value="provisioning">开线中</option><option value="qualification_pending">待验证</option><option value="qualification_failed">全双工不合格</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></div>
+        <div class="table-wrap"><table><thead><tr><th>线路</th><th>环境</th><th>状态</th><th>全双工资格</th><th>拓扑</th><th>带宽</th><th>接入端口</th><th>Profile</th><th>操作</th></tr></thead><tbody id="linesTable"></tbody></table></div>
+      </section>
+
+      <section class="view" id="linksView">
+        <div class="toolbar"><input id="networkLinkSearch" type="search" placeholder="搜索链路、设备或受影响线路"><select id="networkLinkEnvironment"><option value="">全部环境</option><option value="production">生产</option><option value="test">测试</option></select><select id="networkLinkStatus"><option value="">全部状态</option><option value="ready">可用</option><option value="maintenance">维护</option><option value="disabled">停用</option></select><span class="toolbar-note">生产链路必须按方向独立计费</span></div>
+        <div class="table-wrap"><table class="network-links-table"><thead><tr><th>链路</th><th>环境 / 状态</th><th>计费模式</th><th>前向容量</th><th>反向容量</th><th>受影响线路</th><th>操作</th></tr></thead><tbody id="networkLinksTable"></tbody></table></div>
       </section>
 
       <section class="view" id="operationsView">
@@ -114,6 +120,8 @@
   </form></div>
 
   <div class="modal-backdrop hidden" id="lineEnvironmentModal"><form class="modal" id="lineEnvironmentForm"><div class="modal-head"><div><h2>修改线路环境</h2><p>仅修改控制面分类，不改变已部署的数据面实例</p></div><button type="button" class="icon-button close-line-environment">×</button></div><input type="hidden" name="line_id"><label>环境<select name="environment"><option value="production">生产</option><option value="test">测试</option></select></label><div class="form-error" id="lineEnvironmentError"></div><div class="modal-actions"><button type="button" class="secondary close-line-environment">取消</button><button type="submit" class="primary">保存环境</button></div></form></div>
+
+  <div class="modal-backdrop hidden" id="networkLinkModal"><form class="modal wide" id="networkLinkForm"><div class="modal-head"><div><h2>物理链路</h2><p>分别登记两个方向的可售容量</p></div><button type="button" class="icon-button close-network-link">×</button></div><div class="form-grid three"><label>链路 ID<input name="id" pattern="[A-Za-z0-9_.-]+" placeholder="gz-hk-primary" required></label><label>环境<select name="environment"><option value="production">生产</option><option value="test">测试</option></select></label><label>状态<select name="status"><option value="ready">可用</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></label></div><div class="form-grid two"><label>起点设备<select name="from_device_id" required></select></label><label>起点角色<select name="from_role" required><option value="entry">Entry</option><option value="relay">Relay</option><option value="exit">Exit</option></select></label><label>终点设备<select name="to_device_id" required></select></label><label>终点角色<select name="to_role" required><option value="relay">Relay</option><option value="exit">Exit</option><option value="entry">Entry</option></select></label></div><div class="form-grid three"><label>前向容量 Mbps<input name="forward_capacity_mbps" type="number" min="1" max="100000" required></label><label>反向容量 Mbps<input name="reverse_capacity_mbps" type="number" min="1" max="100000" required></label><label>计费模式<select name="billing_mode" required><option value="independent-directions">按方向独立</option><option value="aggregate-bidirectional">双向合计</option><option value="unknown">待确认</option></select></label></div><div class="form-error" id="networkLinkError"></div><div class="modal-actions"><button type="button" class="secondary close-network-link">取消</button><button class="primary" type="submit">保存链路</button></div></form></div>
 
   <div class="modal-backdrop hidden" id="operationModal"><form class="modal" id="operationForm"><div class="modal-head"><div><h2 id="operationTitle">创建任务</h2><p id="operationTarget"></p></div><button type="button" class="icon-button close-operation">×</button></div><input type="hidden" name="line_id"><input type="hidden" name="kind"><label>发起人<input name="requested_by" value="operator" pattern="[A-Za-z0-9_.-]+" required></label><label>目标 deployment<input name="deployment" placeholder="回滚时填写"></label><label>备注<textarea name="note" rows="3"></textarea></label><div class="form-error" id="operationError"></div><div class="modal-actions"><button type="button" class="secondary close-operation">取消</button><button class="primary" type="submit">提交任务</button></div></form></div>
 

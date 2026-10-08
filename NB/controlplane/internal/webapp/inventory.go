@@ -124,6 +124,8 @@ func (a *App) exportDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) upsertDevice(w http.ResponseWriter, r *http.Request) {
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
 	var request deviceUpsertRequest
 	if !decode(w, r, &request) {
 		return
@@ -145,6 +147,17 @@ func (a *App) upsertDevice(w http.ResponseWriter, r *http.Request) {
 	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
 		problem(w, 500, existingErr.Error())
 		return
+	}
+	if existingErr == nil {
+		active, activeErr := a.store.HasActiveOperationsUsingDevice(r.Context(), item.ID)
+		if activeErr != nil {
+			problem(w, http.StatusInternalServerError, activeErr.Error())
+			return
+		}
+		if active {
+			problem(w, http.StatusConflict, "相关线路仍有排队中或执行中的任务，禁止修改设备")
+			return
+		}
 	}
 	if request.Password != "" {
 		if len(request.Password) > 4096 {
@@ -326,6 +339,8 @@ func validLineSpec(spec central.LineSpec) error {
 func (a *App) saveLineSpec(w http.ResponseWriter, r *http.Request) {
 	a.lineMu.Lock()
 	defer a.lineMu.Unlock()
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
 	var spec central.LineSpec
 	if !decode(w, r, &spec) {
 		return
@@ -336,8 +351,34 @@ func (a *App) saveLineSpec(w http.ResponseWriter, r *http.Request) {
 		spec.ResourceGroup = "managed"
 	}
 	spec.NormalizeRates()
-	if _, err := a.store.Line(r.Context(), spec.LineID); err != nil {
+	line, err := a.store.Line(r.Context(), spec.LineID)
+	if err != nil {
 		problem(w, 404, "line not found")
+		return
+	}
+	active, activeErr := a.store.HasActiveOperations(r.Context(), spec.LineID)
+	if activeErr != nil {
+		problem(w, http.StatusInternalServerError, activeErr.Error())
+		return
+	}
+	if active {
+		problem(w, http.StatusConflict, "线路仍有排队中或执行中的任务，禁止修改部署规格")
+		return
+	}
+	if current, currentErr := a.store.LineSpec(r.Context(), spec.LineID); currentErr == nil &&
+		line.Environment == "production" &&
+		(spec.UpstreamMbps > current.UpstreamMbps || spec.DownstreamMbps > current.DownstreamMbps) {
+		findings, findingErr := a.store.ProductionLineFindings(r.Context(), spec.LineID)
+		if findingErr != nil {
+			problem(w, http.StatusInternalServerError, findingErr.Error())
+			return
+		}
+		if len(findings) > 0 {
+			problem(w, http.StatusConflict, "生产线路治理未完成，禁止扩容："+findings[0].Code)
+			return
+		}
+	} else if currentErr != nil && !errors.Is(currentErr, sql.ErrNoRows) {
+		problem(w, http.StatusInternalServerError, currentErr.Error())
 		return
 	}
 	if err := validLineSpecRequest(spec); err != nil {
@@ -467,9 +508,17 @@ func (a *App) lineDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := map[string]any{"line": line, "snapshots": snapshots}
+	if qualification, qualificationErr := a.store.LatestLineQualification(r.Context(), line.ID); qualificationErr == nil {
+		result["qualification"] = qualification
+	} else if !errors.Is(qualificationErr, sql.ErrNoRows) {
+		problem(w, 500, qualificationErr.Error())
+		return
+	}
 	if operation, operationErr := a.store.LatestSuccessfulOperation(r.Context(), line.ID, "line.open"); operationErr == nil {
-		if _, clientErr := operationClientURL(operation); clientErr == nil {
-			result["client_operation"] = operation
+		if deliveryErr := a.store.ClientDeliveryAllowed(r.Context(), line.ID); deliveryErr == nil {
+			if _, clientErr := operationClientURL(operation); clientErr == nil {
+				result["client_operation"] = operation
+			}
 		}
 	} else if !errors.Is(operationErr, sql.ErrNoRows) {
 		problem(w, 500, operationErr.Error())
@@ -485,6 +534,8 @@ func (a *App) lineDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) discoverInventory(w http.ResponseWriter, r *http.Request) {
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
 	var discovery inventoryDiscovery
 	if !decode(w, r, &discovery) {
 		return
@@ -564,6 +615,7 @@ func (a *App) operationDetail(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "operation not found")
 		return
 	}
+	operation = a.redactOperationClient(r.Context(), operation)
 	events, err := a.store.OperationEvents(r.Context(), operation.ID)
 	if err != nil {
 		problem(w, 500, err.Error())
