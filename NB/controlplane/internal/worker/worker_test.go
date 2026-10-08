@@ -774,6 +774,69 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	}
 }
 
+func TestDynamicLineBuildsSingleHKTopology(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, Operations: []string{"line.open"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599,
+		UDPPortMin: 22048, UDPPortMax: 65535}
+	t.Setenv("NB_SINGLE_HK_PASSWORD", "single-hk-password")
+	entry := trustedDynamicNode(t, "hk-1", "entry", "192.0.2.20", 22, "env:NB_SINGLE_HK_PASSWORD")
+	exit := entry
+	exit.Role = "exit"
+	plan := dynamicPlan{LineID: "hk-single", ResourceGroup: "hk", InstanceID: "hk-single_1",
+		TopologyMode: "single_hk", ServiceProfile: "general",
+		BandwidthMbps: 5, UpstreamMbps: 5, DownstreamMbps: 5,
+		SocksPort: 1082, RelayPort: 0, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		DNSServers: []string{"1.1.1.1"}, BuildMode: "auto", JumpPolicy: "direct",
+		Nodes: []dynamicNode{entry, exit}}
+	runner := NewRunner(registry)
+	line, err := runner.dynamicLine(Operation{ID: "op-single", LineID: plan.LineID, Kind: "line.open"},
+		requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line.TopologyMode != "single_hk" || line.ServiceProfile != "general" || line.MiddlePort != 0 {
+		t.Fatalf("single-HK line=%+v", line)
+	}
+	data, err := os.ReadFile(line.SourceMachinesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source map[string]any
+	if json.Unmarshal(data, &source) != nil || source["middle"] != nil || source["topology_mode"] != "single_hk" {
+		t.Fatalf("single-HK source contains a Middle: %s", data)
+	}
+	steps, err := runner.steps(line, Operation{ID: "op-single", LineID: plan.LineID, Kind: "line.open"},
+		requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provision commandStep
+	for _, step := range steps {
+		if step.Stage == "provision" {
+			provision = step
+			break
+		}
+	}
+	args := strings.Join(provision.Args, " ")
+	if !strings.Contains(args, "--topology-mode single_hk") || !strings.Contains(args, "--service-profile general") || strings.Contains(args, "--middle-port") {
+		t.Fatalf("single-HK provision args=%s", args)
+	}
+
+	invalid := plan
+	invalid.Nodes = append([]dynamicNode(nil), plan.Nodes...)
+	invalid.Nodes[1].DeviceID, invalid.Nodes[1].Device.ID = "hk-2", "hk-2"
+	if err = runner.validateDynamicPlan(Operation{LineID: plan.LineID, Kind: "line.open"}, invalid); err == nil || !strings.Contains(err.Error(), "同一台香港设备") {
+		t.Fatalf("different single-HK devices error=%v", err)
+	}
+	invalid = plan
+	invalid.Nodes = append(invalid.Nodes, trustedDynamicNode(t, "relay-1", "relay", "192.0.2.21", 22, "env:NB_SINGLE_HK_PASSWORD"))
+	if err = runner.validateDynamicPlan(Operation{LineID: plan.LineID, Kind: "line.open"}, invalid); err == nil {
+		t.Fatal("single-HK plan accepted a Relay")
+	}
+}
+
 func TestDynamicDisableBeforeOpenUsesGeneratedSourceTopology(t *testing.T) {
 	registry := testRegistry(t, nil)
 	registry.Lines = nil

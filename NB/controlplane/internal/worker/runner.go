@@ -254,6 +254,14 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		"NB_MIDDLE_PORT":        strconv.Itoa(middlePort),
 		"NB_EXIT_PORT":          strconv.Itoa(exitPort),
 	}
+	if err := line.normalizeTopology(); err != nil {
+		return nil, err
+	}
+	values["NB_TOPOLOGY_MODE"] = line.TopologyMode
+	values["NB_SERVICE_PROFILE"] = line.ServiceProfile
+	if line.TopologyMode == "single_hk" {
+		values["NB_FEC_V15_ACTIVE"] = "off"
+	}
 	for key, value := range line.ExtraEnvironment {
 		values[key] = value
 	}
@@ -313,12 +321,17 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 		if line.WhitelistSourceEnv != "" {
 			result = append(result, commandStep{Name: python, Stage: "whitelist-fetch", Args: []string{filepath.Join(tools, "whitelist_sync.py"), "--source-env", line.WhitelistSourceEnv, "--mode", "auto", "--sing-box", line.SingBox, "--state-dir", filepath.Join(line.StateDir, "whitelist-sync"), "--output", line.WhitelistFile}})
 		}
-		result = append(result, commandStep{Name: python, Stage: "provision", Args: []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
+		provisionArgs := []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
 			"--line-id", line.LineID, "--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64),
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64), "--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
-			"--socks-port", socks, "--middle-port", strconv.Itoa(line.MiddlePort), "--exit-port", strconv.Itoa(line.ExitPort),
+			"--socks-port", socks,
 			"--udp-port-min", strconv.Itoa(line.UDPPortMin), "--udp-port-max", strconv.Itoa(line.UDPPortMax),
-			"--output-dir", outputDir, "--build-mode", line.BuildMode, "--execute"}})
+			"--exit-port", strconv.Itoa(line.ExitPort), "--topology-mode", line.TopologyMode,
+			"--service-profile", line.ServiceProfile, "--output-dir", outputDir, "--build-mode", line.BuildMode, "--execute"}
+		if line.TopologyMode == "trihop" {
+			provisionArgs = append(provisionArgs, "--middle-port", strconv.Itoa(line.MiddlePort))
+		}
+		result = append(result, commandStep{Name: python, Stage: "provision", Args: provisionArgs})
 		if line.WhitelistFile != "" {
 			result = append(result, commandStep{Name: python, Stage: "whitelist", Args: []string{deploy, "wl-push", "--whitelist", line.WhitelistFile}})
 		}

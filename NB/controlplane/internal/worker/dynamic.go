@@ -45,6 +45,8 @@ type dynamicNode struct {
 }
 type dynamicPlan struct {
 	LineID         string        `json:"line_id"`
+	TopologyMode   string        `json:"topology_mode"`
+	ServiceProfile string        `json:"service_profile"`
 	ResourceGroup  string        `json:"resource_group"`
 	InstanceID     string        `json:"instance_id"`
 	BandwidthMbps  int           `json:"bandwidth_mbps"`
@@ -414,7 +416,20 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 	if plan.SourceRef != "" && plan.SourceRef != "repo://current" {
 		return errors.New("线路源码必须使用当前仓库")
 	}
-	if plan.SocksPort < cfg.SocksPortMin || plan.SocksPort > cfg.SocksPortMax || plan.RelayPort < cfg.RelayPortMin || plan.RelayPort+transportWorkerLanes-1 > cfg.RelayPortMax || plan.UDPPortMin < cfg.UDPPortMin || plan.UDPPortMax > cfg.UDPPortMax || plan.UDPPortMin > plan.UDPPortMax || plan.ExitPort < 1 || plan.ExitPort+transportWorkerLanes-1 > 65535 {
+	if plan.TopologyMode == "" {
+		plan.TopologyMode = "trihop"
+	}
+	if plan.ServiceProfile == "" {
+		plan.ServiceProfile = "general"
+	}
+	if plan.TopologyMode != "trihop" && plan.TopologyMode != "single_hk" {
+		return errors.New("线路拓扑模式无效")
+	}
+	if plan.ServiceProfile != "general" && plan.ServiceProfile != "tiktok_live" {
+		return errors.New("线路业务策略无效")
+	}
+	invalidRelay := plan.TopologyMode == "trihop" && (plan.RelayPort < cfg.RelayPortMin || plan.RelayPort+transportWorkerLanes-1 > cfg.RelayPortMax)
+	if plan.SocksPort < cfg.SocksPortMin || plan.SocksPort > cfg.SocksPortMax || invalidRelay || plan.UDPPortMin < cfg.UDPPortMin || plan.UDPPortMax > cfg.UDPPortMax || plan.UDPPortMin > plan.UDPPortMax || plan.ExitPort < 1 || plan.ExitPort+transportWorkerLanes-1 > 65535 {
 		return fmt.Errorf("线路端口超出 worker 授权范围：入口 %d-%d，Relay %d-%d，UDP %d-%d",
 			cfg.SocksPortMin, cfg.SocksPortMax, cfg.RelayPortMin, cfg.RelayPortMax, cfg.UDPPortMin, cfg.UDPPortMax)
 	}
@@ -443,6 +458,13 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 			return fmt.Errorf("设备 %s 的 SSH 主机密钥登记无效", node.Device.ID)
 		}
 		roles[node.Role]++
+	}
+	if plan.TopologyMode == "single_hk" {
+		if roles["entry"] != 1 || roles["exit"] != 1 || roles["relay"] != 0 || len(plan.Nodes) != 2 ||
+			plan.Nodes[0].DeviceID != plan.Nodes[1].DeviceID {
+			return errors.New("香港单节点线路必须且只能在同一台香港设备上包含 Entry 和 Exit")
+		}
+		return nil
 	}
 	if roles["entry"] != 1 || roles["relay"] != 1 || roles["exit"] != 1 {
 		return errors.New("当前 NB 拓扑必须且只能包含一个 Entry、Relay 和 Exit")
@@ -514,6 +536,12 @@ func (r *Runner) ensureDynamicKnownHosts(lineState string, nodes []dynamicNode) 
 
 func (r *Runner) dynamicLine(operation Operation, request requestValues, operationDir string) (LineSpec, error) {
 	plan := request.Plan
+	if plan.TopologyMode == "" {
+		plan.TopologyMode = "trihop"
+	}
+	if plan.ServiceProfile == "" {
+		plan.ServiceProfile = "general"
+	}
 	if plan.UpstreamMbps <= 0 {
 		plan.UpstreamMbps = plan.BandwidthMbps
 	}
@@ -586,7 +614,15 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	if plan.ExitBindIP != "" {
 		exit["outip"] = plan.ExitBindIP
 	}
-	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "paths": map[string]string{"work_dir": "/etc/NB"}, "workers": map[string]int{"entry": transportWorkerLanes, "middle": transportWorkerLanes, "exit": transportWorkerLanes}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false, "dns_servers": plan.DNSServers}}}
+	workers := map[string]int{"entry": transportWorkerLanes, "exit": transportWorkerLanes}
+	transport := map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false, "dns_servers": plan.DNSServers}}
+	source := map[string]any{"topology_mode": plan.TopologyMode, "service_profile": plan.ServiceProfile, "entry": roles["entry"], "exit": exit, "build_host": "entry", "release_retention": 5, "paths": map[string]string{"work_dir": "/etc/NB"}, "workers": workers, "exits": []map[string]any{{"name": exit["name"], "host": "127.0.0.1", "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": transport}
+	if plan.TopologyMode == "trihop" {
+		source["middle"] = roles["middle"]
+		workers["middle"] = transportWorkerLanes
+		transport["middle"] = map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}
+		source["exits"].([]map[string]any)[0]["host"] = exit["host"]
+	}
 	if err := writePrivateJSON(sourcePath, source); err != nil {
 		return LineSpec{}, err
 	}
@@ -627,7 +663,15 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 			hosts = sourcePath
 		}
 	}
-	return LineSpec{LineID: operation.LineID, ResourceGroup: plan.ResourceGroup, InstanceID: plan.InstanceID, HostsFile: hosts, SourceMachinesFile: sourcePath, LineProfileFile: profile, KnownHostsFile: knownHosts, SecurityDir: filepath.Join(lineState, "security"), ClientSecretFile: filepath.Join(lineState, "bootstrap-client-secret.json"), PackageMbps: float64(plan.BandwidthMbps), UpstreamMbps: float64(plan.UpstreamMbps), DownstreamMbps: float64(plan.DownstreamMbps), SocksPort: plan.SocksPort, UDPPortMin: plan.UDPPortMin, UDPPortMax: plan.UDPPortMax, MiddlePort: plan.RelayPort, ExitPort: plan.ExitPort, ExitBindIP: plan.ExitBindIP, EnabledOperations: append([]string(nil), r.registry.Dynamic.Operations...), StateDir: lineState, WhitelistFile: whitelistPath, WhitelistSourceEnv: whitelistSourceEnv, SingBox: r.registry.Dynamic.SingBox, ExtraEnvironment: extraEnvironment, BuildMode: plan.BuildMode}, nil
+	if extraEnvironment == nil {
+		extraEnvironment = map[string]string{}
+	}
+	extraEnvironment["NB_TOPOLOGY_MODE"] = plan.TopologyMode
+	extraEnvironment["NB_SERVICE_PROFILE"] = plan.ServiceProfile
+	if plan.TopologyMode == "single_hk" {
+		extraEnvironment["NB_FEC_V15_ACTIVE"] = "off"
+	}
+	return LineSpec{LineID: operation.LineID, TopologyMode: plan.TopologyMode, ServiceProfile: plan.ServiceProfile, ResourceGroup: plan.ResourceGroup, InstanceID: plan.InstanceID, HostsFile: hosts, SourceMachinesFile: sourcePath, LineProfileFile: profile, KnownHostsFile: knownHosts, SecurityDir: filepath.Join(lineState, "security"), ClientSecretFile: filepath.Join(lineState, "bootstrap-client-secret.json"), PackageMbps: float64(plan.BandwidthMbps), UpstreamMbps: float64(plan.UpstreamMbps), DownstreamMbps: float64(plan.DownstreamMbps), SocksPort: plan.SocksPort, UDPPortMin: plan.UDPPortMin, UDPPortMax: plan.UDPPortMax, MiddlePort: plan.RelayPort, ExitPort: plan.ExitPort, ExitBindIP: plan.ExitBindIP, EnabledOperations: append([]string(nil), r.registry.Dynamic.Operations...), StateDir: lineState, WhitelistFile: whitelistPath, WhitelistSourceEnv: whitelistSourceEnv, SingBox: r.registry.Dynamic.SingBox, ExtraEnvironment: extraEnvironment, BuildMode: plan.BuildMode}, nil
 }
 
 func (r *Runner) resolveSnapshotLine(plan dynamicPlan) (LineSpec, error) {
