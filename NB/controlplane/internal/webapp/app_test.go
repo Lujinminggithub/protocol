@@ -1045,6 +1045,9 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 	if !bytes.Contains(body, []byte(`name="password"`)) || bytes.Contains(body, []byte(`name="secret_ref"`)) {
 		t.Fatal("device form must collect an initial password instead of a secret reference")
 	}
+	if bytes.Contains(body, []byte(`name="resource_group"`)) {
+		t.Fatal("line form still exposes internal resource group metadata")
+	}
 	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/app.js", "", "", nil)
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`operationAvailability`)) ||
 		!bytes.Contains(body, []byte(`disabled title=`)) ||
@@ -1053,6 +1056,8 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 		!bytes.Contains(body, []byte(`upstream_mbps`)) || !bytes.Contains(body, []byte(`downstream_mbps`)) ||
 		!bytes.Contains(body, []byte(`item.role === "entry"`)) ||
 		!bytes.Contains(body, []byte(`tuneResultSection`)) || !bytes.Contains(body, []byte(`transport_rollout`)) ||
+		!bytes.Contains(body, []byte(`影响线路`)) || !bytes.Contains(body, []byte(`affected_lines`)) ||
+		!bytes.Contains(body, []byte(`节点升级待处理`)) || bytes.Contains(body, []byte(`node_release_ack`)) ||
 		!bytes.Contains(body, []byte(`失败原因`)) || !bytes.Contains(body, []byte(`log_excerpt`)) ||
 		bytes.Contains(body, []byte(`event.currentTarget.reset()`)) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
@@ -1095,12 +1100,13 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		{"device_id": "relay-1", "role": "relay", "ordinal": 0, "next_hop_device_id": "exit-1", "jump_candidates": []string{"entry-1"}, "config": map[string]any{}},
 		{"device_id": "exit-1", "role": "exit", "ordinal": 0, "next_hop_device_id": "", "jump_candidates": []string{"relay-1"}, "config": map[string]any{}},
 	}
-	spec := map[string]any{"resource_group": "test-group", "instance_id": "test", "bandwidth_mbps": 20,
+	spec := map[string]any{"instance_id": "test", "bandwidth_mbps": 20,
 		"socks_port": 1082, "relay_port": 4445, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "udp_port_min": 22048, "udp_port_max": 23071,
 		"whitelist": []string{"domain example.com"}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "https://rules.example.invalid/whitelist.srs?key=test-key", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
-	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) {
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) ||
+		!bytes.Contains(body, []byte(`"resource_group":"managed"`)) {
 		t.Fatalf("save topology status=%d body=%s", response.StatusCode, body)
 	}
 	spec["socks_port"] = 1080
@@ -1163,9 +1169,40 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	if response.StatusCode != 200 {
 		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)
 	}
+	upgrade := map[string]any{"line_id": "line-auto", "kind": "line.upgrade", "requested_by": "test",
+		"request": map[string]any{"affected_lines": []string{"forged-line"}}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "upgrade-impact-test", upgrade)
+	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte("forged-line")) ||
+		!bytes.Contains(body, []byte(`"affected_lines":["line-1","line-auto"]`)) {
+		t.Fatalf("upgrade impact status=%d body=%s", response.StatusCode, body)
+	}
+	var upgradeOperation central.Operation
+	if err = json.Unmarshal(body, &upgradeOperation); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.CancelOperation(t.Context(), upgradeOperation.ID, "impact test complete"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "__node_release__", Name: "Node Release",
+		Status: "active", EntryRegion: "control", ExitRegion: "control", Provider: "internal", CapacityMbps: 1}); err != nil {
+		t.Fatal(err)
+	}
+	releaseOperation := central.Operation{ID: "op-release-for-open", LineID: "__node_release__",
+		Kind: "node.release.build", RequestedBy: "test", IdempotencyKey: "release-for-open", Request: json.RawMessage(`{}`)}
+	if _, _, err = database.CreateOperation(t.Context(), releaseOperation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ClaimOperations(t.Context(), releaseOperation.LineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.CompleteOperation(t.Context(), releaseOperation.ID, releaseOperation.LineID, "succeeded",
+		json.RawMessage(`{"node_release":{"release_id":"0123456789abcdef","node_version":{"semantic":"2.1.0"}}}`)); err != nil {
+		t.Fatal(err)
+	}
 	operation := map[string]any{"line_id": "line-1", "kind": "line.open", "requested_by": "test", "request": map[string]any{}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "inventory-test", operation)
-	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"plan"`)) {
+	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"plan"`)) ||
+		!bytes.Contains(body, []byte(`"pending_node_release"`)) {
 		t.Fatalf("create operation status=%d body=%s", response.StatusCode, body)
 	}
 	var created central.Operation

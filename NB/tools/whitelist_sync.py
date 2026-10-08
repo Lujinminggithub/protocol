@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import pathlib
 import re
+import socket
+import ssl
 import subprocess
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -40,7 +44,11 @@ def fetch(url: str, limit: int) -> tuple[bytes, str]:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname:
         raise ValueError("whitelist source must use HTTPS")
-    request = urllib.request.Request(url, headers={"User-Agent": "NB-whitelist-sync/1.0"})
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "NB-whitelist-sync/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
     with urllib.request.urlopen(request, timeout=30) as response:
         final_url = response.geturl()
         if urllib.parse.urlparse(final_url).scheme != "https":
@@ -51,8 +59,49 @@ def fetch(url: str, limit: int) -> tuple[bytes, str]:
     return data, final_url
 
 
-def resolve_source(source_url: str, mode: str, current_digest: str = "") -> tuple[bytes | None, str]:
-    first, final_url = fetch(source_url, MAX_SRS if mode in ("direct", "auto") else MAX_METADATA)
+def resolve_ipv4(host: str) -> list[str]:
+    return sorted({item[4][0] for item in socket.getaddrinfo(
+        host, 443, socket.AF_INET, socket.SOCK_STREAM)})
+
+
+def fetch_at_address(url: str, address: str, limit: int) -> tuple[bytes, str]:
+    """Fetch HTTPS from one DNS answer while preserving certificate hostname checks."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("whitelist backend URL must use HTTPS")
+    ipaddress.IPv4Address(address)
+    port = parsed.port or 443
+    raw = socket.create_connection((address, port), timeout=30)
+    try:
+        tls = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+        try:
+            target = urllib.parse.urlunparse(("", "", parsed.path or "/", parsed.params,
+                                              parsed.query, ""))
+            host = parsed.hostname if port == 443 else f"{parsed.hostname}:{port}"
+            request = (f"GET {target} HTTP/1.1\r\nHost: {host}\r\n"
+                       "User-Agent: NB-whitelist-sync/1.0\r\n"
+                       "Cache-Control: no-cache\r\nPragma: no-cache\r\n"
+                       "Accept: */*\r\nConnection: close\r\n\r\n")
+            tls.sendall(request.encode("ascii"))
+            response = http.client.HTTPResponse(tls)
+            response.begin()
+            if response.status != http.client.OK:
+                raise ValueError(f"whitelist backend returned HTTP {response.status}")
+            data = response.read(limit + 1)
+        finally:
+            tls.close()
+    finally:
+        raw.close()
+    if len(data) > limit:
+        raise ValueError("whitelist response exceeds size limit")
+    return data, url
+
+
+def resolve_source(source_url: str, mode: str, current_digest: str = "", *, fetcher=fetch,
+                   sleeper=time.sleep,
+                   retry_delays=(0.5, 0.5, 1, 1, 1.5, 2, 3, 4, 5),
+                   resolver=resolve_ipv4, address_fetcher=fetch_at_address) -> tuple[bytes | None, str]:
+    first, final_url = fetcher(source_url, MAX_SRS if mode in ("direct", "auto") else MAX_METADATA)
     text = first.decode("utf-8", "replace").strip()
     metadata = text.split("|", 1)
     is_metadata = len(metadata) == 2 and MD5_RE.fullmatch(metadata[0].strip())
@@ -66,11 +115,26 @@ def resolve_source(source_url: str, mode: str, current_digest: str = "") -> tupl
     download_url = metadata[1].strip()
     if urllib.parse.urlparse(download_url).hostname != urllib.parse.urlparse(final_url).hostname:
         raise ValueError("metadata download URL must use the same host")
-    payload, _ = fetch(download_url, MAX_SRS)
+    payload, _ = fetcher(download_url, MAX_SRS)
     actual = hashlib.md5(payload).hexdigest().lower()
-    if actual != expected:
-        raise ValueError("downloaded whitelist MD5 does not match metadata")
-    return payload, actual
+    if actual == expected:
+        return payload, actual
+    for delay in retry_delays:
+        sleeper(delay)
+        payload, _ = fetcher(download_url, MAX_SRS)
+        actual = hashlib.md5(payload).hexdigest().lower()
+        if actual == expected:
+            return payload, actual
+    download_host = urllib.parse.urlparse(download_url).hostname
+    for address in resolver(download_host):
+        try:
+            payload, _ = address_fetcher(download_url, address, MAX_SRS)
+        except (OSError, ValueError, ssl.SSLError):
+            continue
+        actual = hashlib.md5(payload).hexdigest().lower()
+        if actual == expected:
+            return payload, actual
+    raise ValueError("downloaded whitelist MD5 does not match metadata after retries")
 
 
 def values(rule: dict, field: str) -> list:

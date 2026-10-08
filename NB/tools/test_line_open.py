@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 
 from line_open import (artifacts_match, baseline_profile, load_checkpoint,
+                       configuration_deployment_id, deploy_instance_with_retry,
                        deploy_socks_with_retry,
                        ensure_security_material,
                        load_or_create_client_secret,
@@ -122,6 +123,21 @@ def main() -> None:
                 os.environ["NB_CLIENT_PASSWORD"] = old_client
         artifact = root / "stable.json"
         artifact.write_text('{"status":"stable"}\n', encoding="utf-8")
+        hosts_path = root / "hosts.json"
+        profile_path = root / "profile.json"
+        hosts_path.write_text('{"entry":"gz"}\n', encoding="utf-8")
+        profile_path.write_text('{"schema_version":1}\n', encoding="utf-8")
+        config_deployment = configuration_deployment_id(hosts_path, profile_path)
+        assert config_deployment.startswith("cfg-") and len(config_deployment) == 20
+        assert config_deployment == configuration_deployment_id(hosts_path, profile_path)
+        instance_attempts = []
+        deploy_instance_with_retry(config_deployment, 1082, {},
+            runner=lambda command, _env: instance_attempts.append(command), delays=())
+        assert len(instance_attempts) == 1
+        command = instance_attempts[0]
+        assert command[1:3] == ["tools/deploy.py", "deploy-instance"]
+        assert command[-4:] == ["--deployment-id", config_deployment, "--socks-port", "1082"]
+        assert all(value not in command for value in ("build", "prepare-release", "deploy-socks"))
         checkpoint_path = root / "open-checkpoint.json"
         checkpoint = load_checkpoint(checkpoint_path, "fingerprint-a")
         save_checkpoint(checkpoint_path, checkpoint, "qualification", {

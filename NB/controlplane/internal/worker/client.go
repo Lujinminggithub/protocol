@@ -308,7 +308,7 @@ func (c *Client) snapshotLines(ctx context.Context) []LineSpec {
 		seen[line.LineID] = true
 	}
 	for _, plan := range response.Plans {
-		if seen[plan.LineID] || !contains(plan.ResourceGroup, c.registry.Dynamic.ResourceGroups) {
+		if seen[plan.LineID] {
 			continue
 		}
 		line, err := resolver.resolveSnapshotLine(plan)

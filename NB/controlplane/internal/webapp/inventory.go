@@ -332,6 +332,9 @@ func (a *App) saveLineSpec(w http.ResponseWriter, r *http.Request) {
 	}
 	spec.LineID = r.PathValue("id")
 	spec.ExitBindIP = strings.TrimSpace(spec.ExitBindIP)
+	if strings.TrimSpace(spec.ResourceGroup) == "" {
+		spec.ResourceGroup = "managed"
+	}
 	spec.NormalizeRates()
 	if _, err := a.store.Line(r.Context(), spec.LineID); err != nil {
 		problem(w, 404, "line not found")

@@ -269,6 +269,30 @@ def deploy_socks_with_retry(socks_port: int, env: dict, runner=run,
             sleeper(delay)
 
 
+def configuration_deployment_id(hosts: pathlib.Path, profile: pathlib.Path) -> str:
+    digest = hashlib.sha256(hosts.read_bytes() + b"\0" + profile.read_bytes()).hexdigest()
+    return "cfg-" + digest[:16]
+
+
+def deploy_instance_with_retry(deployment_id: str, socks_port: int, env: dict, runner=run,
+                               sleeper=time.sleep, delays=(5, 15)) -> None:
+    """Retry an instance-only deployment without publishing a Node binary."""
+    command = [sys.executable, "tools/deploy.py", "deploy-instance",
+               "--deployment-id", deployment_id, "--socks-port", str(socks_port)]
+    attempts = len(delays) + 1
+    for attempt in range(attempts):
+        try:
+            runner(command, env)
+            return
+        except subprocess.CalledProcessError:
+            if attempt + 1 >= attempts:
+                raise
+            delay = delays[attempt]
+            print(f">>> instance deployment attempt {attempt + 1}/{attempts} failed; "
+                  f"retry in {delay}s", flush=True)
+            sleeper(delay)
+
+
 def sha256_file(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -541,8 +565,8 @@ def main() -> None:
         "qualification_mbps": args.package_mbps * 1.25, "socks_port": args.socks_port,
         "instance_id": os.environ.get("NB_DEPLOY_INSTANCE", ""),
         "middle_port": args.middle_port, "exit_port": args.exit_port,
-        "stages": ["pin-host-keys", "generate-security", "bootstrap-build-deploy",
-                   "active-quic-probe", "stable-build-deploy", "tenant-policy-apply",
+        "stages": ["pin-host-keys", "generate-security", "bootstrap-instance-deploy",
+                   "active-quic-probe", "stable-instance-deploy", "tenant-policy-apply",
                    "client-output"],
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
@@ -566,9 +590,6 @@ def main() -> None:
                  "NB_MIDDLE_PORT": str(args.middle_port),
                 "NB_EXIT_PORT": str(args.exit_port),
                 "NB_OPEN_CLIENT_PASSWORD": client_password,
-                # Opening a new line must not interrupt existing shared-shard
-                # traffic; defer a binary rollout to a maintenance operation.
-                "NB_ALLOW_BINARY_REUSE_WHEN_BUSY": "1",
                 "NB_SSH_INSECURE": "1"})
     ensure_security_material(security, env)
     if reconcile_socks_user(security / "socks.users", args.client_username, client_password):
@@ -606,10 +627,8 @@ def main() -> None:
             bootstrap_deployment = str(bootstrap_stage.get("deployment_id") or "")
             bootstrap_online = deployment_matches(env, bootstrap_deployment) if bootstrap_deployment else False
             if not bootstrap_online:
-                prepare_release(env, args.build_mode)
-                deploy_socks_with_retry(args.socks_port, env)
-                manifest = release_manifest_for(bootstrap_hosts, bootstrap_profile)
-                bootstrap_deployment = str((manifest or {}).get("deployment_id") or "")
+                bootstrap_deployment = configuration_deployment_id(bootstrap_hosts, bootstrap_profile)
+                deploy_instance_with_retry(bootstrap_deployment, args.socks_port, env)
                 if not bootstrap_deployment or not deployment_matches(env, bootstrap_deployment):
                     raise RuntimeError("bootstrap deployment completed but verification failed")
                 save_checkpoint(checkpoint_path, checkpoint, "bootstrap_deploy", {
@@ -642,10 +661,9 @@ def main() -> None:
 
         env["NB_HOSTS_FILE"] = str(qualified_paths["hosts"])
         env["NB_LINE_PROFILE_FILE"] = str(qualified_paths["profile"])
-        prepare_release(env, args.build_mode)
-        deploy_socks_with_retry(args.socks_port, env)
-        manifest = release_manifest_for(qualified_paths["hosts"], qualified_paths["profile"])
-        stable_deployment = str((manifest or {}).get("deployment_id") or "")
+        stable_deployment = configuration_deployment_id(
+            qualified_paths["hosts"], qualified_paths["profile"])
+        deploy_instance_with_retry(stable_deployment, args.socks_port, env)
         if not stable_deployment or not deployment_matches(env, stable_deployment):
             raise RuntimeError("stable deployment completed but verification failed")
         stable_online = True

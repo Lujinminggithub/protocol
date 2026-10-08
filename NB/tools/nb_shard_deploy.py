@@ -48,6 +48,28 @@ def saved_binary_release(instance_work: str, release_id: str, role: str) -> str:
     return f"{instance_work}/releases/{release_id}/shard-{role}-binary-release"
 
 
+def current_deployment_marker(instance_work: str) -> str:
+    return f"{instance_work}/current-deployment"
+
+
+def saved_previous_instance_config(instance_work: str, release_id: str,
+                                   role: str, worker: int) -> str:
+    if not SAFE_ID.fullmatch(release_id) or role not in ROLES or worker < 0 or worker > 31:
+        raise ValueError("invalid previous shard config identity")
+    return f"{instance_work}/releases/{release_id}/previous-shard-{role}-{worker}.conf"
+
+
+def saved_previous_instance_state(instance_work: str, release_id: str,
+                                  role: str, worker: int) -> str:
+    return saved_previous_instance_config(instance_work, release_id, role, worker) + ".state"
+
+
+def saved_previous_deployment_marker(instance_work: str, release_id: str) -> str:
+    if not SAFE_ID.fullmatch(release_id):
+        raise ValueError("invalid previous deployment marker identity")
+    return f"{instance_work}/releases/{release_id}/previous-current-deployment"
+
+
 def command_arguments(command: str) -> list[str]:
     values = shlex.split(command)
     if len(values) < 3 or pathlib.PurePosixPath(values[0]).name != "nb_node":

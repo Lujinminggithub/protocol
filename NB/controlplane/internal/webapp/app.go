@@ -553,15 +553,17 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		}
 		values["plan"] = spec
 		values["deployment_id"] = lineRecord.ActiveDeployment
+		if req.Kind == "line.upgrade" {
+			affected, impactErr := a.store.LinesSharingDeviceRoles(r.Context(), req.LineID)
+			if impactErr != nil {
+				problem(w, 500, impactErr.Error())
+				return
+			}
+			values["affected_lines"] = affected
+		}
 		if req.Kind == "line.open" {
 			if release, releaseErr := a.latestNodeRelease(r.Context()); releaseErr == nil {
-				acknowledged, _ := values["node_release_ack"].(string)
-				releaseID, _ := release["release_id"].(string)
-				if releaseID != "" && acknowledged != releaseID {
-					problem(w, http.StatusConflict, "检测到已验证的 Node 代码更新，请确认候选 Release 后重新提交开线")
-					return
-				}
-				values["node_release"] = release
+				values["pending_node_release"] = release
 			}
 		}
 		if req.Kind == "line.tune" {

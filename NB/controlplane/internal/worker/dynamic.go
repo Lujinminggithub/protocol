@@ -398,8 +398,8 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 		operation.Kind == "line.optimize" && contains("line.validate", cfg.Operations) && contains("line.tune", cfg.Operations)) {
 		return errors.New("当前动态操作未启用")
 	}
-	if plan.LineID != operation.LineID || !safeID.MatchString(plan.LineID) || !contains(plan.ResourceGroup, cfg.ResourceGroups) {
-		return errors.New("线路标识或资源组不在 worker 授权范围内")
+	if plan.LineID != operation.LineID || !safeID.MatchString(plan.LineID) {
+		return errors.New("线路标识不在 worker 授权范围内")
 	}
 	if plan.InstanceID == "" || !safeID.MatchString(plan.InstanceID) || plan.BandwidthMbps < 1 || plan.BandwidthMbps > 1000 ||
 		plan.UpstreamMbps < 1 || plan.UpstreamMbps > 1000 || plan.DownstreamMbps < 1 || plan.DownstreamMbps > 1000 {
@@ -586,7 +586,7 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	if plan.ExitBindIP != "" {
 		exit["outip"] = plan.ExitBindIP
 	}
-	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "workers": map[string]int{"entry": transportWorkerLanes, "middle": transportWorkerLanes, "exit": transportWorkerLanes}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false, "dns_servers": plan.DNSServers}}}
+	source := map[string]any{"entry": roles["entry"], "middle": roles["middle"], "exit": exit, "build_host": "entry", "release_retention": 5, "paths": map[string]string{"work_dir": "/etc/NB"}, "workers": map[string]int{"entry": transportWorkerLanes, "middle": transportWorkerLanes, "exit": transportWorkerLanes}, "exits": []map[string]any{{"name": exit["name"], "host": exit["host"], "port": plan.ExitPort, "weight": 1, "capacity": 0, "fixed_exit": exit["name"]}}, "transport": map[string]any{"entry": map[string]any{"cc": "cubic", "cwin_max_bytes": 524288, "mtu_max": 1452, "udp_gso": false, "udp_port_min": plan.UDPPortMin, "udp_port_max": plan.UDPPortMax, "reorder_gap": 128, "reorder_delay_us": 450000}, "middle": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:F0.25:", "mtu_max": 1452, "udp_gso": false, "reorder_gap": 128, "reorder_delay_us": 462000}, "exit": map[string]any{"cc": "bbr", "bbr_options": "Q0.0001:", "mtu_max": 1452, "udp_gso": false, "dns_servers": plan.DNSServers}}}
 	if err := writePrivateJSON(sourcePath, source); err != nil {
 		return LineSpec{}, err
 	}
@@ -622,6 +622,11 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	}
 	profile := filepath.Join(lineState, "provision", operation.LineID, "stable-profile.json")
 	hosts := filepath.Join(lineState, "provision", operation.LineID, "deployment-hosts.json")
+	if operation.Kind == "line.disable" {
+		if _, statErr := os.Stat(hosts); errors.Is(statErr, os.ErrNotExist) {
+			hosts = sourcePath
+		}
+	}
 	return LineSpec{LineID: operation.LineID, ResourceGroup: plan.ResourceGroup, InstanceID: plan.InstanceID, HostsFile: hosts, SourceMachinesFile: sourcePath, LineProfileFile: profile, KnownHostsFile: knownHosts, SecurityDir: filepath.Join(lineState, "security"), ClientSecretFile: filepath.Join(lineState, "bootstrap-client-secret.json"), PackageMbps: float64(plan.BandwidthMbps), UpstreamMbps: float64(plan.UpstreamMbps), DownstreamMbps: float64(plan.DownstreamMbps), SocksPort: plan.SocksPort, UDPPortMin: plan.UDPPortMin, UDPPortMax: plan.UDPPortMax, MiddlePort: plan.RelayPort, ExitPort: plan.ExitPort, ExitBindIP: plan.ExitBindIP, EnabledOperations: append([]string(nil), r.registry.Dynamic.Operations...), StateDir: lineState, WhitelistFile: whitelistPath, WhitelistSourceEnv: whitelistSourceEnv, SingBox: r.registry.Dynamic.SingBox, ExtraEnvironment: extraEnvironment, BuildMode: plan.BuildMode}, nil
 }
 

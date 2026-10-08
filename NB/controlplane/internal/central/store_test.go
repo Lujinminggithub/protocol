@@ -1233,6 +1233,49 @@ func TestTopologyDeduplicatesSharedDevicesAndKeepsLineEdges(t *testing.T) {
 	}
 }
 
+func TestLinesSharingDeviceRolesReturnsExactBlastRadius(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, id := range []string{"gz", "hk", "us", "uk", "other-entry", "other-relay", "other-exit"} {
+		if _, err = store.UpsertDevice(t.Context(), Device{ID: id, Name: id, Status: "ready",
+			Host: "192.0.2.1", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	topologies := map[string][]LineNode{
+		"line-uk": {{DeviceID: "gz", Role: "entry"}, {DeviceID: "hk", Role: "relay"}, {DeviceID: "uk", Role: "exit"}},
+		"line-us": {{DeviceID: "gz", Role: "entry"}, {DeviceID: "hk", Role: "relay"}, {DeviceID: "us", Role: "exit"}},
+		"line-other": {{DeviceID: "other-entry", Role: "entry"}, {DeviceID: "other-relay", Role: "relay"}, {DeviceID: "other-exit", Role: "exit"}},
+	}
+	index := 0
+	for lineID, nodes := range topologies {
+		if _, err = store.UpsertLine(t.Context(), Line{ID: lineID, Name: lineID, Status: "active",
+			EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+			t.Fatal(err)
+		}
+		spec := LineSpec{LineID: lineID, ResourceGroup: "legacy", InstanceID: lineID + "_1",
+			BandwidthMbps: 10, UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1082 + index,
+			RelayPort: 4445 + index*2, ExitPort: 4443 + index*2,
+			UDPPortMin: 22048 + index*1024, UDPPortMax: 23071 + index*1024,
+			Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`),
+			BuildMode: "auto", JumpPolicy: "auto", Nodes: nodes}
+		if _, err = store.SaveLineSpec(t.Context(), spec); err != nil {
+			t.Fatal(err)
+		}
+		index++
+	}
+	lines, err := store.LinesSharingDeviceRoles(t.Context(), "line-uk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(lines, ",") != "line-uk,line-us" {
+		t.Fatalf("affected lines=%v", lines)
+	}
+}
+
 func TestTopologyLayoutPersistsAndResets(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

@@ -183,8 +183,8 @@ func (r Registry) Validate() error {
 		return fmt.Errorf("worker root is unavailable: %s", r.Root)
 	}
 	if r.Dynamic.Enabled {
-		if len(r.Dynamic.ResourceGroups) == 0 || len(r.Dynamic.Operations) == 0 {
-			return errors.New("dynamic worker requires resource groups and operations")
+		if len(r.Dynamic.Operations) == 0 {
+			return errors.New("dynamic worker requires operations")
 		}
 		for _, group := range r.Dynamic.ResourceGroups {
 			if !safeID.MatchString(group) {

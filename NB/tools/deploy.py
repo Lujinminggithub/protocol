@@ -659,9 +659,126 @@ def act_deploy_socks(socks_port=DEFAULT_SOCKS_PORT):
     print(f">>> 手机配置: SOCKS5 -> {gz['host']}:{socks_port}，使用 NB_SOCKS_USERNAME 对应凭据")
 
 
+def act_deploy_instance(deployment_id, socks_port=DEFAULT_SOCKS_PORT):
+    """Install one named line into an existing shared shard runtime."""
+    if not DEPLOY_INSTANCE:
+        raise RuntimeError("deploy-instance requires NB_DEPLOY_INSTANCE")
+    if not deployment_id or not nb_release.DEPLOYMENT_NAME_RE.fullmatch(deployment_id):
+        raise ValueError("deploy-instance requires a valid --deployment-id")
+    _require_security_material()
+    if not os.environ.get("NB_SOCKS_USERNAME") or not os.environ.get("NB_SOCKS_PASSWORD"):
+        raise RuntimeError("线路实例部署需要 SOCKS 凭据完成端到端门禁")
+    roles = ("exit", "middle", "entry")
+    clients = {}
+    activated = []
+    locked = []
+    try:
+        for role in roles:
+            clients[role] = connect(role)
+            _acquire_deploy_lock(clients[role], role, deployment_id)
+            locked.append(role)
+
+        commands = {}
+        explicit_whitelist = os.environ.get("NB_WHITELIST_FILE", "")
+        local_whitelist = pathlib.Path(explicit_whitelist) if explicit_whitelist else None
+        if local_whitelist is not None and not local_whitelist.is_file():
+            raise RuntimeError("NB_WHITELIST_FILE does not exist")
+
+        exit_client = clients["exit"]
+        _push_security(exit_client, "exit")
+        _push_tiktok_rules(exit_client)
+        exit_whitelist = (_push_whitelist(exit_client, local_whitelist, role="exit")
+                          if local_whitelist is not None else _ensure_remote_whitelist(exit_client))
+        verified_exit_ip = _verify_exit_bind_ip(exit_client)
+        print(f"exit: bind IP verified ({verified_exit_ip})")
+        commands["exit"] = _node_command("exit", wl_remote=exit_whitelist)
+
+        middle_client = clients["middle"]
+        _push_security(middle_client, "middle")
+        _push_tiktok_rules(middle_client)
+        commands["middle"] = _node_command("middle")
+
+        entry_client = clients["entry"]
+        _push_security(entry_client, "entry")
+        _push_tiktok_rules(entry_client)
+        entry_whitelist = (_push_whitelist(entry_client, local_whitelist, role="entry")
+                           if local_whitelist is not None else _ensure_remote_whitelist(entry_client, role="entry"))
+        _push_exit_routes(entry_client)
+        commands["entry"] = _node_command(
+            "entry", socks_port=socks_port, wl_remote=entry_whitelist,
+            exit_routes=_exit_routes_remote())
+
+        for role in roles:
+            state = _install_instance_role(
+                clients[role], role, commands[role], deployment_id=deployment_id)
+            activated.append(role)
+            print(f"{role}: {state}")
+        _smoke_socks(socks_port)
+    except Exception:
+        for role in reversed(activated):
+            try:
+                state = _rollback_instance_role(clients[role], role, deployment_id)
+                print(f"{role}: instance rollback completed ({state})")
+            except Exception as rollback_error:
+                print(f"{role}: instance rollback failed: {rollback_error}", file=sys.stderr)
+        raise
+    finally:
+        for role in locked:
+            try:
+                _release_deploy_lock(clients[role])
+            except Exception as unlock_error:
+                print(f"{role}: release instance deployment lock failed: {unlock_error}", file=sys.stderr)
+        for client in clients.values():
+            client.close()
+    print(f">>> 线路实例部署完成 deployment={deployment_id}")
+
+
 def _activate_existing_deployment(c, role, deployment_id):
-    if not nb_release.RELEASE_NAME_RE.fullmatch(deployment_id) or deployment_id.startswith("legacy-"):
+    if not nb_release.DEPLOYMENT_NAME_RE.fullmatch(deployment_id) or deployment_id.startswith("legacy-"):
         raise ValueError(f"非法 deployment_id: {deployment_id}")
+    if deployment_id.startswith("cfg-"):
+        if not DEPLOY_INSTANCE:
+            raise RuntimeError("config deployment rollback requires NB_DEPLOY_INSTANCE")
+        workers = _effective_workers(role)
+        saved = [nb_shard_deploy.saved_instance_config(INSTANCE_WORK, deployment_id, role, worker)
+                 for worker in range(workers)]
+        checks = " && ".join(f"test -f {shlex.quote(path)}" for path in saved)
+        if "CONFIG_DEPLOYMENT_READY" not in run(
+                c, f"{checks} && echo CONFIG_DEPLOYMENT_READY"):
+            raise RuntimeError(f"{role} config deployment is unavailable: {deployment_id}")
+        active = [f"{nb_shard_deploy.shard_config_dir(WORK, role, worker)}/{DEPLOY_INSTANCE}.conf"
+                  for worker in range(workers)]
+        backups = []
+        marker = nb_shard_deploy.current_deployment_marker(INSTANCE_WORK)
+        marker_backup = marker + ".exact-rollback"
+        marker_existed = "PRESENT" in run(c, f"if test -f {shlex.quote(marker)}; then "
+            f"cp -p {shlex.quote(marker)} {shlex.quote(marker_backup)}; echo PRESENT; else echo ABSENT; fi")
+        try:
+            for source, target in zip(saved, active):
+                backup = target + ".exact-rollback"
+                run(c, f"cp -p {shlex.quote(target)} {shlex.quote(backup)}; "
+                    f"cp -p {shlex.quote(source)} {shlex.quote(target + '.next')}; "
+                    f"mv -f {shlex.quote(target + '.next')} {shlex.quote(target)}")
+                backups.append((target, backup))
+            for worker in range(workers):
+                run(c, f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role, worker))}")
+            run(c, f"printf '%s\\n' {shlex.quote(deployment_id)} > {shlex.quote(marker)}; "
+                f"chmod 0600 {shlex.quote(marker)}")
+            return _verify_deployment_health(c, role, deployment_id, warmup=3)
+        except Exception:
+            for target, backup in backups:
+                run(c, f"test ! -f {shlex.quote(backup)} || mv -f {shlex.quote(backup)} {shlex.quote(target)}")
+            if marker_existed:
+                run(c, f"mv -f {shlex.quote(marker_backup)} {shlex.quote(marker)}")
+            else:
+                run(c, f"rm -f {shlex.quote(marker)} {shlex.quote(marker_backup)}")
+            for worker in range(workers):
+                run(c, f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role, worker))} 2>/dev/null || true")
+            raise
+        finally:
+            for _target, backup in backups:
+                run(c, f"rm -f {shlex.quote(backup)}")
+            run(c, f"rm -f {shlex.quote(marker_backup)}")
     if DEPLOY_INSTANCE:
         workers = _effective_workers(role)
         directory = f"{INSTANCE_WORK}/releases/{deployment_id}"
@@ -793,7 +910,7 @@ def act_wl_push(local_path: pathlib.Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=[
-        "recon", "build", "prepare-release", "deploy-tri", "deploy-socks", "stop", "logs",
+        "recon", "build", "prepare-release", "deploy-tri", "deploy-socks", "deploy-instance", "stop", "logs",
         "wl-show", "wl-push", "fec-status", "fec-on", "fec-off", "current", "rollback-socks"
     ])
     ap.add_argument("--roles", default="entry,middle,exit")
@@ -808,6 +925,7 @@ def main():
     elif a.action == "prepare-release": act_prepare_release()
     elif a.action == "deploy-tri": act_deploy_tri()
     elif a.action == "deploy-socks": act_deploy_socks(a.socks_port)
+    elif a.action == "deploy-instance": act_deploy_instance(a.deployment_id, a.socks_port)
     elif a.action == "current": act_current_deployment()
     elif a.action == "rollback-socks": act_rollback_socks(a.deployment_id,a.socks_port)
     elif a.action == "stop": act_stop(roles, ignore_unavailable=a.ignore_unavailable)

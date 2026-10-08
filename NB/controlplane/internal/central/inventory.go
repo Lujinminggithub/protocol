@@ -386,6 +386,27 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 	return item, nil
 }
 
+// LinesSharingDeviceRoles returns the exact line blast radius of a device-role change.
+func (s *Store) LinesSharingDeviceRoles(ctx context.Context, lineID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT candidate.line_id
+ FROM line_nodes target
+ JOIN line_nodes candidate ON candidate.device_id=target.device_id AND candidate.role=target.role
+ WHERE target.line_id=? ORDER BY candidate.line_id`, lineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []string{}
+	for rows.Next() {
+		var candidate string
+		if err = rows.Scan(&candidate); err != nil {
+			return nil, err
+		}
+		result = append(result, candidate)
+	}
+	return result, rows.Err()
+}
+
 // ActiveLineSpecs returns only deployed lines. Agents use this to rebuild
 // ephemeral worker state after a controller migration or restart.
 func (s *Store) ActiveLineSpecs(ctx context.Context) ([]LineSpec, error) {

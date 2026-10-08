@@ -572,7 +572,7 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	device := func(id, role, host, secret string) dynamicNode {
 		return trustedDynamicNode(t, id, role, host, 22, "env:"+secret)
 	}
-	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "new", BandwidthMbps: 20,
+	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "renamed-production-group", InstanceID: "new", BandwidthMbps: 20,
 		UpstreamMbps: 6, DownstreamMbps: 14,
 		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, ExitBindIP: "192.0.2.30", UDPPortMin: 22048, UDPPortMax: 23071,
 		DNSServers: []string{"9.9.9.9", "1.1.1.1"},
@@ -676,6 +676,45 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	}
 }
 
+func TestDynamicDisableBeforeOpenUsesGeneratedSourceTopology(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, Operations: []string{"line.disable"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599,
+		UDPPortMin: 22048, UDPPortMax: 65535}
+	for _, name := range []string{"ENTRY", "RELAY", "EXIT"} {
+		t.Setenv("NB_DISABLE_"+name, "password-"+name)
+	}
+	node := func(id, role, host, secret string) dynamicNode {
+		return trustedDynamicNode(t, id, role, host, 22, "env:"+secret)
+	}
+	plan := dynamicPlan{LineID: "line-never-opened", ResourceGroup: "renamed-group",
+		InstanceID: "line-never-opened_1", BandwidthMbps: 10, UpstreamMbps: 10, DownstreamMbps: 10,
+		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		DNSServers: []string{"1.1.1.1"}, BuildMode: "auto", JumpPolicy: "auto",
+		Nodes: []dynamicNode{node("entry-1", "entry", "192.0.2.1", "NB_DISABLE_ENTRY"),
+			node("relay-1", "relay", "192.0.2.2", "NB_DISABLE_RELAY"),
+			node("exit-1", "exit", "192.0.2.3", "NB_DISABLE_EXIT")}}
+	line, err := NewRunner(registry).dynamicLine(Operation{ID: "op-disable", LineID: plan.LineID,
+		Kind: "line.disable"}, requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line.HostsFile != line.SourceMachinesFile {
+		t.Fatalf("disable hosts=%q source=%q", line.HostsFile, line.SourceMachinesFile)
+	}
+	data, err := os.ReadFile(line.SourceMachinesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source struct {
+		Paths map[string]string `json:"paths"`
+	}
+	if json.Unmarshal(data, &source) != nil || source.Paths["work_dir"] != "/etc/NB" {
+		t.Fatalf("disable source topology lacks deployment paths: %s", data)
+	}
+}
+
 type fakeRunner struct {
 	calls atomic.Int64
 	delay time.Duration
@@ -771,7 +810,7 @@ func TestClientCollectsDynamicLineSnapshots(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/agent/v1/line-plans":
-			_, _ = w.Write([]byte(`{"plans":[{"line_id":"line-dynamic","resource_group":"test-group"}]}`))
+			_, _ = w.Write([]byte(`{"plans":[{"line_id":"line-dynamic","resource_group":"renamed-group"}]}`))
 		case "/agent/v1/snapshots":
 			var snapshot Snapshot
 			if json.NewDecoder(request.Body).Decode(&snapshot) != nil {
