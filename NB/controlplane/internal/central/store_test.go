@@ -1787,3 +1787,47 @@ func TestTopologyLayoutRejectsUnknownDevice(t *testing.T) {
 		t.Fatal("unknown device layout was accepted")
 	}
 }
+
+func TestLineSpecTopologyAndServiceProfileRoundTrip(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	if _, err = store.UpsertLine(ctx, Line{ID: "single-hk", Name: "single-hk", Status: "draft",
+		Environment: "test", CapacityMbps: 5}); err != nil {
+		t.Fatal(err)
+	}
+	spec := LineSpec{LineID: "single-hk", Environment: "test", ResourceGroup: "hk",
+		InstanceID: "single-hk_1", BandwidthMbps: 5, SocksPort: 1082,
+		UDPPortMin: 22048, UDPPortMax: 23071, ExitPort: 4443,
+		TopologyMode: "single_hk", ServiceProfile: "general",
+		Whitelist: json.RawMessage(`[]`), BuildMode: "auto", SourceRef: "repo://current",
+		JumpPolicy: "direct"}
+	stored, err := store.SaveLineSpec(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.TopologyMode != "single_hk" || stored.ServiceProfile != "general" {
+		t.Fatalf("topology/profile lost: %+v", stored)
+	}
+}
+
+func TestLineSpecTopologyDefaultsAndRejectsUnknownValues(t *testing.T) {
+	spec := LineSpec{}
+	if err := spec.NormalizeTopology(); err != nil {
+		t.Fatal(err)
+	}
+	if spec.TopologyMode != "trihop" || spec.ServiceProfile != "general" {
+		t.Fatalf("legacy defaults=%q/%q", spec.TopologyMode, spec.ServiceProfile)
+	}
+	for _, invalid := range []LineSpec{
+		{TopologyMode: "mesh", ServiceProfile: "general"},
+		{TopologyMode: "single_hk", ServiceProfile: "unknown"},
+	} {
+		if err := invalid.NormalizeTopology(); err == nil {
+			t.Fatalf("accepted invalid topology/profile: %+v", invalid)
+		}
+	}
+}

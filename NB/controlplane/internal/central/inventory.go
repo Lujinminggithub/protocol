@@ -48,6 +48,8 @@ type LineNode struct {
 type LineSpec struct {
 	LineID         string          `json:"line_id"`
 	Environment    string          `json:"environment"`
+	TopologyMode   string          `json:"topology_mode"`
+	ServiceProfile string          `json:"service_profile"`
 	ResourceGroup  string          `json:"resource_group"`
 	InstanceID     string          `json:"instance_id"`
 	BandwidthMbps  int             `json:"bandwidth_mbps"`
@@ -107,6 +109,22 @@ func (spec *LineSpec) NormalizeRates() {
 	if len(spec.DNSServers) == 0 || json.Unmarshal(spec.DNSServers, &servers) != nil || len(servers) == 0 {
 		spec.DNSServers = json.RawMessage(`["1.1.1.1","8.8.8.8"]`)
 	}
+}
+
+func (spec *LineSpec) NormalizeTopology() error {
+	if spec.TopologyMode == "" {
+		spec.TopologyMode = "trihop"
+	}
+	if spec.ServiceProfile == "" {
+		spec.ServiceProfile = "general"
+	}
+	if spec.TopologyMode != "trihop" && spec.TopologyMode != "single_hk" {
+		return errors.New("invalid topology mode")
+	}
+	if spec.ServiceProfile != "general" && spec.ServiceProfile != "tiktok_live" {
+		return errors.New("invalid service profile")
+	}
+	return nil
 }
 
 func validEnvironment(value string) bool { return value == "production" || value == "test" }
@@ -256,6 +274,9 @@ func (s *Store) UpdateDeviceHealth(ctx context.Context, id, health string) error
 
 func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, error) {
 	spec.NormalizeRates()
+	if err := spec.NormalizeTopology(); err != nil {
+		return LineSpec{}, err
+	}
 	if !validEnvironment(spec.Environment) {
 		return LineSpec{}, errors.New("invalid line environment")
 	}
@@ -274,29 +295,31 @@ func (s *Store) SaveLineSpec(ctx context.Context, spec LineSpec) (LineSpec, erro
 	stamp := now()
 	query := s.controlSQL(`INSERT INTO line_specs
 	 (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
-	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at,environment)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
+	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at,environment,topology_mode,service_profile)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(line_id) DO UPDATE SET
  resource_group=excluded.resource_group,instance_id=excluded.instance_id,
 	 bandwidth_mbps=excluded.bandwidth_mbps,upstream_mbps=excluded.upstream_mbps,
 	 downstream_mbps=excluded.downstream_mbps,socks_port=excluded.socks_port,
  udp_port_min=excluded.udp_port_min,udp_port_max=excluded.udp_port_max,
 	 relay_port=excluded.relay_port,exit_port=excluded.exit_port,exit_bind_ip=excluded.exit_bind_ip,dns_servers=excluded.dns_servers,whitelist=excluded.whitelist,
  build_mode=excluded.build_mode,artifact_ref=excluded.artifact_ref,source_ref=excluded.source_ref,
-	 srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at,environment=excluded.environment`, `INSERT INTO line_specs
+	 srs_ref=excluded.srs_ref,jump_policy=excluded.jump_policy,updated_at=excluded.updated_at,environment=excluded.environment,
+	 topology_mode=excluded.topology_mode,service_profile=excluded.service_profile`, `INSERT INTO line_specs
  (line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,socks_port,udp_port_min,udp_port_max,
-	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at,environment)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE resource_group=VALUES(resource_group),
+	 relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,source_ref,srs_ref,jump_policy,created_at,updated_at,environment,topology_mode,service_profile)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE resource_group=VALUES(resource_group),
  instance_id=VALUES(instance_id),bandwidth_mbps=VALUES(bandwidth_mbps),upstream_mbps=VALUES(upstream_mbps),
  downstream_mbps=VALUES(downstream_mbps),socks_port=VALUES(socks_port),udp_port_min=VALUES(udp_port_min),
  udp_port_max=VALUES(udp_port_max),relay_port=VALUES(relay_port),exit_port=VALUES(exit_port),
  exit_bind_ip=VALUES(exit_bind_ip),dns_servers=VALUES(dns_servers),whitelist=VALUES(whitelist),build_mode=VALUES(build_mode),
  artifact_ref=VALUES(artifact_ref),source_ref=VALUES(source_ref),srs_ref=VALUES(srs_ref),
-	 jump_policy=VALUES(jump_policy),updated_at=VALUES(updated_at),environment=VALUES(environment)`)
+	 jump_policy=VALUES(jump_policy),updated_at=VALUES(updated_at),environment=VALUES(environment),
+	 topology_mode=VALUES(topology_mode),service_profile=VALUES(service_profile)`)
 	_, err = tx.ExecContext(ctx, query,
 		spec.LineID, spec.ResourceGroup, spec.InstanceID, spec.BandwidthMbps, spec.UpstreamMbps, spec.DownstreamMbps, spec.SocksPort,
 		spec.UDPPortMin, spec.UDPPortMax, spec.RelayPort, spec.ExitPort, spec.ExitBindIP, normalizedJSON(spec.DNSServers, `["1.1.1.1","8.8.8.8"]`),
 		normalizedJSON(spec.Whitelist, `[]`), spec.BuildMode, spec.ArtifactRef, spec.SourceRef,
-		spec.SRSRef, spec.JumpPolicy, stamp, stamp, spec.Environment)
+		spec.SRSRef, spec.JumpPolicy, stamp, stamp, spec.Environment, spec.TopologyMode, spec.ServiceProfile)
 	if err != nil {
 		return LineSpec{}, err
 	}
@@ -339,16 +362,19 @@ func (s *Store) LineSpec(ctx context.Context, lineID string) (LineSpec, error) {
 	var dnsServers, whitelist []byte
 	err := s.db.QueryRowContext(ctx, `SELECT line_id,resource_group,instance_id,bandwidth_mbps,upstream_mbps,downstream_mbps,
  socks_port,udp_port_min,udp_port_max,relay_port,exit_port,exit_bind_ip,dns_servers,whitelist,build_mode,artifact_ref,
-	 source_ref,srs_ref,jump_policy,created_at,updated_at,environment FROM line_specs WHERE line_id=?`, lineID).Scan(
+	 source_ref,srs_ref,jump_policy,created_at,updated_at,environment,topology_mode,service_profile FROM line_specs WHERE line_id=?`, lineID).Scan(
 		&item.LineID, &item.ResourceGroup, &item.InstanceID, &item.BandwidthMbps, &item.UpstreamMbps, &item.DownstreamMbps, &item.SocksPort,
 		&item.UDPPortMin, &item.UDPPortMax, &item.RelayPort, &item.ExitPort, &item.ExitBindIP, &dnsServers, &whitelist,
 		&item.BuildMode, &item.ArtifactRef, &item.SourceRef, &item.SRSRef, &item.JumpPolicy,
-		&item.CreatedAt, &item.UpdatedAt, &item.Environment)
+		&item.CreatedAt, &item.UpdatedAt, &item.Environment, &item.TopologyMode, &item.ServiceProfile)
 	if err != nil {
 		return LineSpec{}, err
 	}
 	item.Whitelist = json.RawMessage(whitelist)
 	item.DNSServers = json.RawMessage(dnsServers)
+	if err = item.NormalizeTopology(); err != nil {
+		return LineSpec{}, err
+	}
 	var socksAuto, relayAuto, exitAuto, udpAuto bool
 	allocationErr := s.db.QueryRowContext(ctx, `SELECT socks_port_auto,relay_port_auto,exit_port_auto,udp_ports_auto
 	 FROM line_port_allocation WHERE line_id=?`, lineID).Scan(&socksAuto, &relayAuto, &exitAuto, &udpAuto)

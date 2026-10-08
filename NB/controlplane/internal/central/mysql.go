@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS line_specs (
  relay_port INT NOT NULL, exit_port INT NOT NULL, exit_bind_ip VARCHAR(64) NOT NULL DEFAULT '',
  dns_servers MEDIUMBLOB NOT NULL, whitelist MEDIUMBLOB NOT NULL, build_mode VARCHAR(32) NOT NULL,
  artifact_ref TEXT NOT NULL, source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy VARCHAR(64) NOT NULL,
- created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL, environment VARCHAR(32) NOT NULL DEFAULT 'production'
+ created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL, environment VARCHAR(32) NOT NULL DEFAULT 'production',
+ topology_mode VARCHAR(32) NOT NULL DEFAULT 'trihop', service_profile VARCHAR(32) NOT NULL DEFAULT 'general'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS line_port_allocation (
  line_id VARCHAR(191) PRIMARY KEY, socks_port_auto BOOLEAN NOT NULL DEFAULT FALSE,
@@ -166,6 +167,8 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 		`ALTER TABLE ` + "`lines`" + ` ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE devices ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE line_specs ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
+		`ALTER TABLE line_specs ADD COLUMN topology_mode VARCHAR(32) NOT NULL DEFAULT 'trihop'`,
+		`ALTER TABLE line_specs ADD COLUMN service_profile VARCHAR(32) NOT NULL DEFAULT 'general'`,
 	} {
 		if _, alterErr := s.db.ExecContext(ctx, statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate") {
 			return alterErr
@@ -180,5 +183,13 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE line_specs SET environment='production' WHERE environment IS NULL OR environment=''`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE line_specs SET topology_mode='trihop' WHERE topology_mode IS NULL OR topology_mode=''`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE line_specs SET service_profile='general' WHERE service_profile IS NULL OR service_profile=''`)
 	return err
 }

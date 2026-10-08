@@ -399,7 +399,8 @@ CREATE TABLE IF NOT EXISTS devices (
  provider TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
  secret_ref TEXT NOT NULL DEFAULT '', labels BLOB NOT NULL DEFAULT '{}',
  last_health TEXT NOT NULL DEFAULT 'unknown', last_seen_at TEXT NOT NULL DEFAULT '',
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, environment TEXT NOT NULL DEFAULT 'production'
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, environment TEXT NOT NULL DEFAULT 'production',
+ topology_mode TEXT NOT NULL DEFAULT 'trihop', service_profile TEXT NOT NULL DEFAULT 'general'
 );
 CREATE TABLE IF NOT EXISTS topology_layouts (
  device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
@@ -676,12 +677,24 @@ CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_a
 	if lineErr = lineRows.Close(); lineErr != nil {
 		return lineErr
 	}
-	if !lineColumns["environment"] {
-		if _, lineErr = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'`); lineErr != nil {
-			return lineErr
+	for name, definition := range map[string]string{
+		"environment":     "TEXT NOT NULL DEFAULT 'production'",
+		"topology_mode":   "TEXT NOT NULL DEFAULT 'trihop'",
+		"service_profile": "TEXT NOT NULL DEFAULT 'general'",
+	} {
+		if !lineColumns[name] {
+			if _, lineErr = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN `+name+` `+definition); lineErr != nil {
+				return lineErr
+			}
 		}
 	}
 	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET environment='production' WHERE environment IS NULL OR environment=''`); lineErr != nil {
+		return lineErr
+	}
+	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET topology_mode='trihop' WHERE topology_mode IS NULL OR topology_mode=''`); lineErr != nil {
+		return lineErr
+	}
+	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET service_profile='general' WHERE service_profile IS NULL OR service_profile=''`); lineErr != nil {
 		return lineErr
 	}
 	// Older workers represented a role-wide collection failure as a fake node.
