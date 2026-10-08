@@ -798,6 +798,7 @@ func TestDynamicLineBuildsSingleHKTopology(t *testing.T) {
 		UDPPortMin: 22048, UDPPortMax: 65535}
 	t.Setenv("NB_SINGLE_HK_PASSWORD", "single-hk-password")
 	entry := trustedDynamicNode(t, "hk-1", "entry", "192.0.2.20", 22, "env:NB_SINGLE_HK_PASSWORD")
+	entry.Device.Region = "HK"
 	exit := entry
 	exit.Role = "exit"
 	plan := dynamicPlan{LineID: "hk-single", ResourceGroup: "hk", InstanceID: "hk-single_1",
@@ -822,6 +823,11 @@ func TestDynamicLineBuildsSingleHKTopology(t *testing.T) {
 	var source map[string]any
 	if json.Unmarshal(data, &source) != nil || source["middle"] != nil || source["topology_mode"] != "single_hk" {
 		t.Fatalf("single-HK source contains a Middle: %s", data)
+	}
+	rules, err := os.ReadFile(line.WhitelistFile)
+	if err != nil || !bytes.Contains(rules, []byte("ip 0.0.0.0/0")) ||
+		!bytes.Contains(rules, []byte("domain_keyword .")) || bytes.Contains(rules, []byte("tiktok.com")) {
+		t.Fatalf("general single-HK default whitelist=%q error=%v", rules, err)
 	}
 	steps, err := runner.steps(line, Operation{ID: "op-single", LineID: plan.LineID, Kind: "line.open"},
 		requestValues{Plan: plan}, t.TempDir())

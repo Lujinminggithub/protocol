@@ -33,6 +33,7 @@ type dynamicDevice struct {
 	SSHHostKeyStatus      string `json:"ssh_host_key_status"`
 	SSHHostKeyConfirmedAt string `json:"ssh_host_key_confirmed_at"`
 	PrivateIP             string `json:"private_ip"`
+	Region                string `json:"region"`
 	SecretRef             string `json:"secret_ref"`
 }
 type dynamicNode struct {
@@ -464,6 +465,10 @@ func (r *Runner) validateDynamicPlan(operation Operation, plan dynamicPlan) erro
 			plan.Nodes[0].DeviceID != plan.Nodes[1].DeviceID {
 			return errors.New("香港单节点线路必须且只能在同一台香港设备上包含 Entry 和 Exit")
 		}
+		region := strings.ToUpper(strings.TrimSpace(plan.Nodes[0].Device.Region))
+		if !strings.Contains(region, "HK") && !strings.Contains(plan.Nodes[0].Device.Region, "香港") {
+			return errors.New("香港单节点线路必须选择香港区域设备")
+		}
 		return nil
 	}
 	if roles["entry"] != 1 || roles["relay"] != 1 || roles["exit"] != 1 {
@@ -643,9 +648,13 @@ func (r *Runner) dynamicLine(operation Operation, request requestValues, operati
 	if plan.SRSRef == "" {
 		contents := []byte(strings.Join(lines, "\n") + "\n")
 		if len(plan.Whitelist) == 0 {
-			contents, err = os.ReadFile(filepath.Join(r.registry.Root, "tools", "whitelist.local.conf"))
-			if err != nil {
-				return LineSpec{}, fmt.Errorf("默认白名单不可用：%w", err)
+			if plan.TopologyMode == "single_hk" && plan.ServiceProfile == "general" {
+				contents = []byte("# authenticated general single-HK policy\nip 0.0.0.0/0\ndomain_keyword .\ndomain_exact localhost\n")
+			} else {
+				contents, err = os.ReadFile(filepath.Join(r.registry.Root, "tools", "whitelist.local.conf"))
+				if err != nil {
+					return LineSpec{}, fmt.Errorf("默认白名单不可用：%w", err)
+				}
 			}
 		}
 		if err := os.WriteFile(whitelistPath, contents, 0600); err != nil {

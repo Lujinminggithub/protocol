@@ -191,6 +191,18 @@ independently per physical Exit device. The worker passes these allocations to
 the atomic deployment tools. Windows remains the orchestration plane and is
 never part of packet forwarding.
 
+`topology_mode=single_hk` represents one Hong Kong device as logical Entry and
+Exit roles. The control plane allocates SOCKS, UDP relay, and Exit ports but no
+Relay port, deploys only Entry/Exit, and returns the normal
+`socks5://user:password@host:port#line` client URL. `service_profile=general`
+is the default; `tiktok_live` opts into stricter live-stream policy. Single-HK
+plans reject different Entry/Exit devices, any Relay node, and transport/FEC
+profile rollout operations.
+
+An empty whitelist on `single_hk/general` means authenticated general proxy
+access. Supplying static rules or a remote HTTPS SRS restores fail-closed target
+selection. `tiktok_live` keeps the existing TikTok-oriented default policy.
+
 Dynamic deployments use resumable, SHA-256 verified SFTP staging and bounded
 direct/jump SSH strategies. A partial artifact remains under a content-addressed
 `.part` name and resumes on the next attempt. Publication and the remote release
