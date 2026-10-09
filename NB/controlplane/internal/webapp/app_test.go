@@ -1439,7 +1439,7 @@ func TestNetworkLinkUIIsRetired(t *testing.T) {
 	}
 }
 
-func TestQualificationUIShowsDirectionalEvidence(t *testing.T) {
+func TestQualificationUIIsRetired(t *testing.T) {
 	index, err := assets.ReadFile("assets/index.html")
 	if err != nil {
 		t.Fatal(err)
@@ -1448,11 +1448,11 @@ func TestQualificationUIShowsDirectionalEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"待验证", "全双工合格", "全双工不合格",
+	for _, marker := range []string{"全双工资格", "待验证", "全双工合格", "全双工不合格",
 		"target_upstream_mbps", "target_downstream_mbps", "achieved_upstream_mbps",
 		"achieved_downstream_mbps", "required_ratio", "duration_seconds", "deployment_id", "operation_id"} {
-		if !bytes.Contains(index, []byte(marker)) && !bytes.Contains(script, []byte(marker)) {
-			t.Fatalf("qualification UI missing %q", marker)
+		if bytes.Contains(index, []byte(marker)) || bytes.Contains(script, []byte(marker)) {
+			t.Fatalf("retired qualification UI remains %q", marker)
 		}
 	}
 }
@@ -1475,8 +1475,12 @@ func TestGovernanceAPIReportsRemediationAndBlocksUpgrade(t *testing.T) {
 	}
 	governanceNodes := []central.LineNode{}
 	for _, item := range []struct{ id, role string }{{"governance-entry", "entry"}, {"governance-relay", "relay"}, {"governance-exit", "exit"}} {
+		environment := "production"
+		if item.id == "governance-exit" {
+			environment = "test"
+		}
 		if _, err = database.UpsertDevice(t.Context(), central.Device{ID: item.id, Name: item.id, Status: "ready",
-			Environment: "production", Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
+			Environment: environment, Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
 			Labels: json.RawMessage(`{}`)}); err != nil {
 			t.Fatal(err)
 		}
@@ -1547,7 +1551,8 @@ func TestGovernanceAPIReportsRemediationAndBlocksUpgrade(t *testing.T) {
 	defer server.Close()
 	response, body := call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/governance/production-lines", "admin", "", nil)
 	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"line_id":"governance-line"`)) ||
-		!bytes.Contains(body, []byte(`"code":"qualification_required"`)) ||
+		!bytes.Contains(body, []byte(`"code":"maintenance_required"`)) ||
+		bytes.Contains(body, []byte(`"code":"qualification_required"`)) ||
 		bytes.Contains(body, []byte(`"line_id":"governance-test"`)) || !bytes.Contains(body, []byte(`"required_action"`)) {
 		t.Fatalf("governance status=%d body=%s", response.StatusCode, body)
 	}
@@ -1577,10 +1582,13 @@ func TestGovernanceAPIReportsRemediationAndBlocksUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"maintenance_required", "qualification_required", "required_action", "生产治理"} {
+	for _, marker := range []string{"maintenance_required", "required_action", "生产治理"} {
 		if !bytes.Contains(script, []byte(marker)) {
 			t.Fatalf("governance UI missing %q", marker)
 		}
+	}
+	if bytes.Contains(script, []byte("qualification_required")) {
+		t.Fatal("retired qualification governance remains in UI")
 	}
 }
 

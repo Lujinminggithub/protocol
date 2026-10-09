@@ -156,13 +156,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .topology-link { flex: 0 1 100px; min-width: 52px; display: grid; justify-items: center; gap: 5px; }.topology-link span { width: 100%; height: 1px; background: #7ca7ab; position: relative; }.topology-link span::after { content: ""; position: absolute; right: -1px; top: -4px; border-left: 7px solid #7ca7ab; border-top: 4px solid transparent; border-bottom: 4px solid transparent; }.topology-link small { color: var(--muted); font-size: 10px; }
 .topology-empty { min-height: 100px; display: grid; place-items: center; color: var(--muted); }
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }.detail-grid dl { margin: 0; display: grid; grid-template-columns: 120px 1fr; gap: 12px 14px; }.detail-grid dt { color: var(--muted); }.detail-grid dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }.detail-section { margin-top: 24px; }.detail-table { min-width: 760px; }
-.qualification-detail { padding: 17px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-.qualification-summary { min-height: 32px; display: flex; align-items: center; gap: 12px; margin-top: 10px; color: var(--muted); font-size: 12px; }
-.directional-evidence { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-top: 13px; background: var(--line); border: 1px solid var(--line); }
-.directional-evidence > div { min-width: 0; padding: 12px; display: grid; grid-template-columns: minmax(62px,.7fr) 1fr 1fr; gap: 10px; background: white; }
-.directional-evidence span { color: var(--muted); font-size: 11px; }
-.qualification-meta { margin: 13px 0 0; display: grid; grid-template-columns: 92px minmax(0,1fr); gap: 7px 12px; }
-.qualification-meta dt { color: var(--muted); }.qualification-meta dd { margin: 0; overflow-wrap: anywhere; }
 .governance-findings { padding: 16px 0; border-top: 2px solid var(--amber); }
 .governance-finding { padding: 11px 0; border-bottom: 1px solid var(--line); }
 .governance-finding > div { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
@@ -224,10 +217,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
   .traffic-range-bar { position: relative; top: auto; padding: 10px 12px; align-items: stretch; flex-wrap: wrap; }.traffic-range-bar label { width: calc(50% - 5px); }.traffic-range-bar .segmented,.traffic-range-error { width: 100%; }
   .traffic-workspace-body { display: block; }.traffic-analysis-main { padding: 8px 10px 24px; }.traffic-event-rail { position: relative; top: auto; height: auto; padding: 0 12px 80px; border-left: 0; border-top: 1px solid var(--line); }.traffic-summary { align-items: stretch; flex-direction: column; }
   .modal { padding: 18px; }
-  .qualification-summary { align-items: flex-start; flex-direction: column; }
-  .directional-evidence { grid-template-columns: 1fr; }
-  .directional-evidence > div { grid-template-columns: 62px 1fr; }
-  .directional-evidence > div span:last-child { grid-column: 2; }
   .governance-finding > div { align-items: flex-start; flex-direction: column; gap: 4px; }
   .governance-finding > div span { text-align: left; }
 }

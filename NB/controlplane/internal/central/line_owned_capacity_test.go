@@ -70,3 +70,42 @@ func TestLineOwnedGovernanceIgnoresPhysicalLinks(t *testing.T) {
 		}
 	}
 }
+
+func TestActiveProductionLineNeedsNoHistoricalQualificationButStillEnforcesDeviceEnvironment(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedLineOwnedCapacity(t, store, "line-without-qualification")
+
+	findings, err := store.ProductionLineFindings(t.Context(), "line-without-qualification")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("active production line inherited obsolete qualification findings: %+v", findings)
+	}
+	if err = store.ClientDeliveryAllowed(t.Context(), "line-without-qualification"); err != nil {
+		t.Fatalf("active production line without qualification was blocked: %v", err)
+	}
+
+	entry, err := store.Device(t.Context(), "entry-owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.Environment = "test"
+	if _, err = store.UpsertDevice(t.Context(), entry); err != nil {
+		t.Fatal(err)
+	}
+	findings, err = store.ProductionLineFindings(t.Context(), "line-without-qualification")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Code != "maintenance_required" || findings[0].ResourceID != entry.ID {
+		t.Fatalf("device environment governance findings=%+v", findings)
+	}
+	if err = store.ClientDeliveryAllowed(t.Context(), "line-without-qualification"); err == nil {
+		t.Fatal("production line using a test device was allowed")
+	}
+}

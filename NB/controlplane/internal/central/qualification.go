@@ -181,13 +181,6 @@ func (s *Store) ClientDeliveryAllowed(ctx context.Context, lineID string) error 
 	if len(findings) > 0 {
 		return fmt.Errorf("client configuration is blocked by production governance: %s", findings[0].Code)
 	}
-	qualification, err := s.LatestLineQualification(ctx, lineID)
-	if err != nil {
-		return fmt.Errorf("client configuration requires admitted qualification")
-	}
-	if qualification.Status != "admitted" || qualification.DeploymentID != line.ActiveDeployment {
-		return fmt.Errorf("client configuration requires admitted qualification for current deployment")
-	}
 	return nil
 }
 

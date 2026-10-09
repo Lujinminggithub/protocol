@@ -254,6 +254,14 @@ admission, governance, qualification or deletion. Traffic analysis is separate
 observability: its overview and Entry/Middle/Exit directional charts remain
 unchanged and do not represent configurable physical-link capacity.
 
+Full-duplex qualification is also retired as a current product gate. Historical
+`line_qualifications` rows and read paths remain available for audit and older
+clients, but missing, stale or rejected probe evidence does not create a
+governance finding and does not block client delivery for an active line.
+Production governance continues to reject a production line that references a
+non-production device; operators must reclassify the device or the line through
+the Web inventory workflow instead of masking that mismatch as qualification.
+
 Incorrect or superseded draft lines are marked `archived`. Their historical
 operations remain queryable, while the line is excluded from the active line
 list, dashboard totals, and capacity calculations.

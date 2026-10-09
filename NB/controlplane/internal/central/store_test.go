@@ -1719,8 +1719,6 @@ func TestGovernanceAuditsHistoricalProductionLines(t *testing.T) {
 	}
 	want := map[string][]string{
 		"gov-test-device": {"maintenance_required"},
-		"gov-stale":       {"qualification_required"},
-		"gov-weak":        {"qualification_required"},
 	}
 	if !reflect.DeepEqual(byLine, want) {
 		t.Fatalf("governance findings=%v want=%v", byLine, want)
@@ -1730,6 +1728,11 @@ func TestGovernanceAuditsHistoricalProductionLines(t *testing.T) {
 	}
 	if err = store.ClientDeliveryAllowed(ctx, "gov-qualified"); err != nil {
 		t.Fatalf("qualified historical line was blocked: %v", err)
+	}
+	for _, lineID := range []string{"gov-stale", "gov-weak", "gov-missing-link"} {
+		if err = store.ClientDeliveryAllowed(ctx, lineID); err != nil {
+			t.Fatalf("historical qualification/link state blocked %s: %v", lineID, err)
+		}
 	}
 }
 
