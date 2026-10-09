@@ -162,4 +162,19 @@ with tempfile.TemporaryDirectory() as directory:
         else:
             os.environ["NB_CONTROLPLANE_ROOT"] = previous_root
 
+with tempfile.TemporaryDirectory(prefix="platform-deploy-modules-") as directory:
+    root = pathlib.Path(directory)
+    tools = root / "tools"
+    tools.mkdir()
+    (tools / "deploy_core.py").write_text(
+        "import os\nVALUE=os.environ['NB_TEST_ISOLATED_VALUE']\n", encoding="utf-8")
+    (tools / "deploy.py").write_text("from deploy_core import *\n", encoding="utf-8")
+    os.environ["NB_TEST_ISOLATED_VALUE"] = "line-a"
+    deploy_a = platform_upgrade.load_isolated_deploy(root, "line-a")
+    os.environ["NB_TEST_ISOLATED_VALUE"] = "line-b"
+    deploy_b = platform_upgrade.load_isolated_deploy(root, "line-b")
+    assert deploy_a.VALUE == "line-a"
+    assert deploy_b.VALUE == "line-b"
+    assert deploy_a is not deploy_b
+
 print("platform upgrade transaction tests passed")

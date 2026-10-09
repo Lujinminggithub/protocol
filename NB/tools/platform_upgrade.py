@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import importlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -92,6 +92,35 @@ class CompositeUpgradeAdapter:
             close = getattr(adapter, "close", None)
             if callable(close):
                 close()
+
+
+def load_isolated_deploy(root: pathlib.Path, namespace: str):
+    tools = root / "tools"
+    suffix = re.sub(r"[^A-Za-z0-9_]", "_", namespace)
+    core_name = "nb_deploy_core_" + suffix
+    deploy_name = "nb_deploy_" + suffix
+    core_spec = importlib.util.spec_from_file_location(core_name, tools / "deploy_core.py")
+    deploy_spec = importlib.util.spec_from_file_location(deploy_name, tools / "deploy.py")
+    if core_spec is None or core_spec.loader is None or deploy_spec is None or deploy_spec.loader is None:
+        raise RuntimeError("failed to load isolated deployment modules")
+    core_module = importlib.util.module_from_spec(core_spec)
+    deploy_module = importlib.util.module_from_spec(deploy_spec)
+    previous_core = sys.modules.get("deploy_core")
+    added_path = str(tools) not in sys.path
+    if added_path:
+        sys.path.insert(0, str(tools))
+    try:
+        core_spec.loader.exec_module(core_module)
+        sys.modules["deploy_core"] = core_module
+        deploy_spec.loader.exec_module(deploy_module)
+    finally:
+        if previous_core is None:
+            sys.modules.pop("deploy_core", None)
+        else:
+            sys.modules["deploy_core"] = previous_core
+        if added_path:
+            sys.path.remove(str(tools))
+    return deploy_module
 
 
 def execute_transaction(adapter: UpgradeAdapter, *, workers: int,
@@ -354,10 +383,7 @@ class SystemAdapter:
             device_id = str(device.get("id") or device.get("name") or "")
             secret = secrets.get("device:" + device_id) or secrets.get(device_id) or {}
             os.environ["NB_SSH_PASSWORD_" + environment_role] = str(secret.get("password") or "")
-        tools = str(self.current_root / "tools")
-        if tools not in sys.path:
-            sys.path.insert(0, tools)
-        self.deploy = importlib.import_module("deploy")
+        self.deploy = load_isolated_deploy(self.current_root, self.operation_id + "-" + self.line_id)
         self.node_manifest = json.loads((self.current_root / "build" / "release-manifest.json").read_text(encoding="utf-8"))
         self.node_binary = (self.current_root / "build" / "nb_node").read_bytes()
         self.clients = {role: self.deploy.connect(role) for role in ("entry", "middle", "exit")}
