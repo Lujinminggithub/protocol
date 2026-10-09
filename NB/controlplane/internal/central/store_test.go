@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -1233,6 +1234,505 @@ func TestTopologyDeduplicatesSharedDevicesAndKeepsLineEdges(t *testing.T) {
 	}
 }
 
+func TestLinesSharingDeviceRolesReturnsExactBlastRadius(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, id := range []string{"gz", "hk", "us", "uk", "other-entry", "other-relay", "other-exit"} {
+		if _, err = store.UpsertDevice(t.Context(), Device{ID: id, Name: id, Status: "ready",
+			Host: "192.0.2.1", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	topologies := map[string][]LineNode{
+		"line-uk":    {{DeviceID: "gz", Role: "entry"}, {DeviceID: "hk", Role: "relay"}, {DeviceID: "uk", Role: "exit"}},
+		"line-us":    {{DeviceID: "gz", Role: "entry"}, {DeviceID: "hk", Role: "relay"}, {DeviceID: "us", Role: "exit"}},
+		"line-other": {{DeviceID: "other-entry", Role: "entry"}, {DeviceID: "other-relay", Role: "relay"}, {DeviceID: "other-exit", Role: "exit"}},
+	}
+	index := 0
+	for lineID, nodes := range topologies {
+		if _, err = store.UpsertLine(t.Context(), Line{ID: lineID, Name: lineID, Status: "active",
+			EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10}); err != nil {
+			t.Fatal(err)
+		}
+		spec := LineSpec{LineID: lineID, ResourceGroup: "legacy", InstanceID: lineID + "_1",
+			BandwidthMbps: 10, UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1082 + index,
+			RelayPort: 4445 + index*2, ExitPort: 4443 + index*2,
+			UDPPortMin: 22048 + index*1024, UDPPortMax: 23071 + index*1024,
+			Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`),
+			BuildMode: "auto", JumpPolicy: "auto", Nodes: nodes}
+		if _, err = store.SaveLineSpec(t.Context(), spec); err != nil {
+			t.Fatal(err)
+		}
+		index++
+	}
+	lines, err := store.LinesSharingDeviceRoles(t.Context(), "line-uk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(lines, ",") != "line-uk,line-us" {
+		t.Fatalf("affected lines=%v", lines)
+	}
+}
+
+func TestHistoricalNetworkLinksRemainReadableButDoNotReserveCapacity(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, id := range []string{"gz", "hk", "exit"} {
+		if _, err = store.UpsertDevice(t.Context(), Device{ID: id, Name: id, Status: "ready",
+			Environment: "production", Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
+			Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodes := []LineNode{{DeviceID: "gz", Role: "entry"}, {DeviceID: "hk", Role: "relay"},
+		{DeviceID: "exit", Role: "exit"}}
+	for index, item := range []struct {
+		id         string
+		upstream   int
+		downstream int
+	}{{"line-a", 10, 6}, {"line-b", 10, 5}} {
+		if _, err = store.UpsertLine(t.Context(), Line{ID: item.id, Name: item.id, Status: "draft",
+			Environment: "production", EntryRegion: "gz", ExitRegion: "exit", Provider: "test",
+			CapacityMbps: 10}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = store.SaveLineSpec(t.Context(), LineSpec{LineID: item.id, Environment: "production",
+			ResourceGroup: "legacy", InstanceID: item.id + "_1", BandwidthMbps: 10,
+			UpstreamMbps: item.upstream, DownstreamMbps: item.downstream,
+			SocksPort: 1082 + index, RelayPort: 4445 + index*2, ExitPort: 4443 + index*2,
+			UDPPortMin: 22048 + index*1024, UDPPortMax: 23071 + index*1024,
+			Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`),
+			BuildMode: "auto", JumpPolicy: "auto", Nodes: nodes}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, link := range []NetworkLink{
+		{ID: "gz-hk", FromDeviceID: "gz", FromRole: "entry", ToDeviceID: "hk", ToRole: "relay",
+			ForwardCapacityMbps: 20, ReverseCapacityMbps: 10, BillingMode: LinkBillingIndependent,
+			Environment: "production", Status: "ready"},
+		{ID: "hk-exit", FromDeviceID: "hk", FromRole: "relay", ToDeviceID: "exit", ToRole: "exit",
+			ForwardCapacityMbps: 100, ReverseCapacityMbps: 100, BillingMode: LinkBillingIndependent,
+			Environment: "production", Status: "ready"},
+	} {
+		if _, err = store.UpsertNetworkLink(t.Context(), link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := store.ReserveLineCapacity(t.Context(), "line-a", "op-a")
+	if err != nil || len(first) != 0 {
+		t.Fatalf("first reservations=%+v err=%v", first, err)
+	}
+	links, err := store.NetworkLinks(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shared NetworkLink
+	for _, link := range links {
+		if link.ID == "gz-hk" {
+			shared = link
+		}
+	}
+	if shared.ForwardReservedMbps != 0 || shared.ForwardAvailableMbps != 20 ||
+		shared.ReverseReservedMbps != 0 || shared.ReverseAvailableMbps != 10 {
+		t.Fatalf("shared link usage=%+v", shared)
+	}
+	if _, err = store.ReserveLineCapacity(t.Context(), "line-a", "op-a"); err != nil {
+		t.Fatalf("idempotent retry failed: %v", err)
+	}
+	var count int
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM line_capacity_reservations WHERE line_id='line-a'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("reservation count=%d err=%v", count, err)
+	}
+	if reservations, reserveErr := store.ReserveLineCapacity(t.Context(), "line-b", "op-b"); reserveErr != nil || len(reservations) != 0 {
+		t.Fatalf("independent line was coupled to shared capacity reservations=%+v err=%v", reservations, reserveErr)
+	}
+	if err = store.ReleaseLineCapacity(t.Context(), "line-a", "op-release"); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReleaseLineCapacity(t.Context(), "line-a", "op-release"); err != nil {
+		t.Fatalf("idempotent release failed: %v", err)
+	}
+}
+
+func TestLineQualificationPersistsAndSelectsLatestDeterministically(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.UpsertLine(t.Context(), Line{ID: "line-qualified", Name: "qualified",
+		Status: "qualification_pending", Environment: "production", EntryRegion: "gz",
+		ExitRegion: "es", Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	for _, operationID := range []string{"op-a", "op-b"} {
+		if _, _, err = store.CreateOperation(t.Context(), Operation{ID: operationID,
+			LineID: "line-qualified", Kind: "line.optimize", RequestedBy: "test",
+			IdempotencyKey: "qualification-" + operationID, Request: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+		if err = store.CancelOperation(t.Context(), operationID, "qualification fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := LineQualification{LineID: "line-qualified", DeploymentID: "deployment-1",
+		OperationID: "op-a", TargetUpstreamMbps: 10, TargetDownstreamMbps: 10,
+		AchievedUpstreamMbps: 9.5, AchievedDownstreamMbps: 9.5, DurationSeconds: 90,
+		RequiredRatio: 0.95, Status: "admitted", Reasons: json.RawMessage(`[]`),
+		Evidence: json.RawMessage(`{"probe":"concurrent"}`)}
+	if first, err = store.SaveLineQualification(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.OperationID = "op-b"
+	second.Status = "rejected"
+	second.AchievedDownstreamMbps = 9.49
+	second.Reasons = json.RawMessage(`["insufficient-downlink"]`)
+	if second, err = store.SaveLineQualification(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	stamp := "2026-10-08T00:00:00Z"
+	if _, err = store.db.ExecContext(t.Context(), `UPDATE line_qualifications SET created_at=? WHERE line_id=?`,
+		stamp, "line-qualified"); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := store.LatestLineQualification(t.Context(), "line-qualified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.OperationID != "op-b" || latest.Status != "rejected" ||
+		latest.AchievedDownstreamMbps != 9.49 || string(latest.Reasons) != `["insufficient-downlink"]` {
+		t.Fatalf("latest qualification=%+v", latest)
+	}
+	if _, err = store.SaveLineQualification(t.Context(), LineQualification{LineID: "line-qualified",
+		DeploymentID: "deployment-1", OperationID: "op-invalid", TargetUpstreamMbps: 10,
+		TargetDownstreamMbps: 10, AchievedUpstreamMbps: 10, AchievedDownstreamMbps: 10,
+		DurationSeconds: 90, RequiredRatio: 0.95, Status: "admitted",
+		Reasons: json.RawMessage(`not-json`), Evidence: json.RawMessage(`{}`)}); err == nil {
+		t.Fatal("malformed reasons were accepted")
+	}
+	if _, err = store.SaveLineQualification(t.Context(), LineQualification{LineID: "line-qualified",
+		DeploymentID: "deployment-1", OperationID: "op-invalid-ratio", TargetUpstreamMbps: 10,
+		TargetDownstreamMbps: 10, AchievedUpstreamMbps: 10, AchievedDownstreamMbps: 10,
+		DurationSeconds: 90, RequiredRatio: 1.1, Status: "admitted",
+		Reasons: json.RawMessage(`[]`), Evidence: json.RawMessage(`{}`)}); err == nil {
+		t.Fatal("invalid required ratio was accepted")
+	}
+}
+
+func TestTwoPhaseProductionOpenRequiresMatchingQualification(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	lineID := "line-two-phase"
+	if _, err = store.UpsertLine(ctx, Line{ID: lineID, Name: "two phase", Status: "draft",
+		Environment: "production", EntryRegion: "gz", ExitRegion: "es", Provider: "test",
+		CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"entry-phase", "relay-phase", "exit-phase"} {
+		if _, err = store.UpsertDevice(ctx, Device{ID: id, Name: id, Status: "ready",
+			Environment: "production", Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
+			Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.SaveLineSpec(ctx, LineSpec{LineID: lineID, Environment: "production",
+		ResourceGroup: "managed", InstanceID: lineID + "_1", BandwidthMbps: 10,
+		UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1082, RelayPort: 4445, ExitPort: 4443,
+		UDPPortMin: 22048, UDPPortMax: 23071, Whitelist: json.RawMessage(`[]`),
+		DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", JumpPolicy: "auto",
+		Nodes: []LineNode{{DeviceID: "entry-phase", Role: "entry"},
+			{DeviceID: "relay-phase", Role: "relay"}, {DeviceID: "exit-phase", Role: "exit"}}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range []NetworkLink{
+		{ID: "phase-entry-relay", FromDeviceID: "entry-phase", FromRole: "entry",
+			ToDeviceID: "relay-phase", ToRole: "relay", ForwardCapacityMbps: 10,
+			ReverseCapacityMbps: 10, BillingMode: LinkBillingIndependent, Environment: "production", Status: "ready"},
+		{ID: "phase-relay-exit", FromDeviceID: "relay-phase", FromRole: "relay",
+			ToDeviceID: "exit-phase", ToRole: "exit", ForwardCapacityMbps: 10,
+			ReverseCapacityMbps: 10, BillingMode: LinkBillingIndependent, Environment: "production", Status: "ready"},
+	} {
+		if _, err = store.UpsertNetworkLink(ctx, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.UpsertNetworkLink(ctx, NetworkLink{ID: "phase-historical", FromDeviceID: "entry-phase",
+		FromRole: "entry", ToDeviceID: "exit-phase", ToRole: "relay", ForwardCapacityMbps: 10,
+		ReverseCapacityMbps: 10, BillingMode: LinkBillingIndependent, Environment: "production",
+		Status: "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	historicalStamp := now()
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO line_capacity_reservations
+ (line_id,link_id,forward_mbps,reverse_mbps,state,operation_id,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?)`, lineID, "phase-historical", 10, 10, "released", "old-open", historicalStamp, historicalStamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.UpsertLine(ctx, Line{ID: "line-cancel-open", Name: "cancel open", Status: "draft",
+		Environment: "production", EntryRegion: "gz", ExitRegion: "es", Provider: "test",
+		CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	stamp := now()
+	for _, linkID := range []string{"phase-entry-relay", "phase-relay-exit"} {
+		if _, err = store.db.ExecContext(ctx, `INSERT INTO line_capacity_reservations
+ (line_id,link_id,forward_mbps,reverse_mbps,state,operation_id,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?)`, "line-cancel-open", linkID, 10, 10, "reserved", "op-cancel-open", stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancelOpen := Operation{ID: "op-cancel-open", LineID: "line-cancel-open", Kind: "line.open",
+		RequestedBy: "operator", IdempotencyKey: "cancel-two-phase", Request: json.RawMessage(`{}`)}
+	if _, _, err = store.CreateOperation(ctx, cancelOpen); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CancelOperation(ctx, cancelOpen.ID, "operator cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	cancelledLine, err := store.Line(ctx, cancelOpen.LineID)
+	if err != nil || cancelledLine.Status != "maintenance" {
+		t.Fatalf("cancelled open line=%+v err=%v", cancelledLine, err)
+	}
+	var historicalReserved int
+	if err = store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM line_capacity_reservations WHERE line_id=? AND state='reserved'`,
+		cancelOpen.LineID).Scan(&historicalReserved); err != nil || historicalReserved != 2 {
+		t.Fatalf("cancelled open changed historical reservations=%d err=%v", historicalReserved, err)
+	}
+	if _, err = store.ReserveLineCapacity(ctx, lineID, "op-open-phase"); err != nil {
+		t.Fatal(err)
+	}
+	open := Operation{ID: "op-open-phase", LineID: lineID, Kind: "line.open", RequestedBy: "operator",
+		IdempotencyKey: "open-two-phase", Request: json.RawMessage(`{"plan":{"line_id":"line-two-phase"}}`)}
+	if _, _, err = store.CreateOperation(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	if line, lineErr := store.Line(ctx, lineID); lineErr != nil || line.Status != "provisioning" {
+		t.Fatalf("queued open line=%+v err=%v", line, lineErr)
+	}
+	if _, err = store.ClaimOperations(ctx, lineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	openResult := json.RawMessage(`{"deployment":"deployment-phase","profile":"line-two-phase:1","client_url":"socks5://user:secret@192.0.2.1:1082"}`)
+	if err = store.CompleteOperation(ctx, open.ID, lineID, "succeeded", openResult); err != nil {
+		t.Fatal(err)
+	}
+	line, err := store.Line(ctx, lineID)
+	if err != nil || line.Status != "qualification_pending" || line.ActiveDeployment != "deployment-phase" {
+		t.Fatalf("open completion line=%+v err=%v", line, err)
+	}
+	if err = store.ClientDeliveryAllowed(ctx, lineID); err == nil {
+		t.Fatal("pending production line exposed client material")
+	}
+	qualify, err := store.OperationByIdempotencyKey(ctx, "auto-qualify-"+lineID+"-deployment-phase")
+	if err != nil || qualify.Kind != "line.optimize" || qualify.Status != "queued" ||
+		!strings.Contains(string(qualify.Request), `"deployment_id":"deployment-phase"`) {
+		t.Fatalf("automatic qualification=%+v err=%v", qualify, err)
+	}
+	if _, err = store.ClaimOperations(ctx, lineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	evidence := `{"admission":{"status":"admitted","reasons":[],"target_upstream_mbps":10,"target_downstream_mbps":10,"achieved_upstream_mbps":9.5,"achieved_downstream_mbps":9.5,"required_ratio":0.95,"duration_seconds":90}}`
+	if err = store.CompleteOperation(ctx, qualify.ID, lineID, "succeeded", json.RawMessage(
+		`{"profile":"line-two-phase:2","transport_generation":2,"evidence":`+evidence+`}`)); err != nil {
+		t.Fatal(err)
+	}
+	line, err = store.Line(ctx, lineID)
+	if err != nil || line.Status != "active" || line.Profile != "line-two-phase:2" {
+		t.Fatalf("qualified line=%+v err=%v", line, err)
+	}
+	if err = store.ClientDeliveryAllowed(ctx, lineID); err != nil {
+		t.Fatalf("admitted production line did not expose client material: %v", err)
+	}
+	qualification, err := store.LatestLineQualification(ctx, lineID)
+	if err != nil || qualification.Status != "admitted" || qualification.DeploymentID != "deployment-phase" {
+		t.Fatalf("qualification=%+v err=%v", qualification, err)
+	}
+	var activeReservations int
+	if err = store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM line_capacity_reservations WHERE line_id=? AND state='active'`, lineID).Scan(&activeReservations); err != nil || activeReservations != 0 {
+		t.Fatalf("active reservations=%d err=%v", activeReservations, err)
+	}
+	var historicalReleased int
+	if err = store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM line_capacity_reservations WHERE line_id=? AND state='released'`, lineID).Scan(&historicalReleased); err != nil || historicalReleased != 1 {
+		t.Fatalf("historical released reservations=%d err=%v", historicalReleased, err)
+	}
+}
+
+func TestTwoPhaseRejectsFailedAndStaleQualifications(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	for _, test := range []struct {
+		lineID, deployment, requestDeployment, admission, target, completionStatus, wantStatus string
+		wantError                                                                              bool
+	}{
+		{"line-rejected", "deployment-current", "deployment-current", "rejected", "10", "failed", "qualification_failed", false},
+		{"line-stale", "deployment-current", "deployment-old", "admitted", "10", "succeeded", "qualification_pending", false},
+		{"line-low-target", "deployment-current", "deployment-current", "admitted", "1", "succeeded", "qualification_failed", false},
+	} {
+		if _, err = store.UpsertLine(ctx, Line{ID: test.lineID, Name: test.lineID,
+			Status: "qualification_pending", Environment: "production", EntryRegion: "gz",
+			ExitRegion: "es", Provider: "test", CapacityMbps: 10,
+			ActiveDeployment: test.deployment}); err != nil {
+			t.Fatal(err)
+		}
+		request, _ := json.Marshal(map[string]any{"deployment_id": test.requestDeployment})
+		op := Operation{ID: "op-" + test.lineID, LineID: test.lineID, Kind: "line.optimize",
+			RequestedBy: "system", IdempotencyKey: "qualify-" + test.lineID, Request: request}
+		if _, _, err = store.CreateOperation(ctx, op); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = store.ClaimOperations(ctx, test.lineID, 1); err != nil {
+			t.Fatal(err)
+		}
+		reasons := `[]`
+		if test.admission == "rejected" {
+			reasons = `["insufficient-downlink"]`
+		}
+		result := json.RawMessage(`{"profile":"` + test.lineID + `:2","transport_generation":2,"evidence":{"admission":{"status":"` + test.admission + `","reasons":` + reasons + `,"target_upstream_mbps":` + test.target + `,"target_downstream_mbps":` + test.target + `,"achieved_upstream_mbps":10,"achieved_downstream_mbps":9.49,"required_ratio":0.95,"duration_seconds":90}}}`)
+		err = store.CompleteOperation(ctx, op.ID, test.lineID, test.completionStatus, result)
+		if (err != nil) != test.wantError {
+			t.Fatalf("%s completion error=%v wantError=%v", test.lineID, err, test.wantError)
+		}
+		line, lineErr := store.Line(ctx, test.lineID)
+		if lineErr != nil || line.Status != test.wantStatus {
+			t.Fatalf("%s line=%+v err=%v", test.lineID, line, lineErr)
+		}
+		storedOperation, operationErr := store.Operation(ctx, op.ID)
+		if operationErr != nil || (test.lineID == "line-stale" && storedOperation.Status != "failed") {
+			t.Fatalf("%s operation=%+v err=%v", test.lineID, storedOperation, operationErr)
+		}
+	}
+}
+
+func TestGovernanceAuditsHistoricalProductionLines(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	seed := func(lineID, lineEnvironment, entryEnvironment, billingMode string, createLinks bool,
+		qualificationDeployment string) {
+		deployment := lineID + "-deployment"
+		if _, seedErr := store.UpsertLine(ctx, Line{ID: lineID, Name: lineID, Status: "active",
+			Environment: lineEnvironment, EntryRegion: "gz", ExitRegion: "exit", Provider: "test",
+			CapacityMbps: 10, ActiveDeployment: deployment, Profile: lineID + ":2"}); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		deviceIDs := []string{lineID + "-entry", lineID + "-relay", lineID + "-exit"}
+		for index, deviceID := range deviceIDs {
+			environment := "production"
+			if index == 0 {
+				environment = entryEnvironment
+			}
+			if _, seedErr := store.UpsertDevice(ctx, Device{ID: deviceID, Name: deviceID, Status: "ready",
+				Environment: environment, Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
+				Labels: json.RawMessage(`{}`)}); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+		}
+		if _, seedErr := store.SaveLineSpec(ctx, LineSpec{LineID: lineID, Environment: lineEnvironment,
+			ResourceGroup: "managed", InstanceID: lineID + "_1", BandwidthMbps: 10,
+			UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1082, RelayPort: 4445, ExitPort: 4443,
+			UDPPortMin: 22048, UDPPortMax: 23071, Whitelist: json.RawMessage(`[]`),
+			DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", JumpPolicy: "auto",
+			Nodes: []LineNode{{DeviceID: deviceIDs[0], Role: "entry"},
+				{DeviceID: deviceIDs[1], Role: "relay"}, {DeviceID: deviceIDs[2], Role: "exit"}}}); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if createLinks {
+			for index, endpoints := range [][4]string{{deviceIDs[0], "entry", deviceIDs[1], "relay"},
+				{deviceIDs[1], "relay", deviceIDs[2], "exit"}} {
+				if _, seedErr := store.UpsertNetworkLink(ctx, NetworkLink{ID: lineID + "-link-" + string(rune('a'+index)),
+					FromDeviceID: endpoints[0], FromRole: endpoints[1], ToDeviceID: endpoints[2], ToRole: endpoints[3],
+					ForwardCapacityMbps: 10, ReverseCapacityMbps: 10, BillingMode: billingMode,
+					Environment: "production", Status: "ready"}); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+			}
+		}
+		if qualificationDeployment != "" {
+			operationID := "op-" + lineID
+			if _, _, seedErr := store.CreateOperation(ctx, Operation{ID: operationID, LineID: lineID,
+				Kind: "line.optimize", RequestedBy: "governance", IdempotencyKey: "governance-" + lineID,
+				Request: json.RawMessage(`{}`)}); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if _, seedErr := store.ClaimOperations(ctx, lineID, 1); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if seedErr := store.CompleteOperation(ctx, operationID, lineID, "succeeded",
+				json.RawMessage(`{"profile":"`+lineID+`:2"}`)); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if _, seedErr := store.SaveLineQualification(ctx, LineQualification{LineID: lineID,
+				DeploymentID: qualificationDeployment, OperationID: operationID,
+				TargetUpstreamMbps: 10, TargetDownstreamMbps: 10, AchievedUpstreamMbps: 10,
+				AchievedDownstreamMbps: 10, DurationSeconds: 90, RequiredRatio: 0.95,
+				Status: "admitted", Reasons: json.RawMessage(`[]`), Evidence: json.RawMessage(`{}`)}); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+		}
+	}
+	seed("gov-test-device", "production", "test", LinkBillingIndependent, true, "gov-test-device-deployment")
+	seed("gov-missing-link", "production", "production", LinkBillingIndependent, false, "gov-missing-link-deployment")
+	seed("gov-aggregate", "production", "production", LinkBillingAggregate, true, "gov-aggregate-deployment")
+	seed("gov-stale", "production", "production", LinkBillingIndependent, true, "old-deployment")
+	seed("gov-qualified", "production", "production", LinkBillingIndependent, true, "gov-qualified-deployment")
+	seed("gov-weak", "production", "production", LinkBillingIndependent, true, "gov-weak-deployment")
+	if _, err = store.db.ExecContext(ctx, `UPDATE line_qualifications SET achieved_downstream_mbps=1 WHERE line_id='gov-weak'`); err != nil {
+		t.Fatal(err)
+	}
+	seed("gov-test-line", "test", "test", LinkBillingUnknown, false, "")
+
+	findings, err := store.AuditProductionLines(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeSets := map[string]map[string]bool{}
+	for _, finding := range findings {
+		if codeSets[finding.LineID] == nil {
+			codeSets[finding.LineID] = map[string]bool{}
+		}
+		codeSets[finding.LineID][finding.Code] = true
+	}
+	byLine := map[string][]string{}
+	for lineID, codes := range codeSets {
+		for code := range codes {
+			byLine[lineID] = append(byLine[lineID], code)
+		}
+		sort.Strings(byLine[lineID])
+	}
+	want := map[string][]string{
+		"gov-test-device": {"maintenance_required"},
+		"gov-stale":       {"qualification_required"},
+		"gov-weak":        {"qualification_required"},
+	}
+	if !reflect.DeepEqual(byLine, want) {
+		t.Fatalf("governance findings=%v want=%v", byLine, want)
+	}
+	if err = store.ClientDeliveryAllowed(ctx, "gov-aggregate"); err != nil {
+		t.Fatalf("historical link billing incorrectly blocked line delivery: %v", err)
+	}
+	if err = store.ClientDeliveryAllowed(ctx, "gov-qualified"); err != nil {
+		t.Fatalf("qualified historical line was blocked: %v", err)
+	}
+}
+
 func TestTopologyLayoutPersistsAndResets(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {
@@ -1279,5 +1779,89 @@ func TestTopologyLayoutRejectsUnknownDevice(t *testing.T) {
 	err = store.SaveTopologyLayouts(t.Context(), []TopologyLayout{{DeviceID: "missing", X: 1, UpdatedBy: "operator"}})
 	if err == nil {
 		t.Fatal("unknown device layout was accepted")
+	}
+}
+
+func TestLineSpecTopologyAndServiceProfileRoundTrip(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	if _, err = store.UpsertLine(ctx, Line{ID: "single-hk", Name: "single-hk", Status: "draft",
+		Environment: "test", CapacityMbps: 5}); err != nil {
+		t.Fatal(err)
+	}
+	spec := LineSpec{LineID: "single-hk", Environment: "test", ResourceGroup: "hk",
+		InstanceID: "single-hk_1", BandwidthMbps: 5, SocksPort: 1082,
+		UDPPortMin: 22048, UDPPortMax: 23071, ExitPort: 4443,
+		TopologyMode: "single_hk", ServiceProfile: "general",
+		Whitelist: json.RawMessage(`[]`), BuildMode: "auto", SourceRef: "repo://current",
+		JumpPolicy: "direct"}
+	stored, err := store.SaveLineSpec(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.TopologyMode != "single_hk" || stored.ServiceProfile != "general" {
+		t.Fatalf("topology/profile lost: %+v", stored)
+	}
+}
+
+func TestLineSpecTopologyDefaultsAndRejectsUnknownValues(t *testing.T) {
+	spec := LineSpec{}
+	if err := spec.NormalizeTopology(); err != nil {
+		t.Fatal(err)
+	}
+	if spec.TopologyMode != "trihop" || spec.ServiceProfile != "general" {
+		t.Fatalf("legacy defaults=%q/%q", spec.TopologyMode, spec.ServiceProfile)
+	}
+	for _, invalid := range []LineSpec{
+		{TopologyMode: "mesh", ServiceProfile: "general"},
+		{TopologyMode: "single_hk", ServiceProfile: "unknown"},
+	} {
+		if err := invalid.NormalizeTopology(); err == nil {
+			t.Fatalf("accepted invalid topology/profile: %+v", invalid)
+		}
+	}
+}
+
+func TestGeneralSingleHKNeedsNoExternalCapacityReservation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	if _, err = store.UpsertDevice(ctx, Device{ID: "hk-prod", Name: "HK", Status: "ready",
+		Environment: "production", Host: "192.0.2.20", SSHPort: 22, SSHUser: "root",
+		Labels: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.UpsertLine(ctx, Line{ID: "hk-general", Name: "HK general", Status: "draft",
+		Environment: "production", CapacityMbps: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.SaveLineSpec(ctx, LineSpec{LineID: "hk-general", Environment: "production",
+		TopologyMode: "single_hk", ServiceProfile: "general", ResourceGroup: "hk",
+		InstanceID: "hk-general_1", BandwidthMbps: 5, UpstreamMbps: 5, DownstreamMbps: 5,
+		SocksPort: 1082, UDPPortMin: 22048, UDPPortMax: 23071, ExitPort: 4443,
+		Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`),
+		BuildMode: "auto", SourceRef: "repo://current", JumpPolicy: "direct",
+		Nodes: []LineNode{{DeviceID: "hk-prod", Role: "entry"}, {DeviceID: "hk-prod", Role: "exit"}}}); err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := store.ReserveLineCapacity(ctx, "hk-general", "op-open")
+	if err != nil || len(reservations) != 0 {
+		t.Fatalf("single-HK reservations=%v error=%v", reservations, err)
+	}
+	findings, err := store.ProductionLineFindings(ctx, "hk-general")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, finding := range findings {
+		if finding.Code == "capacity_unknown" || finding.Code == "qualification_required" {
+			t.Fatalf("general single-HK received strict finding: %+v", finding)
+		}
 	}
 }

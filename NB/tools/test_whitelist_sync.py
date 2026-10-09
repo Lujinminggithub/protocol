@@ -1,11 +1,51 @@
 #!/usr/bin/env python3
 import pathlib
 import tempfile
+import hashlib
 
 import whitelist_sync
 
 
 def main() -> None:
+    good = b"verified-srs"
+    bad = b"stale-srs"
+    expected = hashlib.md5(good).hexdigest()
+    calls = []
+
+    def inconsistent_fetch(url: str, _limit: int):
+        calls.append(url)
+        if len(calls) == 1:
+            return f"{expected}|https://rules.example/download.srs".encode(), url
+        if len(calls) == 2:
+            return bad, url
+        return good, url
+
+    delays = []
+    payload, digest = whitelist_sync.resolve_source(
+        "https://rules.example/metadata", "auto", fetcher=inconsistent_fetch,
+        sleeper=delays.append, retry_delays=(0.25,))
+    assert payload == good and digest == expected
+    assert delays == [0.25] and len(calls) == 3
+
+    backend_calls = []
+
+    def stale_fetch(url: str, _limit: int):
+        if url.endswith("metadata"):
+            return f"{expected}|https://rules.example/download.srs".encode(), url
+        return bad, url
+
+    def backend_fetch(url: str, address: str, _limit: int):
+        backend_calls.append((url, address))
+        return (good if address == "192.0.2.11" else bad), url
+
+    payload, digest = whitelist_sync.resolve_source(
+        "https://rules.example/metadata", "auto", fetcher=stale_fetch,
+        sleeper=lambda _delay: None, retry_delays=(),
+        resolver=lambda _host: ["192.0.2.10", "192.0.2.11"],
+        address_fetcher=backend_fetch)
+    assert payload == good and digest == expected
+    assert [address for _url, address in backend_calls] == ["192.0.2.10", "192.0.2.11"]
+
     rules = whitelist_sync.convert({
         "version": 1,
         "rules": [{

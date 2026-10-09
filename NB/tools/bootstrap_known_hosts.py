@@ -47,7 +47,7 @@ def main() -> None:
     import deploy_core as deploy
 
     keys = deploy.paramiko.HostKeys()
-    for role in ("entry", "middle", "exit"):
+    for role in reversed(deploy.deployment_roles()):
         client = deploy.connect(role)
         try:
             key = client.get_transport().get_remote_server_key()

@@ -51,6 +51,8 @@ type DynamicConfig struct {
 
 type LineSpec struct {
 	LineID             string            `json:"line_id"`
+	TopologyMode       string            `json:"topology_mode,omitempty"`
+	ServiceProfile     string            `json:"service_profile,omitempty"`
 	ResourceGroup      string            `json:"resource_group"`
 	InstanceID         string            `json:"instance_id"`
 	HostsFile          string            `json:"hosts_file"`
@@ -76,6 +78,36 @@ type LineSpec struct {
 	SingBox            string            `json:"sing_box,omitempty"`
 	ExtraEnvironment   map[string]string `json:"-"`
 	BuildMode          string            `json:"build_mode,omitempty"`
+}
+
+func (line *LineSpec) normalizeTopology() error {
+	if line.TopologyMode == "" {
+		line.TopologyMode = "trihop"
+	}
+	if line.ServiceProfile == "" {
+		line.ServiceProfile = "general"
+	}
+	if line.TopologyMode != "trihop" && line.TopologyMode != "single_hk" {
+		return errors.New("线路拓扑模式无效")
+	}
+	if line.ServiceProfile != "general" && line.ServiceProfile != "tiktok_live" {
+		return errors.New("线路业务策略无效")
+	}
+	return nil
+}
+
+func (line LineSpec) roleOrder() []string {
+	if line.TopologyMode == "single_hk" {
+		return []string{"entry", "exit"}
+	}
+	return []string{"entry", "middle", "exit"}
+}
+
+func (line LineSpec) activationOrder() []string {
+	if line.TopologyMode == "single_hk" {
+		return []string{"exit", "entry"}
+	}
+	return []string{"exit", "middle", "entry"}
 }
 
 func LoadRegistry(path string) (Registry, error) {
@@ -108,6 +140,9 @@ func LoadRegistry(path string) (Registry, error) {
 		registry.Python = "python"
 	}
 	for index := range registry.Lines {
+		if err := registry.Lines[index].normalizeTopology(); err != nil {
+			return Registry{}, err
+		}
 		line := &registry.Lines[index]
 		if line.UpstreamMbps <= 0 {
 			line.UpstreamMbps = line.PackageMbps
@@ -183,8 +218,8 @@ func (r Registry) Validate() error {
 		return fmt.Errorf("worker root is unavailable: %s", r.Root)
 	}
 	if r.Dynamic.Enabled {
-		if len(r.Dynamic.ResourceGroups) == 0 || len(r.Dynamic.Operations) == 0 {
-			return errors.New("dynamic worker requires resource groups and operations")
+		if len(r.Dynamic.Operations) == 0 {
+			return errors.New("dynamic worker requires operations")
 		}
 		for _, group := range r.Dynamic.ResourceGroups {
 			if !safeID.MatchString(group) {

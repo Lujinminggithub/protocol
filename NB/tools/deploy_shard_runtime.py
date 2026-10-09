@@ -26,6 +26,31 @@ def verify_all_controls(c, role, *, work, run):
     return result.strip()
 
 
+def restart_worker_with_deadline(c, role, worker, *, work, run, deadline_seconds=2.0):
+    service = nb_shard_deploy.shard_service(role, worker)
+    root = nb_shard_deploy.shard_config_dir(work, role, worker)
+    deadline_ms = int(max(0.5, min(2.0, deadline_seconds)) * 1000)
+    probe = ("import json,pathlib,socket,stat;"
+        f"root=pathlib.Path({root!r});configs=list(root.glob('*.conf'));"
+        "paths=[next(x.split('=',1)[1] for x in p.read_text().splitlines() if x.startswith('control_path=')) for p in configs];"
+        "assert paths;"
+        "responses=[];"
+        "[(lambda s,p:(s.settimeout(.2),s.connect(p),s.sendall(b'health\\n'),responses.append(json.loads(s.recv(8192).decode())),s.close()))"
+        "(socket.socket(socket.AF_UNIX),p) for p in paths];"
+        "assert len(responses)==len(paths) and all(x.get('status') in ('ok','starting') for x in responses)")
+    command = (
+        f"started=$(date +%s%3N); systemctl enable {shlex.quote(service)} >/dev/null; "
+        f"timeout 2s systemctl restart {shlex.quote(service)} || exit 31; "
+        f"for i in $(seq 1 20); do if systemctl is-active --quiet {shlex.quote(service)} && "
+        f"python3 -c {shlex.quote(probe)} 2>/dev/null; then ended=$(date +%s%3N); "
+        f"elapsed=$((ended-started)); test $elapsed -le {deadline_ms} || exit 32; "
+        "echo WORKER_CONTROL_OK elapsed_ms=$elapsed; exit 0; fi; sleep 0.1; done; exit 33")
+    result = run(c, command, tmo=10).strip()
+    if "WORKER_CONTROL_OK" not in result:
+        raise RuntimeError(f"{role}[{worker}] did not recover within {deadline_ms}ms")
+    return result
+
+
 def active_sessions(c, role, *, work, run) -> int:
     root = nb_shard_deploy.shard_root(work)
     script = ("import json,pathlib,socket;"
@@ -79,6 +104,133 @@ def _memory_limits(lab, role):
     return high, maximum
 
 
+def install_instance(c, role, command, environment, deployment_id, *, work,
+                     instance_work, deploy_instance, lab, run, push_bytes,
+                     effective_workers):
+    """Install one line config without changing the shared shard runtime."""
+    workers = effective_workers(role)
+    if (not deploy_instance or not nb_shard_deploy.SAFE_ID.fullmatch(deploy_instance) or
+            not nb_shard_deploy.SAFE_ID.fullmatch(deployment_id)):
+        raise ValueError("named instance deployment requires safe instance and deployment IDs")
+    root = nb_shard_deploy.shard_root(work)
+    services = [nb_shard_deploy.shard_service(role, worker) for worker in range(workers)]
+    ready = (f"test -x {shlex.quote(root + '/nb_node')} && "
+             f"test -f {shlex.quote('/etc/systemd/system/nb-' + role + '-shard@.service')} && " +
+             " && ".join(f"systemctl is-active --quiet {shlex.quote(service)}" for service in services) +
+             " && echo RUNTIME_READY || echo RUNTIME_MISSING")
+    if "RUNTIME_READY" not in run(c, ready, tmo=20):
+        raise RuntimeError(f"runtime-preflight: {role} shared shard runtime is not ready")
+
+    release_dir = f"{instance_work}/releases/{deployment_id}"
+    run(c, f"mkdir -p {shlex.quote(release_dir)}")
+    marker = nb_shard_deploy.current_deployment_marker(instance_work)
+    previous_marker = nb_shard_deploy.saved_previous_deployment_marker(instance_work, deployment_id)
+    run(c, f"if test -f {shlex.quote(marker)}; then cp -p {shlex.quote(marker)} "
+        f"{shlex.quote(previous_marker)}; printf 'present\\n' > {shlex.quote(previous_marker + '.state')}; "
+        f"else printf 'absent\\n' > {shlex.quote(previous_marker + '.state')}; fi")
+    backups = []
+    try:
+        for worker in range(workers):
+            directory = nb_shard_deploy.shard_config_dir(work, role, worker)
+            path = f"{directory}/{deploy_instance}.conf"
+            candidate = path + ".next"
+            backup = path + ".rollback"
+            state = run(c, f"mkdir -p {shlex.quote(directory)}; "
+                f"if test -f {shlex.quote(path)}; then cp -p {shlex.quote(path)} {shlex.quote(backup)}; "
+                "echo CONFIG_PRESENT; else echo CONFIG_ABSENT; fi")
+            existed = "CONFIG_PRESENT" in state
+            saved_previous = nb_shard_deploy.saved_previous_instance_config(
+                instance_work, deployment_id, role, worker)
+            saved_state = nb_shard_deploy.saved_previous_instance_state(
+                instance_work, deployment_id, role, worker)
+            if existed:
+                run(c, f"cp -p {shlex.quote(path)} {shlex.quote(saved_previous)}; "
+                    f"printf 'present\\n' > {shlex.quote(saved_state)}")
+            else:
+                run(c, f"printf 'absent\\n' > {shlex.quote(saved_state)}")
+            config = nb_shard_deploy.render_instance_config(
+                deploy_instance, role, worker, command, environment,
+                int(os.environ.get("NB_INSTANCE_MAX_SESSIONS", "1024")),
+                int(os.environ.get("NB_INSTANCE_MAX_QUEUE_BYTES", str(64 * 1024 * 1024))),
+            )
+            push_bytes(c, config.encode("utf-8"), candidate, mode=0o600)
+            run(c, f"chmod 0600 {shlex.quote(candidate)} && mv -f {shlex.quote(candidate)} {shlex.quote(path)}")
+            backups.append((worker, path, candidate, backup, existed))
+
+        for service in services:
+            run(c, f"systemctl reload {shlex.quote(service)}")
+        controls = [nb_shard_deploy.line_control_path(deploy_instance, role, worker)
+                    for worker in range(workers)]
+        condition = " && ".join(f"test -S {shlex.quote(path)}" for path in controls)
+        gate = run(c, f"for i in $(seq 1 40); do if {condition}; then echo INSTANCE_CONTROL_OK; "
+            "exit 0; fi; sleep 0.25; done; echo INSTANCE_CONTROL_MISSING; exit 1", tmo=20)
+        if "INSTANCE_CONTROL_OK" not in gate:
+            raise RuntimeError(f"{role} instance control socket gate failed")
+        for worker, path, _candidate, _backup, _existed in backups:
+            saved = nb_shard_deploy.saved_instance_config(instance_work, deployment_id, role, worker)
+            run(c, f"cp -p {shlex.quote(path)} {shlex.quote(saved)}")
+        run(c, f"printf '%s\\n' {shlex.quote(deployment_id)} > {shlex.quote(marker)}; chmod 0600 {shlex.quote(marker)}")
+    except Exception:
+        for _worker, path, candidate, backup, existed in backups:
+            if existed:
+                run(c, f"mv -f {shlex.quote(backup)} {shlex.quote(path)}")
+            else:
+                run(c, f"rm -f {shlex.quote(path)} {shlex.quote(backup)}")
+            run(c, f"rm -f {shlex.quote(candidate)}")
+        for service in services:
+            run(c, f"systemctl reload {shlex.quote(service)} 2>/dev/null || true")
+        raise
+    finally:
+        for _worker, _path, candidate, backup, _existed in backups:
+            run(c, f"rm -f {shlex.quote(candidate)} {shlex.quote(backup)}")
+    return f"instance controls=ok workers={workers} deployment={deployment_id}"
+
+
+def rollback_instance(c, role, deployment_id, *, work, instance_work,
+                      deploy_instance, run, effective_workers):
+    """Restore only one line's configs saved by install_instance."""
+    workers = effective_workers(role)
+    if (not deploy_instance or not nb_shard_deploy.SAFE_ID.fullmatch(deploy_instance) or
+            not nb_shard_deploy.SAFE_ID.fullmatch(deployment_id)):
+        raise ValueError("instance rollback requires safe instance and deployment IDs")
+    restored_present = []
+    for worker in range(workers):
+        path = f"{nb_shard_deploy.shard_config_dir(work, role, worker)}/{deploy_instance}.conf"
+        saved = nb_shard_deploy.saved_previous_instance_config(instance_work, deployment_id, role, worker)
+        state_path = nb_shard_deploy.saved_previous_instance_state(instance_work, deployment_id, role, worker)
+        state = run(c, f"cat {shlex.quote(state_path)} 2>/dev/null || true").strip()
+        if state == "present":
+            run(c, f"cp -p {shlex.quote(saved)} {shlex.quote(path + '.next')} && "
+                f"mv -f {shlex.quote(path + '.next')} {shlex.quote(path)}")
+            restored_present.append(worker)
+        elif state == "absent":
+            run(c, f"rm -f {shlex.quote(path)} {shlex.quote(path + '.next')}")
+        else:
+            raise RuntimeError(f"{role} instance rollback state is unavailable")
+    marker = nb_shard_deploy.current_deployment_marker(instance_work)
+    previous_marker = nb_shard_deploy.saved_previous_deployment_marker(instance_work, deployment_id)
+    marker_state = run(c, f"cat {shlex.quote(previous_marker + '.state')} 2>/dev/null || true").strip()
+    if marker_state == "present":
+        run(c, f"cp -p {shlex.quote(previous_marker)} {shlex.quote(marker)}")
+    elif marker_state == "absent":
+        run(c, f"rm -f {shlex.quote(marker)}")
+    else:
+        raise RuntimeError(f"{role} deployment marker rollback state is unavailable")
+    for worker in range(workers):
+        run(c, f"systemctl reload {shlex.quote(nb_shard_deploy.shard_service(role, worker))}")
+    controls = [nb_shard_deploy.line_control_path(deploy_instance, role, worker)
+                for worker in range(workers)]
+    conditions = []
+    for worker, control in enumerate(controls):
+        conditions.append(("test -S " if worker in restored_present else "test ! -S ") + shlex.quote(control))
+    condition = " && ".join(conditions)
+    gate = run(c, f"for i in $(seq 1 40); do if {condition}; then echo INSTANCE_ROLLBACK_OK; "
+        "exit 0; fi; sleep 0.25; done; echo INSTANCE_ROLLBACK_FAILED; exit 1", tmo=20)
+    if "INSTANCE_ROLLBACK_OK" not in gate:
+        raise RuntimeError(f"{role} instance rollback control gate failed")
+    return f"instance rollback=ok workers={workers} deployment={deployment_id}"
+
+
 def install_role(c, role, command, environment, release_id, binary_release_id, warmup, *,
                  work, instance_work, deploy_instance, lab, run, push_bytes,
                  effective_workers, legacy_service_name):
@@ -111,9 +263,12 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
     shared_sha = run(c, f"sha256sum {shlex.quote(shared_release)} | awk '{{print $1}}'").strip()
     binary_changed = not previous_target_exists or previous_sha != shared_sha
     binary_reused = False
+    interrupted_sessions = 0
     effective_binary_release_id = binary_release_id
     if previous_target_exists and binary_changed:
-        if _reuse_current_binary_when_busy(c, role, work=work, run=run):
+        if os.environ.get("NB_FORCE_SHARED_ROLLOUT") == "1":
+            interrupted_sessions = active_sessions(c, role, work=work, run=run)
+        elif _reuse_current_binary_when_busy(c, role, work=work, run=run):
             binary_changed = False
             binary_reused = True
             effective_binary_release_id = pathlib.PurePosixPath(previous_target).parent.name
@@ -133,9 +288,13 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
         service = nb_shard_deploy.shard_service(role, worker)
         active = run(c, f"systemctl is-active {shlex.quote(service)} 2>/dev/null || true").strip() == "active"
         action = "restart" if active and binary_changed else "start"
-        state = run(c, f"systemctl enable {shlex.quote(service)} >/dev/null; "
-            f"systemctl {action} {shlex.quote(service)}; sleep {warmup}; "
-            f"systemctl is-active {shlex.quote(service)}").strip().splitlines()
+        if binary_changed and os.environ.get("NB_FORCE_SHARED_ROLLOUT") == "1":
+            restart_worker_with_deadline(c, role, worker, work=work, run=run)
+            state = ["active"]
+        else:
+            state = run(c, f"systemctl enable {shlex.quote(service)} >/dev/null; "
+                f"systemctl {action} {shlex.quote(service)}; sleep {warmup}; "
+                f"systemctl is-active {shlex.quote(service)}").strip().splitlines()
         if "active" not in state:
             detail = run(c, f"systemctl status {shlex.quote(service)} --no-pager -l; "
                 f"journalctl -u {shlex.quote(service)} -n 40 --no-pager")
@@ -186,4 +345,5 @@ def install_role(c, role, command, environment, release_id, binary_release_id, w
         for _path, backup, _existed in backups:
             run(c, f"rm -f {shlex.quote(backup)}")
     reused = " binary_reused=true" if binary_reused else ""
-    return f"shard workers={workers} binary_changed={str(binary_changed).lower()}{reused} controls=ok"
+    return (f"shard workers={workers} binary_changed={str(binary_changed).lower()}{reused} "
+            f"sessions_interrupted={interrupted_sessions} controls=ok")

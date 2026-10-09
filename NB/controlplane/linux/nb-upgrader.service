@@ -1,0 +1,26 @@
+[Unit]
+Description=NB independent platform upgrade executor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/nb-controlplane/repo
+EnvironmentFile=/opt/nb-controlplane/etc/nb-web-worker.env
+Environment=NB_CONTROLPLANE_ROOT=/opt/nb-controlplane/repo
+Environment=NB_UPGRADER_STATE_DIR=/opt/nb-controlplane/data/upgrader
+ExecStart=/opt/nb-controlplane/bin/nb-upgrader
+Restart=always
+RestartSec=2s
+TimeoutStopSec=500ms
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nb-controlplane
+
+[Install]
+WantedBy=multi-user.target

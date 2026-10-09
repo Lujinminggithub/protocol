@@ -254,6 +254,14 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 		"NB_MIDDLE_PORT":        strconv.Itoa(middlePort),
 		"NB_EXIT_PORT":          strconv.Itoa(exitPort),
 	}
+	if err := line.normalizeTopology(); err != nil {
+		return nil, err
+	}
+	values["NB_TOPOLOGY_MODE"] = line.TopologyMode
+	values["NB_SERVICE_PROFILE"] = line.ServiceProfile
+	if line.TopologyMode == "single_hk" {
+		values["NB_FEC_V15_ACTIVE"] = "off"
+	}
 	for key, value := range line.ExtraEnvironment {
 		values[key] = value
 	}
@@ -263,7 +271,7 @@ func (r *Runner) environment(line LineSpec) (map[string]string, error) {
 	if err != nil && line.SourceMachinesFile != "" {
 		return nil, err
 	}
-	for _, role := range []string{"entry", "middle", "exit"} {
+	for _, role := range line.roleOrder() {
 		host := roleObject(credentials, role)
 		if host == nil {
 			continue
@@ -300,31 +308,40 @@ func (r *Runner) steps(line LineSpec, operation Operation, request requestValues
 	if lineState == "" {
 		lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)
 	}
+	probePreflight := commandStep{Name: python, Stage: "probe-preflight", Args: []string{
+		filepath.Join(tools, "probe_cleanup.py"), "--preflight",
+	}}
 	switch operation.Kind {
 	case "line.open":
 		outputDir := filepath.Join(operationDir, "line-open")
 		if line.StateDir != "" {
 			outputDir = line.StateDir
 		}
-		result := []commandStep{}
+		result := []commandStep{probePreflight}
 		if line.WhitelistSourceEnv != "" {
 			result = append(result, commandStep{Name: python, Stage: "whitelist-fetch", Args: []string{filepath.Join(tools, "whitelist_sync.py"), "--source-env", line.WhitelistSourceEnv, "--mode", "auto", "--sing-box", line.SingBox, "--state-dir", filepath.Join(line.StateDir, "whitelist-sync"), "--output", line.WhitelistFile}})
 		}
-		result = append(result, commandStep{Name: python, Stage: "provision", Args: []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
+		provisionArgs := []string{filepath.Join(tools, "line_open.py"), line.SourceMachinesFile,
 			"--line-id", line.LineID, "--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64),
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64), "--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
-			"--socks-port", socks, "--middle-port", strconv.Itoa(line.MiddlePort), "--exit-port", strconv.Itoa(line.ExitPort),
+			"--socks-port", socks,
 			"--udp-port-min", strconv.Itoa(line.UDPPortMin), "--udp-port-max", strconv.Itoa(line.UDPPortMax),
-			"--output-dir", outputDir, "--build-mode", line.BuildMode, "--execute"}})
+			"--exit-port", strconv.Itoa(line.ExitPort), "--topology-mode", line.TopologyMode,
+			"--service-profile", line.ServiceProfile, "--output-dir", outputDir, "--build-mode", line.BuildMode, "--execute"}
+		if line.TopologyMode == "trihop" {
+			provisionArgs = append(provisionArgs, "--middle-port", strconv.Itoa(line.MiddlePort))
+		}
+		result = append(result, commandStep{Name: python, Stage: "provision", Args: provisionArgs})
 		if line.WhitelistFile != "" {
 			result = append(result, commandStep{Name: python, Stage: "whitelist", Args: []string{deploy, "wl-push", "--whitelist", line.WhitelistFile}})
 		}
 		return result, nil
 	case "line.validate", "line.optimize":
-		return []commandStep{{Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
+		return []commandStep{probePreflight, {Name: python, Stage: "validate", Args: []string{filepath.Join(tools, "line_probe.py"),
 			"--package-mbps", strconv.FormatFloat(line.PackageMbps, 'f', -1, 64), "--active",
 			"--upstream-mbps", strconv.FormatFloat(line.UpstreamMbps, 'f', -1, 64),
 			"--downstream-mbps", strconv.FormatFloat(line.DownstreamMbps, 'f', -1, 64),
+			"--minimum-throughput-ratio", "0.95", "--duration", "90",
 			"--socks-port", socks, "--via-entry-ssh", "--cache", filepath.Join(lineState, "provision", line.LineID, "probe-cache.json"),
 			"--output", filepath.Join(operationDir, "validation.json")}}}, nil
 	case "line.tune":
@@ -386,7 +403,7 @@ func (r *Runner) currentDeployment(ctx context.Context, line LineSpec, environme
 		return "", err
 	}
 	deployment := ""
-	for _, role := range []string{"entry", "middle", "exit"} {
+	for _, role := range line.roleOrder() {
 		if roles[role] == "" || (deployment != "" && roles[role] != deployment) {
 			return "", errors.New("各节点角色的 deployment 不一致")
 		}
@@ -447,11 +464,83 @@ func (r *Runner) runNodeReleaseBuild(ctx context.Context, operation Operation, r
 		return Result{LogFile: logPath}, errors.New("Node Release 发布元数据无效")
 	}
 	_ = os.Remove(archive)
-	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "node-build", Status: "succeeded", Message: "Node Release 构建并激活完成"})
-	return Result{LogFile: logPath, Message: "Node Release 构建并激活完成", NodeRelease: json.RawMessage(line)}, nil
+	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 2, Stage: "node-build", Status: "succeeded", Message: "平台候选构建完成，等待升级"})
+	return Result{LogFile: logPath, Message: "平台候选构建完成，等待升级", NodeRelease: json.RawMessage(line)}, nil
 }
 
-func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
+func operationNeedsProbeCleanup(kind string) bool {
+	return kind == "line.open" || kind == "line.validate" || kind == "line.optimize"
+}
+
+func (r *Runner) cleanupProbes(operation Operation, logPath string) error {
+	var request requestValues
+	if len(operation.Request) > 0 && json.Unmarshal(operation.Request, &request) != nil {
+		return errors.New("任务请求无效，无法清理主动探针")
+	}
+	operationDir := filepath.Join(r.registry.StateDir, operation.ID)
+	line, ok := r.registry.Line(operation.LineID)
+	if !ok {
+		var err error
+		line, err = r.dynamicLine(operation, request, operationDir)
+		if err != nil {
+			return err
+		}
+	}
+	environment, err := r.environment(line)
+	if err != nil {
+		return err
+	}
+	args := []string{filepath.Join(r.registry.Root, "tools", "probe_cleanup.py")}
+	output := io.Discard
+	var logFile *os.File
+	if logPath != "" {
+		logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+		defer logFile.Close()
+		output = logFile
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return r.execute(cleanupCtx, commandStep{Name: r.registry.Python, Stage: "probe-cleanup", Args: args}, environment, output)
+}
+
+func appendCleanupDiagnostic(result *Result, cleanupErr error) {
+	line := redactFailureText("主动探针清理失败: " + cleanupErr.Error())
+	if result.LogFile != "" {
+		if logFile, err := os.OpenFile(result.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
+			_, _ = fmt.Fprintln(logFile, line)
+			_ = logFile.Close()
+		}
+	}
+	if result.Failure != nil {
+		if result.Failure.LogExcerpt != "" {
+			result.Failure.LogExcerpt += "\n"
+		}
+		result.Failure.LogExcerpt += line
+	}
+}
+
+func (r *Runner) Run(ctx context.Context, operation Operation) (result Result, runErr error) {
+	result, runErr = r.runOperation(ctx, operation)
+	if !operationNeedsProbeCleanup(operation.Kind) {
+		return result, runErr
+	}
+	cleanupErr := r.cleanupProbes(operation, result.LogFile)
+	if cleanupErr == nil {
+		return result, runErr
+	}
+	if runErr != nil {
+		appendCleanupDiagnostic(&result, cleanupErr)
+		return result, runErr
+	}
+	result.Failure = operationFailure("probe-cleanup", cleanupErr, result.LogFile)
+	result.Message = result.Failure.Summary
+	return result, cleanupErr
+}
+
+func (r *Runner) runOperation(ctx context.Context, operation Operation) (Result, error) {
 	_ = emitOperationEvent(ctx, OperationEvent{Sequence: 1, Stage: "prepare", Status: "running", Message: "正在准备任务"})
 	failPreparation := func(err error, result Result) (Result, error) {
 		result.Failure = operationFailure("prepare", err, result.LogFile)
@@ -550,6 +639,16 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 			result.Message = result.Failure.Summary
 			return result, optimizeErr
 		}
+		result.Evidence = json.RawMessage(evidence)
+		if admissionErr := probe.AdmissionError(); admissionErr != nil {
+			validationErr := fmt.Errorf("线路验证未通过：%w", admissionErr)
+			result.Failure = operationFailure("validation", validationErr, logPath)
+			result.Message = result.Failure.Summary
+			_ = emitOperationEvent(ctx, OperationEvent{Sequence: sequence, Stage: "validation", Status: "failed",
+				Message: result.Failure.Summary, Parameters: map[string]any{"failure": result.Failure,
+					"admission": probe.Admission}})
+			return result, validationErr
+		}
 		profile, generateErr := transportprofile.Generate(line.LineID, 1, line.PackageMbps, probe)
 		if generateErr != nil {
 			result.Failure = operationFailure("profile-generate", generateErr, logPath)
@@ -557,7 +656,6 @@ func (r *Runner) Run(ctx context.Context, operation Operation) (Result, error) {
 			return result, generateErr
 		}
 		request.TransportProfile = profile
-		result.Evidence = json.RawMessage(evidence)
 		_ = atomicJSON(filepath.Join(operationDir, "optimize-checkpoint.json"), map[string]any{
 			"line_id": line.LineID, "deployment_id": request.DeploymentID,
 			"stage": "profile-generated", "evidence": json.RawMessage(evidence), "profile": profile,

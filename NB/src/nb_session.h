@@ -63,7 +63,9 @@ typedef struct proxy_stream {
     int tcp_read_paused;
     int upstream_fc_enabled;
     int upstream_fc_blocked;
+    int probe_traffic;           /* internal probe classification on every forwarding role */
     int probe_mode;              /* exit internal probe: 1=sink, 2=echo, 4=downlink source */
+    int metrics_business_open;
     uint64_t probe_bytes;
     uint64_t probe_hash;
     uint64_t probe_expected_bytes;

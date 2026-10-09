@@ -175,6 +175,7 @@ func (s *Store) DeleteLine(ctx context.Context, id string, request LineDeletionR
 	controlDeletes := []string{
 		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
 		`DELETE FROM operations WHERE line_id=?`,
+		`DELETE FROM line_qualifications WHERE line_id=?`,
 	}
 	if s.dialect != "mysql" {
 		controlDeletes = append(controlDeletes, `DELETE FROM snapshots WHERE line_id=?`)
@@ -286,6 +287,7 @@ func (s *Store) completeScheduledDeletion(ctx context.Context, tx *sql.Tx, lineI
 	queries := []string{
 		`DELETE FROM operation_events WHERE operation_id IN (SELECT id FROM operations WHERE line_id=?)`,
 		`DELETE FROM operations WHERE line_id=?`,
+		`DELETE FROM line_qualifications WHERE line_id=?`,
 	}
 	if s.dialect != "mysql" {
 		queries = append(queries, `DELETE FROM snapshots WHERE line_id=?`)

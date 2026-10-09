@@ -116,6 +116,9 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/lines/{id}/spec", a.admin(a.lineSpec))
 	mux.HandleFunc("PUT /api/v1/lines/{id}/spec", a.admin(a.saveLineSpec))
 	mux.HandleFunc("GET /api/v1/devices", a.admin(a.devices))
+	mux.HandleFunc("GET /api/v1/network-links", a.admin(a.networkLinks))
+	mux.HandleFunc("PUT /api/v1/network-links/{id}", a.admin(a.upsertNetworkLink))
+	mux.HandleFunc("GET /api/v1/governance/production-lines", a.admin(a.productionLineGovernance))
 	mux.HandleFunc("GET /api/v1/devices/export", a.admin(a.exportDevices))
 	mux.HandleFunc("POST /api/v1/devices/host-key/scan", a.admin(a.scanDeviceHostKey))
 	mux.HandleFunc("POST /api/v1/devices", a.admin(a.upsertDevice))
@@ -135,6 +138,13 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/node-releases/uploads/{id}", a.admin(a.uploadNodeSourceChunk))
 	mux.HandleFunc("POST /api/v1/node-releases/uploads/{id}/complete", a.admin(a.completeNodeSourceUpload))
 	mux.HandleFunc("GET /api/v1/node-releases/status", a.admin(a.nodeReleaseStatus))
+	mux.HandleFunc("GET /api/v1/platform-releases/status", a.admin(a.platformReleaseStatus))
+	mux.HandleFunc("POST /api/v1/platform-releases/uploads", a.admin(a.uploadNodeSource))
+	mux.HandleFunc("PUT /api/v1/platform-releases/uploads/{id}", a.admin(a.uploadNodeSourceChunk))
+	mux.HandleFunc("POST /api/v1/platform-releases/uploads/{id}/complete", a.admin(a.completeNodeSourceUpload))
+	mux.HandleFunc("GET /api/v1/platform-upgrades/preview", a.admin(a.platformUpgradePreview))
+	mux.HandleFunc("POST /api/v1/platform-upgrades", a.admin(a.createPlatformUpgrade))
+	mux.HandleFunc("POST /api/v1/platform-upgrades/{id}/rollback", a.admin(a.rollbackPlatformUpgrade))
 	mux.HandleFunc("POST /agent/v1/snapshots", a.agent(a.snapshot))
 	mux.HandleFunc("POST /agent/v1/incidents", a.agent(a.agentIncident))
 	mux.HandleFunc("POST /agent/v1/executors/heartbeat", a.agent(a.executorHeartbeat))
@@ -154,7 +164,27 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/nb/v1/billing-periods", a.agent(a.rawEvent))
 	static, _ := fs.Sub(assets, "assets")
 	mux.Handle("/", http.FileServer(http.FS(static)))
-	return requestLog(securityHeaders(mux))
+	return requestLog(securityHeaders(a.platformWriteGuard(mux)))
+}
+
+func (a *App) platformWriteGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutating := r.Method == http.MethodPost || r.Method == http.MethodPut ||
+			r.Method == http.MethodPatch || r.Method == http.MethodDelete
+		exempt := strings.HasPrefix(r.URL.Path, "/api/v1/auth/") || !strings.HasPrefix(r.URL.Path, "/api/v1/")
+		if mutating && !exempt {
+			active, err := a.store.HasActivePlatformOperation(r.Context())
+			if err != nil {
+				problem(w, http.StatusServiceUnavailable, "无法确认平台升级锁")
+				return
+			}
+			if active {
+				problem(w, http.StatusConflict, "平台升级进行中，普通写操作已暂停")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func requestLog(next http.Handler) http.Handler {
@@ -324,7 +354,9 @@ func validLine(line central.Line) error {
 	if !safeID.MatchString(line.ID) || strings.TrimSpace(line.Name) == "" || len(line.Name) > 100 {
 		return errors.New("invalid line identity")
 	}
-	if line.Status != "draft" && line.Status != "validating" && line.Status != "active" && line.Status != "maintenance" && line.Status != "disabled" && line.Status != "archived" && line.Status != "deleting" {
+	if line.Status != "draft" && line.Status != "provisioning" && line.Status != "qualification_pending" &&
+		line.Status != "qualification_failed" && line.Status != "validating" && line.Status != "active" &&
+		line.Status != "maintenance" && line.Status != "disabled" && line.Status != "archived" && line.Status != "deleting" {
 		return errors.New("invalid line status")
 	}
 	if line.Environment != "" && line.Environment != "production" && line.Environment != "test" {
@@ -393,8 +425,7 @@ func (a *App) patchLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fields := map[string]any{"name": &line.Name, "status": &line.Status, "environment": &line.Environment, "entry_region": &line.EntryRegion,
-		"exit_region": &line.ExitRegion, "provider": &line.Provider, "capacity_mbps": &line.CapacityMbps,
-		"active_deployment": &line.ActiveDeployment, "profile": &line.Profile, "secret_ref": &line.SecretRef}
+		"exit_region": &line.ExitRegion, "provider": &line.Provider, "capacity_mbps": &line.CapacityMbps}
 	for key, value := range patch {
 		target, ok := fields[key]
 		if !ok {
@@ -470,7 +501,24 @@ func (a *App) operations(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, err.Error())
 		return
 	}
+	for index := range items {
+		items[index] = a.redactOperationClient(r.Context(), items[index])
+	}
 	writeJSON(w, 200, map[string]any{"operations": items})
+}
+
+func (a *App) redactOperationClient(ctx context.Context, operation central.Operation) central.Operation {
+	if operation.Kind != "line.open" || len(operation.Result) == 0 ||
+		a.store.ClientDeliveryAllowed(ctx, operation.LineID) == nil {
+		return operation
+	}
+	values := map[string]any{}
+	if json.Unmarshal(operation.Result, &values) != nil {
+		return operation
+	}
+	delete(values, "client_url")
+	operation.Result, _ = json.Marshal(values)
+	return operation
 }
 
 type operationRequest struct {
@@ -514,6 +562,10 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "任务参数无效")
 		return
 	}
+	if req.Kind == "line.upgrade" {
+		problem(w, http.StatusConflict, "共享 Node 升级必须从版本升级中心发起")
+		return
+	}
 	if existing, existingErr := a.store.OperationByIdempotencyKey(r.Context(), key); existingErr == nil {
 		if existing.LineID != req.LineID || existing.Kind != req.Kind || existing.RequestedBy != req.RequestedBy ||
 			!sameUserOperationRequest(existing.Request, req.Request) {
@@ -547,21 +599,48 @@ func (a *App) createOperation(w http.ResponseWriter, r *http.Request) {
 			problem(w, 409, "线路部署参数无效："+specErr.Error())
 			return
 		}
+		if req.Kind == "line.open" && lineRecord.Environment == "production" {
+			if specErr = a.validateProductionTopology(r.Context(), spec); specErr != nil {
+				problem(w, http.StatusConflict, specErr.Error())
+				return
+			}
+		}
 		var values map[string]any
 		if len(req.Request) == 0 || json.Unmarshal(req.Request, &values) != nil {
 			values = map[string]any{}
 		}
 		values["plan"] = spec
 		values["deployment_id"] = lineRecord.ActiveDeployment
-		if req.Kind == "line.open" {
-			if release, releaseErr := a.latestNodeRelease(r.Context()); releaseErr == nil {
-				acknowledged, _ := values["node_release_ack"].(string)
-				releaseID, _ := release["release_id"].(string)
-				if releaseID != "" && acknowledged != releaseID {
-					problem(w, http.StatusConflict, "检测到已验证的 Node 代码更新，请确认候选 Release 后重新提交开线")
+		if req.Kind == "line.upgrade" {
+			affected, impactErr := a.store.LinesSharingDeviceRoles(r.Context(), req.LineID)
+			if impactErr != nil {
+				problem(w, 500, impactErr.Error())
+				return
+			}
+			for _, affectedLineID := range affected {
+				findings, findingErr := a.store.ProductionLineFindings(r.Context(), affectedLineID)
+				if findingErr != nil {
+					problem(w, http.StatusInternalServerError, findingErr.Error())
 					return
 				}
-				values["node_release"] = release
+				if len(findings) > 0 {
+					problem(w, http.StatusConflict, "受影响生产线路 "+affectedLineID+" 治理未完成，禁止升级："+findings[0].Code)
+					return
+				}
+			}
+			values["affected_lines"] = affected
+		}
+		if req.Kind == "line.optimize" && lineRecord.Environment == "production" &&
+			(lineRecord.Status == "qualification_pending" || lineRecord.Status == "qualification_failed") {
+			if lineRecord.ActiveDeployment == "" {
+				problem(w, http.StatusConflict, "生产线路缺少待验收 deployment")
+				return
+			}
+			values["deployment_id"] = lineRecord.ActiveDeployment
+		}
+		if req.Kind == "line.open" {
+			if release, releaseErr := a.latestNodeRelease(r.Context()); releaseErr == nil {
+				values["pending_node_release"] = release
 			}
 		}
 		if req.Kind == "line.tune" {
@@ -628,6 +707,7 @@ func sameUserOperationRequest(existing, requested json.RawMessage) bool {
 		}
 		delete(values, "plan")
 		delete(values, "transport_profile")
+		delete(values, "capacity_reservations")
 		return values
 	}
 	return reflect.DeepEqual(decodeRequest(existing), decodeRequest(requested))
@@ -668,7 +748,8 @@ func (a *App) executors(w http.ResponseWriter, r *http.Request) {
 func validOperationKind(kind string) bool {
 	return kind == "line.open" || kind == "line.validate" || kind == "line.upgrade" ||
 		kind == "line.rollback" || kind == "line.disable" || kind == "line.tune" ||
-		kind == "line.optimize" || kind == "node.release.build"
+		kind == "line.optimize" || kind == "node.release.build" ||
+		kind == "platform.upgrade" || kind == "platform.rollback"
 }
 
 func (a *App) executorHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -717,6 +798,19 @@ func (a *App) rawEvent(w http.ResponseWriter, r *http.Request) {
 	var payload json.RawMessage
 	if !decode(w, r, &payload) {
 		return
+	}
+	if r.URL.Path == "/api/nb/v1/usage-events" {
+		var usage struct {
+			LineID string `json:"line_id"`
+		}
+		if json.Unmarshal(payload, &usage) != nil || !safeID.MatchString(usage.LineID) {
+			problem(w, http.StatusBadRequest, "usage event requires a valid line_id")
+			return
+		}
+		if err := a.store.ClientDeliveryAllowed(r.Context(), usage.LineID); err != nil {
+			problem(w, http.StatusConflict, "usage event rejected: "+err.Error())
+			return
+		}
 	}
 	inserted, err := a.store.RecordRawEvent(r.Context(), r.URL.Path, key, payload)
 	if err != nil {
@@ -972,6 +1066,10 @@ func (a *App) clientQR(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "operation not found")
 		return
 	}
+	if err = a.store.ClientDeliveryAllowed(r.Context(), operation.LineID); err != nil {
+		problem(w, http.StatusConflict, err.Error())
+		return
+	}
 	clientURL, err := operationClientURL(operation)
 	if err != nil {
 		problem(w, 404, err.Error())
@@ -990,6 +1088,10 @@ func (a *App) attachClientConfig(w http.ResponseWriter, r *http.Request) {
 	lineID := r.PathValue("id")
 	if !safeID.MatchString(lineID) {
 		problem(w, 400, "invalid line id")
+		return
+	}
+	if err := a.store.ClientDeliveryAllowed(r.Context(), lineID); err != nil {
+		problem(w, http.StatusConflict, err.Error())
 		return
 	}
 	var request struct {

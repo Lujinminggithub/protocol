@@ -4,6 +4,10 @@
 
 NB 是基于 picoquic 的可级联三跳传输系统。生产基线 `v1.5` 保留可靠 TCP-over-QUIC 语义，拓扑为 `entry -> middle -> exit -> target`；P2 服务端 A/B/C 已按受限范围关闭：IPv4-only、FEC observe-only、公共 UDP 单报文不超过 1001 字节。手机 App 暂不开发，未来客户端基于 Xray-core，当前只维护协议收发 demo。
 
+`single_hk` 是兼容的单节点拓扑：同一台香港设备运行 Entry 和 Exit，Entry 通过 `127.0.0.1` 直达本机 Exit，不启动 Middle。客户端接口仍是带用户名/密码的标准 SOCKS5，连接地址为香港设备公网地址和线路 `socks_port`。由于标准 SOCKS5 客户端不承载 NB QUIC，单节点模式固定关闭 NB FEC。
+
+业务策略分为 `general` 和 `tiktok_live`。`general` 是默认通用代理策略，不要求直播吞吐；未配置静态白名单或远程 SRS 时，它允许通过认证的客户端访问通用 IPv4、域名和端口，生产使用应按业务范围收紧规则。`tiktok_live` 使用 TikTok/Teko、媒体端口和严格验证规则，不改变客户端连接格式。
+
 ## 当前基线
 
 - 普通 QUIC 主链为默认数据面，自动 FEC 处于观察模式。

@@ -45,6 +45,21 @@ func TestGenerateSeparatesPhysicalSegments(t *testing.T) {
 	}
 }
 
+func TestGenerateRejectsFailedProbeAdmission(t *testing.T) {
+	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
+		"entry_middle": {QUIC: QUICEvidence{PacketsObserved: 10000, WindowsValid: 6},
+			Candidate: candidate("cubic", 524288, 1452, 16, 20000)},
+		"middle_exit": {QUIC: QUICEvidence{PacketsObserved: 10000, WindowsValid: 6},
+			Candidate: candidate("bbr", 0, 1452, 16, 20000)},
+	}}
+	probe.Admission.Status = "rejected"
+	probe.Admission.Reasons = []string{"insufficient-downlink"}
+	if _, err := Generate("gz-hk-uk", 1, 10, probe); err == nil ||
+		!strings.Contains(err.Error(), "insufficient-downlink") {
+		t.Fatalf("rejected admission generated a profile: %v", err)
+	}
+}
+
 func TestGenerateDoesNotTurnLoadedShortHopIntoBBR(t *testing.T) {
 	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
 		"entry_middle": {ICMP: ICMP{RTTAvgMS: 4.4}, QUIC: QUICEvidence{RTTP95MS: 45.7, JitterP95MS: 46.5, PacketsObserved: 172992, WindowsValid: 18, ReorderGapMax: 4, ReorderDelayMaxMS: 220.6}, Candidate: candidate("cubic", 524288, 1404, 128, 450000)},

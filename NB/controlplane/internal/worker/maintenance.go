@@ -25,6 +25,9 @@ func fileFingerprint(path string) (uint64, error) {
 }
 
 func (r *Runner) maintainTransportProfile(ctx context.Context, line LineSpec) error {
+	if line.TopologyMode == "single_hk" {
+		return nil
+	}
 	lineState := line.StateDir
 	if lineState == "" {
 		lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)

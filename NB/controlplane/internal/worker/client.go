@@ -29,6 +29,15 @@ type ClientConfig struct {
 	SnapshotEvery        time.Duration
 	SnapshotTimeout      time.Duration
 	OperationConcurrency int
+	Capabilities         []ExecutorCapability
+	PollLineIDs          []string
+	DisableBackground    bool
+}
+
+type ExecutorCapability struct {
+	LineID     string   `json:"line_id"`
+	Operations []string `json:"operations"`
+	Reason     string   `json:"reason,omitempty"`
 }
 
 type operationRunner interface {
@@ -69,6 +78,10 @@ func emitOperationEvent(ctx context.Context, event OperationEvent) error {
 		return emit(ctx, event)
 	}
 	return nil
+}
+
+func EmitOperationEvent(ctx context.Context, event OperationEvent) error {
+	return emitOperationEvent(ctx, event)
 }
 
 func NewClient(registry Registry, runner operationRunner, cfg ClientConfig) (*Client, error) {
@@ -142,19 +155,17 @@ func (c *Client) request(ctx context.Context, method, path string, body any, out
 }
 
 func (c *Client) heartbeat(ctx context.Context) error {
-	type lineCapability struct {
-		LineID     string   `json:"line_id"`
-		Operations []string `json:"operations"`
-		Reason     string   `json:"reason,omitempty"`
+	lines := append([]ExecutorCapability(nil), c.cfg.Capabilities...)
+	if len(lines) == 0 {
+		lines = make([]ExecutorCapability, 0, len(c.registry.Lines)+2)
+		for _, line := range c.registry.Lines {
+			lines = append(lines, ExecutorCapability{LineID: line.LineID, Operations: line.SortedOperations(), Reason: line.DisabledReason})
+		}
+		if c.registry.Dynamic.Enabled {
+			lines = append(lines, ExecutorCapability{LineID: "*", Operations: derivedOperations(c.registry.Dynamic.Operations)})
+		}
+		lines = append(lines, ExecutorCapability{LineID: "__node_release__", Operations: []string{"node.release.build"}})
 	}
-	lines := make([]lineCapability, 0, len(c.registry.Lines))
-	for _, line := range c.registry.Lines {
-		lines = append(lines, lineCapability{LineID: line.LineID, Operations: line.SortedOperations(), Reason: line.DisabledReason})
-	}
-	if c.registry.Dynamic.Enabled {
-		lines = append(lines, lineCapability{LineID: "*", Operations: derivedOperations(c.registry.Dynamic.Operations)})
-	}
-	lines = append(lines, lineCapability{LineID: "__node_release__", Operations: []string{"node.release.build"}})
 	payload := map[string]any{"worker_id": c.registry.WorkerID, "status": "ready", "version": c.cfg.Version,
 		"lines": lines, "observed_at": time.Now().UTC().Format(time.RFC3339Nano)}
 	return c.request(ctx, http.MethodPost, "/agent/v1/executors/heartbeat", payload, nil)
@@ -308,7 +319,7 @@ func (c *Client) snapshotLines(ctx context.Context) []LineSpec {
 		seen[line.LineID] = true
 	}
 	for _, plan := range response.Plans {
-		if seen[plan.LineID] || !contains(plan.ResourceGroup, c.registry.Dynamic.ResourceGroups) {
+		if seen[plan.LineID] {
 			continue
 		}
 		line, err := resolver.resolveSnapshotLine(plan)
@@ -373,11 +384,18 @@ func (c *Client) poll(ctx context.Context) error {
 	if err := c.retryPersistedResults(ctx); err != nil {
 		return err
 	}
-	lines := append([]LineSpec(nil), c.registry.Lines...)
-	if c.registry.Dynamic.Enabled {
-		lines = append(lines, LineSpec{LineID: "*"})
+	lines := []LineSpec{}
+	if len(c.cfg.PollLineIDs) > 0 {
+		for _, lineID := range c.cfg.PollLineIDs {
+			lines = append(lines, LineSpec{LineID: lineID})
+		}
+	} else {
+		lines = append(lines, c.registry.Lines...)
+		if c.registry.Dynamic.Enabled {
+			lines = append(lines, LineSpec{LineID: "*"})
+		}
+		lines = append(lines, LineSpec{LineID: "__node_release__"})
 	}
-	lines = append(lines, LineSpec{LineID: "__node_release__"})
 	var operations []Operation
 	for _, line := range lines {
 		limit := 1
@@ -535,6 +553,9 @@ func (c *Client) runHeartbeat(ctx context.Context) {
 				fmt.Fprintf(os.Stderr, "nb-web-worker heartbeat failed: %v; retrying\n", err)
 				continue
 			}
+			if c.cfg.DisableBackground {
+				continue
+			}
 			if err := c.syncInventory(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
 			}
@@ -549,16 +570,18 @@ func (c *Client) Run(ctx context.Context) error {
 	if err := c.heartbeat(ctx); err != nil {
 		return err
 	}
-	if err := c.syncInventory(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+	if !c.cfg.DisableBackground {
+		if err := c.syncInventory(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+		}
+		if err := c.syncRuntimePortClaims(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "nb-web-worker runtime port scan: %v\n", err)
+		}
+		if err := c.syncClientConfigs(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
+		}
+		go c.collectSnapshots(ctx)
 	}
-	if err := c.syncRuntimePortClaims(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "nb-web-worker runtime port scan: %v\n", err)
-	}
-	if err := c.syncClientConfigs(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "nb-web-worker %v\n", err)
-	}
-	go c.collectSnapshots(ctx)
 	go c.runHeartbeat(ctx)
 	poll := time.NewTicker(c.cfg.PollEvery)
 	maintenance := time.NewTicker(c.cfg.MaintenanceEvery)
@@ -572,16 +595,24 @@ func (c *Client) Run(ctx context.Context) error {
 			return nil
 		case <-poll.C:
 			if err := c.poll(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 		case <-maintenance.C:
+			if c.cfg.DisableBackground {
+				continue
+			}
 			if runner, ok := c.runner.(interface{ Maintain(context.Context) error }); ok {
 				if err := runner.Maintain(ctx); err != nil {
 					fmt.Fprintf(os.Stderr, "nb-web-worker maintenance failed: %v\n", err)
 				}
 			}
 		case <-snapshots.C:
-			go c.collectSnapshots(ctx)
+			if !c.cfg.DisableBackground {
+				go c.collectSnapshots(ctx)
+			}
 		}
 	}
 }

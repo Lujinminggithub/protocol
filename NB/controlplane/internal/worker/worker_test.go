@@ -8,17 +8,22 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"nb-controlplane/internal/transportprofile"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -110,8 +115,117 @@ func TestOptimizeUsesValidationStep(t *testing.T) {
 	runner := NewRunner(testRegistry(t, []string{"line.validate", "line.tune"}))
 	line := runner.registry.Lines[0]
 	steps, err := runner.steps(line, Operation{ID: "op-optimize", LineID: line.LineID, Kind: "line.optimize"}, requestValues{}, t.TempDir())
-	if err != nil || len(steps) != 1 || steps[0].Stage != "validate" || !slices.Contains(steps[0].Args, "--active") {
+	if err != nil || len(steps) != 2 || steps[0].Stage != "probe-preflight" ||
+		!slices.Contains(steps[0].Args, "--preflight") || steps[1].Stage != "validate" ||
+		!slices.Contains(steps[1].Args, "--active") {
 		t.Fatalf("optimize steps=%+v err=%v", steps, err)
+	}
+	if !slices.Contains(steps[1].Args, "--minimum-throughput-ratio") ||
+		!slices.Contains(steps[1].Args, "0.95") || !slices.Contains(steps[1].Args, "--duration") ||
+		!slices.Contains(steps[1].Args, "90") {
+		t.Fatalf("optimize qualification contract=%v", steps[1].Args)
+	}
+	for _, kind := range []string{"line.open", "line.validate", "line.optimize"} {
+		if !operationNeedsProbeCleanup(kind) {
+			t.Fatalf("%s did not require probe cleanup", kind)
+		}
+	}
+	if operationNeedsProbeCleanup("line.tune") {
+		t.Fatal("profile-only tune unexpectedly requires probe cleanup")
+	}
+}
+
+func TestSingleHKRoleOrderAndTransportTuneRejection(t *testing.T) {
+	line := LineSpec{LineID: "hk-single", TopologyMode: "single_hk", ServiceProfile: "general"}
+	if !slices.Equal(line.roleOrder(), []string{"entry", "exit"}) ||
+		!slices.Equal(line.activationOrder(), []string{"exit", "entry"}) {
+		t.Fatalf("single-HK role order=%v/%v", line.roleOrder(), line.activationOrder())
+	}
+	_, _, err := NewRunner(testRegistry(t, nil)).applyPlannedProfile(t.Context(), line, "deployment",
+		transportprofile.Profile{}, map[string]string{}, io.Discard, new(int))
+	if err == nil || !strings.Contains(err.Error(), "没有可调优的中继传输链路") {
+		t.Fatalf("single-HK tune error=%v", err)
+	}
+}
+
+func TestOptimizeStopsAtRejectedValidationAdmission(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate", "line.tune"})
+	script := `import json,sys
+output=sys.argv[sys.argv.index("--output")+1]
+with open(output,"w",encoding="utf-8") as handle:
+ json.dump({"schema_version":2,"admission":{"status":"rejected","reasons":["insufficient-downlink"],"achieved_upstream_mbps":10,"achieved_downstream_mbps":6.5},"segments":{}},handle)
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleanupMarker := filepath.Join(registry.StateDir, "probe-cleanup-rejected")
+	cleanupScript := `import pathlib
+pathlib.Path(` + strconv.Quote(cleanupMarker) + `).write_text("cleaned",encoding="utf-8")
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "probe_cleanup.py"), []byte(cleanupScript), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(registry)
+	result, err := runner.Run(t.Context(), Operation{ID: "op-rejected", LineID: "line-1", Kind: "line.optimize"})
+	if err == nil || !strings.Contains(err.Error(), "insufficient-downlink") {
+		t.Fatalf("rejected validation error=%v result=%+v", err, result)
+	}
+	if result.Failure == nil || result.Failure.Stage != "validation" ||
+		!bytes.Contains(result.Evidence, []byte(`"status": "rejected"`)) {
+		t.Fatalf("rejected validation was not preserved: %+v", result)
+	}
+	if _, statErr := os.Stat(filepath.Join(registry.StateDir, "op-rejected", "optimize-checkpoint.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected validation created a tune checkpoint: %v", statErr)
+	}
+	if _, statErr := os.Stat(cleanupMarker); statErr != nil {
+		t.Fatalf("rejected validation did not clean probe sessions: %v", statErr)
+	}
+}
+
+func TestValidateCleansProbeSessionsAfterSuccess(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate"})
+	probe := `import json,sys
+output=sys.argv[sys.argv.index("--output")+1]
+with open(output,"w",encoding="utf-8") as handle: json.dump({"schema_version":2},handle)
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(probe), 0600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(registry.StateDir, "probe-cleanup-success")
+	cleanup := `import pathlib
+pathlib.Path(` + strconv.Quote(marker) + `).write_text("cleaned",encoding="utf-8")
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "probe_cleanup.py"), []byte(cleanup), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRunner(registry).Run(t.Context(), Operation{ID: "op-validate-cleanup", LineID: "line-1", Kind: "line.validate"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("successful validation did not clean probe sessions: %v", err)
+	}
+}
+
+func TestValidateFailsWhenProbeCleanupCannotBeConfirmed(t *testing.T) {
+	registry := testRegistry(t, []string{"line.validate"})
+	probe := `import json,sys
+output=sys.argv[sys.argv.index("--output")+1]
+with open(output,"w",encoding="utf-8") as handle: json.dump({"schema_version":2},handle)
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "line_probe.py"), []byte(probe), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := `import sys
+if "--preflight" not in sys.argv:
+ raise RuntimeError("probe sessions remain")
+`
+	if err := os.WriteFile(filepath.Join(registry.Root, "tools", "probe_cleanup.py"), []byte(cleanup), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewRunner(registry).Run(t.Context(), Operation{ID: "op-cleanup-failed", LineID: "line-1", Kind: "line.validate"})
+	if err == nil || result.Failure == nil || result.Failure.Stage != "probe-cleanup" ||
+		!strings.Contains(result.Failure.LogExcerpt, "probe sessions remain") {
+		t.Fatalf("cleanup failure was not enforced: err=%v result=%+v", err, result)
 	}
 }
 
@@ -373,7 +487,11 @@ func testRegistry(t *testing.T, operations []string) Registry {
 			t.Fatal(err)
 		}
 	}
-	registry := Registry{SchemaVersion: 1, WorkerID: "worker-1", Root: directory, Python: "python",
+	python := "python"
+	if _, err := exec.LookPath(python); err != nil {
+		python = "python3"
+	}
+	registry := Registry{SchemaVersion: 1, WorkerID: "worker-1", Root: directory, Python: python,
 		StateDir: filepath.Join(directory, "state"), Lines: []LineSpec{{LineID: "line-1", ResourceGroup: "shared-1",
 			HostsFile: filepath.Join(directory, "hosts.json"), SourceMachinesFile: filepath.Join(directory, "machines.json"),
 			LineProfileFile: filepath.Join(directory, "profile.json"), KnownHostsFile: filepath.Join(directory, "known_hosts"),
@@ -572,7 +690,7 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	device := func(id, role, host, secret string) dynamicNode {
 		return trustedDynamicNode(t, id, role, host, 22, "env:"+secret)
 	}
-	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "shared-1", InstanceID: "new", BandwidthMbps: 20,
+	plan := dynamicPlan{LineID: "line-new", ResourceGroup: "renamed-production-group", InstanceID: "new", BandwidthMbps: 20,
 		UpstreamMbps: 6, DownstreamMbps: 14,
 		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, ExitBindIP: "192.0.2.30", UDPPortMin: 22048, UDPPortMax: 23071,
 		DNSServers: []string{"9.9.9.9", "1.1.1.1"},
@@ -645,15 +763,16 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 		t.Fatalf("dynamic line did not reject an out-of-range port in Chinese: %v", err)
 	}
 	steps, err := runner.steps(line, Operation{ID: "op-new", LineID: plan.LineID, Kind: "line.open"}, requestValues{Plan: plan}, t.TempDir())
-	if err != nil || len(steps) < 3 || steps[0].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
+	if err != nil || len(steps) < 4 || steps[0].Stage != "probe-preflight" ||
+		steps[1].Stage != "whitelist-fetch" || steps[len(steps)-1].Stage != "whitelist" {
 		t.Fatalf("unexpected dynamic open steps: %#v err=%v", steps, err)
 	}
-	for _, argument := range steps[0].Args {
+	for _, argument := range steps[1].Args {
 		if strings.Contains(argument, "private-key") {
 			t.Fatal("whitelist URL leaked into the command line")
 		}
 	}
-	provisionArgs := strings.Join(steps[1].Args, " ")
+	provisionArgs := strings.Join(steps[2].Args, " ")
 	if !strings.Contains(provisionArgs, "--upstream-mbps 6") || !strings.Contains(provisionArgs, "--downstream-mbps 14") {
 		t.Fatalf("provision command lost directional rates: %s", provisionArgs)
 	}
@@ -673,6 +792,114 @@ func TestDynamicLineBuildsTopologyWithoutPersistingSecretValues(t *testing.T) {
 	if err != nil || !bytes.Contains(defaultRules, []byte("domain default.example")) ||
 		!bytes.Contains(defaultRules, []byte("domain_exact odr.itunes.apple.com")) {
 		t.Fatalf("empty plan did not receive default whitelist: %q err=%v", defaultRules, err)
+	}
+}
+
+func TestDynamicLineBuildsSingleHKTopology(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, Operations: []string{"line.open"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599,
+		UDPPortMin: 22048, UDPPortMax: 65535}
+	t.Setenv("NB_SINGLE_HK_PASSWORD", "single-hk-password")
+	entry := trustedDynamicNode(t, "hk-1", "entry", "192.0.2.20", 22, "env:NB_SINGLE_HK_PASSWORD")
+	entry.Device.Region = "HK"
+	exit := entry
+	exit.Role = "exit"
+	plan := dynamicPlan{LineID: "hk-single", ResourceGroup: "hk", InstanceID: "hk-single_1",
+		TopologyMode: "single_hk", ServiceProfile: "general",
+		BandwidthMbps: 5, UpstreamMbps: 5, DownstreamMbps: 5,
+		SocksPort: 1082, RelayPort: 0, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		DNSServers: []string{"1.1.1.1"}, BuildMode: "auto", JumpPolicy: "direct",
+		Nodes: []dynamicNode{entry, exit}}
+	runner := NewRunner(registry)
+	line, err := runner.dynamicLine(Operation{ID: "op-single", LineID: plan.LineID, Kind: "line.open"},
+		requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line.TopologyMode != "single_hk" || line.ServiceProfile != "general" || line.MiddlePort != 0 {
+		t.Fatalf("single-HK line=%+v", line)
+	}
+	data, err := os.ReadFile(line.SourceMachinesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source map[string]any
+	if json.Unmarshal(data, &source) != nil || source["middle"] != nil || source["topology_mode"] != "single_hk" {
+		t.Fatalf("single-HK source contains a Middle: %s", data)
+	}
+	rules, err := os.ReadFile(line.WhitelistFile)
+	if err != nil || !bytes.Contains(rules, []byte("ip 0.0.0.0/0")) ||
+		!bytes.Contains(rules, []byte("domain_keyword .")) || bytes.Contains(rules, []byte("tiktok.com")) {
+		t.Fatalf("general single-HK default whitelist=%q error=%v", rules, err)
+	}
+	steps, err := runner.steps(line, Operation{ID: "op-single", LineID: plan.LineID, Kind: "line.open"},
+		requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provision commandStep
+	for _, step := range steps {
+		if step.Stage == "provision" {
+			provision = step
+			break
+		}
+	}
+	args := strings.Join(provision.Args, " ")
+	if !strings.Contains(args, "--topology-mode single_hk") || !strings.Contains(args, "--service-profile general") || strings.Contains(args, "--middle-port") {
+		t.Fatalf("single-HK provision args=%s", args)
+	}
+
+	invalid := plan
+	invalid.Nodes = append([]dynamicNode(nil), plan.Nodes...)
+	invalid.Nodes[1].DeviceID, invalid.Nodes[1].Device.ID = "hk-2", "hk-2"
+	if err = runner.validateDynamicPlan(Operation{LineID: plan.LineID, Kind: "line.open"}, invalid); err == nil || !strings.Contains(err.Error(), "同一台香港设备") {
+		t.Fatalf("different single-HK devices error=%v", err)
+	}
+	invalid = plan
+	invalid.Nodes = append(invalid.Nodes, trustedDynamicNode(t, "relay-1", "relay", "192.0.2.21", 22, "env:NB_SINGLE_HK_PASSWORD"))
+	if err = runner.validateDynamicPlan(Operation{LineID: plan.LineID, Kind: "line.open"}, invalid); err == nil {
+		t.Fatal("single-HK plan accepted a Relay")
+	}
+}
+
+func TestDynamicDisableBeforeOpenUsesGeneratedSourceTopology(t *testing.T) {
+	registry := testRegistry(t, nil)
+	registry.Lines = nil
+	registry.Dynamic = DynamicConfig{Enabled: true, Operations: []string{"line.disable"},
+		SocksPortMin: 1082, SocksPortMax: 1199, RelayPortMin: 4445, RelayPortMax: 4599,
+		UDPPortMin: 22048, UDPPortMax: 65535}
+	for _, name := range []string{"ENTRY", "RELAY", "EXIT"} {
+		t.Setenv("NB_DISABLE_"+name, "password-"+name)
+	}
+	node := func(id, role, host, secret string) dynamicNode {
+		return trustedDynamicNode(t, id, role, host, 22, "env:"+secret)
+	}
+	plan := dynamicPlan{LineID: "line-never-opened", ResourceGroup: "renamed-group",
+		InstanceID: "line-never-opened_1", BandwidthMbps: 10, UpstreamMbps: 10, DownstreamMbps: 10,
+		SocksPort: 1082, RelayPort: 4445, ExitPort: 4443, UDPPortMin: 22048, UDPPortMax: 23071,
+		DNSServers: []string{"1.1.1.1"}, BuildMode: "auto", JumpPolicy: "auto",
+		Nodes: []dynamicNode{node("entry-1", "entry", "192.0.2.1", "NB_DISABLE_ENTRY"),
+			node("relay-1", "relay", "192.0.2.2", "NB_DISABLE_RELAY"),
+			node("exit-1", "exit", "192.0.2.3", "NB_DISABLE_EXIT")}}
+	line, err := NewRunner(registry).dynamicLine(Operation{ID: "op-disable", LineID: plan.LineID,
+		Kind: "line.disable"}, requestValues{Plan: plan}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line.HostsFile != line.SourceMachinesFile {
+		t.Fatalf("disable hosts=%q source=%q", line.HostsFile, line.SourceMachinesFile)
+	}
+	data, err := os.ReadFile(line.SourceMachinesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source struct {
+		Paths map[string]string `json:"paths"`
+	}
+	if json.Unmarshal(data, &source) != nil || source.Paths["work_dir"] != "/etc/NB" {
+		t.Fatalf("disable source topology lacks deployment paths: %s", data)
 	}
 }
 
@@ -771,7 +998,7 @@ func TestClientCollectsDynamicLineSnapshots(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/agent/v1/line-plans":
-			_, _ = w.Write([]byte(`{"plans":[{"line_id":"line-dynamic","resource_group":"test-group"}]}`))
+			_, _ = w.Write([]byte(`{"plans":[{"line_id":"line-dynamic","resource_group":"renamed-group"}]}`))
 		case "/agent/v1/snapshots":
 			var snapshot Snapshot
 			if json.NewDecoder(request.Body).Decode(&snapshot) != nil {

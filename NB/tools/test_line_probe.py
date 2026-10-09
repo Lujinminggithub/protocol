@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+import contextlib
+import io
 import json
 import os
+import sys
 import threading
+import types
 
 import line_probe
 from line_probe import (ENTRY_LOCAL_PROBE_SCRIPT, evaluate_admission, fnv1a64,
@@ -85,12 +89,73 @@ class Stopped:
         return True
 
 
+def execute_entry_downlink(payloads):
+    class ProbeSocket:
+        def __init__(self):
+            self.responses = [b"\x05\x02", b"\x01\x00", b"\x05\x00\x00\x01", b"\0" * 6,
+                              *payloads]
+
+        def settimeout(self, _value):
+            pass
+
+        def sendall(self, _value):
+            pass
+
+        def recv(self, _size):
+            return self.responses.pop(0) if self.responses else b""
+
+        def close(self):
+            pass
+
+    fake_socket = types.SimpleNamespace(
+        create_connection=lambda *_args, **_kwargs: ProbeSocket(),
+        timeout=TimeoutError,
+        SHUT_WR=1,
+    )
+    request = {"mode": "downlink", "socks_port": 1084, "username": "user",
+               "password": "password", "size": 0, "target_mbps": 0.000032,
+               "duration_s": 4, "io_timeout": 1}
+    previous_socket = sys.modules.get("socket")
+    previous_stdin = sys.stdin
+    output = io.StringIO()
+    try:
+        sys.modules["socket"] = fake_socket
+        sys.stdin = io.StringIO(json.dumps(request))
+        with contextlib.redirect_stdout(output):
+            exec(ENTRY_LOCAL_PROBE_SCRIPT, {})
+    finally:
+        sys.stdin = previous_stdin
+        if previous_socket is None:
+            sys.modules.pop("socket", None)
+        else:
+            sys.modules["socket"] = previous_socket
+    line = next(value for value in output.getvalue().splitlines()
+                if value.startswith("NBPROBE_RESULT "))
+    return json.loads(line.removeprefix("NBPROBE_RESULT "))
+
+
 def main() -> None:
     compile(ENTRY_LOCAL_PROBE_SCRIPT, "<entry-local-probe>", "exec")
     assert "sock.shutdown(socket.SHUT_WR)" in ENTRY_LOCAL_PROBE_SCRIPT
     assert 'connect_socks("nb-probe-source.internal")' in ENTRY_LOCAL_PROBE_SCRIPT
     assert 'b"NBP2"' in ENTRY_LOCAL_PROBE_SCRIPT
     assert fnv1a64(b"abc") == 0xe71fa2190541574b
+    partial = execute_entry_downlink([bytes([29, 42, 55, 68, 81, 94, 107, 120]), b""])
+    assert partial["bytes"] == 8 and partial["expected_bytes"] == 16
+    assert partial["complete"] is False and partial["ended_early"] is True
+    assert partial["integrity"] == "count-ok" and partial["hash_algorithm"] == "sha256"
+    assert abs(partial["achieved_mbps"] - 0.000016) < 0.0000001
+    rejected_partial = evaluate_admission({"integrity": {"integrity": "ok"},
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 10},
+        "downlink": partial}, 10.0)
+    assert rejected_partial["status"] == "rejected"
+    assert rejected_partial["reasons"] == ["insufficient-downlink"]
+    try:
+        execute_entry_downlink([bytes([29, 99, 55, 68]), b""])
+    except RuntimeError as error:
+        assert "integrity mismatch" in str(error)
+    else:
+        raise AssertionError("corrupt downlink payload was accepted")
     control_sample = control_link_sample([
         {"link": {"sent_packets": 800, "rtt_max_us": 4500, "jitter_max_us": 600,
                   "effective_loss_max_pct": 0.1, "spurious_total": 2,
@@ -238,12 +303,14 @@ def main() -> None:
     assert idle_candidate["auto_apply_allowed"] is False
     assert recommend_mtu(idle, None, current)["confidence"] == "unavailable-keep-current"
     admitted = evaluate_admission({"integrity": {"integrity": "ok"},
-        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.2},
-        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.4}}, 10.0)
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.50},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.50}}, 10.0)
     assert admitted["status"] == "admitted"
+    assert admitted["required_ratio"] == 0.95
+    assert admitted["duration_seconds"] == 90
     rejected = evaluate_admission({"integrity": {"integrity": "ok"},
-        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.1},
-        "downlink": {"integrity": "count-ok", "achieved_mbps": 8.9}}, 10.0)
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.50},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 9.49}}, 10.0)
     assert rejected["status"] == "rejected"
     assert rejected["reasons"] == ["insufficient-downlink"]
     barrier = threading.Barrier(2)

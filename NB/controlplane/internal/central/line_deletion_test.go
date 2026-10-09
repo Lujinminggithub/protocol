@@ -138,6 +138,49 @@ func TestDeleteDraftLineWithSeparateTelemetryDatabase(t *testing.T) {
 	}
 }
 
+func TestDeleteReleasesReservedDirectionalCapacity(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := t.Context()
+	for _, id := range []string{"delete-entry", "delete-relay"} {
+		if _, err = store.UpsertDevice(ctx, Device{ID: id, Name: id, Status: "ready",
+			Environment: "production", Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
+			Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = store.UpsertLine(ctx, Line{ID: "delete-capacity", Name: "delete capacity",
+		Status: "draft", Environment: "production", EntryRegion: "gz", ExitRegion: "hk",
+		Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.UpsertNetworkLink(ctx, NetworkLink{ID: "delete-link", FromDeviceID: "delete-entry",
+		FromRole: "entry", ToDeviceID: "delete-relay", ToRole: "relay", ForwardCapacityMbps: 10,
+		ReverseCapacityMbps: 10, BillingMode: LinkBillingIndependent, Environment: "production",
+		Status: "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	stamp := now()
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO line_capacity_reservations
+ (line_id,link_id,forward_mbps,reverse_mbps,state,operation_id,created_at,updated_at)
+ VALUES(?,?,?,?,?,?,?,?)`, "delete-capacity", "delete-link", 10, 10, "reserved", "open-delete", stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DeleteLine(ctx, "delete-capacity", LineDeletionRequest{RequestedBy: "operator",
+		Reason: "discard unqualified draft"}); err != nil {
+		t.Fatal(err)
+	}
+	links, err := store.NetworkLinks(ctx)
+	if err != nil || len(links) != 1 || links[0].ForwardAvailableMbps != 10 ||
+		links[0].ReverseAvailableMbps != 10 || links[0].ForwardReservedMbps != 0 ||
+		links[0].ReverseReservedMbps != 0 {
+		t.Fatalf("released links=%+v err=%v", links, err)
+	}
+}
+
 func TestScheduledDeletionKeepsDraftUntilCleanupSucceeds(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "central.db"))
 	if err != nil {

@@ -101,6 +101,9 @@ func nextTransportGeneration(requested, floor uint64) uint64 {
 }
 
 func summarizeTransportRollout(line LineSpec, registryStateDir, deploymentID string) *transportRolloutResult {
+	if line.TopologyMode == "single_hk" {
+		return nil
+	}
 	lineState := line.StateDir
 	if lineState == "" {
 		lineState = filepath.Join(registryStateDir, "lines", line.LineID)
@@ -178,6 +181,9 @@ func (r *Runner) activeTransportGeneration(ctx context.Context, line LineSpec, e
 
 func (r *Runner) applyPlannedProfile(ctx context.Context, line LineSpec, deploymentID string, profile transportprofile.Profile,
 	environment map[string]string, output io.Writer, sequence *int) (uint64, string, error) {
+	if line.TopologyMode == "single_hk" {
+		return 0, "", errors.New("香港单节点线路没有可调优的中继传输链路")
+	}
 	lineState := line.StateDir
 	if lineState == "" {
 		lineState = filepath.Join(r.registry.StateDir, "lines", line.LineID)

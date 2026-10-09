@@ -87,3 +87,19 @@ with tempfile.TemporaryDirectory(prefix="node-release-overlay-") as directory:
     assert (candidate / "tools" / "deploy.py").read_text(encoding="utf-8") == "trusted\n"
 
 print("node release orchestration overlay passed")
+
+
+with tempfile.TemporaryDirectory(prefix="node-release-ready-") as directory:
+    base = pathlib.Path(directory)
+    current = base / "repo"
+    candidate = base / "candidate"
+    current.mkdir()
+    candidate.mkdir()
+    (current / "identity.txt").write_text("current\n", encoding="utf-8")
+    (candidate / "identity.txt").write_text("candidate\n", encoding="utf-8")
+    ready = node_release_upload.stage_candidate(current, candidate, "op-test")
+    assert (current / "identity.txt").read_text(encoding="utf-8") == "current\n"
+    assert ready == base / "source-candidates" / "ready-op-test"
+    assert (ready / "identity.txt").read_text(encoding="utf-8") == "candidate\n"
+
+print("node release candidate remains inactive until platform upgrade")

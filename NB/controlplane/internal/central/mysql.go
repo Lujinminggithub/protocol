@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS line_specs (
  relay_port INT NOT NULL, exit_port INT NOT NULL, exit_bind_ip VARCHAR(64) NOT NULL DEFAULT '',
  dns_servers MEDIUMBLOB NOT NULL, whitelist MEDIUMBLOB NOT NULL, build_mode VARCHAR(32) NOT NULL,
  artifact_ref TEXT NOT NULL, source_ref TEXT NOT NULL, srs_ref TEXT NOT NULL, jump_policy VARCHAR(64) NOT NULL,
- created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL, environment VARCHAR(32) NOT NULL DEFAULT 'production'
+ created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL, environment VARCHAR(32) NOT NULL DEFAULT 'production',
+ topology_mode VARCHAR(32) NOT NULL DEFAULT 'trihop', service_profile VARCHAR(32) NOT NULL DEFAULT 'general'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS line_port_allocation (
  line_id VARCHAR(191) PRIMARY KEY, socks_port_auto BOOLEAN NOT NULL DEFAULT FALSE,
@@ -92,6 +93,34 @@ CREATE TABLE IF NOT EXISTS line_nodes (
  ordinal INT NOT NULL, next_hop_device_id VARCHAR(191) NOT NULL DEFAULT '',
  jump_candidates MEDIUMBLOB NOT NULL, config MEDIUMBLOB NOT NULL,
  PRIMARY KEY(line_id,role,ordinal), INDEX line_nodes_device(device_id,line_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS network_links (
+ id VARCHAR(191) PRIMARY KEY,
+ from_device_id VARCHAR(191) NOT NULL, from_role VARCHAR(32) NOT NULL,
+ to_device_id VARCHAR(191) NOT NULL, to_role VARCHAR(32) NOT NULL,
+ forward_capacity_mbps BIGINT NOT NULL, reverse_capacity_mbps BIGINT NOT NULL,
+ billing_mode VARCHAR(32) NOT NULL, environment VARCHAR(32) NOT NULL, status VARCHAR(32) NOT NULL,
+ created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+ UNIQUE KEY network_links_identity(from_device_id,from_role,to_device_id,to_role),
+ INDEX network_links_endpoints(from_device_id,from_role,to_device_id,to_role)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS line_capacity_reservations (
+ line_id VARCHAR(191) NOT NULL, link_id VARCHAR(191) NOT NULL,
+ forward_mbps BIGINT NOT NULL, reverse_mbps BIGINT NOT NULL,
+ state VARCHAR(32) NOT NULL, operation_id VARCHAR(191) NOT NULL,
+ created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+ PRIMARY KEY(line_id,link_id),
+ INDEX line_capacity_reservations_link(link_id,state,line_id),
+ INDEX line_capacity_reservations_operation(operation_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS line_qualifications (
+ operation_id VARCHAR(191) PRIMARY KEY, line_id VARCHAR(191) NOT NULL, deployment_id VARCHAR(191) NOT NULL,
+ target_upstream_mbps DOUBLE NOT NULL, target_downstream_mbps DOUBLE NOT NULL,
+ achieved_upstream_mbps DOUBLE NOT NULL, achieved_downstream_mbps DOUBLE NOT NULL,
+ duration_seconds INT NOT NULL, required_ratio DOUBLE NOT NULL,
+ status VARCHAR(32) NOT NULL, reasons MEDIUMBLOB NOT NULL, evidence MEDIUMBLOB NOT NULL,
+ created_at VARCHAR(40) NOT NULL,
+ INDEX line_qualifications_latest(line_id,created_at,operation_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS operation_events (
  id BIGINT AUTO_INCREMENT PRIMARY KEY, operation_id VARCHAR(191) NOT NULL, sequence INT NOT NULL,
@@ -138,6 +167,8 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 		`ALTER TABLE ` + "`lines`" + ` ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE devices ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
 		`ALTER TABLE line_specs ADD COLUMN environment VARCHAR(32) NOT NULL DEFAULT 'production'`,
+		`ALTER TABLE line_specs ADD COLUMN topology_mode VARCHAR(32) NOT NULL DEFAULT 'trihop'`,
+		`ALTER TABLE line_specs ADD COLUMN service_profile VARCHAR(32) NOT NULL DEFAULT 'general'`,
 	} {
 		if _, alterErr := s.db.ExecContext(ctx, statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate") {
 			return alterErr
@@ -152,5 +183,13 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE line_specs SET environment='production' WHERE environment IS NULL OR environment=''`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE line_specs SET topology_mode='trihop' WHERE topology_mode IS NULL OR topology_mode=''`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE line_specs SET service_profile='general' WHERE service_profile IS NULL OR service_profile=''`)
 	return err
 }

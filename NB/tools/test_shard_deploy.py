@@ -167,6 +167,49 @@ def main() -> None:
         else:
             os.environ["NB_ALLOW_BINARY_REUSE_WHEN_BUSY"] = busy_previous
 
+    force_previous = os.environ.get("NB_FORCE_SHARED_ROLLOUT")
+    os.environ["NB_FORCE_SHARED_ROLLOUT"] = "1"
+    force_commands = []
+    try:
+        def force_run(_client, command, **_kwargs):
+            force_commands.append(command)
+            if "WORKER_CONTROL_OK" in command:
+                return "WORKER_CONTROL_OK elapsed_ms=900\n"
+            if "responses.append" in command:
+                return "4\n"
+            if command.startswith("readlink -f "):
+                return "/etc/xgw/shards/releases/old/nb_node\n"
+            if command.startswith("if test -x "):
+                return "PRESENT\n"
+            if command.startswith("sha256sum "):
+                return "old-sha\n" if "releases/old/" in command else "new-sha\n"
+            if "echo STAGED" in command:
+                return "REUSED\n"
+            if "SHARD_CONTROLS_OK" in command:
+                return "SHARD_CONTROLS_OK 2\n"
+            if command.startswith("systemctl is-active "):
+                return "active\n"
+            if command.startswith("systemctl enable "):
+                return "active\n"
+            if command.startswith("if test -f "):
+                return "ABSENT\n"
+            return ""
+
+        result = runtime.install_role(
+            None, "middle", command, {}, "deploy-force", "new", 0,
+            work="/etc/xgw", instance_work="/etc/xgw/instances/line-a",
+            deploy_instance="line-a", lab={}, run=force_run,
+            push_bytes=lambda *_args, **_kwargs: None,
+            effective_workers=lambda _role: 2,
+            legacy_service_name=lambda role: f"nb-{role}.service")
+        assert "binary_changed=true" in result and "sessions_interrupted=4" in result
+        assert sum("restart nb-middle-shard@" in item for item in force_commands) == 2
+    finally:
+        if force_previous is None:
+            os.environ.pop("NB_FORCE_SHARED_ROLLOUT", None)
+        else:
+            os.environ["NB_FORCE_SHARED_ROLLOUT"] = force_previous
+
     for invalid in ("bad id", "../escape", ""):
         try:
             shard.render_instance_config(invalid, "entry", 0, command, {}, 1, 1024 * 1024)

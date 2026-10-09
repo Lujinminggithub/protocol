@@ -16,6 +16,7 @@
         <button class="nav-item" data-view="devices"><span class="nav-icon">▣</span>设备</button>
         <button class="nav-item" data-view="lines"><span class="nav-icon">⇄</span>线路</button>
         <button class="nav-item" data-view="operations"><span class="nav-icon">≡</span>任务</button>
+        <button class="nav-item" data-view="upgrades"><span class="nav-icon">↑</span>版本升级</button>
         <button class="nav-item" data-view="incidents"><span class="nav-icon">!</span>告警</button>
       </nav>
       <div class="sidebar-foot"><span class="status-dot" id="apiDot"></span><span id="apiStatus">未连接</span></div>
@@ -49,13 +50,25 @@
       </section>
 
       <section class="view" id="linesView">
-        <div class="toolbar"><input id="lineSearch" type="search" placeholder="搜索线路、区域或运营商"><select id="lineEnvironment"><option value="">全部环境</option><option value="production">生产</option><option value="test">测试</option></select><select id="lineStatus"><option value="">全部状态</option><option value="active">运行中</option><option value="draft">草稿</option><option value="validating">验证中</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></div>
-        <div class="table-wrap"><table><thead><tr><th>线路</th><th>环境</th><th>状态</th><th>拓扑</th><th>带宽</th><th>接入端口</th><th>Profile</th><th>操作</th></tr></thead><tbody id="linesTable"></tbody></table></div>
+        <div class="toolbar"><input id="lineSearch" type="search" placeholder="搜索线路、区域或运营商"><select id="lineEnvironment"><option value="">全部环境</option><option value="production">生产</option><option value="test">测试</option></select><select id="lineStatus"><option value="">全部状态</option><option value="active">运行中</option><option value="draft">草稿</option><option value="provisioning">开线中</option><option value="qualification_pending">待验证</option><option value="qualification_failed">全双工不合格</option><option value="maintenance">维护</option><option value="disabled">停用</option></select></div>
+        <div class="table-wrap"><table><thead><tr><th>线路</th><th>环境</th><th>状态</th><th>全双工资格</th><th>拓扑</th><th>上行 / 下行</th><th>接入端口</th><th>Profile</th><th>操作</th></tr></thead><tbody id="linesTable"></tbody></table></div>
       </section>
 
+
       <section class="view" id="operationsView">
-        <div class="toolbar"><select id="operationLine"><option value="">全部线路</option></select><button class="secondary" id="reloadOperations">刷新任务</button><button class="secondary" id="uploadNodeSource">更新 Node</button><button class="secondary" id="deleteSelectedOperations" disabled>清理所选</button><span class="toolbar-note" id="nodeReleaseStatus">执行中和排队中的任务不可清理</span></div>
+        <div class="toolbar"><select id="operationLine"><option value="">全部线路</option></select><button class="secondary" id="reloadOperations">刷新任务</button><button class="secondary" id="uploadNodeSource">版本升级</button><button class="secondary" id="deleteSelectedOperations" disabled>清理所选</button><span class="toolbar-note" id="nodeReleaseStatus">执行中和排队中的任务不可清理</span></div>
         <div class="table-wrap"><table><thead><tr><th class="selection-cell"><input class="selection-checkbox" id="operationSelectAll" type="checkbox" aria-label="选择全部可清理任务"></th><th>任务</th><th>线路</th><th>类型</th><th>状态</th><th>发起人</th><th>开始时间</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="operationsTable"></tbody></table></div>
+      </section>
+
+      <section class="view" id="upgradesView">
+        <section class="upgrade-band"><div class="section-head"><div><h2>当前版本</h2><p>控制面与共享 Node 运行时</p></div><button class="secondary" id="buildPlatformRelease" type="button">上传源码并构建候选</button></div><div class="version-matrix" id="platformVersionMatrix"></div></section>
+        <section class="upgrade-band"><div class="section-head"><div><h2>升级范围</h2><p>按共享物理设备自动计算全部受影响线路</p></div></div>
+          <div class="upgrade-controls"><label>候选版本<select id="platformReleaseSelect"></select></label><label>选择升级单元的任一线路<select id="platformUpgradeLine"></select></label><button class="secondary" id="previewPlatformUpgrade" type="button">预览影响</button></div>
+          <div class="upgrade-preview" id="platformUpgradePreview"><span class="topology-empty">请选择候选和线路后预览</span></div>
+          <label class="upgrade-confirm"><input id="confirmPlatformInterrupt" type="checkbox">我确认升级会终止活动连接，客户端将自动重连</label>
+          <div class="form-error" id="platformUpgradeError"></div>
+          <div class="upgrade-actions"><button class="primary" id="startPlatformUpgrade" type="button" disabled>开始滚动升级</button></div>
+        </section>
       </section>
 
       <section class="view" id="incidentsView">
@@ -107,13 +120,14 @@
   <div class="form-error" id="deviceError"></div><div class="modal-actions"><button type="button" class="secondary close-device">取消</button><button class="primary" id="scanDeviceHostKey" type="submit">扫描主机密钥</button></div></form></div>
 
   <div class="modal-backdrop hidden" id="lineModal"><form class="modal xwide" id="lineForm"><div class="modal-head"><div><h2>开线编排</h2><p>选择设备角色并生成不可变部署计划</p></div><button type="button" class="icon-button close-line">×</button></div>
-    <div class="wizard-section"><h3>基本信息</h3><div class="form-grid three"><label>线路 ID<input name="id" placeholder="gz-hk-sg-1" pattern="[A-Za-z0-9_.-]+" required></label><label>显示名称<input name="name" placeholder="广州 / 香港 / 新加坡" required></label><label>环境<select name="environment"><option value="production">生产</option><option value="test">测试</option></select></label><label>资源组<input name="resource_group" value="gz-hk-primary" required></label><label>入口区域<input name="entry_region" placeholder="CN-GZ" required></label><label>出口区域<input name="exit_region" placeholder="SG" required></label></div></div>
-    <div class="wizard-section"><h3>设备角色</h3><div class="role-grid"><label><span>Entry</span><select name="entry_device" required></select></label><span class="route-arrow">→</span><label><span>Relay</span><select name="relay_device" required></select></label><span class="route-arrow">→</span><label><span>Exit</span><select name="exit_device" required></select></label></div></div>
+    <div class="wizard-section"><h3>基本信息</h3><div class="form-grid three"><label>线路 ID<input name="id" placeholder="gz-hk-sg-1" pattern="[A-Za-z0-9_.-]+" required></label><label>显示名称<input name="name" placeholder="香港单节点" required></label><label>环境<select name="environment"><option value="production">生产</option><option value="test">测试</option></select></label><label>拓扑模式<select name="topology_mode"><option value="trihop">Entry / Relay / Exit 三跳</option><option value="single_hk">香港单节点</option></select></label><label>业务策略<select name="service_profile"><option value="general">通用线路</option><option value="tiktok_live">TikTok 直播严格策略</option></select></label><label>入口区域<input name="entry_region" placeholder="HK" required></label><label>出口区域<input name="exit_region" placeholder="HK" required></label></div></div>
+    <div class="wizard-section"><h3>设备角色</h3><div class="role-grid"><label><span id="entryRoleLabel">Entry</span><select name="entry_device" required></select></label><span class="route-arrow" data-trihop-only>→</span><label data-trihop-only><span>Relay</span><select name="relay_device" required></select></label><span class="route-arrow" data-trihop-only>→</span><label data-trihop-only><span>Exit</span><select name="exit_device" required></select></label></div><p class="field-note hidden" id="singleHKDeviceNote">该香港设备同时运行 Entry 和 Exit，客户端连接该设备的 SOCKS5 端口。</p></div>
     <div class="wizard-section"><h3>线路参数</h3><div class="form-grid four"><label>上行平均 Mbps<input name="upstream_mbps" type="number" min="1" value="10" required></label><label>下行平均 Mbps<input name="downstream_mbps" type="number" min="1" value="10" required></label><label>入口端口<input name="socks_port" type="number" min="0" placeholder="留空自动分配"></label><label>出口 IP<input name="exit_bind_ip" inputmode="decimal" placeholder="留空使用 Exit 默认路由"></label><label>出口 DNS<input name="dns_servers" value="1.1.1.1, 8.8.8.8" placeholder="逗号分隔 IPv4 地址"></label><label>构建策略<select name="build_mode"><option value="auto">优先二进制，无则源码构建</option><option value="binary">仅使用二进制</option><option value="source">强制源码构建</option></select></label><label>跳板策略<select name="jump_policy"><option value="auto">自动选择稳定跳板</option><option value="direct">仅直连</option><option value="pinned">固定 Entry 跳板</option></select></label></div><p class="field-note">上下行数值均为长期平均速率，数据面允许短时突发以承载直播峰值。入口端口留空时自动分配；Relay、Exit 和 UDP 端口始终自动分配。出口 DNS 留空时使用 1.1.1.1 和 8.8.8.8。</p><label>白名单规则<textarea name="whitelist" rows="4" placeholder="domain tiktok.com&#10;port 443"></textarea></label><div class="form-grid three"><label>白名单更新地址<input name="srs_ref" type="url" inputmode="url" autocomplete="off" placeholder="https://example.com/whitelist.srs"></label><label>二进制引用<input name="artifact_ref" placeholder="build/nb_node"></label><label>源码引用<input name="source_ref" value="repo://current"></label></div><p class="field-note">支持返回 MD5|下载地址的更新接口或直接 SRS 下载地址；留空时使用上方静态规则。</p></div>
     <div class="form-error" id="lineError"></div><div class="modal-actions"><button type="button" class="secondary close-line">取消</button><button type="submit" class="primary">保存并创建开线任务</button></div>
   </form></div>
 
   <div class="modal-backdrop hidden" id="lineEnvironmentModal"><form class="modal" id="lineEnvironmentForm"><div class="modal-head"><div><h2>修改线路环境</h2><p>仅修改控制面分类，不改变已部署的数据面实例</p></div><button type="button" class="icon-button close-line-environment">×</button></div><input type="hidden" name="line_id"><label>环境<select name="environment"><option value="production">生产</option><option value="test">测试</option></select></label><div class="form-error" id="lineEnvironmentError"></div><div class="modal-actions"><button type="button" class="secondary close-line-environment">取消</button><button type="submit" class="primary">保存环境</button></div></form></div>
+
 
   <div class="modal-backdrop hidden" id="operationModal"><form class="modal" id="operationForm"><div class="modal-head"><div><h2 id="operationTitle">创建任务</h2><p id="operationTarget"></p></div><button type="button" class="icon-button close-operation">×</button></div><input type="hidden" name="line_id"><input type="hidden" name="kind"><label>发起人<input name="requested_by" value="operator" pattern="[A-Za-z0-9_.-]+" required></label><label>目标 deployment<input name="deployment" placeholder="回滚时填写"></label><label>备注<textarea name="note" rows="3"></textarea></label><div class="form-error" id="operationError"></div><div class="modal-actions"><button type="button" class="secondary close-operation">取消</button><button class="primary" type="submit">提交任务</button></div></form></div>
 

@@ -37,6 +37,16 @@ def main() -> None:
 
     saved_lab = copy.deepcopy(deploy_core.LAB)
     try:
+        deploy_core.LAB["topology_mode"] = "single_hk"
+        assert deploy_core.deployment_roles() == ("exit", "entry")
+        command = deploy_core._node_command(
+            "entry", socks_port=1089, wl_remote="/runtime/whitelist.conf",
+            release_id="release")
+        assert " -n 127.0.0.1 " in command and " -N 4443 " in command
+        assert " -M ''" in command or ' -M ""' in command
+        assert " -E " not in command
+        assert deploy_core._shard_instance_environment("entry", "release")["NB_FEC_V15_ACTIVE"] == "off"
+        deploy_core.LAB["topology_mode"] = "trihop"
         deploy_core.LAB.setdefault("transport", {}).setdefault("entry", {})["signal_direct"] = True
         command = deploy_core._node_command(
             "entry", socks_port=1089, wl_remote="/runtime/whitelist.conf",

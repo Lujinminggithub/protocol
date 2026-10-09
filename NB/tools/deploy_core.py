@@ -86,6 +86,18 @@ port 50021
 """
 
 
+def topology_mode():
+    value = str(LAB.get("topology_mode", "trihop") or "trihop")
+    if value not in ("trihop", "single_hk"):
+        raise ValueError("topology_mode 必须为 trihop 或 single_hk")
+    return value
+
+
+def deployment_roles():
+    """Roles in safe activation order."""
+    return ("exit", "entry") if topology_mode() == "single_hk" else ("exit", "middle", "entry")
+
+
 def _role_host(role):  # role -> dict
     return LAB[role]
 
@@ -578,6 +590,13 @@ def _verify_deployment_health(c, role, deployment_id, warmup=8, expected_hash=No
 
 
 def _remote_current_deployment(c, role):
+    if DEPLOY_INSTANCE:
+        marker = nb_shard_deploy.current_deployment_marker(INSTANCE_WORK)
+        marked = run(c, f"cat {shlex.quote(marker)} 2>/dev/null || true").strip()
+        if marked:
+            if not nb_release.DEPLOYMENT_NAME_RE.fullmatch(marked):
+                raise RuntimeError(f"{role} 当前配置 deployment 无法识别: {marked}")
+            return marked
     output = run(c, f"readlink -f {shlex.quote(INSTANCE_WORK + '/nb_node')} 2>/dev/null | xargs -r dirname | xargs -r basename").strip()
     if not nb_release.RELEASE_NAME_RE.fullmatch(output) or output.startswith("legacy-"):
         raise RuntimeError(f"{role} 当前 deployment 无法识别: {output or 'missing'}")
@@ -645,7 +664,7 @@ def _require_local_build():
 
 def _require_security_material():
     required = [SECURITY_DIR / "ca.pem", SECURITY_DIR / "socks.users", SECURITY_DIR / "tenant.conf"]
-    required += [SECURITY_DIR / f"{role}.{ext}" for role in ("entry", "middle", "exit") for ext in ("pem", "key")]
+    required += [SECURITY_DIR / f"{role}.{ext}" for role in reversed(deployment_roles()) for ext in ("pem", "key")]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         sys.exit("缺少安全材料，请先运行 tools/security_setup.py:\n" + "\n".join(missing))
@@ -694,7 +713,8 @@ def _push_exit_routes(c, remote_path=None):
         name=str(item["name"]);host=str(item["host"]);port=int(item.get("port",4443));weight=int(item.get("weight",1))
         if item.get("fixed_exit",_role_host("exit")["name"])!=_role_host("exit")["name"]:
             raise ValueError(f"出口路由越过固定 exit: {item}")
-        if host!=str(_role_host("exit")["host"]) or port!=EXIT_PORT:
+        expected_host = "127.0.0.1" if topology_mode() == "single_hk" else str(_role_host("exit")["host"])
+        if host!=expected_host or port!=EXIT_PORT:
             raise ValueError(f"exit route/listener drift: route={host}:{port} listener={_role_host('exit')['host']}:{EXIT_PORT}")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or not 1<=port<=65535 or not 1<=weight<=1000:
             raise ValueError(f"非法出口路由配置: {item}")
@@ -771,12 +791,17 @@ def _role_fec_enabled(c, role):
 
 
 def _node_command(role, socks_port=DEFAULT_SOCKS_PORT, wl_remote=None, release_id=None, exit_routes=None):
-    hk = _role_host("middle")
     kz = _role_host("exit")
     sec = _remote_security(role)
     rules = f"{INSTANCE_WORK}/releases/{release_id}/tiktok_flow_rules.conf" if release_id else _tiktok_rules_remote()
     base = f"{INSTANCE_WORK}/nb_node -r {role} -c {sec['cert']} -k {sec['key']} -a {sec['ca']} -F {rules}"
     if role == "entry":
+        if topology_mode() == "single_hk":
+            if not wl_remote:
+                raise ValueError("entry SOCKS 启动需要 whitelist 路径")
+            return (f"{base} -l {socks_port} -n 127.0.0.1 -N {EXIT_PORT} -S "
+                    f"-U {sec['users']} -Q {sec['tenants']} -W {wl_remote} -M ''")
+        hk = _role_host("middle")
         signal_direct=LAB.get("transport",{}).get("entry",{}).get("signal_direct",False)
         if not isinstance(signal_direct,bool):
             raise ValueError("transport.entry.signal_direct 必须为 true 或 false")
@@ -803,6 +828,89 @@ def _install_shard_role(c,role,command,environment,release_id,binary_release_id,
         work=WORK, instance_work=INSTANCE_WORK, deploy_instance=DEPLOY_INSTANCE,
         lab=LAB, run=run, push_bytes=push_bytes, effective_workers=_effective_workers,
         legacy_service_name=_service_name)
+
+
+def _shard_instance_environment(role, release_id):
+    transport = LAB.get("transport", {}).get(role, {})
+    cc = str(transport.get("cc", "bbr")).lower()
+    if cc not in ("bbr", "cubic", "dcubic", "fastcc", "reno"):
+        raise ValueError(f"transport.{role}.cc 非法: {cc}")
+    bbr_options = str(transport.get("bbr_options", "Q0.0001:"))
+    if any(ch in bbr_options for ch in "\r\n\0"):
+        raise ValueError(f"transport.{role}.bbr_options 非法")
+    cwin_max_bytes = int(transport.get("cwin_max_bytes", 0))
+    mtu_max = int(transport.get("mtu_max", 0))
+    udp_gso = transport.get("udp_gso", False)
+    if cwin_max_bytes != 0 and not 65536 <= cwin_max_bytes <= 67108864:
+        raise ValueError(f"transport.{role}.cwin_max_bytes 必须为 0 或 65536..67108864")
+    if mtu_max != 0 and not 1280 <= mtu_max <= 1536:
+        raise ValueError(f"transport.{role}.mtu_max 必须为 0 或 1280..1536")
+    if not isinstance(udp_gso, bool):
+        raise ValueError(f"transport.{role}.udp_gso 必须为 true 或 false")
+    line_id, line_schema = _line_profile_identity()
+    environment = {
+        "NB_FEC_V15": "on", "NB_CC": cc, "NB_BBR_OPTIONS": bbr_options,
+        "NB_UDP_GSO": "on" if udp_gso else "off", "NB_RELEASE_ID": release_id,
+        "NB_LINE_PROFILE_ID": line_id, "NB_LINE_PROFILE_SCHEMA": str(line_schema),
+        "NB_TRANSPORT_LINE_ID": line_id,
+        "NB_TRANSPORT_PROFILE_FILE": f"{INSTANCE_WORK}/transport-profiles/{role}-active.conf",
+    }
+    if topology_mode() == "single_hk":
+        environment["NB_FEC_V15"] = "off"
+        environment["NB_FEC_V15_ACTIVE"] = "off"
+        environment["NB_TOPOLOGY_MODE"] = "single_hk"
+    if cwin_max_bytes:
+        environment["NB_CWIN_MAX_BYTES"] = str(cwin_max_bytes)
+    if mtu_max:
+        environment["NB_MTU_MAX"] = str(mtu_max)
+    if role == "exit":
+        configured_dns = transport.get("dns_servers", ["1.1.1.1", "8.8.8.8"])
+        if not isinstance(configured_dns, list) or not 1 <= len(configured_dns) <= 3:
+            raise ValueError("transport.exit.dns_servers 必须包含 1 到 3 个 IPv4 地址")
+        try:
+            environment["NB_DNS_SERVERS"] = ",".join(
+                str(ipaddress.IPv4Address(value)) for value in configured_dns)
+        except (ipaddress.AddressValueError, TypeError) as exc:
+            raise ValueError("transport.exit.dns_servers 必须是 IPv4 地址") from exc
+    if role == "entry":
+        entry_host = _role_host("entry")
+        advertise_ip = str(transport.get("udp_advertise_ip") or
+            entry_host.get("public_ip") or entry_host["host"]).strip()
+        if advertise_ip:
+            try:
+                ipaddress.IPv4Address(advertise_ip)
+            except ipaddress.AddressValueError as exc:
+                raise ValueError(f"entry UDP 公网地址非法: {advertise_ip}") from exc
+            environment["NB_SOCKS_UDP_ADVERTISE_IP"] = advertise_ip
+        udp_min = int(os.environ.get("NB_SOCKS_UDP_PORT_MIN") or transport.get("udp_port_min", 0))
+        udp_max = int(os.environ.get("NB_SOCKS_UDP_PORT_MAX") or transport.get("udp_port_max", 0))
+        if bool(udp_min) != bool(udp_max) or (udp_min and
+                (udp_min < 1024 or udp_max > 65535 or udp_min > udp_max or udp_max-udp_min+1 > 16384)):
+            raise ValueError("transport.entry UDP 端口范围非法")
+        if udp_min:
+            environment["NB_SOCKS_UDP_PORT_MIN"] = str(udp_min)
+            environment["NB_SOCKS_UDP_PORT_MAX"] = str(udp_max)
+    if role in ("entry", "middle"):
+        reorder_gap = int(transport.get("reorder_gap", 3))
+        reorder_delay_us = int(transport.get("reorder_delay_us", 0))
+        if not 3 <= reorder_gap <= 1024 or not 0 <= reorder_delay_us <= 2000000:
+            raise ValueError(f"transport.{role} reorder 参数越界")
+        environment["NB_REORDER_GAP"] = str(reorder_gap)
+        environment["NB_REORDER_DELAY_US"] = str(reorder_delay_us)
+    return environment
+
+
+def _install_instance_role(c, role, command, *, deployment_id):
+    return deploy_shard_runtime.install_instance(
+        c, role, command, _shard_instance_environment(role, deployment_id), deployment_id,
+        work=WORK, instance_work=INSTANCE_WORK, deploy_instance=DEPLOY_INSTANCE,
+        lab=LAB, run=run, push_bytes=push_bytes, effective_workers=_effective_workers)
+
+
+def _rollback_instance_role(c, role, deployment_id):
+    return deploy_shard_runtime.rollback_instance(
+        c, role, deployment_id, work=WORK, instance_work=INSTANCE_WORK,
+        deploy_instance=DEPLOY_INSTANCE, run=run, effective_workers=_effective_workers)
 
 
 def _install_and_restart_role(c, role, command, warmup=2.0, release_id=None,binary_release_id=None):

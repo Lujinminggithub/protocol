@@ -294,7 +294,7 @@ static uint64_t pool_slot_queue_age(picoquic_cnx_t* cnx,uint64_t now,int* eligib
     for(int i=0;i<MAX_CONN;i++){
         proxy_stream_t* p=&G.streams[i];if(!p->in_use||p->down_cnx!=cnx)continue;
         if(p->flow_class!=NB_FLOW_CLASS_MEDIA&&p->lane_hint!=NB_FLOW_LANE_LATENCY&&
-            p->probe_mode==0&&strstr(p->route,"nb-probe-")==NULL)continue;
+            !p->probe_traffic&&strstr(p->route,"nb-probe-")==NULL)continue;
         uint64_t age=0;
         if(p->udp_mode){
             const uint8_t* data=NULL;size_t length=0;uint64_t queued_at=0;
@@ -623,6 +623,8 @@ static proxy_stream_t* udp_middle_open(picoquic_cnx_t* cnx,const nb_udp_wire_vie
         flow_policy_for_host(target,target_port,&pol);apply_flow_policy(p,&pol);
         snprintf(p->udp_target_host,sizeof(p->udp_target_host),"%s",target);p->udp_target_port=target_port;
     }else nb_flow_policy_default(&pol);
+    if(nb_udp_probe_echo_target(p->udp_target_host,p->udp_target_port))p->probe_traffic=1;
+    else ps_metrics_business_open(p);
     if(p->down_pool_id<0){ps_set_close_reason(p,"udp-middle-pool-fail");ps_free(p);return NULL;}
     cnx_pool_t* pool=&G.pools[p->down_pool_id];int idx=pool_pick(pool,pol.lane_hint==NB_FLOW_LANE_LATENCY);
     if(idx<0){ps_set_close_reason(p,"udp-middle-no-path");ps_free(p);return NULL;}

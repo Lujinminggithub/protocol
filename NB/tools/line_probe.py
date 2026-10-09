@@ -44,6 +44,7 @@ MTU_SAFETY_MARGIN = 48
 MTU_RECOMMEND_MAX = 1500
 
 ENTRY_LOCAL_PROBE_SCRIPT = r'''
+import hashlib
 import json
 import math
 import re
@@ -68,6 +69,13 @@ def fnv1a64(data):
     for byte in data:
         value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
     return value
+
+PROBE_PATTERN = bytes((index * 13 + 29) & 0xff for index in range(256))
+
+def probe_pattern(offset, length):
+    phase = offset & 0xff
+    repeats = (phase + length + len(PROBE_PATTERN) - 1) // len(PROBE_PATTERN)
+    return (PROBE_PATTERN * repeats)[phase:phase + length]
 
 def connect_socks(target):
     username = request["username"].encode()
@@ -127,25 +135,32 @@ elif mode == "downlink":
     sock = connect_socks("nb-probe-source.internal")
     sock.sendall(struct.pack("!4sQ", b"NBP2", target_bytes))
     started = time.monotonic()
+    deadline = started + duration_s
+    sock.settimeout(min(1.0, request["io_timeout"]))
     received = 0
-    value = 14695981039346656037
-    while received < target_bytes:
-        data = sock.recv(min(64 * 1024, target_bytes - received))
+    ended_early = False
+    digest = hashlib.sha256()
+    while received < target_bytes and time.monotonic() < deadline:
+        try:
+            data = sock.recv(min(64 * 1024, target_bytes - received))
+        except socket.timeout:
+            continue
         if not data:
+            ended_early = True
             break
-        expected = bytes((((received + index) * 13 + 29) & 0xff) for index in range(len(data)))
+        expected = probe_pattern(received, len(data))
         if data != expected:
             raise RuntimeError("downlink integrity mismatch at offset=%d" % received)
-        for byte in data:
-            value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+        digest.update(data)
         received += len(data)
     elapsed = time.monotonic() - started
     sock.close()
-    if received != target_bytes:
-        raise RuntimeError("downlink count mismatch: expected=%d received=%d" % (target_bytes, received))
     result = {"bytes": received, "elapsed_s": elapsed,
-        "planned_duration_s": duration_s, "achieved_mbps": received * 8.0 / max(elapsed, 0.001) / 1000000.0,
-        "integrity": "count-ok", "hash": "%016x" % value, "origin": "entry-local"}
+        "planned_duration_s": duration_s, "expected_bytes": target_bytes,
+        "achieved_mbps": received * 8.0 / max(float(duration_s), 0.001) / 1000000.0,
+        "integrity": "count-ok", "complete": received == target_bytes,
+        "ended_early": ended_early, "hash": digest.hexdigest(),
+        "hash_algorithm": "sha256", "origin": "entry-local"}
 elif mode == "load":
     target_mbps = request["target_mbps"]
     duration_s = request["duration_s"]
@@ -351,7 +366,8 @@ def recommend(summary: dict, current: dict, target_mbps: float,
 
 def evaluate_admission(active_probe: dict | None, target_mbps: float,
                        downstream_target_mbps: float | None = None,
-                       min_throughput_ratio: float = 0.90) -> dict:
+                       min_throughput_ratio: float = 0.95,
+                       duration_seconds: int = 90) -> dict:
     reasons = []
     active_probe = active_probe or {}
     integrity = active_probe.get("integrity") or {}
@@ -376,6 +392,8 @@ def evaluate_admission(active_probe: dict | None, target_mbps: float,
         "throughput_ratio": min(achieved_up/target_mbps if target_mbps>0 else 0,
             achieved_down/down_target if down_target>0 else 0),
         "minimum_throughput_ratio": min_throughput_ratio,
+        "required_ratio": min_throughput_ratio,
+        "duration_seconds": duration_seconds,
     }
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
@@ -392,6 +410,42 @@ def fnv1a64(data: bytes) -> int:
     for byte in data:
         value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
     return value
+
+
+PROBE_PATTERN = bytes((index * 13 + 29) & 0xff for index in range(256))
+
+
+def probe_pattern(offset: int, length: int) -> bytes:
+    phase = offset & 0xff
+    repeats = (phase + length + len(PROBE_PATTERN) - 1) // len(PROBE_PATTERN)
+    return (PROBE_PATTERN * repeats)[phase:phase + length]
+
+
+def receive_downlink_stream(sock: socket.socket, target_bytes: int, duration_s: int) -> dict:
+    started = time.monotonic()
+    deadline = started + duration_s
+    received = 0
+    ended_early = False
+    digest = hashlib.sha256()
+    while received < target_bytes and time.monotonic() < deadline:
+        try:
+            data = sock.recv(min(64 * 1024, target_bytes - received))
+        except socket.timeout:
+            continue
+        if not data:
+            ended_early = True
+            break
+        if data != probe_pattern(received, len(data)):
+            raise RuntimeError(f"下行探针完整性失败 offset={received}")
+        digest.update(data)
+        received += len(data)
+    elapsed = time.monotonic() - started
+    return {"bytes": received, "elapsed_s": elapsed, "planned_duration_s": duration_s,
+        "expected_bytes": target_bytes,
+        "achieved_mbps": received * 8.0 / max(float(duration_s), 0.001) / 1_000_000.0,
+        "integrity": "count-ok", "complete": received == target_bytes,
+        "ended_early": ended_early, "hash": digest.hexdigest(),
+        "hash_algorithm": "sha256"}
 
 
 class EntrySSHSocket:
@@ -502,18 +556,14 @@ def run_downlink_probe(entry_host: str,socks_port: int,target_mbps: float,durati
                        io_timeout: float = 30) -> dict:
     target_bytes=int(target_mbps*1_000_000/8.0*duration_s)
     sock=socks_connect(entry_host,socks_port,PROBE_SOURCE_HOST,max(io_timeout,duration_s+15))
-    sock.sendall(struct.pack("!4sQ",b"NBP2",target_bytes));started=time.monotonic();received=0
-    while received<target_bytes:
-        data=sock.recv(min(64*1024,target_bytes-received))
-        if not data:break
-        expected=bytes((((received+index)*13+29)&0xff) for index in range(len(data)))
-        if data!=expected:raise RuntimeError(f"下行探针完整性失败 offset={received}")
-        received+=len(data)
-    elapsed=time.monotonic()-started;sock.close()
-    if received!=target_bytes:raise RuntimeError(f"下行探针计数失败 expected={target_bytes} received={received}")
-    return {"bytes":received,"elapsed_s":elapsed,
-        "achieved_mbps":received*8.0/max(elapsed,0.001)/1_000_000.0,
-        "integrity":"count-ok","origin":"controller"}
+    sock.settimeout(min(1.0, io_timeout))
+    sock.sendall(struct.pack("!4sQ",b"NBP2",target_bytes))
+    try:
+        result = receive_downlink_stream(sock, target_bytes, duration_s)
+    finally:
+        sock.close()
+    result["origin"] = "controller"
+    return result
 
 
 def parse_entry_probe_line(raw_line: str) -> dict | None:
@@ -780,6 +830,8 @@ def main() -> None:
     parser.add_argument("--upstream-mbps",type=float,help="业务上行平均限速验证目标")
     parser.add_argument("--downstream-mbps",type=float,help="业务下行平均限速验证目标")
     parser.add_argument("--duration", type=int, default=90, help="主动负载持续秒数")
+    parser.add_argument("--minimum-throughput-ratio", type=float, default=0.95,
+                        help="每个方向最低达标比例，默认 0.95")
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--via-entry-ssh", action="store_true",
                         help="reach the Entry-local SOCKS listener through the pinned SSH connection")
@@ -807,6 +859,8 @@ def main() -> None:
         raise SystemExit("探针目标速率必须在 0.1..2000 Mbps")
     if args.duration < 10 or args.duration > 600:
         raise SystemExit("--duration 必须在 10..600")
+    if args.minimum_throughput_ratio < 0.5 or args.minimum_throughput_ratio > 1.0:
+        raise SystemExit("--minimum-throughput-ratio 必须在 0.5..1.0")
 
     cache_key_payload = {
         "hosts_sha256": hashlib.sha256(deploy.LAB_FILE.read_bytes()).hexdigest(),
@@ -814,6 +868,7 @@ def main() -> None:
         "package_mbps": package_mbps, "upstream_mbps": args.upstream_mbps if args.upstream_mbps is not None else (package_mbps or target_mbps),
         "downstream_mbps": args.downstream_mbps if args.downstream_mbps is not None else (package_mbps or target_mbps),
         "headroom_ratio": args.headroom_ratio, "duration": args.duration,
+        "minimum_throughput_ratio": args.minimum_throughput_ratio,
         "ping_samples": args.ping_samples, "probe_origin": args.probe_origin, "policy_version": 1,
     }
     cache_key = hashlib.sha256(json.dumps(cache_key_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -897,7 +952,8 @@ def main() -> None:
             "qualification_mbps": target_mbps,
             "headroom_ratio": args.headroom_ratio if package_mbps is not None else None,
         },
-        "admission": evaluate_admission(active_result, shaping_up, shaping_down) if args.active else {
+        "admission": evaluate_admission(active_result, shaping_up, shaping_down,
+            args.minimum_throughput_ratio, args.duration) if args.active else {
             "status": "not-evaluated",
             "reasons": ["active-quic-required"],
             "target_mbps": min(shaping_up,shaping_down),

@@ -307,9 +307,6 @@ func (r *Runner) runtimePortBatches(ctx context.Context, plans []dynamicPlan) ([
 		}
 	}()
 	for _, plan := range plans {
-		if !contains(plan.ResourceGroup, r.registry.Dynamic.ResourceGroups) {
-			continue
-		}
 		for _, node := range plan.Nodes {
 			key := node.DeviceID + ":" + node.Role
 			if seen[key] {

@@ -3,6 +3,7 @@ package central
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -398,7 +399,8 @@ CREATE TABLE IF NOT EXISTS devices (
  provider TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
  secret_ref TEXT NOT NULL DEFAULT '', labels BLOB NOT NULL DEFAULT '{}',
  last_health TEXT NOT NULL DEFAULT 'unknown', last_seen_at TEXT NOT NULL DEFAULT '',
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, environment TEXT NOT NULL DEFAULT 'production'
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, environment TEXT NOT NULL DEFAULT 'production',
+ topology_mode TEXT NOT NULL DEFAULT 'trihop', service_profile TEXT NOT NULL DEFAULT 'general'
 );
 CREATE TABLE IF NOT EXISTS topology_layouts (
  device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
@@ -437,6 +439,33 @@ CREATE TABLE IF NOT EXISTS line_nodes (
  ordinal INTEGER NOT NULL, next_hop_device_id TEXT NOT NULL DEFAULT '',
  jump_candidates BLOB NOT NULL DEFAULT '[]', config BLOB NOT NULL DEFAULT '{}',
  PRIMARY KEY(line_id,role,ordinal)
+);
+CREATE TABLE IF NOT EXISTS network_links (
+ id TEXT PRIMARY KEY,
+ from_device_id TEXT NOT NULL REFERENCES devices(id), from_role TEXT NOT NULL,
+ to_device_id TEXT NOT NULL REFERENCES devices(id), to_role TEXT NOT NULL,
+ forward_capacity_mbps INTEGER NOT NULL, reverse_capacity_mbps INTEGER NOT NULL,
+ billing_mode TEXT NOT NULL, environment TEXT NOT NULL, status TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(from_device_id,from_role,to_device_id,to_role)
+);
+CREATE TABLE IF NOT EXISTS line_capacity_reservations (
+ line_id TEXT NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+ link_id TEXT NOT NULL REFERENCES network_links(id),
+ forward_mbps INTEGER NOT NULL, reverse_mbps INTEGER NOT NULL,
+ state TEXT NOT NULL, operation_id TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ PRIMARY KEY(line_id,link_id)
+);
+CREATE TABLE IF NOT EXISTS line_qualifications (
+ operation_id TEXT PRIMARY KEY,
+ line_id TEXT NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+ deployment_id TEXT NOT NULL,
+ target_upstream_mbps REAL NOT NULL, target_downstream_mbps REAL NOT NULL,
+ achieved_upstream_mbps REAL NOT NULL, achieved_downstream_mbps REAL NOT NULL,
+ duration_seconds INTEGER NOT NULL, required_ratio REAL NOT NULL,
+ status TEXT NOT NULL, reasons BLOB NOT NULL, evidence BLOB NOT NULL,
+ created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS operation_events (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -483,6 +512,10 @@ CREATE INDEX IF NOT EXISTS operations_ready ON operations(line_id,status,created
 CREATE INDEX IF NOT EXISTS raw_events_path ON raw_events(path,received_at);
 CREATE INDEX IF NOT EXISTS devices_status ON devices(status,region,name);
 CREATE INDEX IF NOT EXISTS line_nodes_device ON line_nodes(device_id,line_id);
+CREATE INDEX IF NOT EXISTS network_links_endpoints ON network_links(from_device_id,from_role,to_device_id,to_role);
+CREATE INDEX IF NOT EXISTS line_capacity_reservations_link ON line_capacity_reservations(link_id,state,line_id);
+CREATE INDEX IF NOT EXISTS line_capacity_reservations_operation ON line_capacity_reservations(operation_id);
+CREATE INDEX IF NOT EXISTS line_qualifications_latest ON line_qualifications(line_id,created_at DESC,operation_id DESC);
 CREATE INDEX IF NOT EXISTS runtime_port_claims_lookup ON runtime_port_claims(device_id,role,resource_kind,port_start,port_end);
 CREATE INDEX IF NOT EXISTS operation_events_order ON operation_events(operation_id,sequence);
 CREATE INDEX IF NOT EXISTS line_deletion_audit_line ON line_deletion_audit(line_id,deleted_at DESC);
@@ -644,12 +677,24 @@ CREATE INDEX IF NOT EXISTS user_sessions_user ON user_sessions(user_id,expires_a
 	if lineErr = lineRows.Close(); lineErr != nil {
 		return lineErr
 	}
-	if !lineColumns["environment"] {
-		if _, lineErr = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'`); lineErr != nil {
-			return lineErr
+	for name, definition := range map[string]string{
+		"environment":     "TEXT NOT NULL DEFAULT 'production'",
+		"topology_mode":   "TEXT NOT NULL DEFAULT 'trihop'",
+		"service_profile": "TEXT NOT NULL DEFAULT 'general'",
+	} {
+		if !lineColumns[name] {
+			if _, lineErr = s.db.ExecContext(ctx, `ALTER TABLE line_specs ADD COLUMN `+name+` `+definition); lineErr != nil {
+				return lineErr
+			}
 		}
 	}
 	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET environment='production' WHERE environment IS NULL OR environment=''`); lineErr != nil {
+		return lineErr
+	}
+	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET topology_mode='trihop' WHERE topology_mode IS NULL OR topology_mode=''`); lineErr != nil {
+		return lineErr
+	}
+	if _, lineErr = s.db.ExecContext(ctx, `UPDATE line_specs SET service_profile='general' WHERE service_profile IS NULL OR service_profile=''`); lineErr != nil {
 		return lineErr
 	}
 	// Older workers represented a role-wide collection failure as a fake node.
@@ -736,6 +781,24 @@ func (s *Store) UpdateLineEnvironment(ctx context.Context, id, environment strin
 func (s *Store) HasActiveOperations(ctx context.Context, lineID string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running')`, lineID).Scan(&count)
+	return count > 0, err
+}
+
+func (s *Store) HasActiveOperationsUsingDevice(ctx context.Context, deviceID string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT o.id) FROM operations o
+ JOIN line_nodes n ON n.line_id=o.line_id
+ WHERE n.device_id=? AND o.status IN ('queued','dispatched','running')`, deviceID).Scan(&count)
+	return count > 0, err
+}
+
+func (s *Store) HasActiveOperationsUsingLink(ctx context.Context, fromDeviceID, fromRole,
+	toDeviceID, toRole string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT o.id) FROM operations o
+ JOIN line_nodes source ON source.line_id=o.line_id AND source.device_id=? AND source.role=?
+ JOIN line_nodes target ON target.line_id=o.line_id AND target.device_id=? AND target.role=?
+ WHERE o.status IN ('queued','dispatched','running')`, fromDeviceID, fromRole, toDeviceID, toRole).Scan(&count)
 	return count > 0, err
 }
 
@@ -874,7 +937,12 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) (Opera
 	}
 	stamp := now()
 	operation.Status, operation.CreatedAt, operation.UpdatedAt = "queued", stamp, stamp
-	inserted, err := s.db.ExecContext(ctx, `INSERT INTO operations
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	defer tx.Rollback()
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO operations
  (id,line_id,kind,status,requested_by,idempotency_key,request,created_at,updated_at)
  SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (
  SELECT 1 FROM operations WHERE line_id=? AND status IN ('queued','dispatched','running'))`,
@@ -890,7 +958,30 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) (Opera
 	if count != 1 {
 		return Operation{}, false, errors.New("line already has an active operation")
 	}
+	if operation.Kind == "line.open" {
+		if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+`
+ SET status='provisioning',updated_at=? WHERE id=? AND environment='production'`, stamp, operation.LineID); err != nil {
+			return Operation{}, false, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return Operation{}, false, err
+	}
 	return operation, false, nil
+}
+
+func automaticQualificationID(lineID, deploymentID string) string {
+	digest := sha256.Sum256([]byte(lineID + "\x00" + deploymentID))
+	return fmt.Sprintf("op-auto-%x", digest[:12])
+}
+
+func automaticQualificationKey(lineID, deploymentID string) string {
+	key := "auto-qualify-" + lineID + "-" + deploymentID
+	if len(key) <= 191 {
+		return key
+	}
+	digest := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("auto-qualify-%s-%x", lineID, digest[:16])
 }
 
 func (s *Store) OperationByIdempotencyKey(ctx context.Context, key string) (Operation, error) {
@@ -1078,8 +1169,8 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 	}
 	defer tx.Rollback()
 	var kind, currentStatus string
-	var currentResult []byte
-	if err = tx.QueryRowContext(ctx, `SELECT kind,status,result FROM operations WHERE id=? AND line_id=?`, id, lineID).Scan(&kind, &currentStatus, &currentResult); err != nil {
+	var currentRequest, currentResult []byte
+	if err = tx.QueryRowContext(ctx, `SELECT kind,status,request,result FROM operations WHERE id=? AND line_id=?`, id, lineID).Scan(&kind, &currentStatus, &currentRequest, &currentResult); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			var completed int
 			if completionErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM line_deletion_completions WHERE operation_id=? AND line_id=?`, id, lineID).Scan(&completed); completionErr == nil && completed == 1 && status == "succeeded" {
@@ -1092,10 +1183,64 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 		if currentStatus == status && bytes.Equal(currentResult, result) {
 			return nil
 		}
+		if kind == "line.optimize" && currentStatus == "failed" && bytes.Equal(currentResult, result) {
+			return nil
+		}
 		return fmt.Errorf("operation is not active")
 	}
+	var lineEnvironment, lineStatus, currentDeployment string
+	var configuredCapacity float64
+	if err = tx.QueryRowContext(ctx, `SELECT environment,status,active_deployment,capacity_mbps FROM `+s.linesTable()+` WHERE id=?`, lineID).
+		Scan(&lineEnvironment, &lineStatus, &currentDeployment, &configuredCapacity); err != nil {
+		return err
+	}
+	var values struct {
+		Deployment          string `json:"deployment"`
+		Profile             string `json:"profile"`
+		TransportGeneration uint64 `json:"transport_generation"`
+	}
+	_ = json.Unmarshal(result, &values)
+	var requestValues struct {
+		DeploymentID string `json:"deployment_id"`
+	}
+	_ = json.Unmarshal(currentRequest, &requestValues)
+	qualificationFlow := lineEnvironment == "production" && kind == "line.optimize" &&
+		(lineStatus == "qualification_pending" || lineStatus == "qualification_failed")
+	var qualification LineQualification
+	var qualificationErr error
+	qualificationTerminal := false
+	if qualificationFlow {
+		if requestValues.DeploymentID == "" || requestValues.DeploymentID != currentDeployment {
+			qualificationTerminal = true
+		} else {
+			expectedUpstream, expectedDownstream := configuredCapacity, configuredCapacity
+			specErr := tx.QueryRowContext(ctx, `SELECT CASE WHEN upstream_mbps>0 THEN upstream_mbps ELSE bandwidth_mbps END,
+ CASE WHEN downstream_mbps>0 THEN downstream_mbps ELSE bandwidth_mbps END FROM line_specs WHERE line_id=?`, lineID).
+				Scan(&expectedUpstream, &expectedDownstream)
+			if specErr != nil && !errors.Is(specErr, sql.ErrNoRows) {
+				return specErr
+			}
+			qualification, qualificationErr = lineQualificationFromResult(lineID, requestValues.DeploymentID,
+				id, expectedUpstream, expectedDownstream, result)
+			if qualificationErr != nil && status == "succeeded" {
+				qualificationTerminal = true
+			}
+			if qualificationErr == nil && qualification.Status == "admitted" && status != "succeeded" {
+				qualificationTerminal = true
+			}
+			if qualificationErr == nil && qualification.Status == "admitted" && status == "succeeded" {
+				if values.Profile == "" {
+					qualificationTerminal = true
+				}
+			}
+		}
+	}
+	effectiveStatus := status
+	if qualificationTerminal {
+		effectiveStatus = "failed"
+	}
 	updated, err := tx.ExecContext(ctx, `UPDATE operations SET status=?,result=?,updated_at=?
- WHERE id=? AND line_id=? AND status IN ('dispatched','running')`, status, []byte(result), now(), id, lineID)
+ WHERE id=? AND line_id=? AND status IN ('dispatched','running')`, effectiveStatus, []byte(result), now(), id, lineID)
 	if err != nil {
 		return err
 	}
@@ -1106,19 +1251,48 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 	if err != nil {
 		return err
 	}
-	pendingDeletion, _, err := s.completeScheduledDeletion(ctx, tx, lineID, id, status)
+	if lineEnvironment == "production" && kind == "line.open" && effectiveStatus != "succeeded" {
+		if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='maintenance',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+			return err
+		}
+	}
+	pendingDeletion, _, err := s.completeScheduledDeletion(ctx, tx, lineID, id, effectiveStatus)
 	if err != nil {
 		return err
 	}
-	if status == "succeeded" {
-		var values struct {
-			Deployment          string `json:"deployment"`
-			Profile             string `json:"profile"`
-			TransportGeneration uint64 `json:"transport_generation"`
-		}
-		_ = json.Unmarshal(result, &values)
+	if effectiveStatus == "succeeded" {
 		switch kind {
-		case "line.open", "line.upgrade", "line.rollback":
+		case "line.open":
+			if lineEnvironment == "production" {
+				if values.Deployment == "" {
+					return errors.New("successful production open requires a deployment result")
+				}
+				if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='qualification_pending',
+ active_deployment=?,profile=CASE WHEN ?='' THEN profile ELSE ? END,updated_at=? WHERE id=?`,
+					values.Deployment, values.Profile, values.Profile, now(), lineID); err != nil {
+					return err
+				}
+				request := map[string]any{}
+				if len(currentRequest) > 0 && json.Unmarshal(currentRequest, &request) != nil {
+					return errors.New("open operation request is invalid")
+				}
+				request["deployment_id"] = values.Deployment
+				encodedRequest, marshalErr := json.Marshal(request)
+				if marshalErr != nil {
+					return marshalErr
+				}
+				autoID := automaticQualificationID(lineID, values.Deployment)
+				stamp := now()
+				if _, err = tx.ExecContext(ctx, `INSERT INTO operations
+ (id,line_id,kind,status,requested_by,idempotency_key,request,created_at,updated_at)
+ VALUES(?,?,'line.optimize','queued','system',?,?,?,?)`, autoID, lineID,
+					automaticQualificationKey(lineID, values.Deployment), encodedRequest, stamp, stamp); err != nil {
+					return err
+				}
+				break
+			}
+			fallthrough
+		case "line.upgrade", "line.rollback":
 			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='active',
  active_deployment=CASE WHEN ?='' THEN active_deployment ELSE ? END,
  profile=CASE WHEN ?='' THEN profile ELSE ? END,updated_at=? WHERE id=?`,
@@ -1133,10 +1307,54 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 				return err
 			}
 		case "line.tune", "line.optimize":
+			if qualificationFlow {
+				break
+			}
 			if values.Profile == "" {
 				return errors.New("successful transport tuning requires a profile result")
 			}
 			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET profile=?,updated_at=? WHERE id=?`, values.Profile, now(), lineID); err != nil {
+				return err
+			}
+			if values.TransportGeneration > 0 {
+				query := s.controlSQL(`INSERT INTO transport_generations(line_id,current_generation,updated_at)
+				 VALUES(?,?,?) ON CONFLICT(line_id) DO UPDATE SET current_generation=MAX(transport_generations.current_generation,excluded.current_generation),updated_at=excluded.updated_at`,
+					`INSERT INTO transport_generations(line_id,current_generation,updated_at) VALUES(?,?,?)
+				 ON DUPLICATE KEY UPDATE current_generation=GREATEST(current_generation,VALUES(current_generation)),updated_at=VALUES(updated_at)`)
+				if _, err = tx.ExecContext(ctx, query, lineID, values.TransportGeneration, now()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if qualificationFlow {
+		if qualificationTerminal {
+			if requestValues.DeploymentID == currentDeployment {
+				if _, updateErr := tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='qualification_failed',updated_at=? WHERE id=?`, now(), lineID); updateErr != nil {
+					return updateErr
+				}
+			}
+			return tx.Commit()
+		}
+		if qualificationErr != nil {
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='qualification_failed',updated_at=? WHERE id=?`, now(), lineID); updateErr != nil {
+				return updateErr
+			}
+			return tx.Commit()
+		}
+		if err = saveLineQualificationTx(ctx, tx, qualification); err != nil {
+			return err
+		}
+		if qualification.Status == "rejected" {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='qualification_failed',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+				return err
+			}
+		} else {
+			if values.Profile == "" {
+				return errors.New("successful qualification requires a profile result")
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='active',profile=?,updated_at=? WHERE id=?`,
+				values.Profile, now(), lineID); err != nil {
 				return err
 			}
 			if values.TransportGeneration > 0 {
@@ -1156,8 +1374,19 @@ func (s *Store) CompleteOperation(ctx context.Context, id, lineID, status string
 func (s *Store) CancelOperation(ctx context.Context, id, reason string) error {
 	unlock := s.lockWrite()
 	defer unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var lineID, kind, environment, lineStatus string
+	if err = tx.QueryRowContext(ctx, `SELECT o.line_id,o.kind,l.environment,l.status FROM operations o
+ JOIN `+s.linesTable()+` l ON l.id=o.line_id WHERE o.id=?`, id).
+		Scan(&lineID, &kind, &environment, &lineStatus); err != nil {
+		return err
+	}
 	result, _ := json.Marshal(map[string]string{"reason": reason})
-	updated, err := s.db.ExecContext(ctx, `UPDATE operations SET status='cancelled',result=?,updated_at=?
+	updated, err := tx.ExecContext(ctx, `UPDATE operations SET status='cancelled',result=?,updated_at=?
  WHERE id=? AND status IN ('queued','cancelled')`, result, now(), id)
 	if err != nil {
 		return err
@@ -1166,7 +1395,20 @@ func (s *Store) CancelOperation(ctx context.Context, id, reason string) error {
 	if err == nil && count != 1 {
 		err = fmt.Errorf("only queued or cancelled operations can be cancelled")
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if environment == "production" && kind == "line.open" && lineStatus == "provisioning" {
+		if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='maintenance',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+			return err
+		}
+	}
+	if environment == "production" && kind == "line.optimize" && lineStatus == "qualification_pending" {
+		if _, err = tx.ExecContext(ctx, `UPDATE `+s.linesTable()+` SET status='qualification_failed',updated_at=? WHERE id=?`, now(), lineID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RecordExecutor(ctx context.Context, item Executor) error {

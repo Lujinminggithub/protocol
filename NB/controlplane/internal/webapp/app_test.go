@@ -437,7 +437,7 @@ func TestClientConfigurationAndQRCode(t *testing.T) {
 	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
 	defer server.Close()
 
-	_, err = database.UpsertLine(t.Context(), central.Line{ID: "line-1", Name: "test", Status: "draft",
+	_, err = database.UpsertLine(t.Context(), central.Line{ID: "line-1", Name: "test", Status: "draft", Environment: "test",
 		EntryRegion: "entry", ExitRegion: "exit", Provider: "test", CapacityMbps: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -480,6 +480,62 @@ func TestClientConfigurationAndQRCode(t *testing.T) {
 	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/lines/line-1/detail", "admin", "", nil)
 	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"client_operation"`)) || !bytes.Contains(body, []byte(clientURL)) {
 		t.Fatalf("line detail omitted client config status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestClientGateHidesProductionMaterialUntilQualification(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := t.Context()
+	lineID := "line-client-gate"
+	if _, err = database.UpsertLine(ctx, central.Line{ID: lineID, Name: "client gate",
+		Status: "qualification_pending", Environment: "production", EntryRegion: "gz",
+		ExitRegion: "es", Provider: "test", CapacityMbps: 10, ActiveDeployment: "deployment-gate"}); err != nil {
+		t.Fatal(err)
+	}
+	operation, _, err := database.CreateOperation(ctx, central.Operation{ID: "op-client-gate", LineID: lineID,
+		Kind: "line.open", RequestedBy: "test", IdempotencyKey: "client-gate-open", Request: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ClaimOperations(ctx, lineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	clientURL := "socks5://user:password@192.0.2.10:1082#line-client-gate"
+	if err = database.CompleteOperation(ctx, operation.ID, lineID, "succeeded", json.RawMessage(
+		`{"deployment":"deployment-gate","profile":"line-client-gate:1","client_url":"`+clientURL+`"}`)); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	response, body := call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/operations/"+operation.ID+"/client-qr", "admin", "", nil)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("pending QR status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/lines/"+lineID+"/detail", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || bytes.Contains(body, []byte(clientURL)) || bytes.Contains(body, []byte(`"client_operation"`)) {
+		t.Fatalf("pending detail leaked client material status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/operations/"+operation.ID, "admin", "", nil)
+	if response.StatusCode != http.StatusOK || bytes.Contains(body, []byte(clientURL)) || bytes.Contains(body, []byte(`"client_url"`)) {
+		t.Fatalf("pending operation detail leaked client material status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/operations?line_id="+lineID, "admin", "", nil)
+	if response.StatusCode != http.StatusOK || bytes.Contains(body, []byte(clientURL)) || bytes.Contains(body, []byte(`"client_url"`)) {
+		t.Fatalf("pending operation list leaked client material status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/lines/"+lineID+"/client-config", "agent", "",
+		map[string]string{"client_url": clientURL})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("pending attachment status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/nb/v1/usage-events", "agent", "pending-usage",
+		map[string]any{"line_id": lineID, "bytes": 1024})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("pending usage status=%d body=%s", response.StatusCode, body)
 	}
 }
 
@@ -905,7 +961,7 @@ func TestCentralWebWorkflow(t *testing.T) {
 	server := httptest.NewServer(New(database, Config{AdminToken: "admin-secret", AgentToken: "agent-secret"}).Handler())
 	defer server.Close()
 
-	line := map[string]any{"id": "gz-hk-us", "name": "GZ / HK / US", "status": "active", "entry_region": "Guangzhou",
+	line := map[string]any{"id": "gz-hk-us", "name": "GZ / HK / US", "status": "active", "environment": "test", "entry_region": "Guangzhou",
 		"exit_region": "United States", "provider": "multi", "capacity_mbps": 10, "active_deployment": "dep-1", "profile": "gz-hk-us:1", "secret_ref": "vault/nb/lines/gz-hk-us"}
 	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin-secret", "", line)
 	if response.StatusCode != 201 {
@@ -948,7 +1004,7 @@ func TestCentralWebWorkflow(t *testing.T) {
 	}
 	heartbeat := map[string]any{"worker_id": "windows-1", "status": "ready", "version": "test",
 		"observed_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"lines":       []map[string]any{{"line_id": "gz-hk-us", "operations": []string{"line.validate", "line.upgrade"}}}}
+		"lines":       []map[string]any{{"line_id": "gz-hk-us", "operations": []string{"line.validate", "line.rollback"}}}}
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/agent/v1/executors/heartbeat", "agent-secret", "", heartbeat)
 	if response.StatusCode != 200 {
 		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)
@@ -963,7 +1019,7 @@ func TestCentralWebWorkflow(t *testing.T) {
 		t.Fatalf("raw event status=%d body=%s", response.StatusCode, body)
 	}
 
-	operation := map[string]any{"line_id": "gz-hk-us", "kind": "line.upgrade", "requested_by": "operator", "request": map[string]any{"deployment": "dep-2"}}
+	operation := map[string]any{"line_id": "gz-hk-us", "kind": "line.rollback", "requested_by": "operator", "request": map[string]any{"deployment": "dep-2"}}
 	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin-secret", "web-op-1", operation)
 	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"status":"queued"`)) {
 		t.Fatalf("operation status=%d body=%s", response.StatusCode, body)
@@ -1045,6 +1101,9 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 	if !bytes.Contains(body, []byte(`name="password"`)) || bytes.Contains(body, []byte(`name="secret_ref"`)) {
 		t.Fatal("device form must collect an initial password instead of a secret reference")
 	}
+	if bytes.Contains(body, []byte(`name="resource_group"`)) {
+		t.Fatal("line form still exposes internal resource group metadata")
+	}
 	response, body = call(t, server.Client(), http.MethodGet, server.URL+"/app.js", "", "", nil)
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`operationAvailability`)) ||
 		!bytes.Contains(body, []byte(`disabled title=`)) ||
@@ -1053,9 +1112,61 @@ func TestCentralWebSeparatesAdminAndAgentTokens(t *testing.T) {
 		!bytes.Contains(body, []byte(`upstream_mbps`)) || !bytes.Contains(body, []byte(`downstream_mbps`)) ||
 		!bytes.Contains(body, []byte(`item.role === "entry"`)) ||
 		!bytes.Contains(body, []byte(`tuneResultSection`)) || !bytes.Contains(body, []byte(`transport_rollout`)) ||
+		!bytes.Contains(body, []byte(`影响线路`)) || !bytes.Contains(body, []byte(`affected_lines`)) ||
+		!bytes.Contains(body, []byte(`节点升级待处理`)) || bytes.Contains(body, []byte(`node_release_ack`)) ||
 		!bytes.Contains(body, []byte(`失败原因`)) || !bytes.Contains(body, []byte(`log_excerpt`)) ||
 		bytes.Contains(body, []byte(`event.currentTarget.reset()`)) {
 		t.Fatalf("line lifecycle actions missing from UI status=%d", response.StatusCode)
+	}
+}
+
+func TestSingleHKLineSpecAPI(t *testing.T) {
+	directory := t.TempDir()
+	database, err := central.Open(filepath.Join(directory, "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	app := New(database, Config{AdminToken: "admin", AgentToken: "agent",
+		DeviceSecretsFile: filepath.Join(directory, "device-secrets.json")})
+	app.verifySSHCredentials = func(context.Context, string, int, string, string, ssh.PublicKey) error { return nil }
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+	device := map[string]any{"id": "hk-1", "name": "Hong Kong", "status": "ready",
+		"host": "192.0.2.20", "ssh_port": 22, "ssh_user": "root", "region": "HK",
+		"environment": "test", "provider": "test", "password": "secret", "labels": map[string]any{}}
+	for key, value := range confirmedDeviceFields(t, app, "192.0.2.20", 22) {
+		device[key] = value
+	}
+	response, body := call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/devices", "admin", "", device)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create device status=%d body=%s", response.StatusCode, body)
+	}
+	line := map[string]any{"id": "hk-single", "name": "HK single", "status": "draft",
+		"environment": "test", "entry_region": "HK", "exit_region": "HK", "provider": "test",
+		"capacity_mbps": 5, "active_deployment": "", "profile": "", "secret_ref": ""}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create line status=%d body=%s", response.StatusCode, body)
+	}
+	nodes := []map[string]any{{"device_id": "hk-1", "role": "entry", "ordinal": 0},
+		{"device_id": "hk-1", "role": "exit", "ordinal": 0}}
+	spec := map[string]any{"topology_mode": "single_hk", "service_profile": "general",
+		"instance_id": "hk-single_1", "environment": "test", "bandwidth_mbps": 5,
+		"upstream_mbps": 5, "downstream_mbps": 5, "socks_port": 0, "relay_port": 0,
+		"exit_port": 0, "udp_port_min": 0, "udp_port_max": 0, "dns_servers": []string{"1.1.1.1"},
+		"whitelist": []string{}, "build_mode": "auto", "source_ref": "repo://current",
+		"jump_policy": "direct", "nodes": nodes}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/hk-single/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"topology_mode":"single_hk"`)) ||
+		!bytes.Contains(body, []byte(`"service_profile":"general"`)) || !bytes.Contains(body, []byte(`"relay_port":0`)) {
+		t.Fatalf("save single-HK status=%d body=%s", response.StatusCode, body)
+	}
+	spec["nodes"] = []map[string]any{{"device_id": "hk-1", "role": "entry", "ordinal": 0},
+		{"device_id": "other", "role": "exit", "ordinal": 0}}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/hk-single/spec", "admin", "", spec)
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("同一台香港设备")) {
+		t.Fatalf("different-device status=%d body=%s", response.StatusCode, body)
 	}
 }
 
@@ -1084,7 +1195,7 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 			t.Fatalf("create device status=%d body=%s", response.StatusCode, body)
 		}
 	}
-	line := map[string]any{"id": "line-1", "name": "test line", "status": "draft", "entry_region": "entry",
+	line := map[string]any{"id": "line-1", "name": "test line", "status": "draft", "environment": "test", "entry_region": "entry",
 		"exit_region": "exit", "provider": "test", "capacity_mbps": 20, "active_deployment": "", "profile": "", "secret_ref": ""}
 	response, body := call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", line)
 	if response.StatusCode != 201 {
@@ -1095,12 +1206,13 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 		{"device_id": "relay-1", "role": "relay", "ordinal": 0, "next_hop_device_id": "exit-1", "jump_candidates": []string{"entry-1"}, "config": map[string]any{}},
 		{"device_id": "exit-1", "role": "exit", "ordinal": 0, "next_hop_device_id": "", "jump_candidates": []string{"relay-1"}, "config": map[string]any{}},
 	}
-	spec := map[string]any{"resource_group": "test-group", "instance_id": "test", "bandwidth_mbps": 20,
+	spec := map[string]any{"instance_id": "test", "environment": "test", "bandwidth_mbps": 20,
 		"socks_port": 1082, "relay_port": 4445, "exit_port": 4443, "exit_bind_ip": "192.0.2.3", "udp_port_min": 22048, "udp_port_max": 23071,
 		"whitelist": []string{"domain example.com"}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "https://rules.example.invalid/whitelist.srs?key=test-key", "jump_policy": "auto", "nodes": nodes}
 	response, body = call(t, client, http.MethodPut, server.URL+"/api/v1/lines/line-1/spec", "admin", "", spec)
-	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) {
+	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"exit_bind_ip":"192.0.2.3"`)) ||
+		!bytes.Contains(body, []byte(`"resource_group":"managed"`)) {
 		t.Fatalf("save topology status=%d body=%s", response.StatusCode, body)
 	}
 	spec["socks_port"] = 1080
@@ -1135,13 +1247,13 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("Exit")) || !bytes.Contains(body, []byte("冲突")) {
 		t.Fatalf("shared exit port conflict status=%d body=%s", response.StatusCode, body)
 	}
-	autoLine := map[string]any{"id": "line-auto", "name": "auto allocated line", "status": "draft", "entry_region": "entry",
+	autoLine := map[string]any{"id": "line-auto", "name": "auto allocated line", "status": "draft", "environment": "test", "entry_region": "entry",
 		"exit_region": "exit", "provider": "test", "capacity_mbps": 20, "active_deployment": "", "profile": "", "secret_ref": ""}
 	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/lines", "admin", "", autoLine)
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("create auto line status=%d body=%s", response.StatusCode, body)
 	}
-	autoSpec := map[string]any{"resource_group": "other-group", "instance_id": "", "bandwidth_mbps": 20,
+	autoSpec := map[string]any{"resource_group": "other-group", "environment": "test", "instance_id": "", "bandwidth_mbps": 20,
 		"socks_port": 1083, "relay_port": 0, "exit_port": 0, "udp_port_min": 0, "udp_port_max": 0,
 		"whitelist": []string{}, "build_mode": "auto", "artifact_ref": "", "source_ref": "repo://current",
 		"srs_ref": "", "jump_policy": "auto", "nodes": nodes}
@@ -1163,9 +1275,32 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	if response.StatusCode != 200 {
 		t.Fatalf("heartbeat status=%d body=%s", response.StatusCode, body)
 	}
+	upgrade := map[string]any{"line_id": "line-auto", "kind": "line.upgrade", "requested_by": "test",
+		"request": map[string]any{"affected_lines": []string{"forged-line"}}}
+	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "upgrade-impact-test", upgrade)
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("版本升级中心")) {
+		t.Fatalf("upgrade impact status=%d body=%s", response.StatusCode, body)
+	}
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "__node_release__", Name: "Node Release",
+		Status: "active", EntryRegion: "control", ExitRegion: "control", Provider: "internal", CapacityMbps: 1}); err != nil {
+		t.Fatal(err)
+	}
+	releaseOperation := central.Operation{ID: "op-release-for-open", LineID: "__node_release__",
+		Kind: "node.release.build", RequestedBy: "test", IdempotencyKey: "release-for-open", Request: json.RawMessage(`{}`)}
+	if _, _, err = database.CreateOperation(t.Context(), releaseOperation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ClaimOperations(t.Context(), releaseOperation.LineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.CompleteOperation(t.Context(), releaseOperation.ID, releaseOperation.LineID, "succeeded",
+		json.RawMessage(`{"node_release":{"release_id":"0123456789abcdef","node_version":{"semantic":"2.1.0"}}}`)); err != nil {
+		t.Fatal(err)
+	}
 	operation := map[string]any{"line_id": "line-1", "kind": "line.open", "requested_by": "test", "request": map[string]any{}}
 	response, body = call(t, client, http.MethodPost, server.URL+"/api/v1/operations", "admin", "inventory-test", operation)
-	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"plan"`)) {
+	if response.StatusCode != 201 || !bytes.Contains(body, []byte(`"plan"`)) ||
+		!bytes.Contains(body, []byte(`"pending_node_release"`)) {
 		t.Fatalf("create operation status=%d body=%s", response.StatusCode, body)
 	}
 	var created central.Operation
@@ -1188,6 +1323,264 @@ func TestInventoryTopologyAndOperationEvents(t *testing.T) {
 	response, body = call(t, client, http.MethodGet, server.URL+"/api/v1/operations/"+created.ID, "admin", "", nil)
 	if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"whitelist-fetch"`)) || bytes.Contains(body, []byte("NB_TEST_SRS_URL=")) {
 		t.Fatalf("operation detail status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestProductionOpenRequiresIndependentDirectionalCapacity(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	device := func(id, environment string) central.Device {
+		return central.Device{ID: id, Name: id, Status: "ready", Environment: environment,
+			Host: "192.0.2.1", SSHPort: 22, SSHUser: "root", Labels: json.RawMessage(`{}`)}
+	}
+	for _, item := range []central.Device{device("entry-prod", "production"), device("relay-test", "test"),
+		device("exit-prod", "production")} {
+		if _, err = database.UpsertDevice(t.Context(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lineID := "line-full-duplex"
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: lineID, Name: lineID, Status: "draft",
+		Environment: "production", EntryRegion: "gz", ExitRegion: "es", Provider: "test",
+		CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	nodes := []central.LineNode{{DeviceID: "entry-prod", Role: "entry"},
+		{DeviceID: "relay-test", Role: "relay"}, {DeviceID: "exit-prod", Role: "exit"}}
+	if _, err = database.SaveLineSpec(t.Context(), central.LineSpec{LineID: lineID, Environment: "production",
+		ResourceGroup: "managed", InstanceID: lineID + "_1", BandwidthMbps: 10,
+		UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1082, RelayPort: 4445, ExitPort: 4443,
+		UDPPortMin: 22048, UDPPortMax: 23071, Whitelist: json.RawMessage(`[]`),
+		DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", JumpPolicy: "auto",
+		Nodes: nodes}); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.RecordExecutor(t.Context(), central.Executor{WorkerID: "worker-capacity", Status: "ready",
+		Version: "test", ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Lines: []central.ExecutorLine{{LineID: "*", Operations: []string{"line.open"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	create := func(key string) (*http.Response, []byte) {
+		return call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin", key,
+			map[string]any{"line_id": lineID, "kind": "line.open", "requested_by": "operator",
+				"request": map[string]any{}})
+	}
+	response, body := create("capacity-device-env")
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("relay-test")) ||
+		!bytes.Contains(body, []byte("production")) {
+		t.Fatalf("test device preflight status=%d body=%s", response.StatusCode, body)
+	}
+	if _, err = database.UpsertDevice(t.Context(), device("relay-test", "production")); err != nil {
+		t.Fatal(err)
+	}
+	response, body = create("capacity-missing-link")
+	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte("capacity_reservations")) {
+		t.Fatalf("line-owned open status=%d body=%s", response.StatusCode, body)
+	}
+	storedSpec, err := database.LineSpec(t.Context(), lineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/"+lineID+"/spec", "admin", "", storedSpec)
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("禁止修改部署规格")) {
+		t.Fatalf("active operation spec mutation status=%d body=%s", response.StatusCode, body)
+	}
+	for _, id := range []string{"test-entry", "test-relay", "test-exit"} {
+		if _, err = database.UpsertDevice(t.Context(), device(id, "test")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "line-test-capacity", Name: "test",
+		Status: "draft", Environment: "test", EntryRegion: "gz", ExitRegion: "test", Provider: "test",
+		CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.SaveLineSpec(t.Context(), central.LineSpec{LineID: "line-test-capacity",
+		Environment: "test", ResourceGroup: "managed", InstanceID: "line-test-capacity_1",
+		BandwidthMbps: 10, UpstreamMbps: 10, DownstreamMbps: 10, SocksPort: 1083,
+		RelayPort: 4447, ExitPort: 4445, UDPPortMin: 23072, UDPPortMax: 24095,
+		Whitelist: json.RawMessage(`[]`), DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto",
+		JumpPolicy: "auto", Nodes: []central.LineNode{{DeviceID: "test-entry", Role: "entry"},
+			{DeviceID: "test-relay", Role: "relay"}, {DeviceID: "test-exit", Role: "exit"}}}); err != nil {
+		t.Fatal(err)
+	}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin",
+		"capacity-test-line", map[string]any{"line_id": "line-test-capacity", "kind": "line.open",
+			"requested_by": "operator", "request": map[string]any{}})
+	if response.StatusCode != http.StatusCreated || bytes.Contains(body, []byte(`"capacity_reservations"`)) {
+		t.Fatalf("test line capacity status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestNetworkLinkUIIsRetired(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"linksView", "networkLinksTable", "networkLinkModal",
+		"forward_capacity_mbps", "reverse_capacity_mbps", "billing_mode"} {
+		if bytes.Contains(index, []byte(marker)) || bytes.Contains(script, []byte(marker)) {
+			t.Fatalf("retired network link UI remains %q", marker)
+		}
+	}
+	for _, marker := range []string{`name="upstream_mbps"`, `name="downstream_mbps"`} {
+		if !bytes.Contains(index, []byte(marker)) {
+			t.Fatalf("line directional input missing %q", marker)
+		}
+	}
+}
+
+func TestQualificationUIShowsDirectionalEvidence(t *testing.T) {
+	index, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"待验证", "全双工合格", "全双工不合格",
+		"target_upstream_mbps", "target_downstream_mbps", "achieved_upstream_mbps",
+		"achieved_downstream_mbps", "required_ratio", "duration_seconds", "deployment_id", "operation_id"} {
+		if !bytes.Contains(index, []byte(marker)) && !bytes.Contains(script, []byte(marker)) {
+			t.Fatalf("qualification UI missing %q", marker)
+		}
+	}
+}
+
+func TestGovernanceAPIReportsRemediationAndBlocksUpgrade(t *testing.T) {
+	database, err := central.Open(filepath.Join(t.TempDir(), "central.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "governance-line", Name: "governance",
+		Status: "active", Environment: "production", EntryRegion: "gz", ExitRegion: "es",
+		Provider: "test", CapacityMbps: 10, ActiveDeployment: "deployment-current"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "governance-test", Name: "test",
+		Status: "active", Environment: "test", EntryRegion: "gz", ExitRegion: "lab",
+		Provider: "test", CapacityMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	governanceNodes := []central.LineNode{}
+	for _, item := range []struct{ id, role string }{{"governance-entry", "entry"}, {"governance-relay", "relay"}, {"governance-exit", "exit"}} {
+		if _, err = database.UpsertDevice(t.Context(), central.Device{ID: item.id, Name: item.id, Status: "ready",
+			Environment: "production", Host: "192.0.2.1", SSHPort: 22, SSHUser: "root",
+			Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+		governanceNodes = append(governanceNodes, central.LineNode{DeviceID: item.id, Role: item.role})
+	}
+	if _, err = database.SaveLineSpec(t.Context(), central.LineSpec{LineID: "governance-line", Environment: "production",
+		ResourceGroup: "managed", InstanceID: "governance_1", BandwidthMbps: 10, UpstreamMbps: 10,
+		DownstreamMbps: 10, SocksPort: 1082, RelayPort: 4445, ExitPort: 4443,
+		UDPPortMin: 22048, UDPPortMax: 23071, Whitelist: json.RawMessage(`[]`),
+		DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", JumpPolicy: "auto",
+		Nodes: governanceNodes}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"governance-clean-relay", "governance-clean-exit"} {
+		if _, err = database.UpsertDevice(t.Context(), central.Device{ID: id, Name: id, Status: "ready",
+			Environment: "production", Host: "192.0.2.2", SSHPort: 22, SSHUser: "root",
+			Labels: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cleanLineID := "governance-clean"
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: cleanLineID, Name: "clean", Status: "active",
+		Environment: "production", EntryRegion: "gz", ExitRegion: "uk", Provider: "test", CapacityMbps: 10,
+		ActiveDeployment: "clean-deployment", Profile: cleanLineID + ":2"}); err != nil {
+		t.Fatal(err)
+	}
+	cleanNodes := []central.LineNode{{DeviceID: "governance-entry", Role: "entry"},
+		{DeviceID: "governance-clean-relay", Role: "relay"}, {DeviceID: "governance-clean-exit", Role: "exit"}}
+	if _, err = database.SaveLineSpec(t.Context(), central.LineSpec{LineID: cleanLineID, Environment: "production",
+		ResourceGroup: "managed", InstanceID: "governance_clean_1", BandwidthMbps: 10, UpstreamMbps: 10,
+		DownstreamMbps: 10, SocksPort: 1083, RelayPort: 4447, ExitPort: 4445,
+		UDPPortMin: 23072, UDPPortMax: 24095, Whitelist: json.RawMessage(`[]`),
+		DNSServers: json.RawMessage(`["1.1.1.1"]`), BuildMode: "auto", JumpPolicy: "auto", Nodes: cleanNodes}); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range []central.NetworkLink{
+		{ID: "governance-clean-entry-relay", FromDeviceID: "governance-entry", FromRole: "entry",
+			ToDeviceID: "governance-clean-relay", ToRole: "relay", ForwardCapacityMbps: 10,
+			ReverseCapacityMbps: 10, BillingMode: central.LinkBillingIndependent, Environment: "production", Status: "ready"},
+		{ID: "governance-clean-relay-exit", FromDeviceID: "governance-clean-relay", FromRole: "relay",
+			ToDeviceID: "governance-clean-exit", ToRole: "exit", ForwardCapacityMbps: 10,
+			ReverseCapacityMbps: 10, BillingMode: central.LinkBillingIndependent, Environment: "production", Status: "ready"},
+	} {
+		if _, err = database.UpsertNetworkLink(t.Context(), link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cleanOperation := central.Operation{ID: "op-governance-clean", LineID: cleanLineID, Kind: "line.optimize",
+		RequestedBy: "test", IdempotencyKey: "governance-clean-qualification", Request: json.RawMessage(`{}`)}
+	if _, _, err = database.CreateOperation(t.Context(), cleanOperation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ClaimOperations(t.Context(), cleanLineID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.CompleteOperation(t.Context(), cleanOperation.ID, cleanLineID, "succeeded",
+		json.RawMessage(`{"profile":"governance-clean:2"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.SaveLineQualification(t.Context(), central.LineQualification{LineID: cleanLineID,
+		DeploymentID: "clean-deployment", OperationID: cleanOperation.ID, TargetUpstreamMbps: 10,
+		TargetDownstreamMbps: 10, AchievedUpstreamMbps: 10, AchievedDownstreamMbps: 10,
+		DurationSeconds: 90, RequiredRatio: 0.95, Status: "admitted", Reasons: json.RawMessage(`[]`),
+		Evidence: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(New(database, Config{AdminToken: "admin", AgentToken: "agent"}).Handler())
+	defer server.Close()
+	response, body := call(t, server.Client(), http.MethodGet, server.URL+"/api/v1/governance/production-lines", "admin", "", nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"line_id":"governance-line"`)) ||
+		!bytes.Contains(body, []byte(`"code":"qualification_required"`)) ||
+		bytes.Contains(body, []byte(`"line_id":"governance-test"`)) || !bytes.Contains(body, []byte(`"required_action"`)) {
+		t.Fatalf("governance status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin",
+		"governance-upgrade", map[string]any{"line_id": "governance-line", "kind": "line.upgrade",
+			"requested_by": "operator", "request": map[string]any{}})
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("版本升级中心")) {
+		t.Fatalf("governance upgrade status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPost, server.URL+"/api/v1/operations", "admin",
+		"governance-shared-upgrade", map[string]any{"line_id": cleanLineID, "kind": "line.upgrade",
+			"requested_by": "operator", "request": map[string]any{}})
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("版本升级中心")) {
+		t.Fatalf("shared governance upgrade status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPut, server.URL+"/api/v1/lines/governance-line/spec", "admin", "",
+		map[string]any{"environment": "production", "upstream_mbps": 11, "downstream_mbps": 10})
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("禁止扩容")) {
+		t.Fatalf("governance expansion status=%d body=%s", response.StatusCode, body)
+	}
+	response, body = call(t, server.Client(), http.MethodPatch, server.URL+"/api/v1/lines/"+cleanLineID, "admin", "",
+		map[string]any{"active_deployment": "forged-deployment"})
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte("unsupported field")) {
+		t.Fatalf("governance metadata patch status=%d body=%s", response.StatusCode, body)
+	}
+	script, err := assets.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"maintenance_required", "qualification_required", "required_action", "生产治理"} {
+		if !bytes.Contains(script, []byte(marker)) {
+			t.Fatalf("governance UI missing %q", marker)
+		}
 	}
 }
 
@@ -1268,7 +1661,7 @@ func TestAgentRuntimePortClaimsProtectAutomaticAndExplicitPorts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "line-runtime", Name: "runtime", Status: "draft", Provider: "test"}); err != nil {
+	if _, err = database.UpsertLine(t.Context(), central.Line{ID: "line-runtime", Name: "runtime", Status: "draft", Environment: "test", Provider: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	observed := time.Now().UTC()
@@ -1281,7 +1674,7 @@ func TestAgentRuntimePortClaimsProtectAutomaticAndExplicitPorts(t *testing.T) {
 	}
 	nodes := []map[string]any{{"device_id": "entry-runtime", "role": "entry", "ordinal": 0},
 		{"device_id": "relay-runtime", "role": "relay", "ordinal": 0}, {"device_id": "exit-runtime", "role": "exit", "ordinal": 0}}
-	autoSpec := map[string]any{"resource_group": "shared", "instance_id": "line-runtime_1", "bandwidth_mbps": 5,
+	autoSpec := map[string]any{"resource_group": "shared", "environment": "test", "instance_id": "line-runtime_1", "bandwidth_mbps": 5,
 		"upstream_mbps": 5, "downstream_mbps": 5, "socks_port": 0, "relay_port": 0, "exit_port": 0,
 		"udp_port_min": 0, "udp_port_max": 0, "dns_servers": []string{"1.1.1.1"}, "whitelist": []string{},
 		"build_mode": "auto", "source_ref": "repo://current", "jump_policy": "auto", "nodes": nodes}
