@@ -130,6 +130,7 @@ assert combined["sessions_interrupted"] == 28
 
 upgrade_source = (repo_root / "tools" / "platform_upgrade.py").read_text(encoding="utf-8")
 assert "systemctl start --no-block" in upgrade_source
+assert "systemctl kill --kill-who=all --signal=KILL" in upgrade_source
 assert "timeout 2s systemctl restart" not in upgrade_source
 materialize = platform_upgrade.shared_release_materialize_command(
     "/etc/NB", "/etc/NB/instances/line-b", "release-1", "deployment-1", "a" * 64)

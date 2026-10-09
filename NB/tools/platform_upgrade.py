@@ -85,7 +85,10 @@ class CompositeUpgradeAdapter:
     def activate_node(self, role: str, worker: int, deadline_seconds: float) -> dict:
         targets = []
         for device_id, adapter in self._unique(role):
-            result = adapter.activate_node(role, worker, deadline_seconds)
+            try:
+                result = adapter.activate_node(role, worker, deadline_seconds)
+            except Exception as error:
+                raise RuntimeError(f"{device_id} {role}[{worker}] activation failed: {error}") from error
             targets.append({"device_id": device_id, **result})
         return {
             "sessions_interrupted": sum(int(item.get("sessions_interrupted", 0)) for item in targets),
@@ -470,7 +473,9 @@ class SystemAdapter:
             "assert len(responses)==len(paths) and all(x.get('status') in ('ok','starting') for x in responses)")
         deadline_ms = int(deadline_seconds * 1000)
         expected_sha = self.node_manifest["artifact"]["sha256"]
-        command = (f"started=$(date +%s%3N); timeout 1s systemctl stop {shlex.quote(service)} || true; "
+        command = (f"started=$(date +%s%3N); systemctl stop --no-block {shlex.quote(service)} || true; "
+            f"systemctl kill --kill-who=all --signal=KILL {shlex.quote(service)} 2>/dev/null || true; "
+            f"systemctl reset-failed {shlex.quote(service)} 2>/dev/null || true; "
             f"systemctl start --no-block {shlex.quote(service)} || exit 31; "
             f"for i in $(seq 1 20); do pid=$(systemctl show -p MainPID --value {shlex.quote(service)}); "
             f"if systemctl is-active --quiet {shlex.quote(service)} && test -n \"$pid\" && "
@@ -495,7 +500,9 @@ class SystemAdapter:
         self.deploy.run(client, f"ln -sfn {shlex.quote(relative)} {shlex.quote(temporary)}; "
             f"mv -Tf {shlex.quote(temporary)} {shlex.quote(root + '/nb_node')}; "
             f"service={shlex.quote('nb-' + role + '-shard@' + str(worker))}; "
-            f"timeout 1s systemctl stop $service || true; systemctl start --no-block $service; "
+            f"systemctl stop --no-block $service || true; "
+            f"systemctl kill --kill-who=all --signal=KILL $service 2>/dev/null || true; "
+            f"systemctl reset-failed $service 2>/dev/null || true; systemctl start --no-block $service; "
             f"for i in $(seq 1 20); do systemctl is-active --quiet $service && exit 0; sleep .1; done; exit 1", tmo=10)
 
     def smoke(self) -> None:
