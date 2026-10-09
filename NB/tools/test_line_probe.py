@@ -186,6 +186,11 @@ def main() -> None:
     ])
     assert control_sample["sent"] == 1300 and control_sample["rtt"] == 5.1
     assert control_sample["reorder_gap"] == 4 and control_sample["block"] == 1
+    directional = control_link_sample([
+        {"bytes": {"c2s": 3_000_000, "s2c": 7_000_000}, "link": {}},
+    ], previous_bytes=8_000_000, previous_c2s=2_500_000, previous_s2c=5_500_000)
+    assert directional["c2s_delta"] == 500_000
+    assert directional["s2c_delta"] == 1_500_000
     byte_fallback = control_link_sample([
         {"link": {"samples": 1, "sent_packets": 2, "rtt_max_us": 4500,
                   "jitter_max_us": 600, "effective_loss_max_pct": 0.1,
@@ -331,6 +336,13 @@ def main() -> None:
         "downlink": {"integrity": "count-ok", "achieved_mbps": 9.49}}, 10.0)
     assert rejected["status"] == "rejected"
     assert rejected["reasons"] == ["insufficient-downlink"]
+    admitted_with_business = evaluate_admission({"integrity": {"integrity": "ok"},
+        "uplink": {"integrity": "count-ok", "achieved_mbps": 9.97},
+        "downlink": {"integrity": "count-ok", "achieved_mbps": 7.1},
+        "background": {"upstream_mbps": 0.03, "downstream_mbps": 3.0}}, 10.0)
+    assert admitted_with_business["status"] == "admitted"
+    assert admitted_with_business["achieved_downstream_mbps"] == 10.1
+    assert admitted_with_business["probe_downstream_mbps"] == 7.1
     barrier = threading.Barrier(2)
     def direction(name):
         barrier.wait(timeout=1)

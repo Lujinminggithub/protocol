@@ -373,8 +373,11 @@ def evaluate_admission(active_probe: dict | None, target_mbps: float,
     integrity = active_probe.get("integrity") or {}
     uplink = active_probe.get("uplink") or active_probe.get("load") or {}
     downlink = active_probe.get("downlink") or uplink
-    achieved_up = float(uplink.get("achieved_mbps", 0) or 0)
-    achieved_down = float(downlink.get("achieved_mbps", 0) or 0)
+    background = active_probe.get("background") or {}
+    probe_up = float(uplink.get("achieved_mbps", 0) or 0)
+    probe_down = float(downlink.get("achieved_mbps", 0) or 0)
+    achieved_up = probe_up + max(0.0, float(background.get("upstream_mbps", 0) or 0))
+    achieved_down = probe_down + max(0.0, float(background.get("downstream_mbps", 0) or 0))
     if integrity.get("integrity") != "ok":
         reasons.append("payload-integrity")
     if uplink.get("integrity") != "count-ok":reasons.append("uplink-integrity")
@@ -389,6 +392,7 @@ def evaluate_admission(active_probe: dict | None, target_mbps: float,
         "target_upstream_mbps":target_mbps,"target_downstream_mbps":down_target,
         "achieved_mbps": min(achieved_up,achieved_down),
         "achieved_upstream_mbps": achieved_up,"achieved_downstream_mbps": achieved_down,
+        "probe_upstream_mbps": probe_up,"probe_downstream_mbps": probe_down,
         "throughput_ratio": min(achieved_up/target_mbps if target_mbps>0 else 0,
             achieved_down/down_target if down_target>0 else 0),
         "minimum_throughput_ratio": min_throughput_ratio,
@@ -769,13 +773,18 @@ def collect_segment(source_role: str, target: str, samples: int, target_mbps: fl
     }
 
 
-def control_link_sample(records: list[dict], previous_bytes: int = 0) -> dict:
+def control_link_sample(records: list[dict], previous_bytes: int = 0,
+                        previous_c2s: int = 0, previous_s2c: int = 0) -> dict:
     links = [record.get("link", {}) for record in records if isinstance(record, dict)]
     current_bytes = sum(
         int((record.get("bytes") or {}).get(direction, 0) or 0)
         for record in records if isinstance(record, dict)
         for direction in ("c2s", "s2c"))
     bytes_delta = max(0, current_bytes - int(previous_bytes or 0))
+    current_c2s = sum(int((record.get("bytes") or {}).get("c2s", 0) or 0)
+                      for record in records if isinstance(record, dict))
+    current_s2c = sum(int((record.get("bytes") or {}).get("s2c", 0) or 0)
+                      for record in records if isinstance(record, dict))
     raw_sent = sum(int(link.get("sent_packets", 0) or 0) for link in links)
     # Some runtimes expose path-quality sent_packets as a tiny per-tick sample
     # while bytes remains cumulative. Estimate packets from byte deltas so a
@@ -785,6 +794,10 @@ def control_link_sample(records: list[dict], previous_bytes: int = 0) -> dict:
         "sent": max(raw_sent, estimated_sent),
         "raw_sent": raw_sent,
         "bytes_delta": bytes_delta,
+        "c2s_bytes": current_c2s,
+        "s2c_bytes": current_s2c,
+        "c2s_delta": max(0, current_c2s - int(previous_c2s or 0)),
+        "s2c_delta": max(0, current_s2c - int(previous_s2c or 0)),
         "quality_samples": sum(int(link.get("samples", 0) or 0) for link in links),
         "spurious": sum(int(link.get("spurious_total", 0) or 0) for link in links),
         "rtt": max((float(link.get("rtt_max_us", 0) or 0) / 1000.0 for link in links), default=0.0),
@@ -816,14 +829,19 @@ for path in paths:
 print(json.dumps(metrics,separators=(',',':')))
 """
     connection = None
-    previous_bytes = 0
+    previous_bytes = previous_c2s = previous_s2c = 0
+    initialized = False
     try:
         connection = deploy.connect(role)
         while not stop_event.is_set():
             raw = deploy.checked_run(connection, "python3 -c " + shlex.quote(script), tmo=20).strip()
             records = json.loads(raw)
-            sample = control_link_sample(records, previous_bytes)
-            previous_bytes += sample["bytes_delta"]
+            sample = control_link_sample(records, previous_bytes, previous_c2s, previous_s2c)
+            if not initialized:
+                sample["bytes_delta"] = sample["c2s_delta"] = sample["s2c_delta"] = 0
+                initialized = True
+            previous_bytes = sample["c2s_bytes"] + sample["s2c_bytes"]
+            previous_c2s, previous_s2c = sample["c2s_bytes"], sample["s2c_bytes"]
             output.append(sample)
             ready_event.set()
             if stop_event.wait(interval_s):
@@ -834,6 +852,14 @@ print(json.dumps(metrics,separators=(',',':')))
     finally:
         if connection is not None:
             connection.close()
+
+
+def background_business_rate(samples: list[dict], duration_s: int) -> dict:
+    duration = max(float(duration_s), 0.001)
+    return {
+        "upstream_mbps": sum(int(item.get("c2s_delta", 0) or 0) for item in samples) * 8.0 / duration / 1_000_000.0,
+        "downstream_mbps": sum(int(item.get("s2c_delta", 0) or 0) for item in samples) * 8.0 / duration / 1_000_000.0,
+    }
 
 
 def main() -> None:
@@ -942,7 +968,8 @@ def main() -> None:
                 thread.join(25)
         time.sleep(12)
         active_logs = {role: log_since(role, offsets[role]) for role in offsets}
-        active_result = {"integrity": integrity, "uplink": uplink, "downlink": downlink}
+        active_result = {"integrity": integrity, "uplink": uplink, "downlink": downlink,
+            "background": background_business_rate(active_metric_samples["entry"], args.duration)}
 
     entry_segment = collect_segment("entry", middle_target, args.ping_samples, target_mbps)
     middle_segment = collect_segment("middle", exit_host["host"], args.ping_samples, target_mbps)
