@@ -22,6 +22,21 @@ ROLES = ("exit", "middle", "entry")
 STAGE_ROLES = ("entry", "middle", "exit")
 
 
+def shared_release_materialize_command(work: str, instance_work: str, release_id: str,
+                                       deployment_id: str, expected_sha: str) -> str:
+    shared = f"{work}/shards/releases/{release_id}/nb_node"
+    destination = f"{instance_work}/releases/{deployment_id}/nb_node"
+    temporary = destination + ".materialize"
+    parent = str(pathlib.PurePosixPath(destination).parent)
+    return (f"test \"$(sha256sum {shlex.quote(shared)} | awk '{{print $1}}')\" = {shlex.quote(expected_sha)}; "
+            f"mkdir -p {shlex.quote(parent)}; "
+            f"if test -f {shlex.quote(destination)}; then "
+            f"test \"$(sha256sum {shlex.quote(destination)} | awk '{{print $1}}')\" = {shlex.quote(expected_sha)}; "
+            f"else cp -p {shlex.quote(shared)} {shlex.quote(temporary)} && chmod 0755 {shlex.quote(temporary)} && "
+            f"mv -f {shlex.quote(temporary)} {shlex.quote(destination)}; fi; "
+            "echo MIDDLE_SHARED_SOURCE_VERIFIED")
+
+
 class UpgradeAdapter(Protocol):
     def switch_scripts(self) -> None: ...
     def rollback_scripts(self) -> None: ...
@@ -396,6 +411,12 @@ class SystemAdapter:
             self.deploy._copy_release_between_nodes(self.clients["entry"], "entry", self.clients["middle"], "middle", self.node_manifest)
             self.deploy._stage_release(self.clients["middle"], "middle", self.node_manifest)
         elif role == "exit":
+            materialize = shared_release_materialize_command(
+                self.deploy.WORK, self.deploy.INSTANCE_WORK, self.node_manifest["release_id"],
+                self.node_manifest["deployment_id"], self.node_manifest["artifact"]["sha256"])
+            if "MIDDLE_SHARED_SOURCE_VERIFIED" not in self.deploy.checked_run(
+                    self.clients["middle"], materialize):
+                raise RuntimeError("middle shared Node source verification failed")
             self.deploy._copy_release_between_nodes(self.clients["middle"], "middle", self.clients["exit"], "exit", self.node_manifest)
             self.deploy._stage_release(self.clients["exit"], "exit", self.node_manifest)
         else:
