@@ -195,7 +195,7 @@ func calculateLink(evidence SegmentEvidence, targetMbps float64) Link {
 	if gap > 64 {
 		gap = 64
 	}
-	delayCapMS := 120.0
+	delayCapMS := math.Min(750, math.Max(120, pathRTT*3))
 	if pathRTT <= 30 {
 		delayCapMS = 80
 	}

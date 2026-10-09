@@ -90,7 +90,7 @@ func TestGenerateDoesNotTurnLoadedShortHopIntoBBR(t *testing.T) {
 	if entry.ReorderGap > 64 || entry.ReorderDelayUS > 80000 {
 		t.Fatalf("short-hop reorder envelope is not bounded: %+v", entry)
 	}
-	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 120000 {
+	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 607000 {
 		t.Fatalf("long-hop reorder envelope is not bounded: %+v", middle)
 	}
 }
@@ -168,7 +168,7 @@ func TestGenerateBoundsKZReorderInsteadOfPreservingProbeCandidate(t *testing.T) 
 	if middle.SeedRTTUS != 286274 || middle.StartupCWinBytes != 458752 {
 		t.Fatalf("long-haul seed must use QUIC RTT and 2x average wire BDP: %+v", middle)
 	}
-	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 120000 {
+	if middle.ReorderGap > 64 || middle.ReorderDelayUS > 607000 {
 		t.Fatalf("KZ reorder envelope is not bounded for live traffic: %+v", middle)
 	}
 }
@@ -188,6 +188,24 @@ func TestGenerateUsesRobustEvidenceInsteadOfTransientMaximum(t *testing.T) {
 	middle := profile.Segments["middle_exit"].Source
 	if middle.ReorderGap != 15 || middle.ReorderDelayUS != 49000 {
 		t.Fatalf("robust evidence was not used: %+v", middle)
+	}
+}
+
+func TestGenerateScalesReorderToleranceForHighRTTReversePath(t *testing.T) {
+	probe := Probe{SchemaVersion: 2, Segments: map[string]SegmentEvidence{
+		"entry_middle": {QUIC: QUICEvidence{PacketsObserved: 12000, WindowsValid: 6}, Candidate: candidate("cubic", 524288, 1404, 8, 20000)},
+		"middle_exit": {ICMP: ICMP{RTTAvgMS: 235}, QUIC: QUICEvidence{RTTP95MS: 251,
+			JitterP95MS: 2.7, PacketsObserved: 453260, WindowsValid: 18,
+			ReorderWindows: 18, ReorderGapP95: 4, ReorderDelayP95MS: 507.6},
+			Candidate: candidate("bbr", 0, 1404, 12, 120000)},
+	}}
+	profile, err := Generate("gz-hk-uk-10002", 3, 10, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	middle := profile.Segments["middle_exit"].Source
+	if middle.ReorderDelayUS < 515000 || middle.ReorderDelayUS > 520000 {
+		t.Fatalf("high-RTT reverse reorder tolerance=%d, want about 516000", middle.ReorderDelayUS)
 	}
 }
 
