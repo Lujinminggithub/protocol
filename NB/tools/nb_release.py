@@ -12,8 +12,8 @@ from typing import Iterable, Mapping
 
 
 SCHEMA_VERSION = 2
-NODE_PRODUCT_VERSION = "V200R001C02"
-NODE_SEMANTIC_VERSION = "2.1.2"
+NODE_PRODUCT_VERSION = "V200R001C03"
+NODE_SEMANTIC_VERSION = "2.1.3"
 RELEASE_NAME_RE = re.compile(r"^(?:[0-9a-f]{16}(?:-[0-9a-f]{12})?|legacy-[0-9a-f]{16})$")
 DEPLOYMENT_NAME_RE = re.compile(
     r"^(?:(?:[0-9a-f]{16}(?:-[0-9a-f]{12})?|legacy-[0-9a-f]{16})|cfg-[0-9a-f]{16})$")

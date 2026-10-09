@@ -349,18 +349,6 @@ static void transport_refresh_outbound_pools(void){
     }
 }
 
-static int transport_outbound_pools_current(void){
-    if(G.role!=ROLE_ENTRY&&G.role!=ROLE_MIDDLE)return 1;
-    uint64_t generation=transport_active_generation();
-    if(generation==0)return 1;
-    for(int pool_id=0;pool_id<G.pool_count;pool_id++)for(int idx=0;idx<POOL_SIZE;idx++){
-        cnx_pool_t* pool=&G.pools[pool_id];if(!pool->configured)continue;
-        if(pool->generation_refresh[idx]||!pool_cnx_ready(pool->cnx[idx])||
-            !pool_connection_is_current(pool->cnx[idx]))return 0;
-    }
-    return 1;
-}
-
 static void pool_close_candidate(cnx_pool_t* pool,int idx){
     if(pool->replacement_cnx[idx]&&!pool->replacement_closing[idx]){
         pool->replacement_closing[idx]=1;picoquic_close(pool->replacement_cnx[idx],0x4e4243ULL);

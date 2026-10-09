@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix="platform-release-") as directory:
         "release_id": "0123456789abcdef",
         "deployment_id": "0123456789abcdef-0123456789ab",
         "source_digest": "a" * 64,
-        "node_version": {"product": "V200R001C02", "semantic": "2.1.2"},
+        "node_version": {"product": "V200R001C03", "semantic": "2.1.3"},
         "artifact": {"sha256": platform_release.sha256_file(root / "build" / "nb_node")},
     }
     manifest = platform_release.create_platform_manifest(

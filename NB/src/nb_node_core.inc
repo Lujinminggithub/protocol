@@ -332,7 +332,6 @@ static int pool_init(cnx_pool_t* pool, struct sockaddr_storage* addr);
 static int pool_get_or_create(struct sockaddr_storage* addr);
 static void pool_close_candidate(cnx_pool_t* pool,int idx);
 static void transport_refresh_outbound_pools(void);
-static int transport_outbound_pools_current(void);
 static int downstream_open_stream(proxy_stream_t* p, const char* route, const nb_flow_policy_t* pol);
 static int pool_udp_fec_needed(cnx_pool_t* pool,uint64_t now);
 static int pool_udp_fec_refresh(cnx_pool_t* pool,uint64_t now);
@@ -535,9 +534,6 @@ static int control_render(const char* command,char* out,size_t cap,void* ctx){
     const char* schema_text=nb_instance_env(nb_current_instance,"NB_LINE_PROFILE_SCHEMA");char* schema_end=NULL;
     long schema_long=schema_text?strtol(schema_text,&schema_end,10):0;
     int profile_schema=(schema_text&&schema_end&&*schema_end==0&&schema_long>=0&&schema_long<=999999)?(int)schema_long:0;
-    if((!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))&&
-        !transport_outbound_pools_current())
-        return snprintf(out,cap,"{\"error\":\"transport generation transition pending\"}\n");
     if(!strcmp(command,"profile status")||!strcmp(command,"GET /profile"))
         return nb_transport_profile_render_status(&nb_current_instance->transport_profiles,out,cap);
     if(!strcmp(command,"probe status")||!strcmp(command,"GET /probe")){

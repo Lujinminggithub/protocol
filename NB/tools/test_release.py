@@ -36,7 +36,7 @@ def main() -> None:
         loaded = nb_release.load_and_validate_manifest(manifest_path, root, binary)
         assert loaded["release_id"] == nb_release.sha256_file(binary)[:16]
         assert loaded["deployment_id"].startswith(loaded["release_id"] + "-")
-        assert loaded["node_version"] == {"product": "V200R001C02", "semantic": "2.1.2"}
+        assert loaded["node_version"] == {"product": "V200R001C03", "semantic": "2.1.3"}
 
         # Manifests from before the input split may contain deployment Python;
         # changing that orchestration code must not invalidate the Node binary.
