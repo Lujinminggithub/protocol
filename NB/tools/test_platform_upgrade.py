@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import json
+import os
 import pathlib
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import platform_upgrade
@@ -106,5 +109,35 @@ except RuntimeError as error:
     assert "entry unavailable" in str(error)
 assert ("rollback", "exit", 0, 2.0) in partial.calls
 assert partial.calls[-1] == ("rollback-scripts",)
+
+with tempfile.TemporaryDirectory() as directory:
+    install_root = pathlib.Path(directory)
+    current = install_root / "repo"
+    candidate = install_root / "source-candidates" / "ready-test"
+    (candidate / "build").mkdir(parents=True)
+    current.mkdir()
+    (current / "identity.txt").write_text("current", encoding="utf-8")
+    (candidate / "identity.txt").write_text("candidate", encoding="utf-8")
+    manifest_path = candidate / "build" / "platform-release.json"
+    manifest_path.write_text(json.dumps({
+        "release_id": "release-reusable",
+        "candidate_root": str(candidate),
+        "scripts": {"files": []},
+    }), encoding="utf-8")
+    previous_root = os.environ.get("NB_CONTROLPLANE_ROOT")
+    os.environ["NB_CONTROLPLANE_ROOT"] = str(current)
+    try:
+        system = platform_upgrade.SystemAdapter(manifest_path, "line-a", "op-first")
+        system.switch_scripts()
+        assert candidate.is_dir(), "platform candidate was consumed by first upgrade unit"
+        assert (current / "identity.txt").read_text(encoding="utf-8") == "candidate"
+        system.rollback_scripts()
+        assert candidate.is_dir(), "platform candidate disappeared after rollback"
+        assert (current / "identity.txt").read_text(encoding="utf-8") == "current"
+    finally:
+        if previous_root is None:
+            os.environ.pop("NB_CONTROLPLANE_ROOT", None)
+        else:
+            os.environ["NB_CONTROLPLANE_ROOT"] = previous_root
 
 print("platform upgrade transaction tests passed")

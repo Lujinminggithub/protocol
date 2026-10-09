@@ -162,16 +162,21 @@ class SystemAdapter:
         releases = self.install_root / "source-releases"
         releases.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.source_backup = releases / f"repo-before-{self.release_id}"
+        activation = releases / f"repo-next-{self.operation_id}"
         if self.source_backup.exists():
             shutil.rmtree(self.source_backup)
+        if activation.exists():
+            shutil.rmtree(activation)
+        shutil.copytree(self.candidate_root, activation)
         os.replace(self.current_root, self.source_backup)
         try:
-            os.replace(self.candidate_root, self.current_root)
+            os.replace(activation, self.current_root)
         except Exception:
             os.replace(self.source_backup, self.current_root)
             self.source_backup = None
+            if activation.exists():
+                shutil.rmtree(activation)
             raise
-        self.candidate_root = self.current_root
         self.manifest_path = self.current_root / "build" / "platform-release.json"
 
     def rollback_scripts(self) -> None:
