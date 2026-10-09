@@ -19,9 +19,10 @@ assert "Wants=network-online.target nb-web.service" in worker_unit
 
 
 class FakeAdapter:
-    def __init__(self, fail_at=None):
+    def __init__(self, fail_at=None, name="single"):
         self.calls = []
         self.fail_at = fail_at
+        self.name = name
 
     def switch_scripts(self):
         self.calls.append(("scripts",))
@@ -111,6 +112,25 @@ except RuntimeError as error:
     assert "entry unavailable" in str(error)
 assert ("rollback", "exit", 0, 2.0) in partial.calls
 assert partial.calls[-1] == ("rollback-scripts",)
+
+shared_a = FakeAdapter(name="line-a")
+shared_b = FakeAdapter(name="line-b")
+composite = platform_upgrade.CompositeUpgradeAdapter([
+    ({"entry": "entry-shared", "middle": "middle-shared", "exit": "exit-a"}, shared_a),
+    ({"entry": "entry-shared", "middle": "middle-shared", "exit": "exit-b"}, shared_b),
+])
+combined = platform_upgrade.execute_transaction(composite, workers=1, deadline_seconds=2.0)
+assert [call for call in shared_a.calls if call[0] == "stage"] == [
+    ("stage", "entry"), ("stage", "middle"), ("stage", "exit")]
+assert [call for call in shared_b.calls if call[0] == "stage"] == [("stage", "exit")]
+assert [call[:3] for call in shared_a.calls if call[0] == "activate"] == [
+    ("activate", "exit", 0), ("activate", "middle", 0), ("activate", "entry", 0)]
+assert [call[:3] for call in shared_b.calls if call[0] == "activate"] == [("activate", "exit", 0)]
+assert combined["sessions_interrupted"] == 28
+
+upgrade_source = (repo_root / "tools" / "platform_upgrade.py").read_text(encoding="utf-8")
+assert "systemctl start --no-block" in upgrade_source
+assert "timeout 2s systemctl restart" not in upgrade_source
 
 with tempfile.TemporaryDirectory() as directory:
     install_root = pathlib.Path(directory)

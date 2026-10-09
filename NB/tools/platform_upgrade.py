@@ -33,6 +33,67 @@ class UpgradeAdapter(Protocol):
     def smoke(self) -> None: ...
 
 
+class CompositeUpgradeAdapter:
+    """Runs one transaction across every unique physical device-role target."""
+
+    def __init__(self, members: list[tuple[dict[str, str], UpgradeAdapter]]):
+        if not members:
+            raise ValueError("platform upgrade requires at least one affected line")
+        self.members = members
+        self.primary = members[0][1]
+
+    def _unique(self, role: str) -> list[tuple[str, UpgradeAdapter]]:
+        selected: dict[str, UpgradeAdapter] = {}
+        for devices, adapter in self.members:
+            device_id = str(devices.get(role, ""))
+            if not device_id:
+                raise RuntimeError(f"affected line is missing {role} device identity")
+            selected.setdefault(device_id, adapter)
+        return list(selected.items())
+
+    def switch_scripts(self) -> None:
+        self.primary.switch_scripts()
+
+    def rollback_scripts(self) -> None:
+        self.primary.rollback_scripts()
+
+    def switch_controlplane(self, service: str) -> None:
+        self.primary.switch_controlplane(service)
+
+    def rollback_controlplane(self, service: str) -> None:
+        self.primary.rollback_controlplane(service)
+
+    def stage_node(self, role: str) -> None:
+        for _device_id, adapter in self._unique(role):
+            adapter.stage_node(role)
+
+    def activate_node(self, role: str, worker: int, deadline_seconds: float) -> dict:
+        targets = []
+        for device_id, adapter in self._unique(role):
+            result = adapter.activate_node(role, worker, deadline_seconds)
+            targets.append({"device_id": device_id, **result})
+        return {
+            "sessions_interrupted": sum(int(item.get("sessions_interrupted", 0)) for item in targets),
+            "downtime_ms": max((int(item.get("downtime_ms", 0)) for item in targets), default=0),
+            "configs": sum(int(item.get("configs", 0)) for item in targets),
+            "targets": targets,
+        }
+
+    def rollback_node(self, role: str, worker: int, deadline_seconds: float) -> None:
+        for _device_id, adapter in reversed(self._unique(role)):
+            adapter.rollback_node(role, worker, deadline_seconds)
+
+    def smoke(self) -> None:
+        for _devices, adapter in self.members:
+            adapter.smoke()
+
+    def close(self) -> None:
+        for _devices, adapter in self.members:
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                close()
+
+
 def execute_transaction(adapter: UpgradeAdapter, *, workers: int,
                         deadline_seconds: float = 2.0) -> dict:
     if workers < 1 or workers > 32 or not 0.5 <= deadline_seconds <= 2.0:
@@ -136,11 +197,16 @@ class SystemAdapter:
         self.runtime_plan = None
         self.units_installed = False
 
-    def _rollback_record(self, release_id: str | None = None) -> pathlib.Path:
-        return self.install_root / "data" / "upgrader" / "releases" / ((release_id or self.release_id) + ".json")
+    def _rollback_record(self, release_id: str | None = None,
+                         upgrade_operation_id: str | None = None,
+                         line_id: str | None = None) -> pathlib.Path:
+        name = "-".join((release_id or self.release_id,
+                         upgrade_operation_id or self.operation_id,
+                         line_id or self.line_id)) + ".json"
+        return self.install_root / "data" / "upgrader" / "releases" / name
 
-    def load_rollback_record(self, release_id: str) -> None:
-        record = json.loads(self._rollback_record(release_id).read_text(encoding="utf-8"))
+    def load_rollback_record(self, release_id: str, upgrade_operation_id: str, line_id: str) -> None:
+        record = json.loads(self._rollback_record(release_id, upgrade_operation_id, line_id).read_text(encoding="utf-8"))
         self.release_id = release_id
         self.line_id = record["line_id"]
         self.source_backup = pathlib.Path(record["source_backup"]) if record.get("source_backup") else None
@@ -357,7 +423,8 @@ class SystemAdapter:
             "assert len(responses)==len(paths) and all(x.get('status') in ('ok','starting') for x in responses)")
         deadline_ms = int(deadline_seconds * 1000)
         expected_sha = self.node_manifest["artifact"]["sha256"]
-        command = (f"started=$(date +%s%3N); timeout 2s systemctl restart {shlex.quote(service)} || exit 31; "
+        command = (f"started=$(date +%s%3N); timeout 1s systemctl stop {shlex.quote(service)} || true; "
+            f"systemctl start --no-block {shlex.quote(service)} || exit 31; "
             f"for i in $(seq 1 20); do pid=$(systemctl show -p MainPID --value {shlex.quote(service)}); "
             f"if systemctl is-active --quiet {shlex.quote(service)} && test -n \"$pid\" && "
             f"test \"$(sha256sum /proc/$pid/exe 2>/dev/null|awk '{{print $1}}')\" = {shlex.quote(expected_sha)} && "
@@ -380,7 +447,9 @@ class SystemAdapter:
         relative = str(pathlib.PurePosixPath(previous).relative_to(root))
         self.deploy.run(client, f"ln -sfn {shlex.quote(relative)} {shlex.quote(temporary)}; "
             f"mv -Tf {shlex.quote(temporary)} {shlex.quote(root + '/nb_node')}; "
-            f"timeout 2s systemctl restart {shlex.quote('nb-' + role + '-shard@' + str(worker))}", tmo=10)
+            f"service={shlex.quote('nb-' + role + '-shard@' + str(worker))}; "
+            f"timeout 1s systemctl stop $service || true; systemctl start --no-block $service; "
+            f"for i in $(seq 1 20); do systemctl is-active --quiet $service && exit 0; sleep .1; done; exit 1", tmo=10)
 
     def smoke(self) -> None:
         self._load_deploy()
@@ -410,27 +479,72 @@ class SystemAdapter:
         self.clients = {}
 
 
+def line_device_ids(install_root: pathlib.Path, line_id: str) -> dict[str, str]:
+    inventory_path = install_root / "data" / "worker" / "lines" / line_id / "source-machines.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    aliases = {"entry": "edges", "middle": "relays", "exit": "terminals"}
+    result: dict[str, str] = {}
+    for role, list_key in aliases.items():
+        device = inventory.get(role)
+        if not isinstance(device, dict):
+            values = inventory.get(list_key) or []
+            device = values[0] if len(values) == 1 else {}
+        device_id = str(device.get("id") or device.get("name") or "")
+        if not device_id:
+            raise RuntimeError(f"line {line_id} is missing {role} device identity")
+        result[role] = device_id
+    return result
+
+
+def system_composite(manifest: pathlib.Path, line_ids: list[str], operation_id: str) -> CompositeUpgradeAdapter:
+    members = []
+    for line_id in dict.fromkeys(line_ids):
+        adapter = SystemAdapter(manifest, line_id, operation_id)
+        members.append((line_device_ids(adapter.install_root, line_id), adapter))
+    return CompositeUpgradeAdapter(members)
+
+
+def rollback_composite(manifest: pathlib.Path, release_id: str, upgrade_operation_id: str,
+                       operation_id: str) -> CompositeUpgradeAdapter:
+    root = pathlib.Path(os.environ.get("NB_CONTROLPLANE_ROOT", "/opt/nb-controlplane/repo")).parent
+    records = []
+    directory = root / "data" / "upgrader" / "releases"
+    for path in directory.glob(f"{release_id}-{upgrade_operation_id}-*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        records.append(record)
+    if not records:
+        raise RuntimeError("platform rollback record is unavailable")
+    records.sort(key=lambda item: (not bool(item.get("source_backup")), str(item.get("line_id", ""))))
+    members = []
+    for record in records:
+        line_id = str(record["line_id"])
+        adapter = SystemAdapter(manifest, line_id, operation_id)
+        adapter.load_rollback_record(release_id, upgrade_operation_id, line_id)
+        members.append((line_device_ids(adapter.install_root, line_id), adapter))
+    return CompositeUpgradeAdapter(members)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("upgrade", "rollback"))
     parser.add_argument("--manifest", type=pathlib.Path)
-    parser.add_argument("--line-id")
+    parser.add_argument("--line-id", action="append")
     parser.add_argument("--release-id")
+    parser.add_argument("--upgrade-operation-id")
     parser.add_argument("--operation-id", required=True)
     parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args()
     if args.action == "upgrade":
         if args.manifest is None or not args.line_id:
             parser.error("upgrade requires --manifest and --line-id")
-        adapter = SystemAdapter(args.manifest, args.line_id, args.operation_id)
+        adapter = system_composite(args.manifest, args.line_id, args.operation_id)
         result = execute_transaction(adapter, workers=args.workers, deadline_seconds=2.0)
     else:
-        if not args.release_id:
-            parser.error("rollback requires --release-id")
+        if not args.release_id or not args.upgrade_operation_id:
+            parser.error("rollback requires --release-id and --upgrade-operation-id")
         root = pathlib.Path(os.environ.get("NB_CONTROLPLANE_ROOT", "/opt/nb-controlplane/repo"))
         manifest = root / "build" / "platform-release.json"
-        adapter = SystemAdapter(manifest, "rollback", args.operation_id)
-        adapter.load_rollback_record(args.release_id)
+        adapter = rollback_composite(manifest, args.release_id, args.upgrade_operation_id, args.operation_id)
         result = execute_rollback(adapter, workers=args.workers, deadline_seconds=2.0)
     print("PLATFORM_UPGRADE_JSON=" + json.dumps(result, separators=(",", ":")))
 
