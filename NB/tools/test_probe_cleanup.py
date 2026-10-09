@@ -20,14 +20,14 @@ fake_deploy = types.SimpleNamespace(
     connect=lambda role: (calls.append(("connect", role)) or Connection()),
     checked_run=lambda connection, command, tmo=0: (
         calls.append(("run", command)) or
-        ('Newbility Node V200R001C01 (2.1.1)\n' if "--version" in command else
+        ('Newbility Node V200R001C02 (2.1.2)\n' if "--version" in command else
         ('{"status":"cleaned","before":1,"cleaned":1,"active":0}\n'
          if "probe cleanup" in command else
          '{"status":"ok","active":0}\n'))),
 )
 sys.modules["deploy"] = fake_deploy
 sys.modules["nb_release"] = types.SimpleNamespace(
-    NODE_PRODUCT_VERSION="V200R001C01", NODE_SEMANTIC_VERSION="2.1.1")
+    NODE_PRODUCT_VERSION="V200R001C02", NODE_SEMANTIC_VERSION="2.1.2")
 spec = importlib.util.spec_from_file_location("probe_cleanup", ROOT / "tools" / "probe_cleanup.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -38,7 +38,7 @@ assert all(item["active"] == 0 for item in result)
 assert sum("probe cleanup" in item[1] for item in calls if item[0] == "run") == 6
 assert sum("probe status" in item[1] for item in calls if item[0] == "run") == 6
 preflight = module.preflight_all()
-assert len(preflight) == 3 and all(item["version"] == "V200R001C01 (2.1.1)" for item in preflight)
+assert len(preflight) == 3 and all(item["version"] == "V200R001C02 (2.1.2)" for item in preflight)
 
 session_header = (ROOT / "src" / "nb_session.h").read_text(encoding="utf-8")
 transport_source = (ROOT / "src" / "nb_node_transport.inc").read_text(encoding="utf-8")
@@ -46,6 +46,8 @@ control_source = (ROOT / "src" / "nb_node_core.inc").read_text(encoding="utf-8")
 assert "int probe_traffic;" in session_header
 assert "target_ok&&ps_internal_probe_target(thost,tport)" in transport_source
 assert "G.streams[i].in_use&&G.streams[i].probe_traffic" in control_source
+assert "picoquic_set_loss_reorder_tolerance(cnx,link->reorder_gap,link->reorder_delay_us)" in control_source
+assert "if((G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE)&&outbound&&" not in control_source
 
 attempts = []
 original_invoke = module.invoke

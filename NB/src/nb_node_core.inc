@@ -409,8 +409,9 @@ static int transport_bind_connection(picoquic_cnx_t* cnx,int outbound){
     runtime->transport_profile_bound=1;runtime->transport_generation=selected->active?selected->generation:0;
     if(!selected->active)return 0;
     const nb_transport_link_profile_t* link=&selected->link;transport_set_connection_cc(cnx,link);
-    if((G.role==ROLE_ENTRY||G.role==ROLE_MIDDLE)&&outbound&&
-        picoquic_set_loss_reorder_tolerance(cnx,link->reorder_gap,link->reorder_delay_us)!=0)return -1;
+    /* Reorder tolerance belongs to the sender of each direction. Exit and
+     * Middle also send on inbound QUIC connections for reverse traffic. */
+    if(picoquic_set_loss_reorder_tolerance(cnx,link->reorder_gap,link->reorder_delay_us)!=0)return -1;
     return 0;
 }
 

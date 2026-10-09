@@ -314,7 +314,7 @@ endif()
 
 add_executable(nb_node src/nb_node.c src/nb_instance.c src/nb_transport_profile.c src/nb_transport_seed.c src/nb_shard.c src/nb_policy.c src/nb_live.c src/nb_wait.c src/nb_probe.c src/nb_udp_probe_echo.c src/nb_lstream.c src/nb_metrics.c src/nb_session_index.c src/nb_bridge.c src/nb_send.c src/nb_path.c src/nb_pool.c src/nb_pool_health.c src/nb_pmtu.c src/nb_dns.c src/nb_fec.c src/nb_fec_policy.c src/nb_fec_rs.c src/nb_yfe2_profile.c src/nb_yfe2_negotiation.c src/nb_yfe2_wire.c src/nb_yfe2_block.c src/nb_yfe2_worker.c src/nb_yfe2_rx.c src/nb_yfe2_adaptive.c src/nb_yfe2_node.c src/nb_yfe2_metrics.c src/nb_ring.c src/nb_auth.c src/nb_auth_async.c src/nb_control.c src/nb_routes.c src/nb_tenant.c src/nb_tenant_shared.c src/nb_tenant_wire.c src/nb_udp.c src/nb_udp_queue.c src/nb_udp_fec.c src/nb_udp_io.c src/nb_udp_lifecycle.c src/nb_whitelist.c src/log/log4c.c)
 target_link_libraries(nb_node nb_connect)
-target_compile_definitions(nb_node PRIVATE _GNU_SOURCE NB_VERSION_PRODUCT="V200R001C00" NB_VERSION_SEMANTIC="${PROJECT_VERSION}")
+target_compile_definitions(nb_node PRIVATE _GNU_SOURCE NB_VERSION_PRODUCT="V200R001C02" NB_VERSION_SEMANTIC="${PROJECT_VERSION}")
 target_compile_options(nb_node PRIVATE -O2 -Wall -Wextra -Werror)
 target_include_directories(nb_node PRIVATE
   ${CMAKE_SOURCE_DIR}/src
@@ -323,7 +323,7 @@ target_include_directories(nb_node PRIVATE
   ${PQ_DIR}/src/picotls/include)
 if(BUILD_TESTING)
   add_test(NAME nb_node_version COMMAND nb_node --version)
-  set_tests_properties(nb_node_version PROPERTIES PASS_REGULAR_EXPRESSION "V200R001C00 \\(2.1.0\\)")
+  set_tests_properties(nb_node_version PROPERTIES PASS_REGULAR_EXPRESSION "V200R001C02 \\(2.1.2\\)")
 endif()
 
 set(PQ_LIBS
