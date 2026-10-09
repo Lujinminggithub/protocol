@@ -136,6 +136,24 @@ def execute_entry_downlink(payloads):
 
 def main() -> None:
     compile(ENTRY_LOCAL_PROBE_SCRIPT, "<entry-local-probe>", "exec")
+    rejected_cache = {
+        "_probe_cache_key": "same-key",
+        "admission": {"status": "rejected"},
+        "active_probe": {
+            "uplink": {"integrity": "count-ok", "bytes": 1, "expected_bytes": 1},
+            "downlink": {"integrity": "count-ok", "bytes": 1, "expected_bytes": 1, "complete": True},
+        },
+    }
+    assert not line_probe.cache_candidate_reusable(rejected_cache, "same-key")
+    admitted_cache = {
+        "_probe_cache_key": "same-key",
+        "admission": {"status": "admitted"},
+        "active_probe": {
+            "uplink": {"integrity": "count-ok", "bytes": 1, "expected_bytes": 1},
+            "downlink": {"integrity": "count-ok", "bytes": 1, "expected_bytes": 1, "complete": True},
+        },
+    }
+    assert line_probe.cache_candidate_reusable(admitted_cache, "same-key")
     assert "sock.shutdown(socket.SHUT_WR)" in ENTRY_LOCAL_PROBE_SCRIPT
     assert 'connect_socks("nb-probe-source.internal")' in ENTRY_LOCAL_PROBE_SCRIPT
     assert 'b"NBP2"' in ENTRY_LOCAL_PROBE_SCRIPT

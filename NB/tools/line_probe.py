@@ -395,6 +395,26 @@ def evaluate_admission(active_probe: dict | None, target_mbps: float,
         "required_ratio": min_throughput_ratio,
         "duration_seconds": duration_seconds,
     }
+
+
+def cache_candidate_reusable(candidate: dict, cache_key: str) -> bool:
+    """Only reuse a completed, admitted active probe for the exact topology key."""
+    if not isinstance(candidate, dict) or candidate.get("_probe_cache_key") != cache_key:
+        return False
+    if (candidate.get("admission") or {}).get("status") != "admitted":
+        return False
+    active_probe = candidate.get("active_probe") or {}
+    for direction in ("uplink", "downlink"):
+        measurement = active_probe.get(direction) or {}
+        if measurement.get("integrity") != "count-ok":
+            return False
+        expected = measurement.get("expected_bytes")
+        if expected is not None and int(measurement.get("bytes", -1)) != int(expected):
+            return False
+    downlink = active_probe.get("downlink") or {}
+    return downlink.get("complete") is not False
+
+
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -876,7 +896,7 @@ def main() -> None:
         try:
             cached = json.loads(args.cache.read_text(encoding="utf-8"))
             candidate = cached.get("candidate") if isinstance(cached, dict) else None
-            if isinstance(candidate, dict) and candidate.get("_probe_cache_key") == cache_key:
+            if cache_candidate_reusable(candidate, cache_key):
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 args.output.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 print(f"PROBE_CACHE_HIT key={cache_key[:16]}")
@@ -974,13 +994,19 @@ def main() -> None:
     output = args.output or pathlib.Path("build") / "line-profile-candidate.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    if args.active and args.cache:
+    if args.active and args.cache and cache_candidate_reusable(result, cache_key):
         args.cache.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.cache.with_suffix(args.cache.suffix + ".tmp")
         temporary.write_text(json.dumps({"schema_version": 1, "cache_key": cache_key,
                                          "candidate": result}, ensure_ascii=False, indent=2) + "\n",
                              encoding="utf-8")
         temporary.replace(args.cache)
+    elif args.active and args.cache:
+        # A rejected result must never poison the next retry with a cache hit.
+        try:
+            args.cache.unlink()
+        except FileNotFoundError:
+            pass
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"候选参数已写入: {output}")
 
