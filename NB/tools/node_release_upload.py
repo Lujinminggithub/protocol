@@ -111,6 +111,7 @@ def controlplane_build_environment(current_root: pathlib.Path, candidate: pathli
     environment["NB_FORCE_REMOTE_BUILD"] = "1"
     environment["NB_BUILD_LOCAL"] = "1"
     environment["NB_ALLOW_UNVERSIONED_SOURCE"] = "1"
+    environment["NB_CONTROLPLANE_GO_CACHE_ROOT"] = str(current_root.parent / "data" / "go-build-cache")
     inventory = candidate / "tools" / "private" / "kz-machines.json"
     known_hosts = candidate / "tools" / "private" / "kz-known_hosts"
     if inventory.is_file():

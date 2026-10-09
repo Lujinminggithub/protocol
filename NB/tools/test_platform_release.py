@@ -62,12 +62,14 @@ with tempfile.TemporaryDirectory(prefix="platform-release-cache-") as directory:
             captured.append(kwargs["env"])
             return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         platform_release.subprocess.run = fake_run
-        platform_release.build_controlplane(root, output, {"NB_CONTROLPLANE_GO": str(go)})
+        cache_root = base / "persistent-cache"
+        platform_release.build_controlplane(root, output, {
+            "NB_CONTROLPLANE_GO": str(go), "NB_CONTROLPLANE_GO_CACHE_ROOT": str(cache_root)})
     finally:
         platform_release.subprocess.run = original_run
-    expected_cache = output / ".cache" / "go-build"
-    expected_modules = output / ".cache" / "go-mod"
-    expected_path = output / ".cache" / "go-path"
+    expected_cache = cache_root / "go-build"
+    expected_modules = cache_root / "go-mod"
+    expected_path = cache_root / "go-path"
     assert captured and all(item["GOCACHE"] == str(expected_cache) for item in captured)
     assert all(item["GOMODCACHE"] == str(expected_modules) for item in captured)
     assert all(item["GOPATH"] == str(expected_path) for item in captured)

@@ -23,6 +23,7 @@ with tempfile.TemporaryDirectory(prefix="node-release-controlplane-build-") as d
     (base / "etc" / "known_hosts").write_text("entry ssh-ed25519 AAAATEST\n", encoding="utf-8")
     environment = node_release_upload.controlplane_build_environment(current, candidate, {})
     assert environment["NB_KNOWN_HOSTS"] == str(base / "etc" / "known_hosts")
+    assert environment["NB_CONTROLPLANE_GO_CACHE_ROOT"] == str(base / "data" / "go-build-cache")
     assert "NB_SSH_PASSWORD_ENTRY" not in environment
 
 print("node release control-plane build isolation passed")

@@ -67,9 +67,10 @@ def build_controlplane(root: pathlib.Path, output: pathlib.Path,
     output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ if environment is None else environment)
     env["CGO_ENABLED"] = "0"
-    go_cache = output / ".cache" / "go-build"
-    go_modules = output / ".cache" / "go-mod"
-    go_path = output / ".cache" / "go-path"
+    cache_root = pathlib.Path(env.get("NB_CONTROLPLANE_GO_CACHE_ROOT", str(output / ".cache")))
+    go_cache = cache_root / "go-build"
+    go_modules = cache_root / "go-mod"
+    go_path = cache_root / "go-path"
     for directory in (go_cache, go_modules, go_path):
         directory.mkdir(parents=True, exist_ok=True)
     env["GOCACHE"] = str(go_cache)

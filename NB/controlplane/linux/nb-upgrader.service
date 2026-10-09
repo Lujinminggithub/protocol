@@ -20,7 +20,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/opt/nb-controlplane
+ReadWritePaths=/opt/nb-controlplane /etc/systemd/system
 
 [Install]
 WantedBy=multi-user.target

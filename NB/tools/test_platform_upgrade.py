@@ -11,6 +11,8 @@ import platform_upgrade
 repo_root = pathlib.Path(platform_upgrade.__file__).resolve().parents[1]
 for unit in ("nb-web.service", "nb-web-worker.service", "nb-upgrader.service"):
     assert "TimeoutStopSec=500ms" in (repo_root / "controlplane" / "linux" / unit).read_text(encoding="utf-8")
+upgrader_unit = (repo_root / "controlplane" / "linux" / "nb-upgrader.service").read_text(encoding="utf-8")
+assert "ReadWritePaths=/opt/nb-controlplane /etc/systemd/system" in upgrader_unit
 worker_unit = (repo_root / "controlplane" / "linux" / "nb-web-worker.service").read_text(encoding="utf-8")
 assert "Requires=nb-web.service" not in worker_unit
 assert "Wants=network-online.target nb-web.service" in worker_unit
