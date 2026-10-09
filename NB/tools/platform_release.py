@@ -68,8 +68,13 @@ def build_controlplane(root: pathlib.Path, output: pathlib.Path,
     env = dict(os.environ if environment is None else environment)
     env["CGO_ENABLED"] = "0"
     go_cache = output / ".cache" / "go-build"
-    go_cache.mkdir(parents=True, exist_ok=True)
+    go_modules = output / ".cache" / "go-mod"
+    go_path = output / ".cache" / "go-path"
+    for directory in (go_cache, go_modules, go_path):
+        directory.mkdir(parents=True, exist_ok=True)
     env["GOCACHE"] = str(go_cache)
+    env["GOMODCACHE"] = str(go_modules)
+    env["GOPATH"] = str(go_path)
     commands = (
         [str(go), "test", "./cmd/...", "./internal/..."],
         [str(go), "build", "-trimpath", "-o", str(output / "nb-web"), "./cmd/nb-web"],

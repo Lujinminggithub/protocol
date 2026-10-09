@@ -66,7 +66,13 @@ with tempfile.TemporaryDirectory(prefix="platform-release-cache-") as directory:
     finally:
         platform_release.subprocess.run = original_run
     expected_cache = output / ".cache" / "go-build"
+    expected_modules = output / ".cache" / "go-mod"
+    expected_path = output / ".cache" / "go-path"
     assert captured and all(item["GOCACHE"] == str(expected_cache) for item in captured)
+    assert all(item["GOMODCACHE"] == str(expected_modules) for item in captured)
+    assert all(item["GOPATH"] == str(expected_path) for item in captured)
     assert expected_cache.is_dir()
+    assert expected_modules.is_dir()
+    assert expected_path.is_dir()
 
 print("platform release tests passed")
