@@ -141,6 +141,11 @@ def load_isolated_deploy(root: pathlib.Path, namespace: str):
     return deploy_module
 
 
+def apply_runtime_environment(values: dict[str, str]) -> None:
+    for name, value in values.items():
+        os.environ[name] = value
+
+
 def execute_transaction(adapter: UpgradeAdapter, *, workers: int,
                         deadline_seconds: float = 2.0) -> dict:
     if workers < 1 or workers > 32 or not 0.5 <= deadline_seconds <= 2.0:
@@ -242,6 +247,7 @@ class SystemAdapter:
         self.node_manifest = None
         self.node_binary = None
         self.runtime_plan = None
+        self.runtime_environment: dict[str, str] = {}
         self.units_installed = False
 
     def _rollback_record(self, release_id: str | None = None,
@@ -379,6 +385,7 @@ class SystemAdapter:
 
     def _load_deploy(self):
         if self.deploy is not None:
+            apply_runtime_environment(self.runtime_environment)
             return
         state = self.install_root / "data" / "worker" / "lines" / self.line_id
         self.runtime_plan = json.loads((state / "runtime-plan.json").read_text(encoding="utf-8"))
@@ -401,6 +408,10 @@ class SystemAdapter:
             device_id = str(device.get("id") or device.get("name") or "")
             secret = secrets.get("device:" + device_id) or secrets.get(device_id) or {}
             os.environ["NB_SSH_PASSWORD_" + environment_role] = str(secret.get("password") or "")
+        names = ("NB_HOSTS_FILE", "NB_KNOWN_HOSTS", "NB_DEPLOY_INSTANCE", "NB_LINE_PROFILE_FILE",
+                 "NB_SECURITY_DIR", "NB_SOCKS_USERNAME", "NB_SOCKS_PASSWORD",
+                 "NB_SSH_PASSWORD_ENTRY", "NB_SSH_PASSWORD_MIDDLE", "NB_SSH_PASSWORD_EXIT")
+        self.runtime_environment = {name: os.environ[name] for name in names if name in os.environ}
         self.deploy = load_isolated_deploy(self.current_root, self.operation_id + "-" + self.line_id)
         self.node_manifest = json.loads((self.current_root / "build" / "release-manifest.json").read_text(encoding="utf-8"))
         self.node_binary = (self.current_root / "build" / "nb_node").read_bytes()

@@ -173,7 +173,8 @@ with tempfile.TemporaryDirectory(prefix="platform-deploy-modules-") as directory
     tools = root / "tools"
     tools.mkdir()
     (tools / "deploy_core.py").write_text(
-        "import os\nVALUE=os.environ['NB_TEST_ISOLATED_VALUE']\n", encoding="utf-8")
+        "import os\nVALUE=os.environ['NB_TEST_ISOLATED_VALUE']\n"
+        "def current_value(): return os.environ['NB_TEST_ISOLATED_VALUE']\n", encoding="utf-8")
     (tools / "deploy.py").write_text("from deploy_core import *\n", encoding="utf-8")
     os.environ["NB_TEST_ISOLATED_VALUE"] = "line-a"
     deploy_a = platform_upgrade.load_isolated_deploy(root, "line-a")
@@ -182,5 +183,9 @@ with tempfile.TemporaryDirectory(prefix="platform-deploy-modules-") as directory
     assert deploy_a.VALUE == "line-a"
     assert deploy_b.VALUE == "line-b"
     assert deploy_a is not deploy_b
+    platform_upgrade.apply_runtime_environment({"NB_TEST_ISOLATED_VALUE": "line-a-runtime"})
+    assert deploy_a.current_value() == "line-a-runtime"
+    platform_upgrade.apply_runtime_environment({"NB_TEST_ISOLATED_VALUE": "line-b-runtime"})
+    assert deploy_b.current_value() == "line-b-runtime"
 
 print("platform upgrade transaction tests passed")
