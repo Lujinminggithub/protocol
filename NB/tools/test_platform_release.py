@@ -48,4 +48,25 @@ try:
 except RuntimeError as error:
     assert "Go" in str(error)
 
+with tempfile.TemporaryDirectory(prefix="platform-release-cache-") as directory:
+    base = pathlib.Path(directory)
+    go = base / "go"
+    go.write_text("test", encoding="utf-8")
+    root = base / "repo"
+    output = base / "output"
+    (root / "controlplane").mkdir(parents=True)
+    captured = []
+    original_run = platform_release.subprocess.run
+    try:
+        def fake_run(command, **kwargs):
+            captured.append(kwargs["env"])
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        platform_release.subprocess.run = fake_run
+        platform_release.build_controlplane(root, output, {"NB_CONTROLPLANE_GO": str(go)})
+    finally:
+        platform_release.subprocess.run = original_run
+    expected_cache = output / ".cache" / "go-build"
+    assert captured and all(item["GOCACHE"] == str(expected_cache) for item in captured)
+    assert expected_cache.is_dir()
+
 print("platform release tests passed")
