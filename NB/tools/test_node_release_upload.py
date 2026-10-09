@@ -10,24 +10,22 @@ import zipfile
 import node_release_upload
 
 
-with tempfile.TemporaryDirectory(prefix="node-release-upload-") as directory:
+with tempfile.TemporaryDirectory(prefix="node-release-controlplane-build-") as directory:
     base = pathlib.Path(directory)
     current = base / "repo"
     candidate = base / "candidate"
     (candidate / "tools").mkdir(parents=True)
-    (base / "data" / "secrets").mkdir(parents=True)
+    (base / "etc").mkdir(parents=True)
     (candidate / "tools" / "lab-hosts.json").write_text(json.dumps({
         "entry": {"name": "entry-1", "password_env": "NB_SSH_PASSWORD_ENTRY"},
         "paths": {"work_dir": "/etc/NB"},
     }), encoding="utf-8")
-    (base / "data" / "secrets" / "device-secrets.json").write_text(json.dumps({
-        "device:entry-1": {"password": "controlled-secret"},
-    }), encoding="utf-8")
-    environment: dict[str, str] = {}
-    node_release_upload.apply_build_credentials(current, candidate, environment)
-    assert environment["NB_SSH_PASSWORD_ENTRY"] == "controlled-secret"
+    (base / "etc" / "known_hosts").write_text("entry ssh-ed25519 AAAATEST\n", encoding="utf-8")
+    environment = node_release_upload.controlplane_build_environment(current, candidate, {})
+    assert environment["NB_KNOWN_HOSTS"] == str(base / "etc" / "known_hosts")
+    assert "NB_SSH_PASSWORD_ENTRY" not in environment
 
-print("node release upload credential resolution passed")
+print("node release control-plane build isolation passed")
 
 
 def add_repository_files(write_file) -> None:

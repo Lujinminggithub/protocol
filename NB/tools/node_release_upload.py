@@ -105,28 +105,25 @@ def overlay_controlplane_orchestration(current: pathlib.Path, candidate: pathlib
         shutil.copy2(source, target)
 
 
-def apply_build_credentials(current_root: pathlib.Path, candidate: pathlib.Path, environment: dict[str, str]) -> None:
-    inventory_path = pathlib.Path(environment.get("NB_HOSTS_FILE", str(candidate / "tools" / "lab-hosts.json")))
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-    build_role = str(inventory.get("build_host") or "entry")
-    role_keys = {"entry": "edges", "middle": "relays", "exit": "terminals"}
-    device = inventory.get(build_role)
-    if not isinstance(device, dict):
-        candidates = inventory.get(role_keys[build_role]) or []
-        if len(candidates) != 1:
-            raise RuntimeError(f"构建拓扑必须且只能包含一个 {build_role} 设备")
-        device = candidates[0]
-    password_env = str(device.get("password_env") or f"NB_SSH_PASSWORD_{build_role.upper()}")
-    if environment.get(password_env):
-        return
-    secrets_path = current_root.parent / "data" / "secrets" / "device-secrets.json"
-    secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
-    device_id = str(device.get("id") or device.get("name") or "")
-    secret = secrets.get("device:" + device_id) or secrets.get(device_id) or {}
-    password = str(secret.get("password") or "") if isinstance(secret, dict) else ""
-    if not password:
-        raise RuntimeError(f"构建机 {device_id} 缺少受控设备凭据")
-    environment[password_env] = password
+def controlplane_build_environment(current_root: pathlib.Path, candidate: pathlib.Path,
+                                   source: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if source is None else source)
+    environment["NB_FORCE_REMOTE_BUILD"] = "1"
+    environment["NB_BUILD_LOCAL"] = "1"
+    environment["NB_ALLOW_UNVERSIONED_SOURCE"] = "1"
+    inventory = candidate / "tools" / "private" / "kz-machines.json"
+    known_hosts = candidate / "tools" / "private" / "kz-known_hosts"
+    if inventory.is_file():
+        environment["NB_HOSTS_FILE"] = str(inventory)
+    if known_hosts.is_file():
+        environment["NB_KNOWN_HOSTS"] = str(known_hosts)
+    else:
+        installed_known_hosts = current_root.parent / "etc" / "known_hosts"
+        if installed_known_hosts.is_file():
+            environment["NB_KNOWN_HOSTS"] = str(installed_known_hosts)
+    if not environment.get("NB_KNOWN_HOSTS"):
+        raise RuntimeError("Node Release 构建缺少受信任的 known_hosts")
+    return environment
 
 
 def stage_candidate(current: pathlib.Path, candidate: pathlib.Path, operation_id: str) -> pathlib.Path:
@@ -157,23 +154,7 @@ def main() -> None:
         git_info["project_path"] = candidate.relative_to(repository).as_posix()
         preserve_private_runtime(args.current_root, candidate)
         overlay_controlplane_orchestration(args.current_root, candidate)
-        environment = os.environ.copy()
-        environment["NB_FORCE_REMOTE_BUILD"] = "1"
-        environment["NB_BUILD_LOCAL"] = "1"
-        environment["NB_ALLOW_UNVERSIONED_SOURCE"] = "1"
-        inventory = candidate / "tools" / "private" / "kz-machines.json"
-        known_hosts = candidate / "tools" / "private" / "kz-known_hosts"
-        if inventory.is_file():
-            environment["NB_HOSTS_FILE"] = str(inventory)
-        if known_hosts.is_file():
-            environment["NB_KNOWN_HOSTS"] = str(known_hosts)
-        else:
-            installed_known_hosts = args.current_root.parent / "etc" / "known_hosts"
-            if installed_known_hosts.is_file():
-                environment["NB_KNOWN_HOSTS"] = str(installed_known_hosts)
-        if not environment.get("NB_KNOWN_HOSTS"):
-            raise RuntimeError("Node Release 构建缺少受信任的 known_hosts")
-        apply_build_credentials(args.current_root, candidate, environment)
+        environment = controlplane_build_environment(args.current_root, candidate)
         result = subprocess.run([environment.get("PYTHON", "python3"), "tools/deploy.py", "build"], cwd=candidate,
                                 env=environment, check=False, capture_output=True, text=True, encoding="utf-8")
         if result.returncode:
